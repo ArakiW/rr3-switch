@@ -1,0 +1,39 @@
+# Build artifacts
+*.o
+*.d
+*.elf
+*.nro
+*.nacp
+*.map
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+*.log
+*.log.*
+
+# Sensitive data
+*.key
+*.pem
+.env
+
+# Large binaries (not in repo)
+*.romfs
+dist/
+reverse/native/arm64/*.so
+analysis/rr3-ui-source/
+tools/emulators/
+tools/devkitPro/

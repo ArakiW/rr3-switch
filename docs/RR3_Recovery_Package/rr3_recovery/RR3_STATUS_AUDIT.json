@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "source": "/mnt/data/PROJECT_STATUS.md",
+  "scope": "Report arithmetic and labels; optional read-only ELF structural checks.",
+  "anchor_elf_va": "0x12b3614",
+  "expected_dso_sha256": "57edb6314fb1f73916446dccf2aab2223a932ae63ccdf2149cffeddb5aa73051",
+  "address_checks": [
+    {
+      "symbol": "onViewRenderJNI",
+      "elf_va": "0x12b3614",
+      "reported_delta": "+0x0",
+      "calculated_delta": "+0x0",
+      "reported_delta_resolves_to_va": "0x12b3614",
+      "status": "PASS_ARITHMETIC_ONLY"
+    },
+    {
+      "symbol": "cloudcell GOT",
+      "elf_va": "0x1f6d5d0",
+      "reported_delta": "+0xcb9fbc",
+      "calculated_delta": "+0xcb9fbc",
+      "reported_delta_resolves_to_va": "0x1f6d5d0",
+      "status": "PASS_ARITHMETIC_ONLY"
+    },
+    {
+      "symbol": "菜单加载器全局",
+      "elf_va": "0x1f6df50",
+      "reported_delta": "+0xcba93c",
+      "calculated_delta": "+0xcba93c",
+      "reported_delta_resolves_to_va": "0x1f6df50",
+      "status": "PASS_ARITHMETIC_ONLY"
+    },
+    {
+      "symbol": "FUN_014bcbac",
+      "elf_va": "0x13bcbac",
+      "reported_delta": "+0x109598",
+      "calculated_delta": "+0x109598",
+      "reported_delta_resolves_to_va": "0x13bcbac",
+      "status": "PASS_ARITHMETIC_ONLY"
+    },
+    {
+      "symbol": "FUN_012034fc",
+      "elf_va": "0x11034fc",
+      "reported_delta": "-0x1b0118",
+      "calculated_delta": "-0x1b0118",
+      "reported_delta_resolves_to_va": "0x11034fc",
+      "status": "PASS_ARITHMETIC_ONLY"
+    },
+    {
+      "symbol": "CloudcellResume",
+      "elf_va": "0x1cf2ad8",
+      "reported_delta": "+0xa3f4c4",
+      "calculated_delta": "+0xa3f4c4",
+      "reported_delta_resolves_to_va": "0x1cf2ad8",
+      "status": "PASS_ARITHMETIC_ONLY"
+    },
+    {
+      "symbol": "hideSplash 检查",
+      "elf_va": "0x12aeee0",
+      "reported_delta": "-0x4e1634",
+      "calculated_delta": "-0x4734",
+      "reported_delta_resolves_to_va": "0xdd1fe0",
+      "status": "ERROR_DELTA_MISMATCH"
+    }
+  ],
+  "findings": [
+    {
+      "severity": "REVIEW",
+      "code": "LABEL_VA_NAMESPACE_DIFFERENCE",
+      "symbol": "FUN_014bcbac",
+      "label_va": "0x14bcbac",
+      "elf_va": "0x13bcbac",
+      "difference": "+0x100000",
+      "note": "May be a documented Ghidra rebase, NOT proof of a wrong runtime address."
+    },
+    {
+      "severity": "REVIEW",
+      "code": "LABEL_VA_NAMESPACE_DIFFERENCE",
+      "symbol": "FUN_012034fc",
+      "label_va": "0x12034fc",
+      "elf_va": "0x11034fc",
+      "difference": "+0x100000",
+      "note": "May be a documented Ghidra rebase, NOT proof of a wrong runtime address."
+    },
+    {
+      "severity": "ERROR",
+      "code": "DELTA_MISMATCH",
+      "symbol": "hideSplash 检查",
+      "elf_va": "0x12aeee0",
+      "reported_delta": "-0x4e1634",
+      "calculated_delta": "-0x4734",
+      "reported_delta_resolves_to_va": "0xdd1fe0",
+      "status": "ERROR_DELTA_MISMATCH",
+      "runtime_cause_proven": false
+    },
+    {
+      "severity": "REVIEW",
+      "code": "VTABLE_SLOT_272_REVIEW",
+      "byte_offset": 272,
+      "assumed_entry_bytes": 8,
+      "index_relative_to_vptr_address_point": 34,
+      "fits_40_function_entries": true,
+      "note": "Arithmetic only. Actual object/vptr/table population and crash provenance are unverified."
+    }
+  ],
+  "elf_check": {
+    "status": "NOT_RUN_NO_ELF_PROVIDED"
+  },
+  "runtime_checks": {
+    "status": "NOT_RUN",
+    "reason": "No project source build, Switch execution, or actual guest trace is performed by this tool."
+  },
+  "source_sha256": "e403dd897e28bc561e0445bb69bb5830cf400e5a8b7fcc7061e117ad16cdaab2",
+  "summary": {
+    "audit_errors": 1,
+    "overall": "FAIL"
+  }
+}

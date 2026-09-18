@@ -1,0 +1,22 @@
+test_bad_delta_destination_is_exact (test_audit_rr3_status.AuditorTests.test_bad_delta_destination_is_exact) ... ok
+test_cli_writes_audit_failure_without_runtime_claim (test_audit_rr3_status.AuditorTests.test_cli_writes_audit_failure_without_runtime_claim) ... ok
+test_correct_delta_passes_arithmetic (test_audit_rr3_status.AuditorTests.test_correct_delta_passes_arithmetic) ... ok
+test_detects_reported_delta_error (test_audit_rr3_status.AuditorTests.test_detects_reported_delta_error) ... ok
+test_duplicate_anchor_rejected (test_audit_rr3_status.AuditorTests.test_duplicate_anchor_rejected) ... ok
+test_elf_header_and_segment (test_audit_rr3_status.AuditorTests.test_elf_header_and_segment) ... ok
+test_invalid_delta_is_not_ignored (test_audit_rr3_status.AuditorTests.test_invalid_delta_is_not_ignored) ... ok
+test_invalid_hash_is_reported (test_audit_rr3_status.AuditorTests.test_invalid_hash_is_reported) ... ok
+test_invalid_segment_alignment_rejected (test_audit_rr3_status.AuditorTests.test_invalid_segment_alignment_rejected) ... ok
+test_missing_section_is_not_a_false_pass (test_audit_rr3_status.AuditorTests.test_missing_section_is_not_a_false_pass) ... ok
+test_optional_elf_hash_mismatch_is_error (test_audit_rr3_status.AuditorTests.test_optional_elf_hash_mismatch_is_error) ... ok
+test_optional_elf_identity_and_zero_fill (test_audit_rr3_status.AuditorTests.test_optional_elf_identity_and_zero_fill) ... ok
+test_output_cannot_overwrite_input (test_audit_rr3_status.AuditorTests.test_output_cannot_overwrite_input) ... ok
+test_rebase_label_difference_is_review_not_error (test_audit_rr3_status.AuditorTests.test_rebase_label_difference_is_review_not_error) ... ok
+test_signed_number_parsing (test_audit_rr3_status.AuditorTests.test_signed_number_parsing) ... ok
+test_truncated_elf_rejected (test_audit_rr3_status.AuditorTests.test_truncated_elf_rejected) ... ok
+test_wrong_architecture_rejected (test_audit_rr3_status.AuditorTests.test_wrong_architecture_rejected) ... ok
+
+----------------------------------------------------------------------
+Ran 17 tests in 0.008s
+
+OK
