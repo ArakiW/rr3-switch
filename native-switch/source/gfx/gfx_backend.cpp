@@ -256,6 +256,15 @@ void parseCompleteMode(const char* text, char* out, size_t capacity) {
     std::snprintf(out, capacity, "%s", known ? lowered : "off");
 }
 
+// Set by readConf() when the file has bytes past the buffer. Reported in the
+// gfx-backend summary line so a truncated conf is visible in the log rather
+// than being a switch that quietly did nothing.
+static bool s_confTruncated = false;
+// Bytes actually consumed from the file. Echoed in the summary line so "the key
+// I set had no effect" can be told apart from "the key never arrived" without
+// having to go and measure the SD card by hand.
+static size_t s_confBytes = 0;
+
 void readConf() {
     if (s_conf.resolved) {
         return;
@@ -276,8 +285,20 @@ void readConf() {
     if (f == nullptr) {
         return;
     }
-    char buffer[256] = {0};
+    // SIZE, because 256 was a silent landmine. This file is read ONCE into a
+    // fixed buffer, so anything past the end is discarded without a word: a
+    // conf carrying a documented header (the real one is 2.7 KB, almost all
+    // comment) put every setting below byte 256 into the void, and two A/B runs
+    // on 2026-10-16 measured the SAME configuration twice because the switch
+    // being tested sat at offset 674. A switch that silently does nothing is
+    // indistinguishable from a switch that does nothing useful, and that is the
+    // one failure mode this parser must never have again -- hence the explicit
+    // truncation flag below, which is reported in the gfx-backend summary line.
+    char buffer[4096] = {0};
     const size_t read = std::fread(buffer, 1, sizeof(buffer) - 1, f);
+    // Anything still queued after the last byte we took means the tail was cut.
+    s_confTruncated = (std::fgetc(f) != EOF);
+    s_confBytes = read;
     std::fclose(f);
     buffer[read] = '\0';
 
@@ -432,14 +453,17 @@ void resolveBackend() {
     s_backend = null ? GfxBackend::kNull : GfxBackend::kMesa;
     s_backendSource = source != nullptr ? source : "default";
 
-    char details[192];
+    char details[256];
     std::snprintf(details, sizeof(details),
                   " backend=%s source=%s value=%s dumpdir=%s zeropage=%d"
-                  " ccmode=%s",
+                  " ccmode=%s menugate=%d ccdone=%d conf_trunc=%d conf_bytes=%zu",
                   gfxBackendName(), s_backendSource,
                   chosen[0] != '\0' ? chosen : "(unset)", kDumpDir,
                   s_conf.zeroPage ? 1 : 0,
-                  s_conf.ccMode[0] != '\0' ? s_conf.ccMode : "off");
+                  s_conf.ccMode[0] != '\0' ? s_conf.ccMode : "off",
+                  s_conf.menuGate ? 1 : 0,
+                  s_conf.cloudcellComplete ? 1 : 0,
+                  s_confTruncated ? 1 : 0, s_confBytes);
     writeLine("gfx-backend", 300, static_cast<unsigned long long>(s_backend), details);
 }
 
