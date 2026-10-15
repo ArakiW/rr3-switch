@@ -84,6 +84,15 @@ bool gfxMenuGateOpen();
 // -- the record it decodes carries an assert whose accepted shape is unproven.
 bool gfxCloudcellCompleteRequests();
 
+// "ccmode=off|now|bg": WHICH context invokes that continuation, as opposed to
+// whether it is invoked at all (ccdone). The only delivery site that existed is
+// the frame loop, and the guest blocks inside frame 0 before reaching it, so:
+//   off -- unchanged behaviour, the frame-loop site is still the only one
+//   now -- invoke it inline inside the endpoint stub, right after the capture
+//   bg  -- cloudcell_defer() it and let the existing alert-pump thread drain it
+// Never returns anything but "off", "now" or "bg".
+const char* gfxCloudcellCompleteMode();
+
 // "mlstub=1": force menu-loader vtable slot 21 to the host stub even when the
 // guest's own vtable is valid. Experiment knob.
 bool gfxForceMenuLoaderStub();

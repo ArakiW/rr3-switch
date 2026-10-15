@@ -394,6 +394,89 @@ struct CloudcellContinuation {
 static CloudcellContinuation g_ccPending{nullptr, nullptr, nullptr, nullptr, nullptr};
 static bool g_ccRequestSeen = false;
 
+// ---- where the continuation gets invoked (ccmode) -------------------------
+//
+// The delivery site that existed -- the frame loop, two calls below -- is
+// unreachable for the run this exists to fix, and unreachable structurally
+// rather than by accident:
+//
+//   The guest calls slot 3 (a getter) and then slot 2 on the endpoint, handing
+//   over a std::function. cloudcellEndpointStubRequest below captures it and
+//   returns 0 without ever calling it. The only code that ever calls it is
+//   cloudcellPumpCompletion(), and its only call site sits AFTER
+//   renderTarget(...) in frame 0's body. The guest blocks INSIDE that call, in
+//   pure guest code (inbridge=0), after one last fopen. So the host's own call
+//   ordering produced a circular wait: the thread that must deliver the answer
+//   is the thread waiting for the answer. Two archived reproductions agree --
+//   loop-top is logged once (it only logs for frames < 3), the 30-frame
+//   heartbeat never arrives, guest-activity is therefore 0, and the
+//   continuation has already been captured twice.
+//
+// "ccmode" moves the delivery point UP to the capture, which is a context that
+// is provably running, and picks the thread it runs on:
+//
+//   now  invoke it inline, right here. Removes the circularity completely; the
+//        cost is guest code running RE-ENTRANTLY inside Cloudcell init, which is
+//        the invariant cloudcell_defer.h exists to protect.
+//   bg   cloudcell_defer() it. cloudcell_pump() drains the whole queue from
+//        whichever thread calls it, and the alert-pump thread -- a raw
+//        threadCreate thread that exists for exactly this purpose -- calls
+//        cloudcell_pump("alert-pump", false) every ~80 ms for the life of the
+//        process (jni_bridge.cpp:2508). So the drain needs no new queue, no new
+//        thread and no edit to that file; the callback runs on a thread that is
+//        still ticking while the game thread is wedged.
+//   off  (default, absent key) nothing here, and the frame-loop site is still
+//        the only delivery site -- i.e. today's behaviour, unchanged.
+//
+// The record is shared state in every mode except off, because bg mode writes
+// it on the game thread and reads it on the pump thread. libnx Mutex, NOT
+// std::mutex, for the reason cloudcell_defer.cpp measured rather than chose:
+// a std mutex on a guest-visible path took host CPU from 13.7 s to 80.7 s by
+// dragging the guest's pthread shim into a host lock. It is not recursive, so
+// the discipline is take -> copy -> drop, and it is NEVER held across the
+// invoke below -- that call is a blr into guest ARM64 code and owes this bridge
+// nothing, so a lock held across it would be held until the process died.
+static Mutex g_ccPendingLock{};
+
+// Take the pending record, or say why there is nothing to take.
+//
+// Three answers rather than a bool, because the frame-loop caller runs this
+// every frame under "ccdone=1" and the caller of an inline "now" delivery can
+// run it from inside the guest. "nothing" has to stay SILENT or it would write
+// one log line per frame forever, which is the same reason cloudcell_pump takes
+// always_log=false on its per-frame site.
+//
+// The record is left in place when it is unusable, exactly as it was before
+// this lock existed: an unusable vtable is a finding to keep re-reporting, not
+// something to consume.
+enum class CcTake { kNothing, kUnusable, kTaken };
+static CcTake takePendingContinuation(CloudcellContinuation* out,
+                                      void** slot6Out) {
+    CcTake result = CcTake::kNothing;
+    mutexLock(&g_ccPendingLock);
+    if (g_ccRequestSeen && g_ccPending.vtable != nullptr) {
+        auto** vtable = reinterpret_cast<void**>(g_ccPending.vtable);
+        result = (vtable != nullptr && vtable[6] != nullptr) ? CcTake::kTaken
+                                                             : CcTake::kUnusable;
+        if (result == CcTake::kTaken) {
+            *out = g_ccPending;
+            *slot6Out = vtable[6];
+            g_ccPending = {};
+            g_ccRequestSeen = false;
+        }
+        else {
+            // Copied out but NOT consumed: the SKIPPED log line below needs the
+            // real vtable to be worth anything, and the record has to survive
+            // so the next caller sees the same unusable capture.
+            *out = g_ccPending;
+        }
+    }
+    mutexUnlock(&g_ccPendingLock);
+    return result;
+}
+
+void cloudcellPumpCompletion(const char* mode);
+
 // x1->vtable[2](x1, str, w2, std::function&&)  -- 0xcf1018's call site.
 extern "C" uint64_t cloudcellEndpointStubRequest(void* self, const void* str,
                                                  uint32_t w2, void* fn) {
@@ -401,16 +484,48 @@ extern "C" uint64_t cloudcellEndpointStubRequest(void* self, const void* str,
     (void)str;
     (void)w2;
     if (fn != nullptr) {
-        std::memcpy(&g_ccPending, fn, sizeof(g_ccPending));
-        g_ccRequestSeen = true;
+        // Copied under the lock, not read out of the global for the log below:
+        // with "bg" set, the alert-pump thread can take and clear this record
+        // between the store above and the snprintf, and an unlocked read of it
+        // here would print the zeros the other thread just left behind -- i.e.
+        // a log line that contradicts itself.
+        CloudcellContinuation captured{};
+        {
+            mutexLock(&g_ccPendingLock);
+            std::memcpy(&g_ccPending, fn, sizeof(g_ccPending));
+            g_ccRequestSeen = true;
+            captured = g_ccPending;
+            mutexUnlock(&g_ccPendingLock);
+        }
         char diag[224];
         __builtin_snprintf(diag, sizeof(diag),
             "cc-endpoint-request: captured continuation vtable=%p invoker=%p"
             " manager=%p payload=%p blob=%p w2=%u",
-            g_ccPending.vtable, g_ccPending.invoker, g_ccPending.manager,
-            g_ccPending.payload, g_ccPending.blob, w2);
+            captured.vtable, captured.invoker, captured.manager,
+            captured.payload, captured.blob, w2);
         appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                             "cc-endpoint-request", 249, 0, diag);
+
+        // Deliver from HERE, the only context on the capture path that is not
+        // downstream of the call the guest is wedged in. Read once per capture,
+        // not per mode branch, so the value the log line reports below and the
+        // value acted on here cannot disagree.
+        const char* mode = gfxCloudcellCompleteMode();
+        if (std::strcmp(mode, "now") == 0) {
+            // Inline. Re-entrant by construction -- the guest is still inside
+            // the Cloudcell call that produced this request -- which is the
+            // hazard cloudcell_defer.h exists to prevent, so this mode is the
+            // diagnostic arm of the A/B and not the safe one.
+            cloudcellPumpCompletion("now");
+        }
+        else if (std::strcmp(mode, "bg") == 0) {
+            // Deferred. Nothing is passed in: the record lives in
+            // g_ccPending, which the drain reads under g_ccPendingLock, so the
+            // callback stays a plain function call on whatever thread
+            // cloudcell_pump() happens to be running on. That is what lets the
+            // existing alert-pump tick take it with no edit to jni_bridge.cpp.
+            cloudcell_defer([]() { cloudcellPumpCompletion("bg"); });
+        }
     } else {
         appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                             "cc-endpoint-request", 249, 0,
@@ -436,35 +551,60 @@ extern "C" void* cloudcellSlot3Endpoint(void* self) {
 // Call the saved continuation once. 0x14-byte record, matching the guest's own
 // reads (0xab36f8 decodes three ints from it). Left all-zero deliberately: the
 // offline branch is a record with non-success values, not a special path.
-void cloudcellPumpCompletion() {
-    if (!g_ccRequestSeen || g_ccPending.vtable == nullptr) {
+//
+// This is a FAILURE record and stays one. There is no Cloudcell server behind
+// this stub, so no authentication is invented, no response body is invented and
+// no success bit is invented: the guest gets a denial it can decode, clears
+// `pending`, and takes its own offline branch. That is the honest outcome, and
+// the alternative -- forging a success -- is the one thing this port must not do.
+//
+// `mode` is the delivery path that got here ("now", "bg" or "frame") and is
+// logged, because "the continuation never ran" and "it ran on the wrong thread"
+// are different failures and only the thread field separates them.
+void cloudcellPumpCompletion(const char* mode) {
+    CloudcellContinuation saved{};
+    void* slot6 = nullptr;
+    const CcTake take = takePendingContinuation(&saved, &slot6);
+    if (take == CcTake::kNothing) {
+        // Silent by design: the frame-loop caller under "ccdone=1" reaches this
+        // once per frame with an empty record. See takePendingContinuation.
         return;
     }
-    // Invoke through vtable[6] (0x30/8), which is 0xcf11d8 -> 0xcf10d4 ->
-    // blob vtable slot 3 -> the unconditional `pending = 0`.
-    auto** vtable = reinterpret_cast<void**>(g_ccPending.vtable);
-    if (vtable == nullptr || vtable[6] == nullptr) {
-        char diag[128];
+    if (take == CcTake::kUnusable) {
+        char diag[160];
         __builtin_snprintf(diag, sizeof(diag),
-            "cc-complete: SKIPPED, vtable=%p slot6=%p", g_ccPending.vtable,
-            vtable != nullptr ? vtable[6] : nullptr);
+            "cc-complete: SKIPPED, mode=%s thread=0x%x pending_vtable=%p"
+            " slot6=%p", mode != nullptr ? mode : "(null)",
+            (unsigned)threadGetCurHandle(), saved.vtable, nullptr);
         appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                             "cc-complete", 249, 0, diag);
         return;
     }
-    using PFNInvoke = void (*)(void*, void*);
-    auto invoke = reinterpret_cast<PFNInvoke>(vtable[6]);
-    uint8_t record[0x14] = {};
-    CloudcellContinuation saved = g_ccPending;
-    g_ccPending = {};
-    g_ccRequestSeen = false;
+    // The one line per delivery actually attempted, and the one that makes the
+    // next run self-diagnosing: it is written BEFORE the invoke, so it survives
+    // a continuation that never returns (the alert-pump worker's own comment on
+    // entered/drained_total records the same shape of hazard). Fields:
+    //   mode     -- where this call was made from, per ccmode
+    //   thread   -- libnx handle of the CALLING thread. In bg mode this is the
+    //               alert-pump thread, which is how a run distinguishes "the
+    //               queue was drained by the background tick" from "the frame
+    //               loop reached its own site after all"; in now mode it is the
+    //               game thread, re-entered.
+    //   valid    -- 1 only when a captured continuation existed AND its vtable
+    //               slot 6 (0xcf11d8 -> 0xcf10d4 -> 0xab36f8) was non-null. It
+    //               cannot be 0 here; the unusable case returned above and logs
+    //               on its own, so valid=1 here is the assertion that the
+    //               delivered record was a real capture.
     char diag[192];
     __builtin_snprintf(diag, sizeof(diag),
-        "cc-complete: invoking slot6=%p with a 0x14 zero record; continuation"
-        " blob=%p invoker=%p", reinterpret_cast<void*>(vtable[6]), saved.blob,
-        saved.invoker);
+        "cc-deliver: mode=%s thread=0x%x valid=1 pending_vtable=%p slot6=%p"
+        " record=0x14-zero", mode != nullptr ? mode : "(null)",
+        (unsigned)threadGetCurHandle(), saved.vtable, slot6);
     appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
-                        "cc-complete", 249, 0, diag);
+                        "cc-deliver", 268, 0, diag);
+    using PFNInvoke = void (*)(void*, void*);
+    auto invoke = reinterpret_cast<PFNInvoke>(slot6);
+    uint8_t record[0x14] = {};
     invoke(&saved, record);
     appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                         "cc-complete-returned", 249, 0);
@@ -2949,8 +3089,15 @@ void* frameLoopDriver(void* opaque) {
         // device the response arrives on a JNI callback (the real Cloudcell
         // init at 0xbc2dec starts no thread of its own), so draining it from the
         // frame loop is what the host does, not a shortcut.
+        //
+        // NOT where this can first happen, though: the guest blocks inside the
+        // renderTarget(...) call lower down in this same frame body, so this site
+        // is unreachable for the run "ccmode" exists to fix. It stays, labelled
+        // "frame" in the log, because it is the delivery site that runs when the
+        // frame loop is alive -- and because with "ccmode" set, this is now a
+        // SECOND chance rather than the only one.
         if (gfxCloudcellCompleteRequests()) {
-            cloudcellPumpCompletion();
+            cloudcellPumpCompletion("frame");
         }
         if (frames < 3) {
             appendGuestBootLine(

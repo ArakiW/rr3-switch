@@ -180,6 +180,9 @@ struct ConfState {
     bool menuGate = false;
     // "ccdone=1" -- call the captured Cloudcell continuation. See above.
     bool cloudcellComplete = false;
+    // "ccmode=now|bg" -- WHERE the captured continuation is invoked from. See
+    // gfxCloudcellCompleteMode() for why the default has to stay empty.
+    char ccMode[8] = {0};
     // "mlstub=1" -- take menu-loader vtable slot 21 even when the guest's own
     // vtable is legal. See guest_view_probe.cpp for the measurement.
     bool forceMenuStub = false;
@@ -225,6 +228,32 @@ bool parseNumber(const char* text, unsigned long long* out) {
 bool parseSwitch(const char* text) {
     return std::strcmp(text, "1") == 0 || std::strcmp(text, "on") == 0 ||
            std::strcmp(text, "true") == 0 || std::strcmp(text, "yes") == 0;
+}
+
+// "ccmode" is the only key here whose value is a word instead of a boolean, and
+// its vocabulary is closed, so an unrecognised value has to RESOLVE rather than
+// be ignored: a typo in a file that lives on an SD card and is edited by hand
+// is otherwise indistinguishable from the default in the log.
+//
+// The value is lowercased first because the key parser above lowercases keys
+// but never values, and "NOW" is the same answer as "now". Anything else --
+// including an empty value -- resolves to "off", which is the behaviour from
+// before this key existed: the capture site does nothing and the frame-loop
+// site still runs, under "ccdone=1".
+void parseCompleteMode(const char* text, char* out, size_t capacity) {
+    char lowered[8] = {0};
+    size_t n = 0;
+    if (text != nullptr) {
+        for (; n + 1 < sizeof(lowered) && text[n] != '\0'; ++n) {
+            const char c = text[n];
+            lowered[n] = (c >= 'A' && c <= 'Z')
+                             ? static_cast<char>(c - 'A' + 'a')
+                             : c;
+        }
+    }
+    const bool known = std::strcmp(lowered, "now") == 0 ||
+                       std::strcmp(lowered, "bg") == 0;
+    std::snprintf(out, capacity, "%s", known ? lowered : "off");
 }
 
 void readConf() {
@@ -309,6 +338,12 @@ void readConf() {
         else if (std::strcmp(key, "ccdone") == 0 ||
                  std::strcmp(key, "cc-done") == 0) {
             s_conf.cloudcellComplete = parseSwitch(value);
+        }
+        else if (std::strcmp(key, "ccmode") == 0 ||
+                 std::strcmp(key, "cc-mode") == 0 ||
+                 std::strcmp(key, "ccdeliver") == 0 ||
+                 std::strcmp(key, "cc-deliver") == 0) {
+            parseCompleteMode(value, s_conf.ccMode, sizeof(s_conf.ccMode));
         }
         else if (std::strcmp(key, "zeropage") == 0) {
             s_conf.zeroPage = parseSwitch(value);
@@ -399,10 +434,12 @@ void resolveBackend() {
 
     char details[192];
     std::snprintf(details, sizeof(details),
-                  " backend=%s source=%s value=%s dumpdir=%s zeropage=%d",
+                  " backend=%s source=%s value=%s dumpdir=%s zeropage=%d"
+                  " ccmode=%s",
                   gfxBackendName(), s_backendSource,
                   chosen[0] != '\0' ? chosen : "(unset)", kDumpDir,
-                  s_conf.zeroPage ? 1 : 0);
+                  s_conf.zeroPage ? 1 : 0,
+                  s_conf.ccMode[0] != '\0' ? s_conf.ccMode : "off");
     writeLine("gfx-backend", 300, static_cast<unsigned long long>(s_backend), details);
 }
 
@@ -541,6 +578,44 @@ bool gfxMenuGateOpen() {
 bool gfxCloudcellCompleteRequests() {
     ensureResolved();
     return s_conf.cloudcellComplete;
+}
+
+// "ccmode=now|bg": WHICH CONTEXT invokes the Cloudcell continuation the guest
+// hands to the endpoint stub, as opposed to WHETHER it is invoked (ccdone).
+//
+// The two questions are separate because the one delivery site that existed --
+// the frame loop at guest_view_probe.cpp:2952 -- is structurally unreachable
+// for the run this exists to fix: the guest blocks inside frame 0's first
+// renderTarget(...) call, and that site is downstream of the very call the
+// guest is stuck in. The continuation is captured twice during Cloudcell init
+// and then nothing can ever run it. So this key moves the delivery point UP to
+// the capture, and picks the thread it runs on:
+//
+//   off (default) -- unchanged. Nothing happens at the capture site and the
+//                    frame-loop site is still the only one, so a run with no
+//                    key behaves exactly as it did before this key existed.
+//   now           -- invoke it synchronously, inside cloudcellEndpointStubRequest,
+//                    right after the capture. Cheapest, and it removes the
+//                    circularity completely: the guest is still inside the call
+//                    that started it. The price is that guest code runs
+//                    RE-ENTRANTLY inside Cloudcell init, which is exactly the
+//                    invariant cloudcell_defer.h exists to protect, so this is
+//                    the diagnostic mode, not the safe one.
+//   bg            -- cloudcell_defer() it and let the existing alert-pump thread
+//                    (jni_bridge.cpp:2508 calls cloudcell_pump("alert-pump",
+//                    false) every ~80 ms, for the life of the process) drain the
+//                    queue from a thread that IS running while the game thread is
+//                    blocked. No new queue and no new thread, and it preserves
+//                    the rule that no guest callback runs inline inside a
+//                    Cloudcell lock.
+//
+// Answers "off" for an absent file, an absent key and every unrecognised value,
+// so the default is this port's pre-switch behaviour and not an accident.
+// Read it from any thread; readConf() is one-shot and resolves under the same
+// guard as the backend selection.
+const char* gfxCloudcellCompleteMode() {
+    ensureResolved();
+    return s_conf.ccMode[0] != '\0' ? s_conf.ccMode : "off";
 }
 
 bool gfxForceMenuLoaderStub() {
