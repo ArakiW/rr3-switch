@@ -101,6 +101,13 @@ analysis/gta5-switch-bundle-report.json
 __pycache__/
 *.pyc
 
+# --- scratch -----------------------------------------------------------------
+# Where the reverse-engineering sub-agents park throwaway scripts. They are
+# numbered and disposable; the real analysis tooling is tracked under
+# tools/guest-analysis/ and must not be confused with this directory.
+native-switch/guest-analysis/scratch/
+guest-analysis/scratch/
+
 # --- run-time scratch written by the port -----------------------------------
 crash_reports/
 *.log
