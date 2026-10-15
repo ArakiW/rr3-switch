@@ -264,6 +264,19 @@ uintptr_t resolveMainImageExport(const char* name);
 // Runtime load bias of libRealRacing3.so (0 if the image is not loaded).
 // Guest VA = loadBias + ELF virtual address.
 uintptr_t resolveMainImageLoadBias();
+
+// Real ELF span of the main guest image, in bytes:
+// maximumAddress - minimumAddress (NOT the 128 MiB kMaximumImageSize cap, and
+// NOT the file size -- bss is mapped beyond the last section on disk).
+// Returns 0 when the main image is not loaded or the span is not sane.
+//
+// Why this exists: a runtime->ELF fold whose upper bound is the loader's 128 MiB
+// cap instead of the real span is loose enough that a host address can fold
+// into the target function's offset range. The write itself would still be
+// confined to this thread's live frame, but it could be the WRONG frame. With
+// the real span (~31 MiB here) the bound is tight enough that this is a real
+// guard rather than a formality.
+uintptr_t resolveMainImageSpanBytes();
 // Collects the runtime address of the named export from every loaded guest
 // image that defines it (e.g. JNI_OnLoad, which only libNimble exports today).
 // Writes up to `max` addresses into `out` and returns the count found.

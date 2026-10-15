@@ -1,4 +1,5 @@
 #include "rr3/cxx_lifecycle.hpp"
+#include "bionic_errno.hpp"
 
 #include <atomic>
 #include <cerrno>
@@ -83,7 +84,7 @@ int guestCxaAtexit(GuestDestructor destructor, void* argument, void* dsoHandle) 
         }
     }
     pthread_mutex_unlock(&gGlobalDestructorMutex);
-    errno = ENOMEM;
+    errno = kGuestErrnoENOMEM;
     return -1;
 }
 
@@ -133,7 +134,7 @@ int guestCxaThreadAtexitImpl(GuestDestructor destructor, void* argument,
         }
     }
     if (list->count == kMaximumThreadDestructors) {
-        errno = ENOMEM;
+        errno = kGuestErrnoENOMEM;
         return -1;
     }
     list->entries[list->count++] = {destructor, argument, dsoHandle, true};

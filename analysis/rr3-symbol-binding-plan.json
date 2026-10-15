@@ -1,0 +1,4979 @@
+{
+  "generated_at": "2026-08-29T13:26:16.3483560+08:00",
+  "input": "E:\\AI\\RealRacing3-switch\\reverse\\native\\arm64\\libRealRacing3.so",
+  "undefined_unique": 706,
+  "weak_unique": 22,
+  "target_defined_names": 12557,
+  "target_name_matches": 215,
+  "binding_counts": {
+    "android-log-shim": 2,
+    "platform-shim-review": 69,
+    "cxx-abi-review": 45,
+    "direct-name-match-candidate": 157,
+    "bionic-abi-shim": 13,
+    "libcxx-bionic-runtime": 150,
+    "middleware-or-disable": 71,
+    "optional-weak-stub": 21,
+    "graphics-shim": 145,
+    "pthread-shim": 33
+  },
+  "category_counts": {
+    "android": 2,
+    "other": 260,
+    "cxx": 195,
+    "fmod": 52,
+    "arcore": 19,
+    "egl": 3,
+    "gles": 142,
+    "pthread": 33
+  },
+  "caveats": [
+    "A matching symbol name is not proof of Bionic/newlib or libc++/libstdc++ ABI compatibility.",
+    "No external relocation is patched by this report.",
+    "Socket APIs require target service initialization before use."
+  ],
+  "symbols": [
+    {
+      "name": "__android_log_print",
+      "weak": false,
+      "category": "android",
+      "target_name_match": false,
+      "binding": "android-log-shim"
+    },
+    {
+      "name": "__android_log_vprint",
+      "weak": false,
+      "category": "android",
+      "target_name_match": false,
+      "binding": "android-log-shim"
+    },
+    {
+      "name": "__assert2",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "__cmsg_nxthdr",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "__cxa_allocate_exception",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "__cxa_atexit",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "__cxa_bad_cast",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "__cxa_begin_catch",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "__cxa_demangle",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "__cxa_end_catch",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "__cxa_finalize",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "__cxa_free_exception",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "__cxa_guard_acquire",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "__cxa_guard_release",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "__cxa_pure_virtual",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "__cxa_rethrow",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "__cxa_throw",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "__dynamic_cast",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "__emutls_get_address",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "__errno",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "bionic-abi-shim"
+    },
+    {
+      "name": "__FD_ISSET_chk",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "__FD_SET_chk",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "__fwrite_chk",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "__gxx_personality_v0",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "__memcpy_chk",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "bionic-abi-shim"
+    },
+    {
+      "name": "__memmove_chk",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "bionic-abi-shim"
+    },
+    {
+      "name": "__memset_chk",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "bionic-abi-shim"
+    },
+    {
+      "name": "__open_2",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "__read_chk",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "__register_atfork",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "__sF",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "__stack_chk_fail",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "bionic-abi-shim"
+    },
+    {
+      "name": "__strcat_chk",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "bionic-abi-shim"
+    },
+    {
+      "name": "__strchr_chk",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "__strcpy_chk",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "bionic-abi-shim"
+    },
+    {
+      "name": "__strlen_chk",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "__strncpy_chk",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "bionic-abi-shim"
+    },
+    {
+      "name": "__strncpy_chk2",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "__strrchr_chk",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "__vsnprintf_chk",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "bionic-abi-shim"
+    },
+    {
+      "name": "__vsprintf_chk",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "bionic-abi-shim"
+    },
+    {
+      "name": "_ctype_",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "bionic-abi-shim"
+    },
+    {
+      "name": "_Unwind_Resume",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_Z12OpenSLResumev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_Z13OpenSLSuspendv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZdaPv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZdlPv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZN2EA6Nimble6getEnvEv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZN2EA6Nimble9findClassEPKc",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZN4FMOD12ChannelGroup6addDSPEPNS_3DSPEPPNS_13DSPConnectionE",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD12ChannelGroup8addGroupEPS0_",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD12ChannelGroup9setVolumeEf",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD3DSP11getUserDataEPPv",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD3DSP12setParameterEif",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD3DSP15getSystemObjectEPPNS_6SystemE",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD3DSP7releaseEv",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD5Sound11getUserDataEPPv",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD5Sound11setUserDataEPv",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD5Sound12getOpenStateEP14FMOD_OPENSTATEPjPbS4_",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD5Sound7releaseEv",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD5Sound9getLengthEPjj",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD6System10getVersionEPj",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD6System11createSoundEPKcjP22FMOD_CREATESOUNDEXINFOPPNS_5SoundE",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD6System11getDSPClockEPjS1_",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD6System12createStreamEPKcjP22FMOD_CREATESOUNDEXINFOPPNS_5SoundE",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD6System14setSpeakerModeE16FMOD_SPEAKERMODE",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD6System15createDSPByTypeE13FMOD_DSP_TYPEPPNS_3DSPE",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD6System16getDSPBufferSizeEPjPi",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD6System16setDSPBufferSizeEji",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD6System17getSoftwareFormatEPiP17FMOD_SOUND_FORMATS1_S1_P18FMOD_DSP_RESAMPLERS1_",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD6System17set3DNumListenersEi",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD6System17setSoftwareFormatEi17FMOD_SOUND_FORMATii18FMOD_DSP_RESAMPLER",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD6System18createChannelGroupEPKcPPNS_12ChannelGroupE",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD6System23set3DListenerAttributesEiPK11FMOD_VECTORS3_S3_S3_",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD6System4initEijPv",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD6System6addDSPEPNS_3DSPEPPNS_13DSPConnectionE",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD6System6updateEv",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD6System7releaseEv",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD6System9createDSPEP20FMOD_DSP_DESCRIPTIONPPNS_3DSPE",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD6System9getOutputEP15FMOD_OUTPUTTYPE",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD6System9playSoundE17FMOD_CHANNELINDEXPNS_5SoundEbPPNS_7ChannelE",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD7Channel11getPositionEPjj",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD7Channel11getUserDataEPPv",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD7Channel11setCallbackEPF11FMOD_RESULTP12FMOD_CHANNEL25FMOD_CHANNEL_CALLBACKTYPEPvS5_E",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD7Channel11setPositionEjj",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD7Channel11setUserDataEPv",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD7Channel12setFrequencyEf",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD7Channel12setLoopCountEi",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD7Channel13setLoopPointsEjjjj",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD7Channel15set3DAttributesEPK11FMOD_VECTORS3_",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD7Channel15setChannelGroupEPNS_12ChannelGroupE",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD7Channel17set3DDopplerLevelEf",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD7Channel19set3DMinMaxDistanceEff",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD7Channel4stopEv",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD7Channel6addDSPEPNS_3DSPEPPNS_13DSPConnectionE",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD7Channel7getModeEPj",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD7Channel7setModeEj",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD7Channel9getPausedEPb",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD7Channel9setPausedEb",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_ZN4FMOD7Channel9setVolumeEf",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "_Znam",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZnamRKSt9nothrow_t",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZNKSt6__ndk112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE13find_first_ofEPKcmm",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNKSt6__ndk112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE2atEm",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNKSt6__ndk112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4copyEPcmm",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNKSt6__ndk112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4findEcm",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNKSt6__ndk112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4findEPKcmm",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNKSt6__ndk112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE5rfindEcm",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNKSt6__ndk112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7compareEmmPKc",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNKSt6__ndk112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7compareEmmPKcm",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNKSt6__ndk112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7compareEmmRKS5_mm",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNKSt6__ndk112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7compareEPKc",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNKSt6__ndk112basic_stringIwNS_11char_traitsIwEENS_9allocatorIwEEE4findEwm",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNKSt6__ndk119__shared_weak_count13__get_deleterERKSt9type_info",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNKSt6__ndk120__vector_base_commonILb1EE20__throw_out_of_rangeEv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNKSt6__ndk123__match_any_but_newlineIcE6__execERNS_7__stateIcEE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNKSt6__ndk16locale4nameEv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNKSt6__ndk16locale9has_facetERNS0_2idE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNKSt6__ndk16locale9use_facetERNS0_2idE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNKSt6__ndk18ios_base6getlocEv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNKSt6__ndk18time_getIcNS_19istreambuf_iteratorIcNS_11char_traitsIcEEEEE3getES4_S4_RNS_8ios_baseERjP2tmPKcSC_",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNKSt9exception4whatEv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZNSt11logic_errorC2EPKc",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZNSt12length_errorD1Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZNSt12out_of_rangeD1Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZNSt13exception_ptrD1Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt13runtime_errorC1EPKc",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZNSt13runtime_errorC1ERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt13runtime_errorD1Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZNSt20bad_array_new_lengthC1Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt20bad_array_new_lengthD1Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZNSt6__ndk111__call_onceERVmPvPFvS2_E",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk111regex_errorC1ENS_15regex_constants10error_typeE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk111regex_errorD1Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk111this_thread9sleep_forERKNS_6chrono8durationIxNS_5ratioILl1ELl1000000000EEEEE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk112__next_primeEm",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk112bad_weak_ptrD1Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE2atEm",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE5eraseEmm",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKc",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendERKS5_mm",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertEmmc",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertEmPKc",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6resizeEmc",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7replaceEmmPKc",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEaSEc",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEC1ERKS5_",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEC1ERKS5_mmRKS4_",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk112basic_stringIwNS_11char_traitsIwEENS_9allocatorIwEEE6resizeEmw",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk112basic_stringIwNS_11char_traitsIwEENS_9allocatorIwEEE9push_backEw",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk112basic_stringIwNS_11char_traitsIwEENS_9allocatorIwEEED2Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk113basic_istreamIcNS_11char_traitsIcEEE4readEPcl",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk113basic_istreamIcNS_11char_traitsIcEEE5seekgExNS_8ios_base7seekdirE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk113basic_istreamIcNS_11char_traitsIcEEE5tellgEv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk113basic_istreamIcNS_11char_traitsIcEEE6sentryC1ERS3_b",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk113basic_istreamIcNS_11char_traitsIcEEE7getlineEPclc",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk113basic_istreamIcNS_11char_traitsIcEEED2Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk113basic_istreamIcNS_11char_traitsIcEEErsERf",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk113basic_istreamIcNS_11char_traitsIcEEErsERi",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk113basic_istreamIcNS_11char_traitsIcEEErsERj",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk113basic_istreamIcNS_11char_traitsIcEEErsERt",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk113basic_istreamIwNS_11char_traitsIwEEE4readEPwl",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk113basic_istreamIwNS_11char_traitsIwEEE5seekgENS_4fposI9mbstate_tEE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk113basic_istreamIwNS_11char_traitsIwEEE5seekgExNS_8ios_base7seekdirE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk113basic_istreamIwNS_11char_traitsIwEEE5tellgEv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk113basic_ostreamIcNS_11char_traitsIcEEE6sentryC1ERS3_",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk113basic_ostreamIcNS_11char_traitsIcEEE6sentryD1Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk113basic_ostreamIcNS_11char_traitsIcEEED2Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk113basic_ostreamIcNS_11char_traitsIcEEElsEd",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk113basic_ostreamIcNS_11char_traitsIcEEElsEf",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk113basic_ostreamIcNS_11char_traitsIcEEElsEPNS_15basic_streambufIcS2_EE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk113basic_ostreamIcNS_11char_traitsIcEEElsEt",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk113basic_ostreamIcNS_11char_traitsIcEEElsEx",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk113basic_ostreamIwNS_11char_traitsIwEEE5writeEPKwl",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk113random_deviceC1ERKNS_12basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk113random_deviceC2ERKNS_12basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk113random_deviceclEv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk113random_deviceD1Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk114__shared_countD2Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk114basic_iostreamIcNS_11char_traitsIcEEED0Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk114basic_iostreamIcNS_11char_traitsIcEEED1Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk114basic_iostreamIcNS_11char_traitsIcEEED2Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk115__get_classnameEPKcb",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk115__thread_structC1Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk115__thread_structD1Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk115basic_streambufIcNS_11char_traitsIcEEEC2Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk115recursive_mutex4lockEv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk115recursive_mutex6unlockEv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk115recursive_mutexC1Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk115recursive_mutexD1Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk117__assoc_sub_state16__on_zero_sharedEv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk117__assoc_sub_state4waitEv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk117__assoc_sub_state9set_valueEv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk118condition_variable10notify_allEv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk118condition_variable10notify_oneEv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk118condition_variable15__do_timed_waitERNS_11unique_lockINS_5mutexEEENS_6chrono10time_pointINS5_12system_clockENS5_8durationIxNS_5ratioILl1ELl1000000000EEEEEEE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk118condition_variable4waitERNS_11unique_lockINS_5mutexEEE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk118condition_variableD1Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk119__shared_weak_count14__release_weakEv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk119__shared_weak_count4lockEv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk119__shared_weak_countD2Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk119__thread_local_dataEv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk120__get_collation_nameEPKc",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk120__throw_system_errorEiPKc",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk14coutE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk14stofERKNS_12basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEEPm",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk14stoiERKNS_12basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEEPmi",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk15ctypeIcE2idE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk15mutex4lockEv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk15mutex6unlockEv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk15mutex8try_lockEv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk15mutexD1Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk15stoulERKNS_12basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEEPmi",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk16__sortIRNS_6__lessIiiEEPiEEvT0_S5_T_",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk16__sortIRNS_6__lessImmEEPmEEvT0_S5_T_",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk16chrono12steady_clock3nowEv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk16chrono12system_clock3nowEv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk16futureIvEC1EPNS_17__assoc_sub_stateE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk16futureIvED1Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk16localeC1ERKS0_",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk16localeC1Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk16localeD1Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk16thread20hardware_concurrencyEv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk16thread4joinEv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk16thread6detachEv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk16threadD1Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk17codecvtIcc9mbstate_tE2idE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk17collateIcE2idE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk17num_getIcNS_19istreambuf_iteratorIcNS_11char_traitsIcEEEEE2idE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk17num_putIcNS_19ostreambuf_iteratorIcNS_11char_traitsIcEEEEE2idE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk18ios_base33__set_badbit_and_consider_rethrowEv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk18ios_base4initEPv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk18ios_base5clearEj",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk18ios_baseD2Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk18time_getIcNS_19istreambuf_iteratorIcNS_11char_traitsIcEEEEE2idE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk19basic_iosIcNS_11char_traitsIcEEED2Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk19to_stringEf",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk19to_stringEi",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk19to_stringEj",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk19to_stringEl",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk19to_stringEm",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk19to_stringEx",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt6__ndk19to_stringEy",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZNSt9exceptionD2Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_Znwm",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZnwmRKSt9nothrow_t",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZSt15set_new_handlerPFvvE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZSt18uncaught_exceptionv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZSt7nothrow",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZSt9terminatev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZThn16_NSt6__ndk114basic_iostreamIcNS_11char_traitsIcEEED0Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZThn16_NSt6__ndk114basic_iostreamIcNS_11char_traitsIcEEED1Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZTINSt6__ndk111regex_errorE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZTINSt6__ndk112bad_weak_ptrE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZTINSt6__ndk117__assoc_sub_stateE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZTINSt6__ndk119__shared_weak_countE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZTINSt6__ndk18ios_baseE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZTISt12length_error",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZTISt12out_of_range",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZTISt13runtime_error",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZTISt20bad_array_new_length",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZTISt9exception",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZTIv",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZTv0_n24_NSt6__ndk114basic_iostreamIcNS_11char_traitsIcEEED0Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZTv0_n24_NSt6__ndk114basic_iostreamIcNS_11char_traitsIcEEED1Ev",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZTVN10__cxxabiv117__class_type_infoE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZTVN10__cxxabiv119__pointer_type_infoE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZTVN10__cxxabiv120__function_type_infoE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZTVN10__cxxabiv120__si_class_type_infoE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZTVN10__cxxabiv121__vmi_class_type_infoE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZTVNSt6__ndk112bad_weak_ptrE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZTVNSt6__ndk117__assoc_sub_stateE",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": false,
+      "binding": "libcxx-bionic-runtime"
+    },
+    {
+      "name": "_ZTVSt12length_error",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "_ZTVSt12out_of_range",
+      "weak": false,
+      "category": "cxx",
+      "target_name_match": true,
+      "binding": "cxx-abi-review"
+    },
+    {
+      "name": "abort",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "accept",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "access",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "acos",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "acosf",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "Anzu__Texture_CreateInstance",
+      "weak": true,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "optional-weak-stub"
+    },
+    {
+      "name": "Anzu__Texture_NativeRenderer_AssignCustomHandler",
+      "weak": true,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "optional-weak-stub"
+    },
+    {
+      "name": "Anzu__Texture_NativeRenderer_GetRenderCallback",
+      "weak": true,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "optional-weak-stub"
+    },
+    {
+      "name": "Anzu__Texture_NativeRenderer_GetRenderID",
+      "weak": true,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "optional-weak-stub"
+    },
+    {
+      "name": "Anzu__Texture_NativeRenderer_SetExpectedFormat",
+      "weak": true,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "optional-weak-stub"
+    },
+    {
+      "name": "Anzu__Texture_PausePlayback",
+      "weak": true,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "optional-weak-stub"
+    },
+    {
+      "name": "Anzu__Texture_RemoveInstance",
+      "weak": true,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "optional-weak-stub"
+    },
+    {
+      "name": "Anzu__Texture_ResumePlayback",
+      "weak": true,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "optional-weak-stub"
+    },
+    {
+      "name": "Anzu__Texture_SetVisibility",
+      "weak": true,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "optional-weak-stub"
+    },
+    {
+      "name": "Anzu__Texture_SetVisibilityScore",
+      "weak": true,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "optional-weak-stub"
+    },
+    {
+      "name": "Anzu_ApplicationActive",
+      "weak": true,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "optional-weak-stub"
+    },
+    {
+      "name": "Anzu_GetVersionFloat",
+      "weak": true,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "optional-weak-stub"
+    },
+    {
+      "name": "Anzu_Initialize",
+      "weak": true,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "optional-weak-stub"
+    },
+    {
+      "name": "Anzu_RegisterLogCallback",
+      "weak": true,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "optional-weak-stub"
+    },
+    {
+      "name": "Anzu_RegisterMessageCallback",
+      "weak": true,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "optional-weak-stub"
+    },
+    {
+      "name": "Anzu_RegisterTextureInitCallback",
+      "weak": true,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "optional-weak-stub"
+    },
+    {
+      "name": "Anzu_RegisterTextureUpdateCallback",
+      "weak": true,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "optional-weak-stub"
+    },
+    {
+      "name": "Anzu_RegisterUriSchemaHook",
+      "weak": true,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "optional-weak-stub"
+    },
+    {
+      "name": "Anzu_SetCoppaRegulated",
+      "weak": true,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "optional-weak-stub"
+    },
+    {
+      "name": "Anzu_SetGDPRConsent",
+      "weak": true,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "optional-weak-stub"
+    },
+    {
+      "name": "Anzu_Uninitialize",
+      "weak": true,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "optional-weak-stub"
+    },
+    {
+      "name": "ArCamera_getDisplayOrientedPose",
+      "weak": false,
+      "category": "arcore",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "ArCamera_getTrackingState",
+      "weak": false,
+      "category": "arcore",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "ArConfig_create",
+      "weak": false,
+      "category": "arcore",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "ArConfig_destroy",
+      "weak": false,
+      "category": "arcore",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "ArCoreApk_checkAvailability",
+      "weak": false,
+      "category": "arcore",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "ArCoreApk_requestInstall",
+      "weak": false,
+      "category": "arcore",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "ArFrame_acquireCamera",
+      "weak": false,
+      "category": "arcore",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "ArFrame_create",
+      "weak": false,
+      "category": "arcore",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "ArFrame_destroy",
+      "weak": false,
+      "category": "arcore",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "ArPose_create",
+      "weak": false,
+      "category": "arcore",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "ArPose_destroy",
+      "weak": false,
+      "category": "arcore",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "ArPose_getMatrix",
+      "weak": false,
+      "category": "arcore",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "ArSession_configure",
+      "weak": false,
+      "category": "arcore",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "ArSession_create",
+      "weak": false,
+      "category": "arcore",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "ArSession_destroy",
+      "weak": false,
+      "category": "arcore",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "ArSession_pause",
+      "weak": false,
+      "category": "arcore",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "ArSession_resume",
+      "weak": false,
+      "category": "arcore",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "ArSession_setCameraTextureName",
+      "weak": false,
+      "category": "arcore",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "ArSession_update",
+      "weak": false,
+      "category": "arcore",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "asinf",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "atan2",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "atan2f",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "atanf",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "atof",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "atoi",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "atol",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "basename",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "bind",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "calloc",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "clearerr",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "clock_gettime",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "close",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "closedir",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "connect",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "cos",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "cosf",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "difftime",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "dlclose",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "dlerror",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "dlopen",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "dlsym",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "EchoCreate",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "EchoDestroy",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "EchoLogin",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "EchoResume",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "EchoSet",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "EchoSuspend",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "eglGetDisplay",
+      "weak": false,
+      "category": "egl",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "eglGetProcAddress",
+      "weak": false,
+      "category": "egl",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "eglQueryString",
+      "weak": false,
+      "category": "egl",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "exit",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "exp2f",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "expf",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "fchmod",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "fchown",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "fclose",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "fcntl",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "fdopen",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "feof",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "ferror",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "fflush",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "fgets",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "fileno",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "fmod",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "FMOD_System_Create",
+      "weak": false,
+      "category": "fmod",
+      "target_name_match": false,
+      "binding": "middleware-or-disable"
+    },
+    {
+      "name": "fmodf",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "fopen",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "fprintf",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "fputc",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "fputs",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "fread",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "free",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "freeaddrinfo",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "frexp",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "fscanf",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "fseek",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "fseeko",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "fstat",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "fsync",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "ftell",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "ftello",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "ftruncate",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "fwrite",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "gai_strerror",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "getaddrinfo",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "getauxval",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "getcwd",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "getentropy",
+      "weak": true,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "getenv",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "geteuid",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "gethostbyname",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "gethostname",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "getnameinfo",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "getpeername",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "getpid",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "getpwuid_r",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "getsockname",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "getsockopt",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "gettimeofday",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "glActiveTexture",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glAttachShader",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glBindAttribLocation",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glBindBuffer",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glBindFramebuffer",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glBindRenderbuffer",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glBindTexture",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glBlendColor",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glBlendEquation",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glBlendEquationSeparate",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glBlendFunc",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glBlendFuncSeparate",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glBufferData",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glBufferSubData",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glCheckFramebufferStatus",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glClear",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glClearColor",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glClearDepthf",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glClearStencil",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glColorMask",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glCompileShader",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glCompressedTexImage2D",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glCompressedTexSubImage2D",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glCopyTexImage2D",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glCopyTexSubImage2D",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glCreateProgram",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glCreateShader",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glCullFace",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glDeleteBuffers",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glDeleteFramebuffers",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glDeleteProgram",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glDeleteRenderbuffers",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glDeleteShader",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glDeleteTextures",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glDepthFunc",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glDepthMask",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glDepthRangef",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glDetachShader",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glDisable",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glDisableVertexAttribArray",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glDrawArrays",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glDrawElements",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glEnable",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glEnableVertexAttribArray",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glFinish",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glFlush",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glFramebufferRenderbuffer",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glFramebufferTexture2D",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glFrontFace",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGenBuffers",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGenerateMipmap",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGenFramebuffers",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGenRenderbuffers",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGenTextures",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGetActiveAttrib",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGetActiveUniform",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGetAttachedShaders",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGetAttribLocation",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGetBooleanv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGetBufferParameteriv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGetError",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGetFloatv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGetFramebufferAttachmentParameteriv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGetIntegerv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGetProgramInfoLog",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGetProgramiv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGetRenderbufferParameteriv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGetShaderInfoLog",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGetShaderiv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGetShaderPrecisionFormat",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGetShaderSource",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGetString",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGetTexParameterfv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGetTexParameteriv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGetUniformfv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGetUniformiv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGetUniformLocation",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGetVertexAttribfv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGetVertexAttribiv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glGetVertexAttribPointerv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glHint",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glIsBuffer",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glIsEnabled",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glIsFramebuffer",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glIsProgram",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glIsRenderbuffer",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glIsShader",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glIsTexture",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glLineWidth",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glLinkProgram",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glPixelStorei",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glPolygonOffset",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glReadPixels",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glReleaseShaderCompiler",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glRenderbufferStorage",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glSampleCoverage",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glScissor",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glShaderBinary",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glShaderSource",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glStencilFunc",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glStencilFuncSeparate",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glStencilMask",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glStencilMaskSeparate",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glStencilOp",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glStencilOpSeparate",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glTexImage2D",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glTexParameterf",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glTexParameterfv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glTexParameteri",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glTexParameteriv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glTexSubImage2D",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glUniform1f",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glUniform1fv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glUniform1i",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glUniform1iv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glUniform2f",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glUniform2fv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glUniform2i",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glUniform2iv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glUniform3f",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glUniform3fv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glUniform3i",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glUniform3iv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glUniform4f",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glUniform4fv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glUniform4i",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glUniform4iv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glUniformMatrix2fv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glUniformMatrix3fv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glUniformMatrix4fv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glUseProgram",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glValidateProgram",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glVertexAttrib1f",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glVertexAttrib1fv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glVertexAttrib2f",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glVertexAttrib2fv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glVertexAttrib3f",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glVertexAttrib3fv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glVertexAttrib4f",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glVertexAttrib4fv",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glVertexAttribPointer",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "glViewport",
+      "weak": false,
+      "category": "gles",
+      "target_name_match": false,
+      "binding": "graphics-shim"
+    },
+    {
+      "name": "gmtime",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "gmtime_r",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "if_nametoindex",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "inet_ntop",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "inet_pton",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "ioctl",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "isalnum",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "ldexp",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "listen",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "localtime",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "localtime_r",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "log",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "log10f",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "logf",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "longjmp",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "bionic-abi-shim"
+    },
+    {
+      "name": "lseek64",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "lstat",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "madvise",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "malloc",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "memalign",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "memchr",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "memcmp",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "memcpy",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "memmove",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "memrchr",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "memset",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "mkdir",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "mktime",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "mlock",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "mmap",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "modf",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "modff",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "mprotect",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "mremap",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "munmap",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "nanosleep",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "nextafterf",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "open",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "opendir",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "perror",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "pipe",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "poll",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "pow",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "powf",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "printf",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "pthread_attr_destroy",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_attr_init",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_attr_setdetachstate",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_cond_broadcast",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_cond_destroy",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_cond_init",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_cond_signal",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_cond_timedwait",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_cond_wait",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_create",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_detach",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_equal",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_exit",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_getspecific",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_join",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_key_create",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_key_delete",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_mutex_destroy",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_mutex_init",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_mutex_lock",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_mutex_trylock",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_mutex_unlock",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_mutexattr_destroy",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_mutexattr_init",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_mutexattr_settype",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_once",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_rwlock_destroy",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_rwlock_init",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_rwlock_rdlock",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_rwlock_unlock",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_rwlock_wrlock",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_self",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "pthread_setspecific",
+      "weak": false,
+      "category": "pthread",
+      "target_name_match": false,
+      "binding": "pthread-shim"
+    },
+    {
+      "name": "ptrace",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "puts",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "qsort",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "raise",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "rand",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "read",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "readdir",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "readlink",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "realloc",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "recv",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "recvfrom",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "recvmmsg",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "remove",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "rename",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "rewind",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "rmdir",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "select",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "sem_close",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "sem_destroy",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "sem_init",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "sem_open",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "sem_post",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "sem_unlink",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "sem_wait",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "send",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "sendmmsg",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "sendto",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "setjmp",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "bionic-abi-shim"
+    },
+    {
+      "name": "setsockopt",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "setvbuf",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "shutdown",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "sigaction",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "signal",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "sincosf",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "sinf",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "sleep",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "snprintf",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "socket",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "sprintf",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "srand",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "sscanf",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "stat",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "statfs",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "stderr",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "stdout",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "strcasecmp",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "strcat",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "strchr",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "strcmp",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "strcpy",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "strcspn",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "strdup",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "strerror",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "strerror_r",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "strftime",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "strlen",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "strncmp",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "strncpy",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "strnlen",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "strpbrk",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "strrchr",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "strspn",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "strstr",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "strtod",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "strtof",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "strtok",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "strtok_r",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "strtol",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "strtoll",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "strtoul",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "strtoull",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "syscall",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "sysconf",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "tanf",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "time",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "timezone",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "tolower",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "toupper",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "unlink",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "usleep",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "utimes",
+      "weak": false,
+      "category": "other",
+      "target_name_match": false,
+      "binding": "platform-shim-review"
+    },
+    {
+      "name": "vfprintf",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "vprintf",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "vsnprintf",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "wcslen",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "wmemcpy",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    },
+    {
+      "name": "write",
+      "weak": false,
+      "category": "other",
+      "target_name_match": true,
+      "binding": "direct-name-match-candidate"
+    }
+  ]
+}

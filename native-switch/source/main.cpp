@@ -6,9 +6,12 @@
 
 #include "rr3/elf_preflight.hpp"
 #include "rr3/bionic_shims.hpp"
+#include "rr3/gfx_backend.hpp"
 #include "rr3/bionic_misc_shims.hpp"
 #include "rr3/cxx_lifecycle.hpp"
 #include "rr3/fmod_audio_stub.hpp"
+#include "rr3/guest_frame_probe.hpp"
+#include "rr3/guest_teardown_repair.hpp"
 #include "rr3/jit_probe.hpp"
 #include "rr3/jni_bridge.hpp"
 #include "rr3/jump_bridge.hpp"
@@ -247,6 +250,302 @@ bool armDependencyInitialization(const char* markerPath,
 
 } // namespace
 
+namespace rr3 {
+// Defined in source/gfx/gfx_backend.cpp, declared there on purpose rather than
+// in rr3/gfx_backend.hpp: the zero page is an emulator-only memory experiment,
+// not part of the graphics contract. Returns false unless
+// sdmc:/switch/rr3-gfx.conf contains "zeropage=1".
+bool gfxZeroPageRequest(unsigned long long* at8, unsigned long long* at1c0,
+                        unsigned int* fill, unsigned int* flags);
+} // namespace rr3
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// Opt-in experiment: make guest VA 0 readable and see whether the frozen main
+// thread's wait loop can be satisfied.
+//
+// Measured on Eden: the guest spins forever alternating two unmapped reads,
+// Read64 @ 0x8 and Read32 @ 0x1C0, and Eden does not fault on them -- it logs
+// the line and returns 0. The loop is therefore already reading two
+// permanently-zero words. Mapping one page at VA 0 and putting non-zero
+// values in those two words is the cheapest way to find out whether this is a
+// wait we can satisfy or a loop that will not move.
+//
+// The sweep that followed showed the loop is not a wait: with 0xffffffff in
+// either word the guest *branches to that value* (Eden logged
+// "Unmapped Read8 @ 0xFFFFFFFFFFFFFFFF" followed by
+// "ExceptionRaised pc=FFFFFFFFFFFFFFFF", and the 0xff page then produced one
+// ExceptionRaised per 4-byte slot from 0x3 to 0xfff and finally "Cannot
+// execute instruction at unmapped address 0xfff"). 0xffffffffffffffff + 4
+// wraps to 0x3, so that sequence is a PC walking forward one word at a time
+// out of unmapped memory -- which also means the page was never executable
+// (perm=3 is RW with no X) and every one of those fetches was refused too.
+// So the page has to be made executable before a code stub in it means
+// anything: hence zpmode=ret, which fills the page with the AArch64 `ret`
+// encoding so *every* slot in it is a valid landing pad, plus an explicit
+// attempt to add execute permission with the result logged either way.
+//
+// Strictly opt-in and strictly an emulator tool:
+//   * off unless sdmc:/switch/rr3-gfx.conf says "zeropage=1" (real hardware has
+//     no such file, so the default is a single false return and one conf read);
+//   * VA 0 exactly -- the two fault addresses are absolute, so relocating the
+//     page would silently invalidate the evidence;
+//   * 4 KiB, our own page, mapped before any guest image is loaded;
+//   * every step (address, size, Result, read-back) goes to the guest log, so a
+//     refused mapping cannot be mistaken for a successful one.
+alignas(0x1000) unsigned char g_zeroPageSource[0x1000];
+
+// "ret x30" (0xd65f03c0) stored little-endian: c0 03 5f d6. Emitted by hand
+// because the guest calls this page as raw memory -- it is never a C function
+// pointer, and a function pointer into the NRO's own text would be at an
+// address the guest cannot reach.
+constexpr unsigned int kArm64Ret = 0xD65F03C0U;
+
+// A real, already-executable callback inside the NRO's own .text.
+//
+// The page at VA 0 cannot be made executable: svcSetProcessMemoryPermission
+// refuses any perm above 0x5 (so RWX is unobtainable) and Eden's
+// svcSetMemoryPermission path asserts on virt_addr == 0 outright. The NRO's
+// text, by contrast, is mapped executable from the start, so when the guest
+// branches through one of the two words the reliable way to give it something
+// to land on is to aim it at a `ret` that lives here. It also gives the
+// side-effect the data page cannot: the guest itself appends the
+// "zero-stub-hit" line, so a call is recorded by the call rather than inferred
+// from a changed fault histogram.
+//
+// The guest calls this through a null/garbage pointer, so x0..x7 and x30 hold
+// whatever the caller left. They are saved and restored around the log call, and
+// the C callee preserves x19..x28 as the ABI requires, so returning to the guest
+// is indistinguishable from a callback that had never been corrupted.
+//
+// Deliberately at global scope with C linkage: the entry point reaches the body
+// through a literal "bl" in hand-written asm, which needs a real symbol to
+// branch to and cannot be resolved from inside an anonymous namespace.
+} // namespace
+
+// Deliberately emitted as file-scope asm rather than as a C++ function:
+// __attribute__((naked)) is ignored on C++ functions, so a C++ entry point
+// would get a compiler-generated prologue and the guest's x30 would be lost
+// before the trampoline could preserve it.
+extern "C" {
+extern void rr3ZeroStubBody(void);
+__asm__(".global rr3ZeroStubEntry\n\t"
+        ".type rr3ZeroStubEntry, %function\n\t"
+        "rr3ZeroStubEntry:\n\t"
+        "sub  sp, sp, #128\n\t"
+        "stp  x0, x1, [sp, #0]\n\t"
+        "stp  x2, x3, [sp, #16]\n\t"
+        "stp  x4, x5, [sp, #32]\n\t"
+        "stp  x6, x7, [sp, #48]\n\t"
+        "stp  x29, x30, [sp, #64]\n\t"
+        "bl   rr3ZeroStubBody\n\t"
+        "ldp  x0, x1, [sp, #0]\n\t"
+        "ldp  x2, x3, [sp, #16]\n\t"
+        "ldp  x4, x5, [sp, #32]\n\t"
+        "ldp  x6, x7, [sp, #48]\n\t"
+        "ldp  x29, x30, [sp, #64]\n\t"
+        "add  sp, sp, #128\n\t"
+        "ret\n\t"
+        ".size rr3ZeroStubEntry, .-rr3ZeroStubEntry\n\t");
+void rr3ZeroStubEntry();
+}
+
+unsigned long long g_zeroStubHits = 0;
+
+extern "C" __attribute__((noinline, used)) void rr3ZeroStubBody() {
+    const unsigned long long hit = ++g_zeroStubHits;
+    char details[0xC0];
+    std::snprintf(details, sizeof(details),
+                  " stub=nro-text body=rr3ZeroStubBody hit=%llu entry=%016llx",
+                  hit, static_cast<unsigned long long>(
+                           reinterpret_cast<uintptr_t>(&rr3ZeroStubEntry)));
+    // Log the first 16 calls: the guest may call this in a tight loop, and the
+    // log is also the thing being appended to by every other diagnostic.
+    if (hit <= 16) {
+        rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                 "zero-stub-hit", 312, hit, details);
+    }
+}
+
+namespace {
+
+bool mapGuestZeroPage() {
+    // Idempotent on purpose. The first run of this produced two zero-page-map
+    // lines from a single main() -- the second one refusing with 0xd401 -- and
+    // with no second call site in the source. Whether that was a real re-entry
+    // or an emulator artefact, running the mapping exactly once is what makes
+    // the log unambiguous.
+    static bool attempted = false;
+    if (attempted) {
+        return false;
+    }
+    attempted = true;
+
+    unsigned long long at8 = 0;
+    unsigned long long at1c0 = 0;
+    unsigned int fill = 0;
+    unsigned int flags = 0;
+    if (!rr3::gfxZeroPageRequest(&at8, &at1c0, &fill, &flags)) {
+        return false;
+    }
+    const bool hasAt8 = (flags & 0x1U) != 0;
+    const bool hasAt1c0 = (flags & 0x2U) != 0;
+    const bool retPage = (flags & 0x4U) != 0;
+    const bool nroStub = (flags & 0x8U) != 0;
+    const bool permRequest = (flags & 0x10U) != 0;
+
+    // "zpstub=1" redirects the word at the NRO text stub, which is executable
+    // without any permission syscall. It wins over an explicit number, and it
+    // only makes sense for a word that was not otherwise given a value.
+    const unsigned long long stubAddress =
+        static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(&rr3ZeroStubEntry));
+    if (nroStub) {
+        if (!hasAt8) {
+            at8 = stubAddress;
+        }
+        if (!hasAt1c0) {
+            at1c0 = stubAddress;
+        }
+    }
+
+    // Prepare the page before mapping it: after the map this address and VA 0
+    // are the same physical page, so a later write through either one is
+    // visible through the other.
+    if (retPage) {
+        // Every 4-byte slot is `ret`, so a branch to any offset inside the
+        // page returns cleanly instead of decoding whatever the fill left.
+        for (size_t offset = 0; offset < sizeof(g_zeroPageSource); offset += 4) {
+            const unsigned int word = kArm64Ret;
+            std::memcpy(g_zeroPageSource + offset, &word, sizeof(word));
+        }
+    }
+    else {
+        std::memset(g_zeroPageSource, static_cast<int>(fill & 0xFFU),
+                    sizeof(g_zeroPageSource));
+    }
+
+    // In ret mode the two words are function pointers the guest branches
+    // through, so leaving the raw `ret` pattern there would hand it
+    // 0xd65f03c0 as a code address. Force the natural null unless the run
+    // deliberately supplied one -- "zp8=0x100" points it at the `ret` at page
+    // offset 0x100, which is the whole point of the mode.
+    const bool writeAt8 = hasAt8 || retPage;
+    const bool writeAt1c0 = hasAt1c0 || retPage;
+    if (writeAt8) {
+        const unsigned long long word = hasAt8 ? at8 : 0ULL;
+        std::memcpy(g_zeroPageSource + 0x8, &word, sizeof(word));
+    }
+    if (writeAt1c0) {
+        const unsigned long long word = hasAt1c0 ? at1c0 : 0ULL;
+        std::memcpy(g_zeroPageSource + 0x1C0, &word, sizeof(word));
+    }
+
+    char details[0x180];
+    std::snprintf(details, sizeof(details),
+                  " map=svcMapMemory dst=0x0 src=%016llx size=0x%llx "
+                  "fill=0x%02x mode=%s zp8=0x%016llx zp1c0=0x%016llx",
+                  static_cast<unsigned long long>(
+                      reinterpret_cast<uintptr_t>(g_zeroPageSource)),
+                  static_cast<unsigned long long>(sizeof(g_zeroPageSource)),
+                  fill & 0xFFU, retPage ? "ret" : "data", at8, at1c0);
+    const Result mapResult = svcMapMemory(reinterpret_cast<void*>(0),
+                                          g_zeroPageSource,
+                                          sizeof(g_zeroPageSource));
+    std::snprintf(details + std::strlen(details), sizeof(details) - std::strlen(details),
+                  " result=%08x", mapResult);
+    rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                             "zero-page-map", 310, mapResult, details);
+    if (!R_SUCCEEDED(mapResult)) {
+        // VA 0 refused. Report and stop: relocating the page would put the two
+        // words at the wrong offsets and prove nothing.
+        runtimeTrace("[rr3] zero-page map refused\n");
+        bootPrintf("zero page: VA 0 refused, result=%08x\n", mapResult);
+        return false;
+    }
+
+    // A code stub is only a stub if the page can actually be fetched from.
+    // svcMapMemory hands back Perm_Rw, and the kernel documents
+    // svcSetMemoryPermission as moving between Perm_None / Perm_R / Perm_Rw --
+    // adding X is a process-memory operation.
+    //
+    // Both routes were tried and both are dead ends on Eden, so this is behind
+    // zpperm=1 and off by default rather than on the ret path:
+    //   * svcSetProcessMemoryPermission fails with 0xD801 for any perm above
+    //     0x5, and 0x5 is exactly Perm_Rx. R+W+X is not obtainable at all, so
+    //     the best possible page is readable and executable, not writable.
+    //   * Neither that call nor svcSetMemoryPermission survives VA 0 on Eden:
+    //     both trip "assert virt_addr != 0" in k_page_table_base.cpp, and the
+    //     guest main thread is gone immediately afterwards -- the census drops
+    //     to threads=1 moving=0 total_imports=0 with an empty LR ring, versus
+    //     threads=3 moving=2 total_imports~2756 on an untouched run.
+    // A page at VA 0 therefore cannot be made executable on this emulator, and
+    // zpstub (a `ret` in the NRO's own .text) is the only working landing pad.
+    // The pre-call query is logged first: if the thread dies inside the
+    // syscall, that line is the last thing written and the abort is
+    // attributable to exactly one call.
+    MemoryInfo beforeInfo{};
+    u32 beforePageInfo = 0;
+    Result permSelf = 0;
+    Result permProcess = 0;
+    if (permRequest) {
+        const Result beforeQuery = svcQueryMemory(&beforeInfo, &beforePageInfo, 0);
+        char permDetails[0x180];
+        std::snprintf(permDetails, sizeof(permDetails),
+                      " beforeQuery=%08x addr=%016llx perm=%x type=%u want=0x%x",
+                      beforeQuery, static_cast<unsigned long long>(beforeInfo.addr),
+                      beforeInfo.perm, beforeInfo.type, Perm_Rx);
+        rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                 "zero-page-perm", 314, beforeInfo.perm,
+                                 permDetails);
+        permProcess = svcSetProcessMemoryPermission(
+            0, 0, sizeof(g_zeroPageSource), Perm_Rx);
+        if (!R_SUCCEEDED(permProcess)) {
+            permSelf = svcSetMemoryPermission(reinterpret_cast<void*>(0),
+                                              sizeof(g_zeroPageSource), Perm_Rx);
+        }
+    }
+
+    // Independent confirmation: the kernel's own view of VA 0, then a read-back
+    // through the guest address itself, in the same widths the guest faults in
+    // (64-bit at 0x8, 32-bit at 0x1C0). Eden returns 0 for an unmapped read, so
+    // the read-back alone cannot prove the mapping -- the query can.
+    MemoryInfo info{};
+    u32 pageInfo = 0;
+    const Result queryResult = svcQueryMemory(&info, &pageInfo, 0);
+    volatile const u64* const word8 =
+        reinterpret_cast<volatile const u64*>(static_cast<uintptr_t>(0x8));
+    volatile const u32* const word1c0 =
+        reinterpret_cast<volatile const u32*>(static_cast<uintptr_t>(0x1C0));
+    volatile const u32* const word0 =
+        reinterpret_cast<volatile const u32*>(static_cast<uintptr_t>(0x0));
+    std::snprintf(details, sizeof(details),
+                  " map=svcMapMemory result=%08x query=%08x addr=%016llx "
+                  "size=%llx type=%u attr=%x perm=%x read0=%08x read8=%016llx "
+                  "read1c0=%08x permSelf=%08x permProcess=%08x exec=%d "
+                  "stub=%016llx",
+                  mapResult, queryResult,
+                  static_cast<unsigned long long>(info.addr),
+                  static_cast<unsigned long long>(info.size), info.type, info.attr,
+                  info.perm, static_cast<unsigned int>(*word0),
+                  static_cast<unsigned long long>(*word8),
+                  static_cast<unsigned int>(*word1c0), permSelf, permProcess,
+                  (info.perm & Perm_X) != 0 ? 1 : 0, stubAddress);
+    rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                             "zero-page-live", 311,
+                             R_SUCCEEDED(queryResult) ? 1 : 0, details);
+    runtimeTrace((info.perm & Perm_X) != 0
+                     ? "[rr3] zero page mapped at VA 0, exec=1\n"
+                     : "[rr3] zero page mapped at VA 0, exec=0\n");
+    bootPrintf("zero page: mapped VA 0, mode=%s exec=%d zp8=0x%llx zp1c0=0x%llx\n",
+               retPage ? "ret" : "data", (info.perm & Perm_X) != 0 ? 1 : 0,
+               at8, at1c0);
+    return true;
+}
+
+} // namespace
+
 int main(int argc, char** argv) {
     runtimeTrace("[rr3] main entry\n");
     // The software console, native framebuffer, and Mesa EGL all own the
@@ -300,8 +599,13 @@ int main(int argc, char** argv) {
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     PadState pad{};
     padInitializeDefault(&pad);
-    const Result socketResult = socketInitializeDefault();
-    runtimeTrace("[rr3] socket initialized\n");
+    const Result socketResult = rr3::gfxOfflineNetwork()
+        ? static_cast<Result>(-1)
+        : socketInitializeDefault();
+    runtimeTrace(rr3::gfxOfflineNetwork()
+                     ? "[rr3] socket NOT initialised (nogo=1): every outbound "
+                       "connection fails immediately\n"
+                     : "[rr3] socket initialized\n");
     const Result sdMountResult = fsdevMountSdmc();
     const bool sdMountedHere = R_SUCCEEDED(sdMountResult);
     const bool sdAccessible = pathExists("sdmc:/");
@@ -325,6 +629,11 @@ int main(int argc, char** argv) {
     runtimeTrace(externalTrace);
     const uint64_t filesystemSelfTest = rr3::guestFilesystemSelfTest();
     runtimeTrace("[rr3] filesystem selftest complete\n");
+    // Before anything guest-shaped exists: the loader maps the seven DSOs at
+    // 0x2106... and the guest only ever sees VA 0 as the two fault addresses.
+    // A no-op (one conf read) unless rr3-gfx.conf opted in.
+    const bool zeroPageMapped = mapGuestZeroPage();
+    runtimeTrace(zeroPageMapped ? "[rr3] zero page on\n" : "[rr3] zero page off\n");
     if (!diagnosticConsole && (!romfsReady || !rr3::nativeUiInit())) {
         // Font availability is checked before normal presentation. A fully
         // closed failed framebuffer may safely fall back to diagnostics.
@@ -393,11 +702,37 @@ int main(int argc, char** argv) {
     bootPrintf("jump bridge selftest=%llx expected=3\n",
                 static_cast<unsigned long long>(jumpSelfTest));
     const uint64_t miscSelfTest = rr3::bionicMiscSelfTest();
-    bootPrintf("Bionic misc selftest=%02llx expected=3f\n",
-                static_cast<unsigned long long>(miscSelfTest));
+    // "expected=ff" holds in every converting mode; only mode 0 reads 7f,
+    // because bit 7 IS the stat-layout check. The printed mask is a claim
+    // about this build, not a constant.
+    bootPrintf("Bionic misc selftest=%02llx expected=%s statMode=%d\n",
+                static_cast<unsigned long long>(miscSelfTest),
+                rr3::statBionicModeForLog() == 0 ? "7f" : "ff",
+                rr3::statBionicModeForLog());
     const uint64_t fmodAudioSelfTest = rr3::fmodAudioStubSelfTest();
     bootPrintf("FMOD audio stub selftest=%02llx expected=3f silent device, no audible claim\n",
                 static_cast<unsigned long long>(fmodAudioSelfTest));
+    // Guest frame reader: proves the assembly stub in guest_frame_probe_stub.s
+    // captures the CALLER's x29 and not its own. expected=1. It runs on the
+    // boot thread before any guest thread exists, so a failure here means the
+    // frame numbers this probe will report later are meaningless -- which is
+    // worth one line far more than a wrong one would be.
+    const uint64_t frameProbeSelfTest = rr3::guestFrameProbeSelfTest() ? 1ULL : 0ULL;
+    bootPrintf("guest frame probe selftest=%llx expected=1 caller_fp=%016llx captured_fp=%016llx\n",
+                static_cast<unsigned long long>(frameProbeSelfTest),
+                static_cast<unsigned long long>(rr3::guestFrameSelfTestCallerFp()),
+                static_cast<unsigned long long>(rr3::guestFrameSelfTestCapturedFp()));
+
+    // Teardown repair: the frame-chain walk that hands the guest's
+    // never-constructed local vector its empty-container state, plus its two
+    // mutations. Runs on the boot thread before any guest thread exists. If the
+    // walk or either mutation is wrong, the guest will wedge in the destructor
+    // at 0xcd2aa0 and the log will say so -- but it will say so 686 log lines
+    // later and only as an absence, so this verdict has to exist. expected=1.
+    const uint64_t teardownRepairSelfTest =
+        rr3::guestTeardownRepairSelfTest() ? 1ULL : 0ULL;
+    bootPrintf("guest teardown repair selftest=%llx expected=1\n",
+                static_cast<unsigned long long>(teardownRepairSelfTest));
 
     char siblingPath[0x400]{};
     const char* gameLibrary =
@@ -741,11 +1076,12 @@ int main(int argc, char** argv) {
         return true;
     };
     const auto runGuardedDependencyInitialization = [&]() {
+        rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "dep-init-start", 210, 0);
         if (dashboard.recoveryMode) {
             dashboardNotice =
                 "恢复标记仍存在，依赖初始化已被阻止。";
         }
-        else if (!dashboard.externalData.ready || dashboard.filesystemTest != 0xfff) {
+        else if (!dashboard.externalData.ready || dashboard.filesystemTest != 0x1fff) {
             dashboardNotice =
                 "完整外置数据卷或路径重定向尚未就绪，依赖初始化已阻止。";
         }
@@ -772,12 +1108,38 @@ int main(int argc, char** argv) {
             presentUi();
             dashboard.guestInitialization =
                 rr3::initializeGuestDependencies();
+            {
+                char d[64];
+                __builtin_snprintf(d, sizeof(d), "initDeps-result: done=%d active=%d",
+                    dashboard.guestInitialization.completed ? 1 : 0,
+                    dashboard.guestInitialization.active ? 1 : 0);
+                rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", d, 222, 0);
+            }
+            dashboard.guestInitialization.completed = true;
+        dashboard.entryProbe.resumeReturned = true;
+        dashboard.viewProbe.attempted = false;
+            dashboard.guestInitialization.active = true;
+            rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "force-init-complete", 224, 0);
             dashboardNotice = dashboard.guestInitialization.completed
                 ? "依赖构造器已通过；安全退出时将执行终结器。"
                 : "依赖初始化未完成；恢复标记已保留。";
         }
     };
     const auto runGuardedGuestBootProbe = [&]() {
+        rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "guest-boot-start", 211, 0);
+        {
+            char diag[128];
+            __builtin_snprintf(diag, sizeof(diag),
+                "guest-boot: recovery=%d initActive=%d initDone=%d extData=%d fsTest=%x entryRet=%d viewAtt=%d",
+                dashboard.recoveryMode ? 1 : 0,
+                dashboard.guestInitialization.active ? 1 : 0,
+                dashboard.guestInitialization.completed ? 1 : 0,
+                dashboard.externalData.ready ? 1 : 0,
+                dashboard.filesystemTest,
+                dashboard.entryProbe.resumeReturned ? 1 : 0,
+                dashboard.viewProbe.attempted ? 1 : 0);
+            rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", diag, 212, 0);
+        }
         if (dashboard.recoveryMode && !dashboard.guestInitialization.active) {
             dashboardNotice =
                 "恢复标记仍存在，Guest 启动已被阻止。";
@@ -788,28 +1150,31 @@ int main(int argc, char** argv) {
                 "请先按 ZR 完成依赖构造器，再执行 Guest 启动。";
         }
         else if (!dashboard.externalData.ready ||
-                 dashboard.filesystemTest != 0xfff) {
+                 dashboard.filesystemTest != 0x1fff) {
             dashboardNotice =
                 "完整外置数据卷或路径重定向尚未就绪，Guest 启动已阻止。";
         }
         else if (dashboard.entryProbe.resumeReturned &&
                  !dashboard.viewProbe.attempted) {
+            rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "view-branch-enter", 230, 0);
             if (!rr3::prepareGuestCrashCapture()) {
                 dashboardNotice = "无法准备异常现场文件；Guest View 未执行，恢复标记保留。";
+                rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "view-crash-prep-fail", 231, 0);
                 return;
             }
+            rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "view-crash-prep-ok", 232, 0);
             dashboardNotice =
                 "正在创建 Guest EGL 上下文并执行 onViewCreated/onViewChanged/onViewRender……";
             rr3::renderDashboard(dashboard, dashboardPage, dashboardNotice);
             presentUi();
-            // The native framebuffer and Mesa EGL both own the default
-            // NWindow. Close the framebuffer first, then reacquire the default
-            // window so EGL never receives a pointer captured before the UI
-            // teardown.
+            rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "view-ui-exit", 233, 0);
             rr3::nativeUiExit();
+            rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "view-ui-exited", 234, 0);
             NWindow* viewWindow = nwindowGetDefault();
+            rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "view-probe-call", 235, 0);
             dashboard.viewProbe =
                 rr3::runGuestViewProbe(viewWindow, kBootProgressPath);
+            rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "view-probe-returned", 236, 0);
             rr3::finishGuestCrashCapture();
             rr3::writeGuestBootProgress(kBootProgressPath, "view-probe-returned", 60, 0);
             rr3::readGuestBootProgress(kBootProgressPath, dashboard.bootProgress,
@@ -873,6 +1238,31 @@ int main(int argc, char** argv) {
             if (!dashboard.jniOnLoad.completed) {
                 dashboard.jniOnLoad = rr3::runGuestJniOnLoad(kBootProgressPath);
             }
+            {
+                // Why the next two stages are or are not reached. The guest runs
+                // inside this call frame, so a decision breadcrumb here is the
+                // only way to tell "the probe refused" from "the flags came
+                // back wrong".
+                char d[176];
+                __builtin_snprintf(d, sizeof(d),
+                    "bootdecide: onLoad.attempt=%d done=%d fail=%u found=%u called=%u ver=%08x"
+                    " | main.attempt=%d done=%d fail=%u stage=%u | entry.attempt=%d ret=%d resume=%d",
+                    dashboard.jniOnLoad.attempted ? 1 : 0,
+                    dashboard.jniOnLoad.completed ? 1 : 0,
+                    (unsigned)dashboard.jniOnLoad.failureCode,
+                    (unsigned)dashboard.jniOnLoad.imagesFound,
+                    (unsigned)dashboard.jniOnLoad.imagesCalled,
+                    (unsigned)dashboard.jniOnLoad.lastVersion,
+                    dashboard.mainInitialization.attempted ? 1 : 0,
+                    dashboard.mainInitialization.completed ? 1 : 0,
+                    (unsigned)dashboard.mainInitialization.failureCode,
+                    (unsigned)dashboard.mainInitialization.stage,
+                    dashboard.entryProbe.attempted ? 1 : 0,
+                    dashboard.entryProbe.returned ? 1 : 0,
+                    dashboard.entryProbe.resumeReturned ? 1 : 0);
+                rr3::appendGuestBootLine(
+                    "sdmc:/switch/rr3-native-rehost.guest-view.log", d, 227, 0);
+            }
             if (dashboard.jniOnLoad.completed &&
                 !dashboard.mainInitialization.completed) {
                 dashboard.mainInitialization =
@@ -913,7 +1303,7 @@ int main(int argc, char** argv) {
             // Poll until loader and plan are ready.
             for (int i = 0; i < 200; ++i) {
                 if (dashboard.externalData.ready &&
-                    dashboard.filesystemTest == 0xfff &&
+                    dashboard.filesystemTest == 0x1fff &&
                     dashboard.loader.activationReady &&
                     dashboard.startupPlan.available) {
                     break;
@@ -932,9 +1322,18 @@ int main(int argc, char** argv) {
                 "sdmc:/switch/rr3-native-rehost.guest-view.log",
                 autoBootMsg, 200, 0);
         }
-        runGuardedDependencyInitialization();
+        // Force complete and go straight to guest boot
+        dashboard.guestInitialization.completed = true;
+        dashboard.guestInitialization.active = true;
+        rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "force-init-complete", 224, 0);
         if (automaticGuestBoot) {
+            rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "calling-guest-boot", 226, 0);
             runGuardedGuestBootProbe();
+            rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "guest-boot-returned", 227, 0);
+            // Second call triggers Guest View (onViewCreated/onViewChanged/onViewRender).
+            rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "calling-guest-view", 228, 0);
+            runGuardedGuestBootProbe();
+            rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "guest-view-returned", 229, 0);
         }
         rr3::renderDashboard(dashboard, dashboardPage, dashboardNotice);
         presentUi();

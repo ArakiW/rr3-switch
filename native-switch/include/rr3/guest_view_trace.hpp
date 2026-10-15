@@ -24,7 +24,35 @@ void* guestViewTracedMalloc(size_t size);
 // Host-symbol target used by the guest resolver for memcpy. It is transparent
 // until the trace has reached stage 30, then records only the first
 // post-stage-30 memcpy enter/return pair.
-void* guestViewTracedMemcpy(void* destination, const void* source, size_t length);
+//
+// AS OF 2026-10-06 this symbol is an ASSEMBLY STUB, not a C function. See
+// source/guest_frame_probe.s for why, and rr3/guest_frame_probe.hpp for what it
+// is for. The short version: x29 is callee-saved, so the guest's own frame
+// pointer is live in x29 at every call site inside the container-teardown
+// function, and a C prologue destroys it before any C statement can read it.
+// The stub captures the incoming x29 and the incoming x30 and hands them to the
+// C body below, which is the same logic this function always had plus the two
+// extra parameters.
+//
+// The symbol is extern "C" so the stub can define it from an assembly file
+// without having to spell out a C++ mangled name.
+extern "C" void* guestViewTracedMemcpy(void* destination, const void* source,
+                                       size_t length);
+
+// The C body the assembly stub calls. Not a resolver target: nothing binds the
+// guest's "memcpy" import to this, the stub is.
+//
+// guestFp is the caller's ARM64 frame pointer and guestLr is the caller's
+// return address, both as they were on entry to the stub. For a guest call
+// through the PLT, guestLr is a guest ELF address and guestFp is that guest
+// function's own frame pointer.
+//
+// Also extern "C", for the same reason as the stub: the stub reaches it with a
+// plain `bl`, and a C++ mangled name would have to be spelled out in the
+// assembly and would then break silently the first time a parameter changed.
+extern "C" void* guestViewTracedMemcpyBody(void* destination, const void* source,
+                                           size_t length, uintptr_t guestFp,
+                                           uintptr_t guestLr);
 
 // Host-symbol target used by the guest resolver for free. It is transparent
 // until the traced post-stage-30 memcpy has returned, then records only the
@@ -90,6 +118,17 @@ struct GuestViewGlStats {
     uint32_t lastDrawElementsCount{};
     uint32_t lastDrawMode{};
     uint32_t lastViewport[4]{};
+    // Set by guestViewTracedGlScissor. Added 2026-10-11 for the black-screen
+    // question: the run reports sc=1, i.e. glScissor is called exactly ONCE in
+    // the whole session, while lastViewport is the full 1280x720. If the game
+    // enables GL_SCISSOR_TEST and never resizes the box, every later fragment
+    // is discarded and the buffer stays exactly as glClear left it -- which is
+    // what the full-screen readback shows (lit=0 of 921600, EARLY and LATE).
+    // Until the rectangle's actual values were logged, "one scissor call" was
+    // a count and not a measurement.
+    uint32_t lastScissor[4]{};
+    uint32_t scissorEnabled{};
+    uint32_t lastBoundFramebuffer{};
     uint32_t lastFboStatus{};
 };
 GuestViewGlStats guestViewGlStats();
@@ -125,6 +164,7 @@ void guestViewTracedGlVertexAttribPointer(GLuint index, GLint size, GLenum type,
 
 // Persist guest android_log lines that mention view/splash/orientation so a
 // device crash still reveals whether VIEW CREATED/CHANGED actually ran.
+void noteContentRootGate(const char* site, uintptr_t renderTarget);
 void guestViewNoteAndroidLog(const char* text);
 
 // Wide-net first-N event log for the next device run (one build, many signals).

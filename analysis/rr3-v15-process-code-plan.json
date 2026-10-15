@@ -1,0 +1,11 @@
+{
+  "mode": 1,
+  "mapping_api": "svcMapProcessCodeMemory",
+  "unmapping_api": "svcUnmapProcessCodeMemory",
+  "image_mappings": 7,
+  "permission_api": "svcSetProcessMemoryPermission",
+  "permission_ranges": 34,
+  "layout": "one continuous ModuleCode mapping per DSO; 7 guard resets, 21 LOAD ranges, 6 RELRO overrides",
+  "fallback_mode": "mode 2 uses seven RX CodeMemory objects plus normal svcMapMemory for R/RW ranges",
+  "safety": "all mappings use final-base relocated bytes; content is rechecked after permissions; failure rolls back and gates constructors"
+}

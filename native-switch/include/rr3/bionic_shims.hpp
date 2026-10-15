@@ -7,6 +7,7 @@
 namespace rr3 {
 
 int* bionicErrno();
+int bionicErrnoFor(int newlibErrno);
 void* bionicMemcpyChk(void* destination, const void* source, size_t length,
                       size_t destinationSize);
 void* bionicMemmoveChk(void* destination, const void* source, size_t length,

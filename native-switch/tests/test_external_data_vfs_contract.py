@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Validate FAT32-safe RR3 data-volume routing and ABI path interception."""
 
 from collections import Counter
@@ -16,7 +16,20 @@ def main() -> None:
     builder = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(builder)
 
-    archive = project / "DXT_960x640+2048x1536数据包-260530-7723.zip"
+    # Globbed, never hardcoded. The previous literal was mojibake -- the UTF-8
+    # bytes of "数据包" decoded as GBK, with one byte collapsed to "?" -- so it
+    # raised OSError at ZipFile() before any project source was read, and the
+    # suite reported 10/11 with no hint that the asset had moved. The dated
+    # suffix also changes whenever the data volumes are regenerated, so a
+    # literal would go stale a second time. Fail loudly on anything but a
+    # single match instead of silently testing the wrong archive.
+    candidates = sorted(project.glob("DXT_*.zip"))
+    if len(candidates) != 1:
+        raise SystemExit(
+            f"expected exactly one DXT_*.zip under {project}, found "
+            f"{len(candidates)}: {[c.name for c in candidates]}"
+        )
+    archive = candidates[0]
     totals: Counter[str] = Counter()
     counts: Counter[str] = Counter()
     names: set[str] = set()
@@ -61,7 +74,7 @@ def main() -> None:
     assert "mapAppRootToContent" in source
     assert "kAppRoot" in source
     assert "files/.depot/" in source
-    assert "0xfff" in main_source
+    assert "0x1fff" in main_source
     assert "rr3::unmountExternalData();" in main_source
     for symbol in (
         "access", "fopen", "open", "__open_2", "stat", "lstat", "statfs",

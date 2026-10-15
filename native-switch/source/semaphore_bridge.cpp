@@ -1,5 +1,6 @@
 #include "rr3/semaphore_bridge.hpp"
 #include "rr3/guest_view_trace.hpp"
+#include "bionic_errno.hpp"
 
 #include <switch.h>
 
@@ -33,7 +34,7 @@ SemaphoreEntry* requireEntry(void* guest) {
     SemaphoreEntry* entry = findEntry(guest);
     mutexUnlock(&gSemaphoreRegistryMutex);
     if (entry == nullptr) {
-        errno = EINVAL;
+        errno = kGuestErrnoEINVAL;
     }
     return entry;
 }
@@ -47,6 +48,15 @@ bool deadlineReached(const struct timespec& deadline) {
         (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec);
 }
 
+// Bounded wait slices for BOTH semaphore waiters. An unbounded semaphoreWait
+// has no breadcrumb when an FMOD mixer thread blocks on a missing Android audio
+// callback, so a blocked guest is invisible. Each 500 ms slice reports via the
+// existing sync-blocked primitive (same pattern as guestPthreadCondWait). The
+// waits themselves are unchanged: guestSemWait stays indefinite, and
+// guestSemTimedWait still re-checks the guest's absolute deadline every
+// iteration, so only the granularity of the poll changes.
+constexpr long kSyncBlockedReportNanos = 500000000LL;
+
 } // namespace
 
 int guestSemInit(void* guestSemaphore, int processShared, unsigned int value) {
@@ -57,7 +67,7 @@ int guestSemInit(void* guestSemaphore, int processShared, unsigned int value) {
     mutexLock(&gSemaphoreRegistryMutex);
     if (findEntry(guestSemaphore) != nullptr) {
         mutexUnlock(&gSemaphoreRegistryMutex);
-        errno = EBUSY;
+        errno = kGuestErrnoEBUSY;
         return -1;
     }
     for (SemaphoreEntry& entry : gSemaphores) {
@@ -71,7 +81,7 @@ int guestSemInit(void* guestSemaphore, int processShared, unsigned int value) {
         }
     }
     mutexUnlock(&gSemaphoreRegistryMutex);
-    errno = ENOSPC;
+    errno = kGuestErrnoENOSPC;
     return -1;
 }
 
@@ -80,7 +90,7 @@ int guestSemDestroy(void* guestSemaphore) {
     SemaphoreEntry* entry = findEntry(guestSemaphore);
     if (entry == nullptr) {
         mutexUnlock(&gSemaphoreRegistryMutex);
-        errno = EINVAL;
+        errno = kGuestErrnoEINVAL;
         return -1;
     }
     entry->used = false;
@@ -103,12 +113,8 @@ int guestSemWait(void* guestSemaphore) {
     if (entry == nullptr) {
         return -1;
     }
-    // Bounded wait slices: an unbounded semaphoreWait has no breadcrumb when
-    // an FMOD mixer thread blocks on a missing Android audio callback. Each
-    // 500 ms slice reports via the existing sync-blocked primitive (same
-    // pattern as guestPthreadCondWait). The wait itself is still indefinite
-    // so legitimate long waits keep their blocking semantics.
-    constexpr long kSyncBlockedReportNanos = 500000000LL;
+    // Bounded wait slices: see kSyncBlockedReportNanos. The wait itself is
+    // still indefinite so legitimate long waits keep their blocking semantics.
     while (!semaphoreTryWait(&entry->native)) {
         guestViewTraceSyncBlocked("sem-wait", 54);
         svcSleepThread(kSyncBlockedReportNanos);
@@ -122,7 +128,7 @@ int guestSemTryWait(void* guestSemaphore) {
         return -1;
     }
     if (!semaphoreTryWait(&entry->native)) {
-        errno = EAGAIN;
+        errno = kGuestErrnoEAGAIN;
         return -1;
     }
     return 0;
@@ -131,26 +137,39 @@ int guestSemTryWait(void* guestSemaphore) {
 int guestSemTimedWait(void* guestSemaphore, const struct timespec* absoluteTimeout) {
     if (absoluteTimeout == nullptr || absoluteTimeout->tv_nsec < 0 ||
         absoluteTimeout->tv_nsec >= 1000000000L) {
-        errno = EINVAL;
+        errno = kGuestErrnoEINVAL;
         return -1;
     }
     SemaphoreEntry* entry = requireEntry(guestSemaphore);
     if (entry == nullptr) {
         return -1;
     }
+    // Same slice and breadcrumb as guestSemWait (ids 52/53/54 are mutex,
+    // cond-wait and sem-wait; 55 is this one). This was the only live 1 ms poll
+    // loop left in the tree and the only waiter with no diagnostic at all.
+    // The deadline check stays at the top of every iteration and is never
+    // skipped or reordered behind the sleep, so the guest's absolute deadline
+    // is still honoured on each pass; only the sleep between passes changed,
+    // from 1 ms to the shared 500 ms slice.
     while (!semaphoreTryWait(&entry->native)) {
         if (deadlineReached(*absoluteTimeout)) {
-            errno = ETIMEDOUT;
+            // NB: this constant is deliberately left as the HOST libc's
+            // numbering. The guest is a bionic build and devkitA64 is newlib,
+            // so ETIMEDOUT here is 116, which the guest reads as ESTALE. That
+            // mismatch is real and already quantified, but it is being fixed
+            // separately -- do not "correct" the value in this file.
+            errno = kGuestErrnoETIMEDOUT;
             return -1;
         }
-        svcSleepThread(1000000);
+        guestViewTraceSyncBlocked("sem-timedwait", 55);
+        svcSleepThread(kSyncBlockedReportNanos);
     }
     return 0;
 }
 
 int guestSemGetValue(void* guestSemaphore, int* value) {
     if (value == nullptr) {
-        errno = EINVAL;
+        errno = kGuestErrnoEINVAL;
         return -1;
     }
     SemaphoreEntry* entry = requireEntry(guestSemaphore);
@@ -166,17 +185,17 @@ int guestSemGetValue(void* guestSemaphore, int* value) {
 }
 
 void* guestSemOpen(const char*, int, ...) {
-    errno = ENOSYS;
+    errno = kGuestErrnoENOSYS;
     return reinterpret_cast<void*>(-1);
 }
 
 int guestSemClose(void*) {
-    errno = ENOSYS;
+    errno = kGuestErrnoENOSYS;
     return -1;
 }
 
 int guestSemUnlink(const char*) {
-    errno = ENOSYS;
+    errno = kGuestErrnoENOSYS;
     return -1;
 }
 

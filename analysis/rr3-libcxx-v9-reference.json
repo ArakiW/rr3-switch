@@ -1,0 +1,18 @@
+{
+  "path": "E:\\AI\\RealRacing3-switch\\reverse\\native\\arm64\\libc++_shared.so",
+  "image_bytes": 1052672,
+  "relative": 1428,
+  "internal_symbol_relocations": 2283,
+  "external_relocations": 162,
+  "unique_external_symbols": 160,
+  "resolver_table_entries": 265,
+  "resolver_table_fnv1a64": "6cdd4e315206951e",
+  "lookup_matched_symbols": 160,
+  "lookup_missing_symbols": 0,
+  "lookup_matched_relocations": 162,
+  "lookup_missing_relocations": 0,
+  "symbol_name_fnv1a64": "91591e75c02f690d",
+  "lookup_matched_name_fnv1a64": "91591e75c02f690d",
+  "invalid": 0,
+  "pre_reloc_fnv1a64": "5a0f86a4994217bd"
+}

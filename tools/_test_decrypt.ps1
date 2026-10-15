@@ -28,7 +28,8 @@ for ($i=0; $i -lt $keys.Count; $i++) {
     for ($j=$i+1; $j -lt $keys.Count; $j++) {
         $a = $data[$keys[$i]]; $b = $data[$keys[$j]]
         $n = [Math]::Min($a.Length, $b.Length)
-        $xor = for ($x=0; $x -lt 16; $x++) { $a[$x] -bxor $b[$x] }
+        $xor = New-Object int[] 16
+for ($x=0; $x -lt 16; $x++) { $xor[$x] = ([int]$a[$x]) -bxor ([int]$b[$x]) }
         $hex = ($xor | ForEach-Object { $_.ToString('X2') }) -join '-'
         Write-Output ("  {0,-14} xor {1,-22} = {2}" -f $keys[$i], $keys[$j], $hex)
     }
@@ -36,8 +37,9 @@ for ($i=0; $i -lt $keys.Count; $i++) {
 
 # Derive keystream for 2dflat assuming plaintext starts at offset 6 with `#version 100` + newline + a 14th char
 $ct = $data['2dflat']
-$pt = [byte[]]('#','v','e','r','s','i','o','n',' ','1','0','0', "`n")  # 13 bytes
-$keystream = for ($i=0; $i -lt $pt.Length; $i++) { $ct[6+$i] -bxor $pt[$i] }
+$pt = [byte[]]@(35, 118, 101, 114, 115, 105, 111, 110, 32, 49, 48, 48, 10)  # '#version 100\n'
+$keystream = New-Object int[] $pt.Length
+for ($i=0; $i -lt $pt.Length; $i++) { $keystream[$i] = ([int]$ct[6+$i]) -bxor ([int]$pt[$i]) }
 Write-Output "`n=== Keystream for 2dflat.vsh (offset 6+), assuming plaintext = `#version 100`+LF ==="
 Write-Output ("  ks[6:18] = " + (($keystream | ForEach-Object { $_.ToString('X2') }) -join ' '))
 
@@ -61,7 +63,7 @@ function Invoke-RC4([byte[]]$data, [byte[]]$key, [int]$drop = 0) {
         $i = ($i + 1) -band 0xFF
         $j = ($j + $S[$i]) -band 0xFF
         $tmp = $S[$i]; $S[$i] = $S[$j]; $S[$j] = $tmp
-        $out[$n] = $data[$n] -bxor $S[($S[$i] + $S[$j]) -band 0xFF]
+        $out[$n] = ([int]$data[$n]) -bxor ([int]$S[($S[$i] + $S[$j]) -band 0xFF])
     }
     return ,$out
 }
@@ -111,7 +113,7 @@ foreach ($n in @(4, 6, 8)) {
 Write-Output "`n=== RC4 with key = bytes 0-1 of cipher (per-file nonce) ==="
 foreach ($b0 in 0..15) {
     foreach ($b1 in 0..15) {
-        $key = [byte[]]@($ct[0] -bxor $b0, $ct[1] -bxor $b1)
+        $key = [byte[]]@(([int]$ct[0]) -bxor $b0, ([int]$ct[1]) -bxor $b1)
         $dec = Invoke-RC4 $ct[6..($ct.Length-1)] $key 0
         if ([System.Text.Encoding]::ASCII.GetString($dec[0..12]) -eq '#version 100') {
             Write-Output ("  HIT  b0={0:X2} b1={1:X2} prefix={2}" -f $b0, $b1, ([System.Text.Encoding]::ASCII.GetString($dec[0..30])))
@@ -122,7 +124,8 @@ foreach ($b0 in 0..15) {
 # Constant XOR with each seed at offset 6
 Write-Output "`n=== Constant XOR at offset 6 (each seed) ==="
 for ($seed = 0; $seed -lt 256; $seed++) {
-    $dec = for ($i=6; $i -lt $ct.Length; $i++) { ($ct[$i] -bxor $seed) -as [byte] }
+    $dec = New-Object byte[] ($ct.Length - 6)
+for ($i=6; $i -lt $ct.Length; $i++) { $dec[$i-6] = (([int]$ct[$i]) -bxor $seed) -as [byte] }
     $text = [System.Text.Encoding]::ASCII.GetString($dec[0..12])
     if ($text.StartsWith('#version 100')) {
         Write-Output ("  HIT  seed=0x{0:X2}" -f $seed)
@@ -136,7 +139,7 @@ for ($a = 0; $a -lt 256; $a += 1) {
         $dec = New-Object byte[] ($ct.Length - 6)
         for ($i=0; $i -lt $dec.Length; $i++) {
             $ks = ($a + $i * $b) -band 0xFF
-            $dec[$i] = $ct[6+$i] -bxor $ks
+            $dec[$i] = ([int]$ct[6+$i]) -bxor $ks
         }
         if ([System.Text.Encoding]::ASCII.GetString($dec[0..12]) -eq '#version 100') {
             Write-Output ("  HIT  a=0x{0:X2} b=0x{1:X2}  preview={2}" -f $a, $b, ([System.Text.Encoding]::ASCII.GetString($dec[0..30])))

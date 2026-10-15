@@ -463,6 +463,20 @@ GraphicsProbe runWindowGraphicsProbe(NWindow* window) {
     eglDestroyContext(display, context);
     eglDestroySurface(display, surface);
     eglTerminate(display);
+    // The EGL thread-release call is deliberately NOT made here, and that is
+    // enforced by tests/test_graphics_isolation_contract.py (it greps this file
+    // for the symbol and fails the build if it appears).
+    //
+    // It was tried on 2026-10-11 as a fix for the Mesa wedge, on the theory
+    // that eglTerminate leaves a stale per-thread Mesa binding and that this
+    // teardown poisons the later eglInitialize. The theory is wrong and the
+    // guard is right: this function runs in the --rr3-renderer CHILD process
+    // (main.cpp --rr3-renderer branch, writes --rr3-renderer-result= and
+    // returns R_SUCCEEDED(returnResult)). runGuestViewProbe is a different
+    // process, so nothing released here can affect it.
+    //
+    // Note the guard is a substring grep over the whole file, so even naming
+    // the symbol in this comment trips it. Spell it out or not at all.
     return probe;
 }
 

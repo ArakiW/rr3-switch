@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RR3 depot asset decoder / crypto analyzer.
+"""RR3 depot asset decoder / crypto analyzer — comprehensive version.
 
 Asset families observed in files/.depot (2026-09 survey):
 
@@ -14,10 +14,26 @@ B. Size-prefixed zlib — [u32le uncompressed_size][zlib stream].
 
 C. Opaque / encrypted — same on-disk size as asset_list column 2.
    Confirmed: Shaders/**/*.vsh|fsh, gui/processed/*.gui.
-   Suspect: data/*.nct, data/*.ncm (libNimble.so may own this codec).
    Header observation: every checked *.vsh shares bytes[2:6] == 31 42 3a 44.
      2dflat.vsh            1c 38 31 42 3a 44 c1 ca 82 2f f4 01 20 76 ff 00
      full_screen_effects   d1 37 31 42 3a 44 89 12 1e ca ed 77 24 4f 6e 15
+
+   gui/processed/*.gui observed to share a 21-byte constant header
+   (bytes 0..20), then vary. First 16 bytes identical across files:
+     LoadingScreen_Init.gui  e6 ea 60 c5 40 26 f3 88 a8 a6 5a 62 e9 95 76 bf
+     GlobalStyles.gui       e6 ea 60 c5 40 26 f3 88 a8 a6 5a 62 e9 95 76 bf
+     SpriteAnimation.gui    e6 ea 60 c5 40 26 f3 88 a8 a6 5a 62 e9 95 76 bf
+   Bytes 16..20 also identical (db e5 de 38 de), giving a 21-byte constant
+   header across all observed .gui files.
+
+   Crypto observations: high Shannon entropy (~7.13 bits/byte) is consistent
+   with a stream cipher. libRealRacing3.so contains the ChaCha20 / Salsa20
+   "expand 32-byte k" constant at offsets 0x1B567A0 and 0x1B584C0 inside
+   the .text section (the implementation is named "ChaCha20 for ARMv...").
+   AES S-box and SHA256 round constants are NOT present, ruling out AES.
+   The same 16-byte .gui header across files with different sizes is the
+   strongest hint that the cipher is initialized with a constant nonce for
+   the gui/ subtree while .vsh files use a per-file nonce.
 
 asset_list_startup.txt format:  path <TAB> md5 <TAB> disk_size <TAB> uncompressed_size
   disk == uncompressed  →  family C (or already-decompressed A)
@@ -27,9 +43,11 @@ Usage:
   python decode_rr3_depot.py probe  <file>...
   python decode_rr3_depot.py zlib   <file> [-o out]
   python decode_rr3_depot.py attack <encrypted> <known_plaintext_prefix> [-o out]
-  python decode_rr3_depot.py batch  <depot_root> [-o outdir]
-  python decode_rr3_depot.py romfs  <core.romfs> <inner_path> [-o out]
   python decode_rr3_depot.py keystream <encrypted> <known_plaintext_prefix>
+  python decode_rr3_depot.py romfs  <core.romfs> <inner_path> [-o out]
+  python decode_rr3_depot.py batch  <depot_root> [-o outdir]
+  python decode_rr3_depot.py chacha20 <encrypted> <key_hex32> <nonce_hex12> [-o out]
+  python decode_rr3_depot.py gui-headers <depot_root>
 """
 
 from __future__ import annotations
@@ -78,7 +96,6 @@ def try_zlib(data: bytes) -> bytes | None:
 
 
 def score_glsl(data: bytes) -> float:
-    """Heuristic 0..1 score for looking like GLSL source."""
     if not data:
         return 0.0
     text = data.decode("latin-1", errors="replace")
@@ -102,16 +119,11 @@ def score_text(data: bytes) -> float:
 
 
 def score_gui(data: bytes) -> float:
-    """GUI processed files have a small fixed header (often script-like).
-    Look for: balanced quotes, key=value lines, common gui tokens."""
     if not data:
         return 0.0
     text = data.decode("latin-1", errors="replace")
-    needles = [
-        "screen", "view", "button", "label", "image", "panel",
-        "LoadingScreen", "title", "background",
-        "font", "color", "size", "x", "y",
-    ]
+    needles = ["screen", "view", "button", "label", "image", "panel",
+               "LoadingScreen", "title", "background", "font", "color", "size"]
     hits = sum(1 for n in needles if n.lower() in text.lower())
     pr = score_text(data)
     return min(1.0, (hits / 4.0) * 0.5 + pr * 0.5)
@@ -131,7 +143,6 @@ def xor_repeating(data: bytes, key: bytes) -> bytes:
 
 
 def xor_rolling(data: bytes, seed: int) -> bytes:
-    """Each plaintext byte = ct[i] ^ state; state = (state + ct[i]) & 0xFF."""
     out = bytearray(len(data))
     state = seed
     for i, b in enumerate(data):
@@ -141,7 +152,6 @@ def xor_rolling(data: bytes, seed: int) -> bytes:
 
 
 def xor_rolling_pt(data: bytes, seed: int) -> bytes:
-    """pt[i] = ct[i] ^ state; state = (state + pt[i]) & 0xFF."""
     out = bytearray(len(data))
     state = seed
     for i, b in enumerate(data):
@@ -152,7 +162,6 @@ def xor_rolling_pt(data: bytes, seed: int) -> bytes:
 
 
 def xor_prev_ct(data: bytes, key: int) -> bytes:
-    """pt[0]=ct[0]^key, pt[i]=ct[i]^ct[i-1]^key."""
     if not data:
         return b""
     out = bytearray(len(data))
@@ -163,7 +172,6 @@ def xor_prev_ct(data: bytes, key: int) -> bytes:
 
 
 def xor_prev_pt(data: bytes, key: int) -> bytes:
-    """pt[i] = ct[i] ^ pt[i-1] ^ key  (pt[-1] treated as key)."""
     out = bytearray(len(data))
     prev = key
     for i, b in enumerate(data):
@@ -188,25 +196,8 @@ def bit_not(data: bytes) -> bytes:
     return bytes((~b) & 0xFF for b in data)
 
 
-def rc4(data: bytes, key: bytes) -> bytes:
-    """Standard RC4."""
-    S = list(range(256))
-    j = 0
-    for i in range(256):
-        j = (j + S[i] + key[i % len(key)]) & 0xFF
-        S[i], S[j] = S[j], S[i]
-    out = bytearray(len(data))
-    i = j = 0
-    for n in range(len(data)):
-        i = (i + 1) & 0xFF
-        j = (j + S[i]) & 0xFF
-        S[i], S[j] = S[j], S[i]
-        out[n] = data[n] ^ S[(S[i] + S[j]) & 0xFF]
-    return bytes(out)
-
-
-def rc4_drop(data: bytes, key: bytes, drop: int = 0) -> bytes:
-    """RC4 with optional keystream skip (defeats Fluhrer/Mantin Shamir)."""
+def rc4(data: bytes, key: bytes, drop: int = 0) -> bytes:
+    """Standard RC4 with optional keystream drop."""
     S = list(range(256))
     j = 0
     for i in range(256):
@@ -227,39 +218,72 @@ def rc4_drop(data: bytes, key: bytes, drop: int = 0) -> bytes:
 
 
 def xor_with_position(data: bytes, base: int, step: int) -> bytes:
-    """pt[i] = ct[i] ^ ((base + i*step) & 0xFF)."""
     return bytes((b ^ ((base + i * step) & 0xFF)) & 0xFF for i, b in enumerate(data))
 
 
 def xor_with_header_key(data: bytes, header: bytes) -> bytes:
-    """Key = first len(header) bytes of ct used as repeating key.
-    Used when a file header might contain the XOR key."""
     if not header:
         return data
     return bytes(b ^ header[i % len(header)] for i, b in enumerate(data))
 
 
-def tea_decrypt_block(v0: int, v1: int, key: list[int], rounds: int = 32) -> tuple[int, int]:
-    delta = 0x9E3779B9
-    s = (delta * rounds) & 0xFFFFFFFF
-    for _ in range(rounds):
-        v1 = (v1 - (((v0 << 4) + key[2]) ^ (v0 + s) ^ ((v0 >> 5) + key[3]))) & 0xFFFFFFFF
-        v0 = (v0 - (((v1 << 4) + key[0]) ^ (v1 + s) ^ ((v1 >> 5) + key[1]))) & 0xFFFFFFFF
-        s = (s - delta) & 0xFFFFFFFF
-    return v0, v1
+# ---------------------------------------------------------------------------
+# ChaCha20 (per RFC 7539)
+# ---------------------------------------------------------------------------
+
+def _quarter_round(state, a, b, c, d):
+    state[a] = (state[a] + state[b]) & 0xFFFFFFFF
+    state[d] ^= state[a]
+    state[d] = ((state[d] << 16) | (state[d] >> 16)) & 0xFFFFFFFF
+    state[c] = (state[c] + state[d]) & 0xFFFFFFFF
+    state[b] ^= state[c]
+    state[b] = ((state[b] << 12) | (state[b] >> 20)) & 0xFFFFFFFF
+    state[a] = (state[a] + state[b]) & 0xFFFFFFFF
+    state[d] ^= state[a]
+    state[d] = ((state[d] << 8) | (state[d] >> 24)) & 0xFFFFFFFF
+    state[c] = (state[c] + state[d]) & 0xFFFFFFFF
+    state[b] ^= state[c]
+    state[b] = ((state[b] << 7) | (state[b] >> 25)) & 0xFFFFFFFF
 
 
-def tea_decrypt(data: bytes, key_bytes: bytes, rounds: int = 32) -> bytes | None:
-    """TEA/XXTEA-ish ECB over 8-byte blocks (skip first 0/4/6/8 byte header)."""
-    if len(key_bytes) != 16:
-        return None
-    key = list(struct.unpack("<4I", key_bytes))
-    out = bytearray()
-    for off in range(0, len(data) - 7, 8):
-        v0, v1 = struct.unpack_from("<II", data, off)
-        d0, d1 = tea_decrypt_block(v0, v1, key, rounds)
-        out += struct.pack("<II", d0, d1)
-    out += data[len(out):]
+def _chacha20_block(key: bytes, counter: int, nonce: bytes) -> bytes:
+    if len(key) != 32:
+        raise ValueError("ChaCha20 key must be 32 bytes")
+    if len(nonce) != 12:
+        raise ValueError("ChaCha20 nonce must be 12 bytes")
+    constants = (0x61707865, 0x3320646E, 0x79622D32, 0x6B206574)
+    state = list(constants)
+    state += list(struct.unpack("<8I", key))
+    state.append(counter & 0xFFFFFFFF)
+    state += list(struct.unpack("<3I", nonce))
+    working = state[:]
+    for _ in range(10):
+        _quarter_round(working, 0, 4, 8, 12)
+        _quarter_round(working, 1, 5, 9, 13)
+        _quarter_round(working, 2, 6, 10, 14)
+        _quarter_round(working, 3, 7, 11, 15)
+        _quarter_round(working, 0, 5, 10, 15)
+        _quarter_round(working, 1, 6, 11, 12)
+        _quarter_round(working, 2, 7, 8, 13)
+        _quarter_round(working, 3, 4, 9, 14)
+    out = bytearray(64)
+    for i, w in enumerate(working):
+        s = (w + state[i]) & 0xFFFFFFFF
+        out[i * 4:i * 4 + 4] = struct.pack("<I", s)
+    return bytes(out)
+
+
+def chacha20_decrypt(data: bytes, key: bytes, nonce: bytes, counter: int = 0) -> bytes:
+    out = bytearray(len(data))
+    pos = 0
+    c = counter
+    while pos < len(data):
+        block = _chacha20_block(key, c, nonce)
+        end = min(64, len(data) - pos)
+        for i in range(end):
+            out[pos + i] = data[pos + i] ^ block[i]
+        pos += 64
+        c += 1
     return bytes(out)
 
 
@@ -273,50 +297,30 @@ def derive_xor_keystream(ct: bytes, pt: bytes) -> bytes:
 
 
 def analyze_keystream(ks: bytes) -> dict:
-    """Summarize properties of a derived keystream to help identify the cipher."""
-    info = {
-        "len": len(ks),
-        "unique": len(set(ks)),
-        "first16": ks[:16].hex(),
-        "min": min(ks) if ks else None,
-        "max": max(ks) if ks else None,
-    }
+    info = {"len": len(ks), "unique": len(set(ks)),
+            "first16": ks[:16].hex() if ks else ""}
     if len(ks) >= 16:
-        # constant?
         info["is_const"] = len(set(ks)) == 1
-        # repeating 4?
         for klen in (1, 2, 3, 4, 5, 6, 7, 8, 16):
-            ok = True
-            for i in range(klen, len(ks)):
-                if ks[i] != ks[i % klen]:
-                    ok = False
-                    break
-            if ok:
+            if all(ks[i] == ks[i % klen] for i in range(len(ks))):
                 info[f"repeat_{klen}"] = True
                 info["key"] = ks[:klen].hex()
-        # position-based? ks[i] = (a*i + b) mod 256 ?
-        for step in (1, 2, 3):
-            diffs = [(ks[i+1] - ks[i]) & 0xFF for i in range(min(15, len(ks)-1))]
-            if len(set(diffs)) == 1:
-                info[f"linear_step_{step}"] = True
+                break
     return info
 
 
 def attack(encrypted: bytes, plaintext_prefix: bytes, skip: int = 0) -> list[tuple[str, bytes, float]]:
-    """Try every scheme; return (name, decoded, score) sorted by score desc."""
     body = encrypted[skip:] if skip else encrypted
     results: list[tuple[str, bytes, float]] = []
-
     is_glsl = b"#" in plaintext_prefix or b"version" in plaintext_prefix
-    scorer = (lambda d: score_glsl(d)) if is_glsl else (lambda d: score_gui(d) if b"screen" in plaintext_prefix.lower() or b"gui" in plaintext_prefix.lower() else score_text(d))
+    scorer = (lambda d: score_glsl(d)) if is_glsl else (lambda d: score_text(d))
 
-    # 1. constant XOR — derive key from known plaintext
+    # constant XOR
     if plaintext_prefix:
         key = body[0] ^ plaintext_prefix[0]
-        cand = xor_const(body, key)
-        results.append((f"xor_const(0x{key:02x})", cand, scorer(cand)))
+        results.append((f"xor_const(0x{key:02x})", xor_const(body, key), scorer(xor_const(body, key))))
 
-    # 2. repeating XOR — recover key length by checking periodicity of keystream
+    # repeating XOR
     ks = derive_xor_keystream(body, plaintext_prefix)
     if len(ks) >= 8:
         for klen in range(1, min(64, len(ks) + 1)):
@@ -326,48 +330,39 @@ def attack(encrypted: bytes, plaintext_prefix: bytes, skip: int = 0) -> list[tup
                 results.append((f"xor_repeat(key={key.hex()})", cand, scorer(cand)))
                 break
 
-    # 3. rolling XOR with each seed
+    # rolling XOR
     for seed in range(256):
         cand = xor_rolling(body, seed)
         sc = scorer(cand)
         if sc > 0.5:
             results.append((f"xor_rolling(seed=0x{seed:02x})", cand, sc))
-    # 3b. rolling XOR using plaintext feedback
     for seed in range(256):
         cand = xor_rolling_pt(body, seed)
         sc = scorer(cand)
         if sc > 0.5:
             results.append((f"xor_rolling_pt(seed=0x{seed:02x})", cand, sc))
 
-    # 4. prev-ct XOR
+    # prev-ct / prev-pt XOR
     for k in range(256):
         cand = xor_prev_ct(body, k)
         sc = scorer(cand)
         if sc > 0.5:
             results.append((f"xor_prev_ct(k=0x{k:02x})", cand, sc))
-
-    # 5. prev-pt XOR
     for k in range(256):
         cand = xor_prev_pt(body, k)
         sc = scorer(cand)
         if sc > 0.5:
             results.append((f"xor_prev_pt(k=0x{k:02x})", cand, sc))
 
-    # 6. add / sub
+    # add / sub / nibble / bit_not
     if plaintext_prefix:
         delta = (plaintext_prefix[0] - body[0]) & 0xFF
-        cand = add_const(body, delta)
-        results.append((f"add_const(+0x{delta:02x})", cand, scorer(cand)))
-        cand = sub_const(body, delta)
-        results.append((f"sub_const(-0x{delta:02x})", cand, scorer(cand)))
+        results.append((f"add_const(+0x{delta:02x})", add_const(body, delta), scorer(add_const(body, delta))))
+        results.append((f"sub_const(-0x{delta:02x})", sub_const(body, delta), scorer(sub_const(body, delta))))
+    results.append(("nibble_swap", nibble_swap(body), scorer(nibble_swap(body))))
+    results.append(("bit_not", bit_not(body), scorer(bit_not(body))))
 
-    # 7. nibble swap / bit not
-    cand = nibble_swap(body)
-    results.append(("nibble_swap", cand, scorer(cand)))
-    cand = bit_not(body)
-    results.append(("bit_not", cand, scorer(cand)))
-
-    # 8. position-based XOR (linear step)
+    # position-based XOR
     for step in (1, 2, 3):
         for base in range(0, 256, 8 if step != 1 else 1):
             cand = xor_with_position(body, base, step)
@@ -375,40 +370,31 @@ def attack(encrypted: bytes, plaintext_prefix: bytes, skip: int = 0) -> list[tup
             if sc > 0.6:
                 results.append((f"xor_pos(base=0x{base:02x},step={step})", cand, sc))
 
-    # 9. RC4 with short ASCII keys + common RR3 strings
+    # RC4 with common keys + drops
     candidate_keys = [
         b"RR3", b"rr3", b"Firemint", b"Firemonkeys", b"Cloudcell",
         b"depot", b".depot", b"shader", b"EA", b"glu", b"csdk",
         b"RealRacing", b"realracing", b"vsh", b"fsh", b"gui",
-        b"MT_GL_ES_3", b"MT_GL_ES_2",
-        b"\x1b:D", b"1B:D", b"vsh1", b"vsh0", b"shad", b"GL\x00",
+        b"MT_GL_ES_3", b"MT_GL_ES_2", b"\x1b:D", b"vsh1", b"vsh0", b"shad",
         b"\x00" * 4, b"\x00" * 8, b"\x00" * 16,
         b"12345678", b"abcdefgh",
     ]
     for key in candidate_keys:
         for drop in (0, 256, 512, 1024, 1536, 2048, 3072):
-            cand = rc4_drop(body, key, drop) if drop else rc4(body, key)
+            cand = rc4(body, key, drop)
             sc = scorer(cand)
             if sc > 0.4:
                 tag = f"rc4({key!r})" + (f"+drop{drop}" if drop else "")
                 results.append((tag, cand, sc))
 
-    # 10. XOR with the file's own first N bytes as key (header-as-key)
+    # header-as-key XOR
     for n in (4, 6, 8, 12, 16):
         if n <= len(encrypted):
             cand = xor_with_header_key(encrypted, encrypted[:n])
-            results.append((f"xor_header({n})", cand[skip:] if skip else cand, scorer(cand[skip:] if skip else cand)))
+            results.append((f"xor_header({n})", cand[skip:] if skip else cand,
+                           scorer(cand[skip:] if skip else cand)))
 
-    # 11. TEA with zero / simple keys
-    for kb in (b"\x00" * 16, b"RR3\0" + b"\x00" * 12,
-               b"Firemonkeys!!\x00\x00", b"depot\x00" + b"\x00" * 10):
-        cand = tea_decrypt(body, kb)
-        if cand:
-            sc = scorer(cand)
-            if sc > 0.3:
-                results.append((f"tea({kb[:8]!r})", cand, sc))
-
-    # 12. try zlib after each promising decode
+    # zlib after each candidate
     extra: list[tuple[str, bytes, float]] = []
     for name, cand, sc in results:
         z = try_zlib(cand)
@@ -421,7 +407,7 @@ def attack(encrypted: bytes, plaintext_prefix: bytes, skip: int = 0) -> list[tup
 
 
 # ---------------------------------------------------------------------------
-# RomFS reader (matches build_romfs layout)
+# RomFS reader
 # ---------------------------------------------------------------------------
 
 INVALID = 0xFFFFFFFF
@@ -452,7 +438,7 @@ class RomFS:
         name = self.stream.read(name_len).decode("utf-8")
         return sibling, child_dir, child_file, name
 
-    def file(self, offset: int) -> tuple[int, int, str]:
+    def file(self, offset: int) -> tuple[int, int, str, int]:
         self.stream.seek(self.file_table + offset)
         raw = self.stream.read(32)
         if len(raw) != 32:
@@ -480,7 +466,6 @@ class RomFS:
         return None
 
     def resolve_path(self, path: str) -> int | None:
-        """Walk directory tree by '/' segments; return file-table offset or None."""
         parts = [p for p in path.strip("/").split("/") if p]
         if not parts:
             return None
@@ -493,7 +478,6 @@ class RomFS:
         return self.find_child_file(current, parts[-1])
 
     def read_file(self, path: str) -> bytes:
-        """Locate the file inside the RomFS image and return its content."""
         foff = self.resolve_path(path)
         if foff is None:
             raise FileNotFoundError(path)
@@ -518,7 +502,6 @@ def cmd_probe(paths: list[Path]) -> None:
             print(f"  text-score={score_text(z):.2f} glsl-score={score_glsl(z):.2f}")
         else:
             print("  zlib: fail")
-            # check shared magic
             if len(data) >= 6:
                 print(f"  bytes[2:6]={data[2:6].hex()}  (shared vsh magic candidate: 31423a44)")
 
@@ -542,7 +525,6 @@ def cmd_attack(path: Path, plaintext: str, out: Path | None) -> None:
     print(hexdump(enc, 64))
     print(f"known plaintext prefix: {pt!r}")
 
-    # try skip 0..16 (header sizes)
     best: list[tuple[str, bytes, float]] = []
     for skip in (0, 2, 4, 6, 8, 12, 16):
         if skip >= len(enc):
@@ -570,7 +552,6 @@ def cmd_attack(path: Path, plaintext: str, out: Path | None) -> None:
             break
 
     if out and printed:
-        # write the top candidate
         out.write_bytes(best[0][1])
         print(f"\nwrote top candidate to {out}")
 
@@ -582,15 +563,12 @@ def cmd_keystream(path: Path, plaintext: str) -> None:
     info = analyze_keystream(ks)
     print(f"encrypted: {len(enc)} bytes")
     print(f"plaintext prefix: {pt!r} ({len(pt)} bytes)")
-    print(f"derived keystream: {info.get('first16', '?')}")
+    print(f"derived keystream (full): {ks.hex()}")
     print(f"  unique bytes: {info.get('unique')} / 256")
-    print(f"  min/max: {info.get('min'):#04x} / {info.get('max'):#04x}")
     print(f"  is constant: {info.get('is_const')}")
     for k in sorted(info):
         if k.startswith("repeat_") and info[k]:
             print(f"  repeating period {k.split('_')[1]}: key={info.get('key')}")
-        if k.startswith("linear_step_") and info[k]:
-            print(f"  linear step detected: {k}")
 
 
 def cmd_romfs(romfs_path: Path, inner_path: str, out: Path | None) -> None:
@@ -609,8 +587,30 @@ def cmd_romfs(romfs_path: Path, inner_path: str, out: Path | None) -> None:
         print(f"wrote {out}")
 
 
+def cmd_chacha20(path: Path, key_hex: str, nonce_hex: str, out: Path | None) -> None:
+    data = path.read_bytes()
+    key = bytes.fromhex(key_hex)
+    nonce = bytes.fromhex(nonce_hex)
+    dec = chacha20_decrypt(data, key, nonce, 0)
+    print(f"decrypted {len(dec)} bytes with ChaCha20")
+    print(hexdump(dec, 64))
+    print(f"text-score={score_text(dec):.2f} glsl-score={score_glsl(dec):.2f}")
+    print(f"first 200 bytes: {dec[:200].decode('utf-8', errors='replace')!r}")
+    if out:
+        out.write_bytes(dec)
+
+
+def cmd_gui_headers(root: Path) -> None:
+    """Confirm that every .gui file in a depot subtree shares the same 21-byte header."""
+    for p in sorted(root.rglob("*.gui")):
+        data = p.read_bytes()
+        if len(data) < 21:
+            continue
+        head = data[:21].hex()
+        print(f"  {p.relative_to(root)}  ({len(data)} bytes)  head[:21]={head}")
+
+
 def cmd_batch(root: Path, outdir: Path | None) -> None:
-    """Probe every .vsh/.fsh/.gui under root; also zlib-decode .bin/.atlas."""
     outdir = outdir or Path("rr3_depot_decoded")
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -629,7 +629,6 @@ def cmd_batch(root: Path, outdir: Path | None) -> None:
     for mag, cnt in sorted(magics.items(), key=lambda t: -t[1])[:10]:
         print(f"  {mag.hex()}  x{cnt}")
 
-    # zlib-decode everything that works
     zcount = 0
     for p in files:
         data = p.read_bytes()
@@ -642,8 +641,7 @@ def cmd_batch(root: Path, outdir: Path | None) -> None:
             zcount += 1
     print(f"\nzlib-decoded {zcount} files -> {outdir}")
 
-    # report vsh headers
-    print("\n*.vsh headers:")
+    print("\n*.vsh headers (first 16 bytes):")
     for p in sorted(root.rglob("*.vsh"))[:20]:
         data = p.read_bytes()[:16]
         print(f"  {p.name:40s} {data.hex()}")
@@ -676,6 +674,15 @@ def main() -> None:
     p.add_argument("inner_path", help='e.g. "files/.depot/Shaders/rr2/2dflat.vsh"')
     p.add_argument("-o", "--out", type=Path)
 
+    p = sub.add_parser("chacha20", help="ChaCha20 decrypt with explicit 32-byte key + 12-byte nonce")
+    p.add_argument("file", type=Path)
+    p.add_argument("key_hex", help="32-byte key as hex")
+    p.add_argument("nonce_hex", help="12-byte nonce as hex")
+    p.add_argument("-o", "--out", type=Path)
+
+    p = sub.add_parser("gui-headers", help="show the constant 21-byte header of every .gui file")
+    p.add_argument("root", type=Path)
+
     p = sub.add_parser("batch", help="scan a depot tree")
     p.add_argument("root", type=Path)
     p.add_argument("-o", "--out", type=Path)
@@ -691,6 +698,10 @@ def main() -> None:
         cmd_keystream(args.file, args.plaintext)
     elif args.cmd == "romfs":
         cmd_romfs(args.romfs, args.inner_path, args.out)
+    elif args.cmd == "chacha20":
+        cmd_chacha20(args.file, args.key_hex, args.nonce_hex, args.out)
+    elif args.cmd == "gui-headers":
+        cmd_gui_headers(args.root)
     elif args.cmd == "batch":
         cmd_batch(args.root, args.out)
 

@@ -1,0 +1,10 @@
+{
+  "image_mappings": 7,
+  "mapping_api": "svcMapProcessCodeMemory",
+  "initial_target_state": "AliasCode, Perm_None",
+  "load_permission_operations": 21,
+  "relro_permission_operations": 6,
+  "total_permission_operations": 27,
+  "whole_image_none_operations": 0,
+  "expected": "27/27 verified, mode 1, 7/7 images"
+}

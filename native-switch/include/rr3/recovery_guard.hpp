@@ -26,12 +26,30 @@ bool writeGuestBootProgress(const char* path, const char* phase,
                             unsigned long long ordinal,
                             unsigned long long target,
                             const char* details = nullptr);
-// Appends one line and fsyncs. Used for guest-view diagnostics that must
-// survive the final handoff breadcrumb overwrite of the progress file.
+// The same single line in the same file, written WITHOUT the whole-card fsync.
+// For progress writes that can repeat on a guest-blocking timer (the
+// blocked-wait breadcrumb). See recovery_guard.cpp: fsync on an emulated SDMC
+// card is a whole-card sync and the census hot log was already moved off it for
+// exactly this reason.
+bool writeGuestBootProgressNoSync(const char* path, const char* phase,
+                                 unsigned long long ordinal,
+                                 unsigned long long target,
+                                 const char* details = nullptr);
+// Appends one line and deliberately does NOT fsync. Used for guest-view
+// diagnostics that must survive the final handoff breadcrumb overwrite of the
+// progress file. See recovery_guard.cpp for the measured reason. The "a" handle
+// is cached per path (one open, many appends); the format is unchanged and is
+// still exactly one flushed line per call.
 bool appendGuestBootLine(const char* path, const char* phase,
                          unsigned long long ordinal,
                          unsigned long long target,
                          const char* details = nullptr);
+// Snapshot of the append-handle cache counters: how many times a handle was
+// freshly opened, reused from the cache, and reopened after an error. Read this
+// at an existing periodic point (the census/sweep in pthread_bridge.cpp) rather
+// than from a new timer; appendGuestBootLine must not report on itself.
+void guestBootLogCacheStats(unsigned long long& opens, unsigned long long& reuses,
+                            unsigned long long& reopens, unsigned int& slots);
 // Reads the breadcrumb back (up to capacity-1 bytes, NUL-terminated). Returns
 // false and leaves an empty string if the file is absent.
 bool readGuestBootProgress(const char* path, char* out, unsigned long capacity);

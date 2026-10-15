@@ -1,10 +1,14 @@
 #include "rr3/guest_view_trace.hpp"
 
+#include "rr3/guest_frame_probe.hpp"
+#include "rr3/guest_teardown_repair.hpp"
 #include "rr3/recovery_guard.hpp"
 
 #include <EGL/egl.h>
 
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -12,6 +16,21 @@ namespace rr3 {
 namespace {
 
 const char* g_progressPath = nullptr;
+// Content-independent quota for guest __android_log_print lines that no filter
+// predicate would keep. Rationale and the resulting bound are stated at
+// guestViewNoteAndroidLog.
+//
+// RAISED 200 -> 4000, 2026-10-04, because the cap was a measurement limit, not
+// a safety limit. 200 was set when the guest never got past the splash, to keep
+// the archived run's 570-line log from growing much; the guest now renders its
+// splash and keeps going, and the quota is spent long before it stops. The
+// archived runs prove the truncation is real and not theoretical -- they carry
+//   phase=guest-log-drop ordinal=1..4 cap=200 reason=quota_spent
+// which is this file correctly reporting that it threw away guest lines, and
+// the lines it throws away are the ones the guest prints AFTER it goes quiet,
+// i.e. the exact evidence for the open question. 4000 lines is ~600 KB of
+// guest-view.log, which the archive already handles for the eden_log tail.
+constexpr unsigned kAndroidLogAnyBudget = 4000;
 // Worker faults use exception capture; only the probe thread owns this breadcrumb stream.
 thread_local bool g_enabled = false;
 bool g_checkpointInProgress = false;
@@ -24,11 +43,44 @@ unsigned int g_vectorGrowth240Calls = 0;
 unsigned int g_vectorStorage40Calls = 0;
 bool g_postStage30MemcpyReturned = false;
 bool g_postStage30FreeTraced = false;
+
+// ---------------------------------------------------------------------------
+// Deallocation-sequence observer.
+//
+// The container-teardown loop in the guest is a REVERSE walk, 0x30 per step,
+// whose exit test is plain pointer equality:
+//     0xcd2abc  cmp  x20, x23      ; begin vs current
+//     0xcd2ac4  b.eq #0xcd2b00      ; equal -> done
+//     0xcd2ad4  sub  x23, x21, #0x30
+// with no modulo guard anywhere. If (end - begin) is not a multiple of 0x30 --
+// and the runtime reads say it is 0x25A77C, i.e. remainder 0x1c -- then the
+// pointer can NEVER equal begin, so the loop never exits and walks down
+// through memory calling operator delete until it faults.
+//
+// This observer exists to make that visible WITHOUT touching any allocator
+// path and WITHOUT patching guest .text. It watches only the POINTER SEQUENCE
+// handed to free(): a legitimate teardown frees a bounded, scattered set; the
+// runaway loop frees a long run with a CONSTANT STRIDE, going down. That
+// difference is the proof, and it comes from the pointer values alone.
+//
+// Deliberately on `free` and not on `_ZdlPv`: free is already shimmed and
+// already forwards to the same std::free the guest allocator uses, so this adds
+// no heap risk and no new row to the frozen symbol table. A `_ZdlPv` shim
+// would have to forward to libc++'s operator delete to stay heap-correct, and
+// whether it preserves the caller's x29 depends on whether libc++'s operator
+// delete establishes a frame of its own -- unknowable without testing, and
+// therefore strictly worse evidence than the stride.
+// ---------------------------------------------------------------------------
+std::atomic<uintptr_t> g_freeSeqLast{0};
+std::atomic<uintptr_t> g_freeSeqStride{0};
+std::atomic<uintptr_t> g_freeSeqRun{0};
+std::atomic<uintptr_t> g_freeSeqTotal{0};
+std::atomic<uintptr_t> g_freeSeqLongestRun{0};
+std::atomic<uintptr_t> g_freeSeqLongestStride{0};
 uintptr_t g_second40Caller = 0;
 uintptr_t g_copyCaller = 0;
 uintptr_t g_copyDestination = 0;
-uintptr_t g_copySource = 0;
-size_t g_copyLength = 0;
+uintptr_t g_copySource = 0;size_t g_copyLength = 0;
 uintptr_t g_freeCaller = 0;
 uintptr_t g_freeAddress = 0;
 uintptr_t g_glCaller = 0;
@@ -159,7 +211,7 @@ unsigned int stageFor(GLenum name, bool returned) {
 }
 
 void checkpointPhase(const char* phase, unsigned int stage,
-                     unsigned long long target) {
+                     unsigned long long target, bool durable = true) {
     if (phase == nullptr || g_progressPath == nullptr ||
         g_checkpointInProgress) {
         return;
@@ -182,8 +234,16 @@ void checkpointPhase(const char* phase, unsigned int stage,
             static_cast<unsigned long long>(g_freeAddress),
             static_cast<unsigned long long>(g_glCaller), g_glObject);
     }
-    writeGuestBootProgress(g_progressPath, phase, stage, target,
-                           stage >= 30 ? details : nullptr);
+    // Only the blocked-wait breadcrumb passes durable=false: it is the one
+    // progress write that repeats on a guest-blocking timer, and it must not
+    // pay for the whole-card fsync that the durable stage checkpoints need.
+    if (durable) {
+        writeGuestBootProgress(g_progressPath, phase, stage, target,
+                               stage >= 30 ? details : nullptr);
+    } else {
+        writeGuestBootProgressNoSync(g_progressPath, phase, stage, target,
+                                     stage >= 30 ? details : nullptr);
+    }
     g_checkpointInProgress = false;
 }
 
@@ -393,14 +453,25 @@ void* guestViewTracedMalloc(size_t size) {
     return result;
 }
 
-void* guestViewTracedMemcpy(void* destination, const void* source, size_t length) {
+extern "C" void* guestViewTracedMemcpyBody(void* destination, const void* source,
+                                            size_t length, uintptr_t guestFp,
+                                            uintptr_t guestLr) {
+    // The caller's frame pointer and return address, captured by the assembly
+    // stub in source/guest_frame_probe.s BEFORE it established a frame of its
+    // own. For a guest call through the PLT these are the guest's own values,
+    // which is the whole point: guestLr lets the frame probe ask "is the caller
+    // inside the container-teardown function?" and guestFp is that function's
+    // live frame pointer. Costs two relaxed atomic increments and a range
+    // compare on the guest's hot path, and nothing else.
+    guestFrameObserve(guestFp, guestLr, reinterpret_cast<uintptr_t>(destination),
+                      "memcpy");
+
     if (!g_enabled || g_checkpointInProgress || !guestViewTraceReached(30) ||
         g_postStage30MemcpyReturned) {
         return std::memcpy(destination, source, length);
     }
 
-    const uintptr_t caller = reinterpret_cast<uintptr_t>(
-        __builtin_return_address(0));
+    const uintptr_t caller = guestLr;
     g_copyCaller = caller;
     g_copyDestination = reinterpret_cast<uintptr_t>(destination);
     g_copySource = reinterpret_cast<uintptr_t>(source);
@@ -416,6 +487,57 @@ void* guestViewTracedMemcpy(void* destination, const void* source, size_t length
 }
 
 void guestViewTracedFree(void* allocation) {
+    // Pointer-sequence observation, first statement, and it never changes what
+    // the function does: std::free is called on every path exactly as before.
+    {
+        const uintptr_t p = reinterpret_cast<uintptr_t>(allocation);
+        const uintptr_t total =
+            g_freeSeqTotal.fetch_add(1, std::memory_order_relaxed) + 1;
+        const uintptr_t last =
+            g_freeSeqLast.load(std::memory_order_relaxed);
+        uintptr_t run = 1;
+        if (last != 0 && p != 0) {
+            const uintptr_t delta = last - p;
+            if (delta == g_freeSeqStride.load(std::memory_order_relaxed)) {
+                run = g_freeSeqRun.fetch_add(1, std::memory_order_relaxed) + 1;
+            } else {
+                g_freeSeqStride.store(delta, std::memory_order_relaxed);
+                g_freeSeqRun.store(1, std::memory_order_relaxed);
+            }
+        }
+        g_freeSeqLast.store(p, std::memory_order_relaxed);
+        uintptr_t best = g_freeSeqLongestRun.load(std::memory_order_relaxed);
+        if (run > best) {
+            g_freeSeqLongestRun.store(run, std::memory_order_relaxed);
+            g_freeSeqLongestStride.store(
+                g_freeSeqStride.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+        }
+        // Milestones only, and only while a run is actually growing, so the log
+        // shows the shape of the runaway instead of a firehose.
+        const bool firstFew = total <= 8;
+        const bool milestone = run == 64 || run == 1024 || run == 16384 ||
+                               run == 131072 || run == 1048576;
+        if (firstFew || milestone) {
+            char line[256];
+            __builtin_snprintf(line, sizeof(line),
+                "total=%llu ptr=0x%llx prev=0x%llx stride=0x%llx run=%llu "
+                "longest_run=%llu longest_stride=0x%llx caller=0x%llx "
+                "note=constant_stride_run_means_a_reverse_teardown_walking_down",
+                (unsigned long long)total, (unsigned long long)p,
+                (unsigned long long)last,
+                (unsigned long long)g_freeSeqStride.load(std::memory_order_relaxed),
+                (unsigned long long)run,
+                (unsigned long long)g_freeSeqLongestRun.load(std::memory_order_relaxed),
+                (unsigned long long)g_freeSeqLongestStride.load(std::memory_order_relaxed),
+                (unsigned long long)reinterpret_cast<uintptr_t>(
+                    __builtin_return_address(0)));
+            (void)appendGuestBootLine(
+                "sdmc:/switch/rr3-native-rehost.guest-view.log",
+                "guest-free-seq", 0, 0, line);
+        }
+    }
+
     if (!g_enabled || g_checkpointInProgress ||
         !g_postStage30MemcpyReturned || g_postStage30FreeTraced) {
         std::free(allocation);
@@ -579,7 +701,10 @@ void guestViewTraceSyncBlocked(const char* primitive, unsigned int stage) {
     if (written <= 0 || static_cast<unsigned int>(written) >= sizeof(phase)) {
         return;
     }
-    checkpointPhase(phase, stage, 0);
+    // durable=false: see checkpointPhase. This is the only caller that can fire
+    // twice a second per blocked guest thread, and it is the caller that turned
+    // a diagnostic breadcrumb into a whole-card fsync on the emulated SDMC.
+    checkpointPhase(phase, stage, 0, false);
 }
 
 unsigned int guestViewTraceLastStage() {
@@ -636,12 +761,59 @@ void guestViewTracedGlDrawArrays(GLenum mode, GLint first, GLsizei count) {
         ++g_glStats.drawArrays;
         g_glStats.lastDrawMode = mode;
         g_glStats.lastDrawElementsCount = static_cast<uint32_t>(count);
-        if (g_glStats.drawArrays <= 3) {
+        // The arguments, not just the tally. With flr=1 (archive
+        // 20261012-021130-flr1) the guest draws 46,630 times -- about two per
+        // presented frame -- and the full-buffer readback is a single flat
+        // colour, RGB(13,31,89), identical at all five probe points. "It draws"
+        // has stopped being informative; "what does it draw" is the question.
+        //
+        // mode/count separate the two worlds: a 4-vertex triangle strip is a
+        // fullscreen quad and means "background only"; a few thousand vertices
+        // means real geometry is being submitted and the problem is downstream
+        // (blend, depth, texture, or the vertex buffer it is reading).
+        if (g_glStats.drawArrays <= 6 || g_glStats.drawArrays % 4096 == 0) {
+            GLint tex = -1;
+            GLint prog = -1;
+            ::glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+            ::glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+            // The bound texture's dimensions, because "it draws 46,690 times"
+            // has stopped being informative and the framebuffer is a single
+            // flat colour (rgb 13,31,89 at every probe point). A quad with a
+            // real 2D texture would show that texture. A uniform fill is what a
+            // 1x1 texture, an uncompressed-but-empty texture, or a texture that
+            // was never uploaded all look like -- and the host's own counters
+            // already say 34 textures were generated, so WHICH one this quad
+            // samples is the question, not whether textures exist.
+            // This portlib's <GLES2/gl2.h> declares neither glGetTexLevelParameteriv nor
+        // GL_TEXTURE_WIDTH/HEIGHT, and pulling in <GLES3/gl3.h> for two enum
+        // values is not worth the header fight. Resolve the entry point the
+        // same way guest_view_probe.cpp resolves glBlitFramebuffer.
+        using PFNGetTexLevel = void (*)(GLenum, GLint, GLenum, GLint*);
+        static PFNGetTexLevel getTexLevel = nullptr;
+        static bool getTexLevelResolved = false;
+        if (!getTexLevelResolved) {
+            getTexLevelResolved = true;
+            getTexLevel = reinterpret_cast<PFNGetTexLevel>(
+                eglGetProcAddress("glGetTexLevelParameteriv"));
+        }
+        GLint tw = -1;
+        GLint th = -1;
+        if (tex > 0 && getTexLevel != nullptr) {
+            static constexpr GLenum kTexWidth = 0x1000;   // ES2 GL_TEXTURE_WIDTH
+            static constexpr GLenum kTexHeight = 0x1001;  // ES2 GL_TEXTURE_HEIGHT
+            getTexLevel(GL_TEXTURE_2D, 0, kTexWidth, &tw);
+            getTexLevel(GL_TEXTURE_2D, 0, kTexHeight, &th);
+        }
+            char diag[288];
+            __builtin_snprintf(diag, sizeof(diag),
+                "drawArrays #%u mode=0x%x first=%d count=%d tex=%d texWH=%dx%d"
+                " prog=%d vp=%u,%u,%u,%u fbo=%u",
+                g_glStats.drawArrays, mode, first, count, tex, tw, th, prog,
+                g_glStats.lastViewport[0], g_glStats.lastViewport[1],
+                g_glStats.lastViewport[2], g_glStats.lastViewport[3],
+                g_glStats.lastBoundFramebuffer);
             appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
-                                "draw-arrays",
-                                static_cast<unsigned long long>(g_glStats.drawArrays),
-                                (static_cast<unsigned long long>(mode) << 32) |
-                                    static_cast<unsigned>(count));
+                                "draw-detail", 249, 0, diag);
         }
     }
     ::glDrawArrays(mode, first, count);
@@ -726,6 +898,45 @@ void guestViewTracedGlCompressedTexImage2D(GLenum target, GLint level,
 void guestViewTracedGlBindFramebuffer(GLenum target, GLuint framebuffer) {
     if (g_glStatsEnabled) {
         ++g_glStats.bindFramebuffer;
+        g_glStats.lastBoundFramebuffer = framebuffer;
+        // gui15 refuted the scissor explanation by logging the rectangle
+        // instead of just the count: glScissor x=0 y=0 w=1280 h=720 covers
+        // the whole screen and clips nothing, while the full-buffer readback
+        // is still lit=0 of 921600 at both frame 30 and frame 3000.
+        //
+        // What survives that refutation: fbo=23/0 with fboChecks=0. The guest
+        // binds a framebuffer 23 times and NEVER checks completeness. Our
+        // readback samples the DEFAULT framebuffer (fb=0). If the guest draws
+        // into an FBO and never blits it out, the screen stays black while
+        // everything else -- 128 mmaps, 78 opens, 95 programs, 191 compressed
+        // textures -- is genuinely fine.
+        //
+        // So name the target. The full-buffer readback is the independent check:
+        // if fb 0 is black and this is non-zero, the guest is rendering into a
+        // texture nobody presents.
+        if (g_glStats.bindFramebuffer <= 4 || framebuffer != g_glStats.lastBoundFramebuffer) {
+            GLenum status = GL_NONE;
+            if (framebuffer != 0) {
+                status = ::glCheckFramebufferStatus(GL_FRAMEBUFFER);
+                g_glStats.fboChecks += 1;
+                g_glStats.lastFboStatus = status;
+                if (status != GL_FRAMEBUFFER_COMPLETE) {
+                    ++g_glStats.fboIncomplete;
+                }
+            }
+            char diag[224];
+            __builtin_snprintf(diag, sizeof(diag),
+                "bindFramebuffer target=0x%x fbo=%u status=0x%x vp=%u,%u,%u,%u"
+                " sc=%u,%u,%u,%u draws=%u",
+                target, framebuffer, status,
+                g_glStats.lastViewport[0], g_glStats.lastViewport[1],
+                g_glStats.lastViewport[2], g_glStats.lastViewport[3],
+                g_glStats.lastScissor[0], g_glStats.lastScissor[1],
+                g_glStats.lastScissor[2], g_glStats.lastScissor[3],
+                g_glStats.drawArrays);
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                "fbo-bind", 249, 0, diag);
+        }
     }
     ::glBindFramebuffer(target, framebuffer);
 }
@@ -770,6 +981,29 @@ void guestViewTracedGlViewport(GLint x, GLint y, GLsizei width, GLsizei height) 
 void guestViewTracedGlScissor(GLint x, GLint y, GLsizei width, GLsizei height) {
     if (g_glStatsEnabled) {
         ++g_glStats.scissors;
+        // The rectangle itself, not just the count. gui14 measured the whole
+        // back buffer twice -- EARLY frame 30 and LATE frame 3000 -- and got
+        // lit=0 of 921600 both times, with every one of the 921,600 red
+        // channels in the lowest bin. The guest reports sc=1 for the entire
+        // session against a full-screen lastViewport=0,0,1280,720, so a single
+        // scissor box that is never resized is the cheapest explanation left:
+        // enable GL_SCISSOR_TEST, discard every fragment outside it, and the
+        // buffer stays exactly as glClear left it.
+        //
+        // This is the measurement that settles it either way. A box that covers
+        // the screen refutes scissor; a box that does not confirms it.
+        g_glStats.lastScissor[0] = static_cast<uint32_t>(x);
+        g_glStats.lastScissor[1] = static_cast<uint32_t>(y);
+        g_glStats.lastScissor[2] = static_cast<uint32_t>(width);
+        g_glStats.lastScissor[3] = static_cast<uint32_t>(height);
+        char diag[192];
+        __builtin_snprintf(diag, sizeof(diag),
+            "glScissor x=%d y=%d w=%d h=%d (call #%u, viewport=%u,%u,%u,%u)",
+            x, y, width, height, g_glStats.scissors,
+            g_glStats.lastViewport[0], g_glStats.lastViewport[1],
+            g_glStats.lastViewport[2], g_glStats.lastViewport[3]);
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "scissor", 249, 0, diag);
     }
     ::glScissor(x, y, width, height);
 }
@@ -857,11 +1091,99 @@ void guestViewTracedGlVertexAttribPointer(GLuint index, GLint size, GLenum type,
     ::glVertexAttribPointer(index, size, type, normalized, stride, pointer);
 }
 
+// Read-only sample of the guest's path-resolver gate.
+//
+// ELF 0x12bf4dc, the resolver the guest runs on every asset name:
+//   ldrb w8,[x0,#1] ; cmp w8,#':' ; b.ne 0x12bf548     -- volume prefix?
+//   0x12bf548: adrp x8,#0x1f78000 ; ldr x8,[x8,#0xd30] ; ldrb w8,[x8]
+//   0x12bf554: cbnz w8, 0x12bf5fc                    -- gate byte set -> ok
+//   0x12bf698: ldrb w8,[x20] ; cmp w8,#'/' ; b.ne 0x12bf6d8
+//   0x12bf6d8: mov w0, wzr                            -- returns 0, failure
+//
+// The gate byte is the FIRST BYTE of whatever *(0x1f78d30) designates, and it is
+// not necessarily a string: sampled in the frame loop, that address held
+// [01 00 00 00 00 00 00 00 | ptr | ptr | ptr] -- a leading flag followed by
+// three heap pointers. Reading those bytes as a NUL-terminated string and
+// reporting the result as "the content root is empty" is precisely the mistake
+// this comment exists to prevent, so it prints the byte and the raw head, never
+// a string built by guessing a layout.
+void noteContentRootGate(const char* site, uintptr_t renderTarget) {
+    static constexpr uint64_t kRenderExportElfVa = 0x12B3614ULL;
+    static constexpr uint64_t kContentRootElfVa = 0x1F78D30ULL;
+    if (renderTarget == 0) {
+        return;
+    }
+    const uint64_t bias = static_cast<uint64_t>(renderTarget) - kRenderExportElfVa;
+    const auto slot = static_cast<uintptr_t>(bias + kContentRootElfVa);
+    const auto slotValue = *reinterpret_cast<const volatile uintptr_t*>(slot);
+    unsigned long long head[2] = {0, 0};
+    unsigned gateByte = 0xFFFFFFFFu;
+    if (slotValue != 0) {
+        const auto obj = static_cast<uintptr_t>(slotValue);
+        head[0] = *reinterpret_cast<const volatile unsigned long long*>(obj);
+        head[1] = *reinterpret_cast<const volatile unsigned long long*>(obj + 8);
+        gateByte = *reinterpret_cast<const volatile unsigned char*>(obj);
+    }
+    char line[208];
+    __builtin_snprintf(line, sizeof(line),
+                      "contentroot-gate: site=%s slot=0x%llx value=0x%llx"
+                      " gatebyte=0x%02x(%s) head0=%016llx head1=%016llx",
+                      site, static_cast<unsigned long long>(slot),
+                      static_cast<unsigned long long>(slotValue), gateByte,
+                      gateByte == 0xFF ? "NOSLOT"
+                                       : (gateByte == 0 ? "ZERO-resolver-returns-0"
+                                                        : "SET-ok"),
+                      head[0], head[1]);
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "contentroot-gate", 300, gateByte, line);
+}
+
 void guestViewNoteAndroidLog(const char* text) {
+    // THE TEARDOWN REPAIR'S ANCHOR MOVED HERE.
+    //
+    // It used to live in androidLogVPrint, on the argument that the guest's NDK
+    // shim 0x109fa18 ends in `bl __android_log_vprint@plt`. That is true of ONE
+    // of the three ways a guest log reaches this function, and an unconditional
+    // entry trace in front of the repair proved it with no ambiguity: over a run
+    // that produced 687 guest log lines, the repair was entered exactly THREE
+    // times, with settled=0 and t_in_attempt=0 on all three -- so nothing was
+    // being eaten by an early return. Those three anchors matched the first
+    // three guest log lines and then nothing. The other 684 lines arrive via
+    // jniCallVoidMethod / jniCallStaticVoidMethodV.
+    //
+    // Hooking here instead is total: this is the ONLY function that can emit
+    // phase=guest-log-any, so every guest log passes through it no matter which
+    // import the caller used.
+    //
+    // And the anchor is still safe. The disassembly of the built ELF shows this
+    // function has NO frame record at entry (cbz x0, ... at 1ebe0; the
+    // stp x29,x30 lands 0x1a8 bytes later, on a conditional path), which is
+    // exactly why reading x29 HERE yields the CALLER's frame pointer rather than
+    // a half-built local one. That was the reason it was rejected as an anchor
+    // when androidLogVPrint was available; on its own it is the correct place,
+    // and the walk already tolerates host frames between here and the guest.
+    {
+        uintptr_t anchorFp = 0;
+        __asm__("mov %0, x29" : "=r"(anchorFp));
+        guestTeardownRepairOnLog(anchorFp);
+    }
     if (text == nullptr) {
         return;
     }
+    // Item 3. The predicate below is a size-control heuristic, and it swallowed
+    // exactly the evidence this port needed: every guest __android_log_print
+    // line from the Cloudcell document subsystem was dropped before reaching
+    // the log, so the guest's own account of its failure was discarded. Two
+    // bounded changes:
+    //   1. keep lines whose text carries the Cloudcell document tag (ctd.), and
+    //   2. keep a fixed quota of lines whatever their content, so no filter can
+    //      again hide an entire subsystem.
+    // The existing per-line budget (the 120-byte hash window) is unchanged.
+    // Note guestViewNoteAndroidLog receives the FORMAT string only; the tag
+    // never reaches this predicate, so rule 1 depends on the guest naming
+    // ctd.dat in its message text. Rule 2 is the backstop for when it does not.
     bool interesting = false;
+    bool cloudcell = false;
     for (const char* p = text; *p != '\0'; ++p) {
         if ((p[0] == 'V' && p[1] == 'I' && p[2] == 'E' && p[3] == 'W') ||
             (p[0] == 's' && p[1] == 'p' && p[2] == 'l' && p[3] == 'a') ||
@@ -870,17 +1192,44 @@ void guestViewNoteAndroidLog(const char* text) {
             interesting = true;
             break;
         }
-    }
-    if (!interesting) {
-        return;
+        if (p[0] == 'c' && p[1] == 't' && p[2] == 'd' && p[3] == '.') {
+            cloudcell = true;
+            break;
+        }
     }
     uint32_t hash = 2166136261u;
     for (const char* p = text; *p != '\0' && p < text + 120; ++p) {
         hash ^= static_cast<uint8_t>(*p);
         hash *= 16777619u;
     }
-    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
-                        "guest-log", 76, hash, text);
+    if (interesting || cloudcell) {
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "guest-log", 76, hash, text);
+        return;
+    }
+    // Content-independent quota. The guest boot is deterministic, so this count
+    // is reproducible run to run; 200 bounds the growth of the archived run's
+    // 570-line log by ~35% from a stream whose volume is not yet measured, and
+    // it only ever ADDS lines that were previously dropped, so the VIEW / splash
+    // evidence above keeps its existing share. Once the cap is hit, the filter
+    // says so in at most 4 more lines, so a dropped line is never mistaken for
+    // a guest that printed nothing.
+    static unsigned s_quota = 0;
+    static unsigned s_dropReports = 0;
+    if (s_quota < kAndroidLogAnyBudget) {
+        ++s_quota;
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "guest-log-any", s_quota, hash, text);
+    }
+    else if (s_dropReports < 4) {
+        ++s_dropReports;
+        char details[96];
+        std::snprintf(details, sizeof(details),
+                      "dropped_by_content_filter reports=%u cap=%u reason=quota_spent",
+                      s_dropReports, kAndroidLogAnyBudget);
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "guest-log-drop", s_dropReports, 0, details);
+    }
 }
 
 void guestViewWideLog(const char* phase, unsigned long long a,

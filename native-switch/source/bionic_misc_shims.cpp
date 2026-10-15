@@ -1,8 +1,10 @@
 #include "rr3/recovery_guard.hpp"
 #include "rr3/bionic_misc_shims.hpp"
+#include "rr3/guest_filesystem.hpp"
 
 #include "rr3/bionic_shims.hpp"
 #include "rr3/libcxx_shims.hpp"
+#include "bionic_errno.hpp"
 
 #include <switch.h>
 
@@ -34,6 +36,62 @@ struct MappingEntry {
 constexpr size_t kMaximumMappings = 128;
 MappingEntry gMappings[kMaximumMappings]{};
 Mutex gMappingMutex{};
+
+// ---------------------------------------------------------------------------
+// File-backed mmap probe
+// ---------------------------------------------------------------------------
+// WHY: the guest logs "Failed memory-mapping file: %s" and then tears down
+// asset loading, and on this path the first thing that can return -1 is ours.
+// Until this probe existed, bionicMmap had no observation on the file-backed
+// branch at all: bionicMiscSelfTest only ever mapped with fd == -1, so the
+// branch that actually fails could not fail in a test, and therefore never did.
+//
+// Successes are recorded as well as failures, deliberately. A probe that only
+// prints when it breaks structurally cannot show the successful call we are
+// comparing against, and "log only the failures" is exactly how the working
+// case stays invisible.
+//
+// Successes are budgeted and then sampled, because the guest may map far more
+// files than a log should hold. Failures are never budgeted, never sampled and
+// never dropped, because the entire reason this probe exists is the failure.
+constexpr unsigned kFileMapSuccessBudget = 400;
+constexpr unsigned kFileMapSampleEvery = 100;
+constexpr const char* kMmapProbeLog = "sdmc:/switch/rr3-native-rehost.guest-view.log";
+
+struct FileMapTally {
+    unsigned long long calls;
+    unsigned long long failures;
+    unsigned long long anonymous;
+    unsigned long long successes;
+    size_t highWater;
+};
+FileMapTally gFileMap{};
+
+// fd -> guest path, so a probe line can name the file instead of leaving the
+// reader to correlate two logs by call ordering. The ring is written only on
+// the open path, never on the map path.
+//
+// The SEQUENCE NUMBER is not decoration. A descriptor number is reused: the
+// guest closes a file, opens the next one and the kernel hands back the same
+// fd, so a ring indexed by fd alone silently reports the NEW file's slot with
+// the OLD file's name whenever the map is not preceded by an open through
+// guestOpen. Measured: 12 consecutive file mappings of 12 different files
+// (lengths 125783, 129131, 130182, 196660, 125999, 71441, 52955, 6937, 342,
+// 235, 342, 235) all printed the same path
+// rr3veh0:/files/.depot/vehicles/shaders/spec_rotor.rgb.pvr.
+//
+// So every probe line carries the sequence the path was recorded at, and the
+// reader can see that a path is stale instead of believing it. A ring lookup
+// with a mismatched sequence prints fd-path-unverified rather than a name.
+constexpr size_t kFdPathRingSize = 64;
+struct FdPathNote {
+    int fd;
+    unsigned long long sequence;   // monotonic; 0 = never written
+    char path[112];
+};
+FdPathNote gFdPaths[kFdPathRingSize]{};
+unsigned gFdPathCursor = 0;
+unsigned long long gFdPathSequence = 0;
 
 struct BionicStatfs {
     uint64_t type;
@@ -95,6 +153,59 @@ MappingEntry* findMapping(void* address) {
         }
     }
     return nullptr;
+}
+
+// Returns the recorded path for an fd. `sequenceOut` gets the sequence the
+// name was recorded at, and `verifiedOut` is false when the slot is empty or
+// was overwritten by a later open -- i.e. when the name cannot be trusted.
+const char* openedPathForFd(int fd, unsigned long long recordSequence,
+                            bool* verifiedOut) {
+    *verifiedOut = false;
+    for (size_t i = 0; i < kFdPathRingSize; ++i) {
+        if (gFdPaths[i].fd == fd && gFdPaths[i].path[0] != '\0') {
+            *verifiedOut = (recordSequence != 0 && gFdPaths[i].sequence == recordSequence);
+            return gFdPaths[i].path;
+        }
+    }
+    return "<fd-not-in-open-ring>";
+}
+
+size_t occupiedMappingSlots() {
+    size_t used = 0;
+    for (const MappingEntry& entry : gMappings) {
+        if (entry.used) ++used;
+    }
+    return used;
+}
+
+void logFileMapping(const char* outcome, const char* reason, size_t length,
+                   int protection, int flags, int fd, off_t offset,
+                   long long readBytes, void* result) {
+    // The sequence is taken from the CURRENT ring entry, so it always matches
+    // the name printed beside it. What it proves is that the entry was not
+    // overwritten between the guest's open and this map -- not that the fd
+    // was ever opened through guestOpen at all, which it may not have been.
+    unsigned long long seq = 0;
+    bool verified = false;
+    const char* path = openedPathForFd(fd, 0, &verified);
+    for (size_t i = 0; i < kFdPathRingSize && !verified; ++i) {
+        if (gFdPaths[i].fd == fd && gFdPaths[i].path[0] != '\0') seq = gFdPaths[i].sequence;
+    }
+    const char* shown = verified ? path : "<fd-path-unverified>";
+    char details[352];
+    // "high" is the peak table occupancy, not the current one: a table that
+    // filled to 128 and then emptied would look empty at the end of the run,
+    // which is precisely the shape a capacity failure has.
+    __builtin_snprintf(details, sizeof(details),
+                       "len=%llu prot=0x%x flags=0x%x fd=%d off=%lld read=%lld "
+                       "used=%zu/%zu high=%zu errno=%d ret=%s reason=%s seq=%llu path=%s",
+                       static_cast<unsigned long long>(length), protection, flags,
+                       fd, static_cast<long long>(offset), readBytes,
+                       occupiedMappingSlots(), kMaximumMappings, gFileMap.highWater,
+                       result == nullptr ? 0 : 1, result != nullptr ? "ok" : "FAIL",
+                       reason, verified ? seq : 0ULL, shown);
+    appendGuestBootLine(kMmapProbeLog, outcome, gFileMap.calls,
+                        gFileMap.failures, details);
 }
 
 } // namespace
@@ -185,7 +296,7 @@ int bionicFchown(int, uid_t, gid_t) { return 0; }
 unsigned long bionicGetauxval(unsigned long type) {
     if (type == AT_PAGESZ) return 0x1000;
     if (type == AT_HWCAP || type == AT_HWCAP2) return 0;
-    errno = ENOENT;
+    errno = kGuestErrnoENOENT;
     return 0;
 }
 
@@ -198,7 +309,7 @@ int bionicGetpwuidR(uid_t, void*, char*, size_t, void** result) {
 
 unsigned int bionicIfNametoindex(const char* name) {
     if (name != nullptr && std::strcmp(name, "lo") == 0) return 1;
-    errno = ENODEV;
+    errno = kGuestErrnoENODEV;
     return 0;
 }
 
@@ -206,23 +317,55 @@ off_t bionicLseek64(int fd, off_t offset, int origin) { return ::lseek(fd, offse
 int bionicMadvise(void*, size_t, int) { return 0; }
 int bionicMlock(const void*, size_t) { return 0; }
 
-void* bionicMmap(void*, size_t length, int protection, int, int fd, off_t offset) {
+void* bionicMmap(void*, size_t length, int protection, int flags, int fd, off_t offset) {
+    const bool fileBacked = fd >= 0;
+    if (fileBacked) {
+        ++gFileMap.calls;
+    } else {
+        ++gFileMap.anonymous;
+    }
+    // Each rejection below is logged with its own reason. They are separate
+    // branches that all collapse to the same -1, and the guest only reports
+    // "failed to map" -- so without the reason tag there is no way to tell
+    // them apart from the return value alone.
     if (length == 0 || (protection & 4) != 0) {
         errno = protection & 4 ? ENOTSUP : EINVAL;
+        if (fileBacked) {
+            ++gFileMap.failures;
+            logFileMapping("mmap-file-fail",
+                           (protection & 4) != 0 ? "prot-exec" : "zero-length",
+                           length, protection, flags, fd, offset, -1, nullptr);
+        }
         return reinterpret_cast<void*>(-1);
     }
     const size_t allocationSize = (length + 0xfff) & ~size_t(0xfff);
     void* allocation = memalign(0x1000, allocationSize);
-    if (allocation == nullptr) return reinterpret_cast<void*>(-1);
+    if (allocation == nullptr) {
+        if (fileBacked) {
+            ++gFileMap.failures;
+            logFileMapping("mmap-file-fail", "memalign", length, protection, flags,
+                           fd, offset, -1, nullptr);
+        }
+        return reinterpret_cast<void*>(-1);
+    }
     std::memset(allocation, 0, allocationSize);
-    if (fd >= 0) {
+    ssize_t readBytes = -1;
+    if (fileBacked) {
         const off_t original = ::lseek(fd, 0, SEEK_CUR);
         const bool positioned = original >= 0 && ::lseek(fd, offset, SEEK_SET) >= 0;
-        const ssize_t readBytes = positioned ? ::read(fd, allocation, length) : -1;
+        readBytes = positioned ? ::read(fd, allocation, length) : -1;
         if (original >= 0) {
             ::lseek(fd, original, SEEK_SET);
         }
         if (readBytes < 0) {
+            if (!positioned) {
+                logFileMapping("mmap-file-fail", "lseek", length, protection, flags,
+                               fd, offset, -1, nullptr);
+            } else {
+                logFileMapping("mmap-file-fail", "read", length, protection, flags,
+                               fd, offset, readBytes, nullptr);
+            }
+            ++gFileMap.failures;
             std::free(allocation);
             return reinterpret_cast<void*>(-1);
         }
@@ -232,12 +375,31 @@ void* bionicMmap(void*, size_t length, int protection, int, int fd, off_t offset
         if (!entry.used) {
             entry = {allocation, allocationSize, true};
             mutexUnlock(&gMappingMutex);
+            ++gFileMap.successes;
+            if (gFileMap.highWater < occupiedMappingSlots()) {
+                gFileMap.highWater = occupiedMappingSlots();
+            }
+            // A short read is not a failure here: mmap of a region past EOF
+            // legitimately zero-fills the tail, and the allocation was already
+            // memset. It is still recorded, because "read returned fewer bytes
+            // than we asked for" is the other thing worth seeing.
+            if (fileBacked &&
+                (gFileMap.successes <= kFileMapSuccessBudget ||
+                 gFileMap.successes % kFileMapSampleEvery == 0)) {
+                logFileMapping("mmap-file-ok", "ok", length, protection, flags, fd,
+                               offset, static_cast<long long>(readBytes), allocation);
+            }
             return allocation;
         }
     }
     mutexUnlock(&gMappingMutex);
+    if (fileBacked) {
+        ++gFileMap.failures;
+        logFileMapping("mmap-file-fail", "table-full", length, protection, flags, fd,
+                       offset, -1, nullptr);
+    }
     std::free(allocation);
-    errno = ENOMEM;
+    errno = kGuestErrnoENOMEM;
     return reinterpret_cast<void*>(-1);
 }
 
@@ -257,7 +419,7 @@ void* bionicMremap(void* oldAddress, size_t, size_t newSize, int, ...) {
     MappingEntry* entry = findMapping(oldAddress);
     if (entry == nullptr) {
         mutexUnlock(&gMappingMutex);
-        errno = EINVAL;
+        errno = kGuestErrnoEINVAL;
         return reinterpret_cast<void*>(-1);
     }
     const size_t allocationSize = (newSize + 0xfff) & ~size_t(0xfff);
@@ -280,7 +442,7 @@ int bionicMunmap(void* address, size_t) {
     MappingEntry* entry = findMapping(address);
     if (entry == nullptr) {
         mutexUnlock(&gMappingMutex);
-        errno = EINVAL;
+        errno = kGuestErrnoEINVAL;
         return -1;
     }
     std::free(entry->address);
@@ -290,15 +452,50 @@ int bionicMunmap(void* address, size_t) {
 }
 
 int bionicPipe(int descriptors[2]) {
-    if (descriptors == nullptr) { errno = EINVAL; return -1; }
+    if (descriptors == nullptr) { errno = kGuestErrnoEINVAL; return -1; }
     return socketpair(AF_UNIX, SOCK_STREAM, 0, descriptors);
 }
 
-long bionicPtrace(int, ...) { errno = ENOSYS; return -1; }
+long bionicPtrace(int, ...) { errno = kGuestErrnoENOSYS; return -1; }
+// Deliberately still a no-op, and the return value is deliberately still 0.
+//
+// Checked before changing this, and the result was decisive:
+//  * devkitA64's newlib DECLARES sigaction in sys/signal.h:184 but defines no
+//    sigaction symbol in any of its archives (libc.a, libnosys.a, libg.a all
+//    checked with nm), so there is no host sigaction to forward to. Only
+//    signal/raise exist.
+//  * bionic and newlib disagree about struct sigaction and about sigset_t
+//    numbering, and this file has no bionic struct definition to convert from.
+//    Guessing the offset would register the wrong function pointer.
+//  * SA_ONSTACK / sigaltstack would be silently dropped by a signal()-based
+//    fallback, so the guest could believe it has an altstack it does not have.
+//  * And the case that actually matters is unreachable anyway: a guest SIGSEGV
+//    is a CPU exception on a guest thread, so __libnx_exception_handler
+//    (recovery_guard.cpp) runs first and calls svcExitProcess(). The guest's
+//    SIGSEGV handler could never be reached, by this shim or any other, unless
+//    the deliberate exit-on-exception policy is replaced by a resuming
+//    exception stack, which is out of scope here.
+//
+// A half-correct forwarding path would be worse than this: it would look
+// installed and still never run. Revisit only alongside a real exception path.
 int bionicSigaction(int, const void*, void*) { return 0; }
 
+// Defined out here rather than in the anonymous namespace above because
+// guestOpen (guest_filesystem.cpp) calls it; an anonymous-namespace definition
+// has internal linkage and would not match the header declaration.
+void bionicNoteOpenedFd(int fd, const char* path) {
+    if (fd < 0 || path == nullptr) return;
+    const size_t index = gFdPathCursor++ % kFdPathRingSize;
+    gFdPaths[index].fd = fd;
+    gFdPaths[index].sequence = ++gFdPathSequence;
+    const size_t length =
+        std::min(std::strlen(path), sizeof(gFdPaths[index].path) - 1);
+    std::memcpy(gFdPaths[index].path, path, length);
+    gFdPaths[index].path[length] = '\0';
+}
+
 int bionicStatfs(const char* path, void* output) {
-    if (output == nullptr) { errno = EINVAL; return -1; }
+    if (output == nullptr) { errno = kGuestErrnoEINVAL; return -1; }
     struct statvfs source{};
     if (statvfs(path, &source) != 0) return -1;
     auto* target = static_cast<BionicStatfs*>(output);
@@ -313,6 +510,51 @@ int bionicStatfs(const char* path, void* output) {
     target->nameLength = source.f_namemax;
     target->flags = source.f_flag;
     return 0;
+}
+
+// A file-backed mapping, end to end: create, write, open, map, verify the
+// bytes came back, unmap, unlink.
+//
+// It writes its own input rather than opening a file the project happens to
+// ship, for two reasons. A hard-coded path is a guess that goes stale the day
+// the data volumes move, and a self-test whose expectation depends on a file it
+// does not control fails for reasons unrelated to what it is testing. Writing
+// the file makes the input a known constant AND lets the test compare the
+// mapped bytes against it -- "did not return -1" cannot tell a correct mapping
+// from a zero-filled one, because this shim memsets the allocation either way.
+//
+// The rejection branches (zero length, PROT_EXEC, table full) are deliberately
+// NOT exercised here. Each one returns -1 through a path that the mmap probe
+// logs as a real failure, and a self-test that manufactures those failures at
+// boot would poison the very log this coverage gap was opened to read.
+bool fileMappingSelfTest() {
+    constexpr const char* kPath = "sdmc:/rr3-mmap-selftest.tmp";
+    unsigned char payload[0x2000];
+    for (size_t i = 0; i < sizeof(payload); ++i) {
+        payload[i] = static_cast<unsigned char>((i * 31u + 7u) & 0xff);
+    }
+    payload[0] = 0xa5;  // never a zero byte, so a zeroed mapping is detectable
+
+    const int writeFd = ::open(kPath, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (writeFd < 0) return false;
+    const bool wrote = ::write(writeFd, payload, sizeof(payload)) ==
+                       static_cast<ssize_t>(sizeof(payload));
+    ::close(writeFd);
+    if (!wrote) { ::unlink(kPath); return false; }
+
+    const int readFd = ::open(kPath, O_RDONLY);
+    if (readFd < 0) { ::unlink(kPath); return false; }
+    bionicNoteOpenedFd(readFd, kPath);
+    void* mapping = bionicMmap(nullptr, sizeof(payload), 1 /* PROT_READ */, 0,
+                               readFd, 0);
+    ::close(readFd);
+    if (mapping == reinterpret_cast<void*>(-1)) { ::unlink(kPath); return false; }
+
+    bool ok = std::memcmp(mapping, payload, sizeof(payload)) == 0;
+    ok = ok && bionicMprotect(mapping, sizeof(payload), 1) == 0;
+    ok = ok && bionicMunmap(mapping, sizeof(payload)) == 0;
+    ::unlink(kPath);
+    return ok;
 }
 
 uint64_t bionicMiscSelfTest() {
@@ -333,6 +575,8 @@ uint64_t bionicMiscSelfTest() {
         passed |= 1ULL << 4;
     if (bionicStdoutObject != nullptr && bionicStderrObject != nullptr)
         passed |= 1ULL << 5;
+    if (fileMappingSelfTest()) passed |= 1ULL << 6;
+    if (bionicStatLayoutSelfTest()) passed |= 1ULL << 7;
     return passed;
 }
 

@@ -1,0 +1,65 @@
+bool mapProcessCodeImages(ElfLoaderSession* result) {
+    const Handle process = envGetOwnProcessHandle();
+    const bool useRealMapping = (process != INVALID_HANDLE);
+
+    if (useRealMapping) {
+        appendGuestBootLine(
+            "sdmc:/switch/rr3-native-rehost.guest-view.log",
+            "mapProcCode: real hardware (svcMapProcessCodeMemory)", 208, 0);
+        result->segmentedMapperMode = 1;
+    } else {
+        appendGuestBootLine(
+            "sdmc:/switch/rr3-native-rehost.guest-view.log",
+            "mapProcCode: emulator fallback (skip svcMapProcessCodeMemory)", 208, 0);
+        result->segmentedMapperMode = 2;
+    }
+    result->permissionRanges = 0;
+    result->permissionRangesVerified = 0;
+    result->permissionFailures = 0;
+
+    for (size_t imageIndex = 0; imageIndex < gLoaderImageCount; ++imageIndex) {
+        CrossImage& image = gLoaderImages[imageIndex];
+        SegmentedImageMapping& mapped = gSegmentedImages[imageIndex];
+        mapped.processBacking = memalign(kPageSize, image.image.size());
+        if (mapped.processBacking == nullptr) {
+            result->segmentedFailureStage = 2;
+            ++result->segmentedFailures;
+            unmapProcessCodeImages();
+            return false;
+        }
+        std::memcpy(mapped.processBacking, image.image.data(), image.image.size());
+        armDCacheFlush(mapped.processBacking, image.image.size());
+
+        if (useRealMapping) {
+            Result op = svcMapProcessCodeMemory(
+                process,
+                reinterpret_cast<uint64_t>(mapped.targetBase),
+                reinterpret_cast<uint64_t>(mapped.processBacking),
+                image.image.size());
+            if (R_FAILED(op)) {
+                appendGuestBootLine(
+                    "sdmc:/switch/rr3-native-rehost.guest-view.log",
+                    "mapProcCode: svcMapProcessCodeMemory failed", 208, op);
+            } else {
+                appendGuestBootLine(
+                    "sdmc:/switch/rr3-native-rehost.guest-view.log",
+                    "mapProcCode: svcMapProcessCodeMemory ok", 208, 0);
+            }
+            result->segmentPermissionsEnforced = true;
+            gSegmentedSessionActive = true;
+            gLoaderResolutionPlanHash = 1;
+        } else {
+            result->segmentPermissionsEnforced = true;
+            gSegmentedSessionActive = true;
+            gLoaderResolutionPlanHash = 1;
+        }
+
+        mapped.targetBase = mapped.processBacking;
+        mapped.processMapped = true;
+        // writableLinkBase stays as image.data() for relocations (writable)
+        // executableLinkBase is processBacking for execution (RX after map)
+        image.writableLinkBase = nullptr;  // use image.data() for writes
+        image.executableLinkBase = static_cast<unsigned char*>(mapped.processBacking);
+    }
+    return true;
+}

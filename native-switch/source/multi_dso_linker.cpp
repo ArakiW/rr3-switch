@@ -216,9 +216,85 @@ struct SegmentedImageMapping {
 SegmentedImageMapping gSegmentedImages[kMaximumLoaderImages];
 bool gSegmentedSessionActive = false;
 
+// Dump every mapped segment's owner/slave pair, whatever path created it.
+//
+// Deliberately walks the global table instead of hooking one mapping function:
+// the previous attempt reported zero lines because it was placed inside
+// mapSegmentedRange's `if (range.slaveMapped)` tail, and the guest's main image
+// is evidently not mapped by that path. Assuming a path is exactly the mistake
+// this project keeps making. The table is the ground truth.
+extern "C" void reportSegmentOwnerSlave() {
+    unsigned total = 0, writable = 0;
+    for (size_t i = 0; i < kMaximumLoaderImages; ++i) {
+        SegmentedImageMapping& image = gSegmentedImages[i];
+        for (SegmentCodeMapping& range : image.ranges) {
+            ++total;
+            if (range.ownerMapped) {
+                ++writable;
+            }
+            char seg[256];
+            __builtin_snprintf(seg, sizeof(seg),
+                               "img=%zu owner=0x%llx slave=0x%llx size=0x%llx "
+                               "perm=0x%x ownerMapped=%d slaveMapped=%d "
+                               "targetIsOwner=%d WRITABLE=%d",
+                               i,
+                               (unsigned long long)(uintptr_t)range.ownerAddress,
+                               (unsigned long long)(uintptr_t)range.targetAddress,
+                               (unsigned long long)range.size, range.permission,
+                               range.ownerMapped ? 1 : 0,
+                               range.slaveMapped ? 1 : 0,
+                               range.targetIsOwner ? 1 : 0,
+                               range.ownerMapped ? 1 : 0);
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                "seg-owner-slave", i,
+                                (unsigned long long)range.size, seg);
+        }
+    }
+    char summary[160];
+    __builtin_snprintf(summary, sizeof(summary),
+                       "segments=%u writable_owner_mapped=%u "
+                       "(a writable alias of guest .text is what patching needs; "
+                       "svcSetMemoryPermission cannot reach it)",
+                       total, writable);
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "seg-owner-slave-sum", total, writable, summary);
+}
+
 void closeSegmentedMappings();
 ElfLoaderUnload closeSegmentedMappingsDetailed();
 u32 permissionForFlags(uint32_t flags);
+
+// Writable alias of a guest code address, or nullptr.
+//
+// Why this exists. Guest .text is mapped as an owner/slave PAIR by
+// mapSegmentedRange: `ownerAddress` is a Perm_Rw mapping the image bytes were
+// memcpy'd into, and `targetAddress` is the Perm_Rx slave the guest actually
+// executes. So a guest code address is NOT writable through svcSetMemoryPermission
+// -- that is the "different memory block" the note in guest_view_probe.cpp:2165
+// ran into, and it is why the NOP patch was abandoned there. The owner view was
+// already there all along; only svcSetMemoryPermission cannot reach it.
+//
+// Any write must be followed by armDCacheFlush() over the same range, and the
+// caller is responsible for instruction-cache coherency.
+extern "C" void* guestCodeWritableAddress(uintptr_t guestAddress) {
+    for (size_t i = 0; i < kMaximumLoaderImages; ++i) {
+        SegmentedImageMapping& image = gSegmentedImages[i];
+        for (SegmentCodeMapping& range : image.ranges) {
+            if (!range.ownerMapped || range.ownerAddress == nullptr) {
+                continue;
+            }
+            const uintptr_t base = reinterpret_cast<uintptr_t>(range.targetAddress);
+            if (guestAddress < base || guestAddress - base >= range.size) {
+                continue;
+            }
+            return reinterpret_cast<void*>(range.ownerAddress
+                                           + (guestAddress - base));
+        }
+    }
+    return nullptr;
+}
+bool rebaseImagesToRuntimeBase(const uintptr_t* abandonedBiases,
+                               ElfLoaderSession* result);
 
 uint64_t alignDown(uint64_t value) {
     return value & ~(kPageSize - 1);
@@ -1004,6 +1080,8 @@ bool mapSegmentedRange(size_t imageIndex, uint64_t pageOffset, uint64_t bytes,
     if (range.backing == nullptr) {
         result->segmentedFailureStage = 2;
         ++result->segmentedFailures;
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+            "segRange: memalign failed", imageIndex, bytes);
         return false;
     }
     Result operation = svcCreateCodeMemory(&range.handle, range.backing, range.size);
@@ -1012,6 +1090,8 @@ bool mapSegmentedRange(size_t imageIndex, uint64_t pageOffset, uint64_t bytes,
         result->segmentedFailureResult = operation;
         std::free(range.backing);
         ++result->segmentedFailures;
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+            "segRange: CreateCodeMemory failed", imageIndex, operation);
         return false;
     }
 
@@ -1032,17 +1112,27 @@ bool mapSegmentedRange(size_t imageIndex, uint64_t pageOffset, uint64_t bytes,
         if (range.ownerAddress == nullptr) {
             result->segmentedFailureStage = 4;
             operation = MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                "segRange: virtmemFindCodeMemory null", imageIndex, bytes);
         }
         else {
             operation = svcControlCodeMemory(range.handle, CodeMapOperation_MapOwner,
                                              range.ownerAddress, range.size, Perm_Rw);
             range.ownerMapped = R_SUCCEEDED(operation);
+            if (R_FAILED(operation)) {
+                appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                    "segRange: MapOwner failed", imageIndex, operation);
+            }
             if (R_SUCCEEDED(operation)) {
                 std::memcpy(range.ownerAddress, image.image.data() + pageOffset, range.size);
                 armDCacheFlush(range.ownerAddress, range.size);
                 operation = svcControlCodeMemory(range.handle, CodeMapOperation_MapSlave,
                                                  range.targetAddress, range.size, permission);
                 range.slaveMapped = R_SUCCEEDED(operation);
+                if (R_FAILED(operation)) {
+                    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "segRange: MapSlave failed", imageIndex, operation);
+                }
             }
         }
     }
@@ -1125,15 +1215,15 @@ bool mapSegmentedRange(size_t imageIndex, uint64_t pageOffset, uint64_t bytes,
             const u32 permission = permissionForFlags(ph.flags);
             for (uint64_t offset = start; offset < end; offset += kPageSize) {
                 const size_t page = static_cast<size_t>(offset / kPageSize);
-                if (page >= pagePermissions.size() ||
-                    (pagePermissions[page] != Perm_None &&
-                     pagePermissions[page] != permission)) {
+                if (page >= pagePermissions.size()) {
                     result->segmentedFailureImage = imageIndex;
                     result->segmentedFailureStage = 12;
                     ++result->segmentedFailures;
                     return false;
                 }
-                pagePermissions[page] = permission;
+                // Use permission union on overlap (code+data sharing a page
+                // is valid in ELF); do not fail.
+                pagePermissions[page] |= permission;
             }
         }
         if (image.relroSize != 0) {
@@ -1203,219 +1293,177 @@ void unmapProcessCodeImages() {
 
 bool mapProcessCodeImages(ElfLoaderSession* result) {
     const Handle process = envGetOwnProcessHandle();
-    if (!envIsSyscallHinted(0x73) || !envIsSyscallHinted(0x77) ||
-        !envIsSyscallHinted(0x78) || process == INVALID_HANDLE) {
-        return false;
-    }
-    result->segmentedMapperMode = 1;
+    const bool useRealMapping = (process != INVALID_HANDLE);
+
+    appendGuestBootLine(
+        "sdmc:/switch/rr3-native-rehost.guest-view.log",
+        useRealMapping ? "mapProcCode: real hw (one-pass)" : "mapProcCode: emulator fallback", 208, 0);
+
+    result->segmentedMapperMode = useRealMapping ? 1 : 2;
     result->permissionRanges = 0;
     result->permissionRangesVerified = 0;
     result->permissionFailures = 0;
 
+    // Bias each image was relocated against before the emulator branch
+    // switched it to the heap backing. Kept for the rebase diagnostic only.
+    uintptr_t abandonedBiases[kMaximumLoaderImages] = {};
+
     for (size_t imageIndex = 0; imageIndex < gLoaderImageCount; ++imageIndex) {
         CrossImage& image = gLoaderImages[imageIndex];
         SegmentedImageMapping& mapped = gSegmentedImages[imageIndex];
+        if (mapped.targetBase == nullptr) {
+            result->segmentedFailureImage = imageIndex;
+            result->segmentedFailureStage = 1;
+            ++result->segmentedFailures;
+            appendGuestBootLine(
+                "sdmc:/switch/rr3-native-rehost.guest-view.log",
+                "mapProcCode: targetBase null", imageIndex, 1);
+            unmapProcessCodeImages();
+            return false;
+        }
         mapped.processBacking = memalign(kPageSize, image.image.size());
-        result->segmentedFailureImage = imageIndex;
-        result->segmentedFailureRegion = imageIndex;
         if (mapped.processBacking == nullptr) {
+            result->segmentedFailureImage = imageIndex;
             result->segmentedFailureStage = 2;
             ++result->segmentedFailures;
+            appendGuestBootLine(
+                "sdmc:/switch/rr3-native-rehost.guest-view.log",
+                "mapProcCode: memalign failed", imageIndex, 2);
             unmapProcessCodeImages();
             return false;
         }
         std::memcpy(mapped.processBacking, image.image.data(), image.image.size());
         armDCacheFlush(mapped.processBacking, image.image.size());
-        MemoryInfo backingInfo{};
-        MemoryInfo targetInfo{};
-        u32 pageInfo = 0;
-        svcQueryMemory(&backingInfo, &pageInfo,
-                       reinterpret_cast<uint64_t>(mapped.processBacking));
-        svcQueryMemory(&targetInfo, &pageInfo,
-                       reinterpret_cast<uint64_t>(mapped.targetBase));
-        result->processBackingType = backingInfo.type;
-        result->processBackingPermission = backingInfo.perm;
-        result->processBackingAttribute = backingInfo.attr;
-        result->processTargetType = targetInfo.type;
-        result->processTargetPermission = targetInfo.perm;
-        const Result mapResult = svcMapProcessCodeMemory(
-            process,
-            reinterpret_cast<uint64_t>(mapped.targetBase),
-            reinterpret_cast<uint64_t>(mapped.processBacking),
-            image.image.size());
-        if (R_FAILED(mapResult)) {
-            result->processMapFailureImage = imageIndex;
-            result->processMapFailureStage = 20;
-            result->processMapFailureResult = mapResult;
-            result->segmentedFailureStage = 20;
-            result->segmentedFailureResult = mapResult;
-            ++result->segmentedFailures;
-            unmapProcessCodeImages();
-            return false;
-        }
-        mapped.processMapped = true;
-    }
 
-    const auto setRange = [&](size_t imageIndex, uint64_t virtualAddress,
-                              uint64_t bytes, u32 permission) {
-        const CrossImage& image = gLoaderImages[imageIndex];
-        const uint64_t start = alignDown(virtualAddress);
-        uint64_t end = 0;
-        if (!alignUp(virtualAddress + bytes, &end) || end <= start) {
-            result->segmentedFailureStage = 21;
-            ++result->permissionFailures;
-            return false;
-        }
-        void* address = reinterpret_cast<void*>(image.loadBias() + start);
-        ++result->permissionRanges;
-        Result operation = svcSetProcessMemoryPermission(
-            process, reinterpret_cast<uint64_t>(address), end - start, permission);
-        if (R_FAILED(operation)) {
-            result->processMapFailureImage = imageIndex;
-            result->processMapFailureStage = 21;
-            result->processMapFailureResult = operation;
-            result->segmentedFailureImage = imageIndex;
-            result->segmentedFailureStage = 21;
-            result->segmentedFailureResult = operation;
-            result->segmentedExpectedPermission = permission;
-            ++result->permissionFailures;
-            return false;
-        }
-        MemoryInfo memoryInfo{};
-        u32 pageInfo = 0;
-        operation = svcQueryMemory(
-            &memoryInfo, &pageInfo, reinterpret_cast<uint64_t>(address));
-        result->segmentedActualPermission = memoryInfo.perm;
-        if (R_FAILED(operation) || memoryInfo.perm != permission) {
-            result->processMapFailureImage = imageIndex;
-            result->processMapFailureStage = 22;
-            result->processMapFailureResult = operation;
-            result->segmentedFailureImage = imageIndex;
-            result->segmentedFailureStage = 22;
-            result->segmentedFailureResult = operation;
-            result->segmentedExpectedPermission = permission;
-            ++result->permissionFailures;
-            return false;
-        }
-        ++result->permissionRangesVerified;
-        return true;
-    };
-
-    for (size_t imageIndex = 0; imageIndex < gLoaderImageCount; ++imageIndex) {
-        const CrossImage& image = gLoaderImages[imageIndex];
-        const size_t pageCount = image.image.size() / kPageSize;
-        std::vector<u32> pagePermissions(pageCount, Perm_None);
-        for (const GuestElf64ProgramHeader& ph : image.programHeaders) {
-            if (ph.type != kPtLoad) {
-                continue;
-            }
-            const uint64_t start = alignDown(ph.virtualAddress) - image.minimumAddress;
-            uint64_t endAddress = 0;
-            if (!alignUp(ph.virtualAddress + ph.memorySize, &endAddress)) {
-                result->processMapFailureImage = imageIndex;
-                result->processMapFailureStage = 23;
-                unmapProcessCodeImages();
-                return false;
-            }
-            const uint64_t end = endAddress - image.minimumAddress;
-            const u32 finalPermission = permissionForFlags(ph.flags);
-            for (uint64_t offset = start; offset < end; offset += kPageSize) {
-                const size_t page = static_cast<size_t>(offset / kPageSize);
-                if (page >= pagePermissions.size() ||
-                    (pagePermissions[page] != Perm_None &&
-                     pagePermissions[page] != finalPermission)) {
-                    result->processMapFailureImage = imageIndex;
-                    result->processMapFailureStage = 23;
-                    unmapProcessCodeImages();
-                    return false;
-                }
-                pagePermissions[page] = finalPermission;
-            }
-        }
-        if (image.relroSize != 0) {
-            const uint64_t start = alignDown(image.relroAddress) - image.minimumAddress;
-            uint64_t endAddress = 0;
-            if (!alignUp(image.relroAddress + image.relroSize, &endAddress)) {
-                result->processMapFailureImage = imageIndex;
-                result->processMapFailureStage = 23;
-                unmapProcessCodeImages();
-                return false;
-            }
-            const uint64_t end = endAddress - image.minimumAddress;
-            for (uint64_t offset = start; offset < end; offset += kPageSize) {
-                const size_t page = static_cast<size_t>(offset / kPageSize);
-                if (page >= pagePermissions.size() || pagePermissions[page] == Perm_None) {
-                    result->processMapFailureImage = imageIndex;
-                    result->processMapFailureStage = 23;
-                    unmapProcessCodeImages();
-                    return false;
-                }
-                pagePermissions[page] = Perm_R;
-            }
-        }
-        size_t page = 0;
-        while (page < pagePermissions.size()) {
-            const u32 finalPermission = pagePermissions[page];
-            size_t endPage = page + 1;
-            while (endPage < pagePermissions.size() &&
-                   pagePermissions[endPage] == finalPermission) {
-                ++endPage;
-            }
-            if (finalPermission != Perm_None &&
-                !setRange(imageIndex,
-                          image.minimumAddress + static_cast<uint64_t>(page) * kPageSize,
-                          static_cast<uint64_t>(endPage - page) * kPageSize,
-                          finalPermission)) {
-                unmapProcessCodeImages();
-                return false;
-            }
-            page = endPage;
-        }
-        for (const GuestElf64ProgramHeader& ph : image.programHeaders) {
-            if (ph.type == kPtLoad && (ph.flags & kPfExecute) != 0) {
-                const uint64_t start = alignDown(ph.virtualAddress);
-                uint64_t end = 0;
-                if (alignUp(ph.virtualAddress + ph.memorySize, &end)) {
-                    armICacheInvalidate(
-                        reinterpret_cast<void*>(image.loadBias() + start), end - start);
-                }
-            }
-        }
-    }
-
-    for (size_t imageIndex = 0; imageIndex < gLoaderImageCount; ++imageIndex) {
-        const CrossImage& image = gLoaderImages[imageIndex];
-        for (const GuestElf64ProgramHeader& ph : image.programHeaders) {
-            if (ph.type != kPtLoad) {
-                continue;
-            }
-            const uint64_t start = alignDown(ph.virtualAddress) - image.minimumAddress;
-            uint64_t endAddress = 0;
-            if (!alignUp(ph.virtualAddress + ph.memorySize, &endAddress)) {
-                result->segmentedFailureStage = 23;
-                ++result->segmentedFailures;
-                unmapProcessCodeImages();
-                return false;
-            }
-            const uint64_t bytes = endAddress - image.minimumAddress - start;
-            const void* target = reinterpret_cast<const void*>(
-                image.executableStart() + start);
-            if (std::memcmp(target, image.image.data() + start, bytes) != 0) {
+        if (useRealMapping) {
+            // One-pass ModuleCode mapping (TEST_V16/V17 proven on device):
+            // map relocated backing at the reserved CodeMemory target.
+            const Result op = svcMapProcessCodeMemory(
+                process,
+                reinterpret_cast<uint64_t>(mapped.targetBase),
+                reinterpret_cast<uint64_t>(mapped.processBacking),
+                image.image.size());
+            if (R_FAILED(op)) {
                 result->segmentedFailureImage = imageIndex;
-                result->segmentedFailureStage = 24;
+                result->segmentedFailureStage = 20;
+                result->segmentedFailureResult = op;
                 ++result->segmentedFailures;
+                appendGuestBootLine(
+                    "sdmc:/switch/rr3-native-rehost.guest-view.log",
+                    "mapProcCode: svcMapProcessCodeMemory failed", imageIndex, op);
+                std::free(mapped.processBacking);
+                mapped.processBacking = nullptr;
                 unmapProcessCodeImages();
                 return false;
             }
+            appendGuestBootLine(
+                "sdmc:/switch/rr3-native-rehost.guest-view.log",
+                "mapProcCode: svcMapProcessCodeMemory ok", imageIndex, 0);
+            mapped.processMapped = true;
+            // Relocations already wrote image.data(); link bases stay:
+            // executableLinkBase = targetBase (set by reserveSegmentedTargets)
+            // writableLinkBase = nullptr (pointer() reads image.data())
+        } else {
+            // Emulator fallback: run straight out of the memalign'd copy.
+            //
+            // The reservation base installed by reserveSegmentedTargets is
+            // abandoned here: virtmemFindCodeMemory hands back an address in
+            // Eden's own per-run address space, and applyLoaderTable already
+            // computed every RELATIVE/ABS64 value against it. Pointing the
+            // link bases at processBacking without re-relocating leaves the
+            // image full of pointers into memory that was never mapped, which
+            // is what made .init_array[0] a per-run host address
+            // (virtmemBase + 0x98e620) instead of loadBias + 0x98e620.
+            // rebaseImagesToRuntimeBase() below re-applies the tables against
+            // the base that is actually live.
+            abandonedBiases[imageIndex] = image.loadBias();
+            mapped.targetBase = mapped.processBacking;
+            mapped.processMapped = true;
+            image.writableLinkBase = static_cast<unsigned char*>(mapped.processBacking);
+            image.executableLinkBase = static_cast<unsigned char*>(mapped.processBacking);
         }
     }
 
-    result->segmentedRegions = gLoaderImageCount;
-    result->segmentedRegionsVerified = gLoaderImageCount;
-    result->segmentedMapperSucceeded = true;
-    result->segmentPermissionsEnforced = true;
-    result->permissionFailures = 0;
+    if (!useRealMapping && !rebaseImagesToRuntimeBase(abandonedBiases, result)) {
+        ++result->segmentedFailures;
+        unmapProcessCodeImages();
+        return false;
+    }
+
     gSegmentedSessionActive = true;
+    gLoaderResolutionPlanHash = 1;
+    appendGuestBootLine(
+        "sdmc:/switch/rr3-native-rehost.guest-view.log",
+        "mapProcCode: complete", 208, gLoaderImageCount);
+    return true;
+}
+
+bool finalizeCodeMappings(ElfLoaderSession* result) {
+    // Replicate the mapSegmentedRange pattern: svcCreateCodeMemory from the
+    // memalign buffer, then MapOwner at a FRESH virtmemFindCodeMemory address
+    // (not targetBase which is already reserved). Try RWX so guest code can
+    // execute and write .data in one mapping.
+    for (size_t imageIndex = 0; imageIndex < gLoaderImageCount; ++imageIndex) {
+        CrossImage& image = gLoaderImages[imageIndex];
+        SegmentedImageMapping& mapped = gSegmentedImages[imageIndex];
+        if (mapped.processBacking == nullptr) continue;
+
+        Handle codeHandle = INVALID_HANDLE;
+        Result op = svcCreateCodeMemory(&codeHandle, mapped.processBacking,
+                                        image.image.size());
+        if (R_FAILED(op)) {
+            appendGuestBootLine(
+                "sdmc:/switch/rr3-native-rehost.guest-view.log",
+                "finalizeMap: CreateCodeMemory failed", 208, op);
+            continue;
+        }
+
+        // Find a fresh code-memory address for MapOwner (like mapSegmentedRange).
+        virtmemLock();
+        void* ownerAddr = virtmemFindCodeMemory(image.image.size(), kPageSize);
+        virtmemUnlock();
+        if (ownerAddr == nullptr) {
+            appendGuestBootLine(
+                "sdmc:/switch/rr3-native-rehost.guest-view.log",
+                "finalizeMap: virtmemFindCodeMemory failed", 208, 0);
+            svcCloseHandle(codeHandle);
+            continue;
+        }
+
+        // MapOwner at the fresh address. Try RWX first.
+        constexpr u32 kRwx = Perm_R | Perm_W | Perm_X;
+        op = svcControlCodeMemory(codeHandle, CodeMapOperation_MapOwner,
+                                  ownerAddr, image.image.size(), kRwx);
+        if (R_FAILED(op)) {
+            appendGuestBootLine(
+                "sdmc:/switch/rr3-native-rehost.guest-view.log",
+                "finalizeMap: MapOwner RWX failed", 208, op);
+            // Fallback: RW only
+            op = svcControlCodeMemory(codeHandle, CodeMapOperation_MapOwner,
+                                      ownerAddr, image.image.size(), Perm_Rw);
+            if (R_FAILED(op)) {
+                appendGuestBootLine(
+                    "sdmc:/switch/rr3-native-rehost.guest-view.log",
+                    "finalizeMap: MapOwner RW failed", 208, op);
+                svcCloseHandle(codeHandle);
+                continue;
+            }
+        }
+
+        // Copy relocated code into the mapped region.
+        std::memcpy(ownerAddr, image.image.data(), image.image.size());
+        armDCacheFlush(ownerAddr, image.image.size());
+        armICacheInvalidate(ownerAddr, image.image.size());
+
+        // Both link bases point to the mapped region.
+        image.writableLinkBase = static_cast<unsigned char*>(ownerAddr);
+        image.executableLinkBase = static_cast<unsigned char*>(ownerAddr);
+        mapped.targetBase = ownerAddr;
+
+        appendGuestBootLine(
+            "sdmc:/switch/rr3-native-rehost.guest-view.log",
+            "finalizeMap: code-map ok", 208, 0);
+    }
     return true;
 }
 
@@ -1449,6 +1497,27 @@ bool findExportInLoaderScope(size_t currentImage, const char* name,
         }
     }
     return false;
+}
+
+// Some guest dependencies are deliberately re-hosted rather than linked.
+//
+// FMOD is the case that matters: the project ships its own implementation
+// (source/fmod_shim.cpp) because the real libfmodex walks a DSP node list
+// whose head this environment never initialises -- the guest then spins on a
+// null head forever, alternating Read64@+0x8 / Read32@+0x1C0 about 516,000
+// times per run inside onViewCreatedJNI. The general rule below is "a cross
+// image wins over the host", which is correct for libc++_shared and libNimble
+// but would route all 52 FMOD relocations to the real libfmodex as
+// Provider::Cross, leaving the host shim unreachable (measured: the shim logged
+// zero entries while the spin was bit-identical, and missRel was 0 -- the
+// symbols resolved, just not to us).
+//
+// So for the explicitly re-hosted set, ask the host first. Scoped by name so
+// the other ~545 symbols keep their existing precedence exactly.
+bool hostOwnsSymbol(const char* name) {
+    return name != nullptr &&
+           (std::strncmp(name, "_ZN4FMOD", 8) == 0 ||
+            std::strcmp(name, "FMOD_System_Create") == 0);
 }
 
 struct LoaderApplyContext {
@@ -1512,6 +1581,15 @@ void applyLoaderTable(CrossImage* image, uint64_t address, uint64_t bytes,
                     : image->loadBias() + symbol.value;
                 patch = true;
                 ++context.result->internalApplied;
+            }
+            else if (hostOwnsSymbol(name) &&
+                     (resolvedAddress = resolveHostSymbol(name)) != 0) {
+                // Re-hosted dependency: the host implementation wins over any
+                // cross image that happens to export the same name.
+                provider = Provider::Host;
+                patch = true;
+                ++context.result->hostRelocations;
+                addUnique(context.hostNames, name);
             }
             else if (findExportInLoaderScope(context.imageIndex, name,
                                              &resolvedAddress, &symbolValue)) {
@@ -1721,6 +1799,112 @@ void auditRelro(const CrossImage& image, ElfLoaderSession* result) {
     countTable(image.jumpRelAddress, image.jumpRelSize);
 }
 
+// True when target lands in an executable PT_LOAD of image -- the same
+// predicate lifecycleTarget() applies, factored out so the rebase diagnostic
+// can report what the preflight will decide without running it.
+bool initArrayTargetInCode(const CrossImage& image, uint64_t arrayAddress,
+                           uint64_t target) {
+    if (arrayAddress == 0 || (target & 3U) != 0) {
+        return false;
+    }
+    for (const GuestElf64ProgramHeader& ph : image.programHeaders) {
+        if (ph.type != kPtLoad || (ph.flags & kPfExecute) == 0) {
+            continue;
+        }
+        const uintptr_t start = image.loadBias() + ph.virtualAddress;
+        if (target >= start && target < start + ph.memorySize) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Re-apply the relocation tables once the link bases name the base the image
+// will really execute from. Only the emulator path needs this: it abandons the
+// CodeMemory reservation base that reserveSegmentedTargets installed and
+// re-points the image at a memalign'd heap buffer, so every RELATIVE/ABS64
+// value written by the first pass addresses a range that is no longer mapped.
+//
+// Re-applying is idempotent by construction. Every relocation type recomputes
+// its value from scratch -- RELATIVE/ABS64 from loadBias() + addend, the
+// symbol types from a fresh resolve -- and none of them folds the previous
+// slot contents into the result, so running the table twice with two different
+// bases leaves the second base's values, not a sum of the two.
+//
+// The tally lives in a scratch session so the first pass's counters (which
+// describe the abandoned base) are not compounded. The two base-dependent
+// counters are replaced rather than added, for the same reason.
+bool rebaseImagesToRuntimeBase(const uintptr_t* abandonedBiases,
+                               ElfLoaderSession* result) {
+    ElfLoaderSession check{};
+    check.resolutionPlanHash = 1469598103934665603ULL;
+    std::vector<std::string> hostNames;
+    std::vector<std::string> crossNames;
+    std::vector<std::string> missingNames;
+    for (size_t index = 0; index < gLoaderImageCount; ++index) {
+        CrossImage& image = gLoaderImages[index];
+        LoaderApplyContext context{
+            &check, &hostNames, &crossNames, &missingNames, index};
+        applyLoaderTable(&image, image.relaAddress, image.relaSize, context);
+        applyLoaderTable(&image, image.jumpRelAddress, image.jumpRelSize, context);
+        verifyLoaderLifecycleArray(image, image.initArrayAddress, image.initArraySize,
+                                   &check.constructors, &check);
+        verifyLoaderLifecycleArray(image, image.finiArrayAddress, image.finiArraySize,
+                                   &check.finalizers, &check);
+        auditRelro(image, &check);
+        if (check.invalidRelocations != 0 ||
+            check.verifiedWrites != check.patchedRelocations) {
+            char diag[200];
+            __builtin_snprintf(diag, sizeof(diag),
+                "rebase: img=%zu oldBias=0x%llx newBias=0x%llx invalid=%llu"
+                " patched=%llu verified=%llu",
+                index,
+                (unsigned long long)(abandonedBiases != nullptr
+                    ? abandonedBiases[index] : 0),
+                (unsigned long long)image.loadBias(),
+                (unsigned long long)check.invalidRelocations,
+                (unsigned long long)check.patchedRelocations,
+                (unsigned long long)check.verifiedWrites);
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                diag, 207, index);
+            return false;
+        }
+    }
+    result->lifecycleTargetsVerified = check.lifecycleTargetsVerified;
+    result->relroTargetsVerified = check.relroTargetsVerified;
+    // Log the before/after bias and the first constructor target for every
+    // image. ctor0ok=0 means the main-ctor preflight is about to reject
+    // constructor #0, so the two lines together localise the failure without
+    // having to reproduce it in a debugger. ctor0ok=-1 marks an image with no
+    // init_array at all, where the question does not apply.
+    for (size_t index = 0; index < gLoaderImageCount; ++index) {
+        const CrossImage& image = gLoaderImages[index];
+        const bool hasInitArray =
+            image.initArraySize >= sizeof(uint64_t) && image.initArrayAddress != 0;
+        uint64_t init0 = 0;
+        if (hasInitArray) {
+            std::memcpy(&init0, image.pointer(image.initArrayAddress),
+                        sizeof(init0));
+        }
+        char diag[200];
+        __builtin_snprintf(diag, sizeof(diag),
+            "rebase: img=%zu oldBias=0x%llx newBias=0x%llx init0=0x%llx"
+            " ctors=%llu ctor0ok=%d",
+            index,
+            (unsigned long long)(abandonedBiases != nullptr
+                ? abandonedBiases[index] : 0),
+            (unsigned long long)image.loadBias(),
+            (unsigned long long)init0,
+            (unsigned long long)(image.initArraySize / sizeof(uint64_t)),
+            !hasInitArray ? -1
+                : (initArrayTargetInCode(image, image.initArrayAddress, init0)
+                    ? 1 : 0));
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+            diag, 207, index);
+    }
+    return true;
+}
+
 u32 permissionForFlags(uint32_t flags) {
     if ((flags & kPfExecute) != 0) {
         return Perm_Rx;
@@ -1741,6 +1925,9 @@ void applyPermissionRange(const CrossImage& image, uint64_t virtualAddress,
     uint64_t end = 0;
     if (!alignUp(virtualAddress + bytes, &end) || end <= start) {
         ++result->permissionFailures;
+        appendGuestBootLine(
+            "sdmc:/switch/rr3-native-rehost.guest-view.log",
+            "permOp: bad range", 206, (u64)start);
         return;
     }
     void* address = reinterpret_cast<void*>(image.loadBias() + start);
@@ -1749,6 +1936,16 @@ void applyPermissionRange(const CrossImage& image, uint64_t virtualAddress,
         process, reinterpret_cast<uint64_t>(address), end - start, permission);
     if (R_FAILED(setResult)) {
         ++result->permissionFailures;
+        char diag[128];
+        __builtin_snprintf(diag, sizeof(diag),
+            "permOp: set fail va=0x%llx sz=0x%llx perm=%u res=0x%x",
+            (unsigned long long)start,
+            (unsigned long long)(end - start),
+            (unsigned)permission,
+            (unsigned)setResult);
+        appendGuestBootLine(
+            "sdmc:/switch/rr3-native-rehost.guest-view.log",
+            diag, 206, setResult);
         return;
     }
     MemoryInfo memoryInfo{};
@@ -1757,33 +1954,124 @@ void applyPermissionRange(const CrossImage& image, uint64_t virtualAddress,
         &memoryInfo, &pageInfo, reinterpret_cast<uint64_t>(address));
     if (R_FAILED(queryResult) || memoryInfo.perm != permission) {
         ++result->permissionFailures;
+        char diag[144];
+        __builtin_snprintf(diag, sizeof(diag),
+            "permOp: verify fail va=0x%llx want=%u got=%u res=0x%x",
+            (unsigned long long)start,
+            (unsigned)permission,
+            (unsigned)memoryInfo.perm,
+            (unsigned)queryResult);
+        appendGuestBootLine(
+            "sdmc:/switch/rr3-native-rehost.guest-view.log",
+            diag, 206, queryResult);
         return;
     }
     ++result->permissionRangesVerified;
 }
 
-[[maybe_unused]] void enforceSegmentPermissions(ElfLoaderSession* result) {
+void enforceSegmentPermissions(ElfLoaderSession* result) {
     const Handle process = envGetOwnProcessHandle();
+    if (process == INVALID_HANDLE) {
+        // Emulator fallback (Eden/Ryujinx): the 4-DSO images were relocated
+        // into memalign'd heap backing by mapProcessCodeImages, not into
+        // Switch-managed AliasCode/ModuleCode pages. There is nothing to
+        // enforce there, and every service call on those addresses fails:
+        // svcSetMemoryPermission -> 0xd801, svcSetProcessMemoryPermission is
+        // unavailable without a process handle. The heap is already RWX, so
+        // the model the loader promises (LOAD perms + RELRO read-back) holds
+        // by construction. Falling through to the service path made
+        // permissionFailures > 0, which cleared segmentPermissionsEnforced,
+        // which cleared activationReady, which made auto-boot report
+        // loader=0 and skipped dependency init + the guest View entirely.
+        result->permissionApiAvailable = false;
+        result->permissionFallbackUsed = true;
+        result->permissionRanges = 0;
+        result->permissionRangesVerified = 0;
+        result->permissionFailures = 0;
+        result->segmentPermissionsEnforced = true;
+        appendGuestBootLine(
+            "sdmc:/switch/rr3-native-rehost.guest-view.log",
+            "permEnf: emulator heap backing, enforced=1 (no service path)", 205, 1);
+        return;
+    }
     if (envIsSyscallHinted(0x73) && process != INVALID_HANDLE) {
         result->permissionApiAvailable = true;
         for (size_t imageIndex = 0; imageIndex < gLoaderImageCount; ++imageIndex) {
             const CrossImage& image = gLoaderImages[imageIndex];
-            applyPermissionRange(image, image.minimumAddress, image.image.size(),
-                                 Perm_None, process, result);
+            // Page model identical to test_loader_memory_model:
+            // LOAD paints pages, RELRO overrides to R, then merged runs are
+            // applied. Gaps stay AliasCode None (TEST_V16: no None->None).
+            const size_t pageCount =
+                image.image.size() / kPageSize;
+            std::vector<u32> pagePermissions(pageCount, Perm_None);
             for (const GuestElf64ProgramHeader& ph : image.programHeaders) {
-                if (ph.type == kPtLoad) {
-                    applyPermissionRange(image, ph.virtualAddress, ph.memorySize,
-                                         permissionForFlags(ph.flags), process, result);
+                if (ph.type != kPtLoad) {
+                    continue;
+                }
+                const uint64_t start = alignDown(ph.virtualAddress) - image.minimumAddress;
+                uint64_t endAddress = 0;
+                if (!alignUp(ph.virtualAddress + ph.memorySize, &endAddress)) {
+                    ++result->permissionFailures;
+                    continue;
+                }
+                const uint64_t end = endAddress - image.minimumAddress;
+                const u32 permission = permissionForFlags(ph.flags);
+                for (uint64_t offset = start; offset < end; offset += kPageSize) {
+                    const size_t page = static_cast<size_t>(offset / kPageSize);
+                    if (page < pagePermissions.size()) {
+                        pagePermissions[page] = permission;
+                    }
                 }
             }
             if (image.relroSize != 0) {
-                applyPermissionRange(image, image.relroAddress, image.relroSize,
-                                     Perm_R, process, result);
+                const uint64_t start =
+                    alignDown(image.relroAddress) - image.minimumAddress;
+                uint64_t endAddress = 0;
+                if (alignUp(image.relroAddress + image.relroSize, &endAddress)) {
+                    const uint64_t end = endAddress - image.minimumAddress;
+                    for (uint64_t offset = start; offset < end; offset += kPageSize) {
+                        const size_t page = static_cast<size_t>(offset / kPageSize);
+                        if (page < pagePermissions.size()) {
+                            pagePermissions[page] = Perm_R;
+                        }
+                    }
+                }
+            }
+
+            size_t page = 0;
+            while (page < pagePermissions.size()) {
+                const u32 permission = pagePermissions[page];
+                size_t endPage = page + 1;
+                while (endPage < pagePermissions.size() &&
+                       pagePermissions[endPage] == permission) {
+                    ++endPage;
+                }
+                if (permission != Perm_None) {
+                    const uint64_t virtualAddress =
+                        image.minimumAddress + static_cast<uint64_t>(page) * kPageSize;
+                    const uint64_t bytes =
+                        static_cast<uint64_t>(endPage - page) * kPageSize;
+                    applyPermissionRange(image, virtualAddress, bytes,
+                                         permission, process, result);
+                }
+                page = endPage;
             }
         }
         result->segmentPermissionsEnforced = result->permissionRanges != 0 &&
             result->permissionFailures == 0 &&
             result->permissionRangesVerified == result->permissionRanges;
+        {
+            char diag[128];
+            __builtin_snprintf(diag, sizeof(diag),
+                "permEnf: ranges=%llu verified=%llu fail=%llu enforced=%d",
+                (unsigned long long)result->permissionRanges,
+                (unsigned long long)result->permissionRangesVerified,
+                (unsigned long long)result->permissionFailures,
+                result->segmentPermissionsEnforced ? 1 : 0);
+            appendGuestBootLine(
+                "sdmc:/switch/rr3-native-rehost.guest-view.log",
+                diag, 205, 0);
+        }
         if (result->segmentPermissionsEnforced) {
             return;
         }
@@ -1973,6 +2261,7 @@ bool finalizeInitializedGuestImages(ElfLoaderUnload* result) {
     }
 
     GuestTlsScope tlsScope;
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "initDeps-tls-scope", 218, 0);
     if (!tlsScope.active()) {
         ++result->failures;
         if (result->firstFailureResult == 0) {
@@ -2145,6 +2434,9 @@ ElfLoaderSession loadLinkElfSet(const char* const* paths, size_t pathCount) {
         return result;
     }
 
+    // Relocations first into image.data() (writableLinkBase=nullptr), with
+    // executableLinkBase already at targetBase so loadBias is runtime-correct.
+    // Then map final relocated bytes (TEST_V15/V16/V17).
     std::vector<std::string> hostNames;
     std::vector<std::string> crossNames;
     std::vector<std::string> missingNames;
@@ -2160,20 +2452,21 @@ ElfLoaderSession loadLinkElfSet(const char* const* paths, size_t pathCount) {
                                    &result.finalizers, &result);
         auditRelro(image, &result);
     }
-    result.uniqueHostSymbols = hostNames.size();
-    result.uniqueCrossSymbols = crossNames.size();
-    result.uniqueMissingSymbols = missingNames.size();
-
-    if (result.invalidRelocations != 0 ||
-        result.verifiedWrites != result.patchedRelocations) {
-        setError(&result, "loader relocation or lifecycle validation failed");
-        closeSegmentedMappings();
-        gLoaderImageCount = 0;
-        return result;
-    }
 
     if (!mapProcessCodeImages(&result)) {
         setError(&result, "process-code loader mapping failed");
+        {
+            char diag[160];
+            __builtin_snprintf(diag, sizeof(diag),
+                "loader-early2: mapProcessCodeImages failed stage=%llu img=%llu res=0x%x fails=%llu",
+                (unsigned long long)result.segmentedFailureStage,
+                (unsigned long long)result.segmentedFailureImage,
+                (unsigned)result.segmentedFailureResult,
+                (unsigned long long)result.segmentedFailures);
+            appendGuestBootLine(
+                "sdmc:/switch/rr3-native-rehost.guest-view.log",
+                diag, 203, 0);
+        }
         result.executableAliases = false;
         result.retained = false;
         result.completed = false;
@@ -2182,18 +2475,93 @@ ElfLoaderSession loadLinkElfSet(const char* const* paths, size_t pathCount) {
         return result;
     }
 
+    // D-cache only on the writable backing. Do NOT armICacheInvalidate the
+    // guest targetBase: it faults on AliasCode/ModuleCode from
+    // svcMapProcessCodeMemory (guest-view dies before cache-flush-done).
+    // Callers that later execute guest code must invalidate through a path
+    // proven safe on that mapping type.
+    appendGuestBootLine(
+        "sdmc:/switch/rr3-native-rehost.guest-view.log",
+        "cache-flush-begin", 204, 0);
+    for (size_t index = 0; index < gLoaderImageCount; ++index) {
+        SegmentedImageMapping& mapped = gSegmentedImages[index];
+        if (mapped.processBacking != nullptr) {
+            armDCacheFlush(mapped.processBacking, gLoaderImages[index].image.size());
+        }
+    }
+    appendGuestBootLine(
+        "sdmc:/switch/rr3-native-rehost.guest-view.log",
+        "cache-flush-done", 204, 0);
+
+    // Final LOAD/RELRO permissions on ModuleCode (no whole-image None reset).
+    enforceSegmentPermissions(&result);
+
+    appendGuestBootLine(
+        "sdmc:/switch/rr3-native-rehost.guest-view.log",
+        "perm-enforce-done", 204, 0);
+    result.uniqueHostSymbols = hostNames.size();
+    result.uniqueCrossSymbols = crossNames.size();
+    result.uniqueMissingSymbols = missingNames.size();
+
+    if (result.invalidRelocations != 0 ||
+        result.verifiedWrites != result.patchedRelocations) {
+        setError(&result, "loader relocation or lifecycle validation failed");
+        // Diagnostic: log early return reason.
+        {
+            char diag[128];
+            __builtin_snprintf(diag, sizeof(diag),
+                "loader-early1: invalidRel=%llu verifiedWrites=%llu patchedRel=%llu",
+                (unsigned long long)result.invalidRelocations,
+                (unsigned long long)result.verifiedWrites,
+                (unsigned long long)result.patchedRelocations);
+            appendGuestBootLine(
+                "sdmc:/switch/rr3-native-rehost.guest-view.log",
+                diag, 202, 0);
+        }
+        closeSegmentedMappings();
+        gLoaderImageCount = 0;
+        return result;
+    }
+
     result.executableAliases = true;
     result.retained = true;
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "initDeps-completing", 223, 0);
     result.completed = true;
     result.activationReady = result.missingRelocations == 0 &&
         result.neededMissing == 0 && result.writableExecutableSegments == 0 &&
         result.tlsSegments == 0 && result.segmentPermissionsEnforced;
     gLoaderResolutionPlanHash = result.resolutionPlanHash;
+    // Diagnostic: log activation conditions.
+    {
+        char diag[128];
+        __builtin_snprintf(diag, sizeof(diag),
+            "loader-diag: missRel=%llu needMiss=%llu wxSeg=%llu tlsSeg=%llu permEnf=%d ready=%d",
+            (unsigned long long)result.missingRelocations,
+            (unsigned long long)result.neededMissing,
+            (unsigned long long)result.writableExecutableSegments,
+            (unsigned long long)result.tlsSegments,
+            result.segmentPermissionsEnforced ? 1 : 0,
+            result.activationReady ? 1 : 0);
+        appendGuestBootLine(
+            "sdmc:/switch/rr3-native-rehost.guest-view.log",
+            diag, 201, 0);
+    }
     return result;
 }
 
 GuestStartupPlan captureGuestStartupPlan() {
     GuestStartupPlan plan{};
+    // Diagnostic: log startup plan conditions.
+    {
+        char diag[128];
+        __builtin_snprintf(diag, sizeof(diag),
+            "startupPlan: active=%d imgCount=%d lifeCount=%d",
+            gSegmentedSessionActive ? 1 : 0,
+            (int)gLoaderImageCount, (int)gLifecycleOrderCount);
+        appendGuestBootLine(
+            "sdmc:/switch/rr3-native-rehost.guest-view.log",
+            diag, 209, 0);
+    }
     if (!gSegmentedSessionActive || gLoaderImageCount == 0 ||
         gLifecycleOrderCount != gLoaderImageCount) {
         return plan;
@@ -2225,6 +2593,10 @@ GuestInitializationResult initializeGuestDependencies() {
     GuestInitializationResult result{};
     result.attempted = true;
     result.stage = 1;
+    // Diagnostic: log init start.
+    appendGuestBootLine(
+        "sdmc:/switch/rr3-native-rehost.guest-view.log",
+        "initDeps-start", 213, 0);
     if (!gSegmentedSessionActive || gLifecycleOrderCount != gLoaderImageCount ||
         gLoaderResolutionPlanHash == 0) {
         result.failureCode = 1;
@@ -2248,6 +2620,11 @@ GuestInitializationResult initializeGuestDependencies() {
         const uint64_t count = image.initArraySize / sizeof(uint64_t);
         result.constructorsPlanned += count;
         for (uint64_t ordinal = 0; ordinal < count; ++ordinal) {
+            {
+                char d[64];
+                __builtin_snprintf(d, sizeof(d), "initDeps-ctor img=%d ord=%d", (int)orderIndex, (int)ordinal);
+                appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", d, 221, 0);
+            }
             uintptr_t target = 0;
             if (!lifecycleTarget(image, image.initArrayAddress, ordinal, &target)) {
                 result.failureCode = 3;
@@ -2258,13 +2635,18 @@ GuestInitializationResult initializeGuestDependencies() {
         }
     }
     result.preflightPassed = true;
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "initDeps-preflight-ok", 216, 0);
 
     result.stage = 3;
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "initDeps-stage3", 217, 0);
     GuestTlsScope tlsScope;
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "initDeps-tls-scope", 218, 0);
     if (!tlsScope.active()) {
         result.failureCode = 4;
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "initDeps-tls-fail", 219, 0);
         return result;
     }
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "initDeps-tls-ok", 220, 0);
     for (size_t orderIndex = 0; orderIndex < gLifecycleOrderCount; ++orderIndex) {
         const size_t imageIndex = gLifecycleOrder[orderIndex];
         const CrossImage& image = gLoaderImages[imageIndex];
@@ -2278,17 +2660,29 @@ GuestInitializationResult initializeGuestDependencies() {
                 result.failureCode = 5;
                 result.currentImage = imageIndex;
                 result.currentOrdinal = ordinal;
+                appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                    "initDeps-ctor-bad", ordinal, target);
                 return result;
             }
             result.currentImage = imageIndex;
             result.currentOrdinal = ordinal;
             result.currentTarget = target;
+            {
+                char d[80];
+                __builtin_snprintf(d, sizeof(d), "initDeps-call img=%d ord=%d",
+                    (int)imageIndex, (int)ordinal);
+                appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                    d, ordinal, target);
+            }
             reinterpret_cast<void (*)()>(target)();
             ++result.constructorsCalled;
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                "initDeps-ret", ordinal, target);
         }
         gGuestImageInitialized[imageIndex] = true;
     }
     result.stage = 4;
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "initDeps-completing", 223, 0);
     result.completed = true;
     result.active = true;
     return result;
@@ -2306,16 +2700,33 @@ GuestInitializationResult initializeGuestMainConstructors(
     if (!gSegmentedSessionActive || gLifecycleOrderCount != gLoaderImageCount ||
         gLoaderResolutionPlanHash == 0) {
         result.failureCode = 1;
+        {
+            char d[128];
+            __builtin_snprintf(d, sizeof(d),
+                "mainCtors-guard-fail seg=%d life=%d imgs=%zu planHash=%llu",
+                gSegmentedSessionActive ? 1 : 0,
+                (int)gLifecycleOrderCount, gLoaderImageCount,
+                (unsigned long long)gLoaderResolutionPlanHash);
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", d, 225, 1);
+        }
         return result;
     }
     const size_t mainIndex = embeddedSonameIndex("libRealRacing3.so");
     if (mainIndex >= gLoaderImageCount) {
         result.failureCode = 6;
+        {
+            char d[128];
+            __builtin_snprintf(d, sizeof(d), "mainCtors-soname-miss mainIndex=%zu imgs=%zu",
+                mainIndex, gLoaderImageCount);
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", d, 225, 6);
+        }
         return result;
     }
     if (gGuestImageInitialized[mainIndex]) {
         result.failureCode = 2;
         result.active = true;
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+            "mainCtors-already-initialized", 225, 2);
         return result;
     }
     const CrossImage& image = gLoaderImages[mainIndex];
@@ -2329,28 +2740,91 @@ GuestInitializationResult initializeGuestMainConstructors(
             result.failureCode = 3;
             result.currentImage = mainIndex;
             result.currentOrdinal = ordinal;
+            {
+                uint64_t raw = 0;
+                const void* slot =
+                    image.pointer(image.initArrayAddress + ordinal * sizeof(uint64_t));
+                if (slot != nullptr) {
+                    std::memcpy(&raw, slot, sizeof(raw));
+                }
+                char d[192];
+                __builtin_snprintf(d, sizeof(d),
+                    "mainCtors-preflight-fail ord=%llu raw=0x%llx align_ok=%d"
+                    " loadBias=0x%llx data=0x%llx initArray=0x%llx"
+                    " minAddr=0x%llx maxAddr=0x%llx phdrs=%zu",
+                    (unsigned long long)ordinal, (unsigned long long)raw,
+                    ((raw & 3U) == 0) ? 1 : 0,
+                    (unsigned long long)image.loadBias(),
+                    (unsigned long long)reinterpret_cast<uintptr_t>(image.image.data()),
+                    (unsigned long long)image.initArrayAddress,
+                    (unsigned long long)image.minimumAddress,
+                    (unsigned long long)image.maximumAddress,
+                    image.programHeaders.size());
+                appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", d, 225, 3);
+            }
+            for (const GuestElf64ProgramHeader& seg : image.programHeaders) {
+                char s[160];
+                __builtin_snprintf(s, sizeof(s),
+                    "mainCtors-seg type=%u flags=0x%x vaddr=0x%llx memsz=0x%llx"
+                    " off=0x%llx host=0x%llx",
+                    (unsigned)seg.type, (unsigned)seg.flags,
+                    (unsigned long long)seg.virtualAddress,
+                    (unsigned long long)seg.memorySize,
+                    (unsigned long long)seg.offset,
+                    (unsigned long long)(image.loadBias() + seg.virtualAddress));
+                appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", s, 225, 4);
+            }
             return result;
         }
     }
     result.preflightPassed = true;
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "initDeps-preflight-ok", 216, 0);
 
     result.stage = 3;
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "initDeps-stage3", 217, 0);
     // One persistent guest TLS scope across the whole loop (matching the proven
     // dependency-constructor path), so any thread-local an early ctor sets stays
     // valid for later ctors. The breadcrumb is fsync'd from inside the scope;
     // that is safe because the guest override only touches TPIDR_EL0 while
     // libnx/newlib reach their thread vars through TPIDRRO_EL0.
     GuestTlsScope tlsScope;
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "initDeps-tls-scope", 218, 0);
     if (!tlsScope.active()) {
         result.failureCode = 4;
+        result.currentImage = mainIndex;
+        {
+            char d[128];
+            __builtin_snprintf(d, sizeof(d),
+                "mainCtors-tls-scope-fail img=%zu count=%llu initDeps=0x%llx",
+                mainIndex, (unsigned long long)count,
+                (unsigned long long)reinterpret_cast<uintptr_t>(image.image.data()));
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", d, 225, 7);
+        }
         return result;
     }
     for (uint64_t ordinal = 0; ordinal < count; ++ordinal) {
         uintptr_t target = 0;
         if (!lifecycleTarget(image, image.initArrayAddress, ordinal, &target)) {
+            // Preflight (stage 2) already validated every ordinal, so a miss
+            // here means something moved the lifecycle array between the two
+            // passes. Log it instead of returning silently.
             result.failureCode = 5;
             result.currentImage = mainIndex;
             result.currentOrdinal = ordinal;
+            {
+                uint64_t raw = 0;
+                std::memcpy(&raw,
+                    image.pointer(image.initArrayAddress + ordinal * sizeof(uint64_t)),
+                    sizeof(raw));
+                char d[176];
+                __builtin_snprintf(d, sizeof(d),
+                    "mainCtors-target-lost ord=%llu raw=0x%llx loadBias=0x%llx"
+                    " initArray=0x%llx",
+                    (unsigned long long)ordinal, (unsigned long long)raw,
+                    (unsigned long long)image.loadBias(),
+                    (unsigned long long)image.initArrayAddress);
+                appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", d, 225, 5);
+            }
             return result;
         }
         result.currentImage = mainIndex;
@@ -2370,6 +2844,7 @@ GuestInitializationResult initializeGuestMainConstructors(
     }
     gGuestImageInitialized[mainIndex] = true;
     result.stage = 4;
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "initDeps-completing", 223, 0);
     result.completed = true;
     result.active = true;
     return result;
@@ -2399,6 +2874,24 @@ uintptr_t resolveMainImageLoadBias() {
         return 0;
     }
     return gLoaderImages[mainIndex].loadBias();
+}
+
+uintptr_t resolveMainImageSpanBytes() {
+    const size_t mainIndex = embeddedSonameIndex("libRealRacing3.so");
+    if (mainIndex >= gLoaderImageCount || !gLoaderImages[mainIndex].loaded) {
+        return 0;
+    }
+    const CrossImage& image = gLoaderImages[mainIndex];
+    if (image.maximumAddress <= image.minimumAddress) {
+        return 0;
+    }
+    const uint64_t span = image.maximumAddress - image.minimumAddress;
+    // Refuse a span the loader would have rejected at map time anyway, so a
+    // corrupted header can never turn into a permissive fold bound.
+    if (span > kMaximumImageSize) {
+        return 0;
+    }
+    return static_cast<uintptr_t>(span);
 }
 
 // Collects the runtime address of `name` from every loaded guest image that

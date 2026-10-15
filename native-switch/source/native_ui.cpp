@@ -1,5 +1,6 @@
 #include "rr3/native_ui.hpp"
 #include "rr3/ui_dashboard.hpp"
+#include "rr3/gfx_backend.hpp"
 
 #include <switch.h>
 #include <ft2build.h>
@@ -269,6 +270,26 @@ bool nativeUiInit() {
     std::snprintf(motionPath, sizeof(motionPath),
                   "%smenu_carselect_transition.banim", motionPrefix);
     gUi.originalMotionTracks = gUi.originalMotionTracks && fileExists(motionPath);
+
+    // A/B SWITCH, 2026-10-11: "nofb=1" in sdmc:/switch/rr3-gfx.conf.
+    //
+    // This framebuffer is the only thing the parent process touches on the GPU
+    // before runGuestViewProbe() calls eglInitialize(), and the Mesa run blocks
+    // there forever (gui4/gui5/mesa1 all terminate at "view-egl-init-begin",
+    // 412 s, no later EGL line). The child that WORKS -- runWindowGraphicsProbe
+    // at main.cpp:566 -- runs before any of this and never touches a
+    // framebuffer. So "create a framebuffer on the default NWindow, close it,
+    // then let Mesa initialise EGL on that same NWindow" is the one remaining
+    // difference, and it is a single-variable question worth one run.
+    //
+    // Reports SUCCESS rather than failing: a false return sends main.cpp down
+    // the consoleInit(nullptr) fallback, which starts deko3d and would occupy
+    // the very frontend this experiment is trying to leave free.
+    if (rr3::gfxSkipFramebufferUi()) {
+        gUi.active = false;
+        return true;
+    }
+
     if (R_FAILED(framebufferCreate(&gUi.framebuffer, nwindowGetDefault(),
                                    kWidth, kHeight, PIXEL_FORMAT_RGBA_8888, 2)) ||
         R_FAILED(framebufferMakeLinear(&gUi.framebuffer))) {

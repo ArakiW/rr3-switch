@@ -46,4 +46,12 @@ int bionicSigaction(int signalNumber, const void* action, void* oldAction);
 int bionicStatfs(const char* path, void* output);
 uint64_t bionicMiscSelfTest();
 
+// Associates a host descriptor with the guest path it was opened from, so a
+// later bionicMmap on that descriptor can name the file in its probe line.
+// bionicMmap receives only an fd, and correlating its log against the guest's
+// own "Failed memory-mapping file: %s" by call ordering alone is a guess; the
+// descriptor is a real key. The store is a small ring and is written on the
+// open path only, never on the map path.
+void bionicNoteOpenedFd(int fd, const char* path);
+
 } // namespace rr3

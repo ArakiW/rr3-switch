@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-09-01T00:00:00+08:00",
+  "title": "Design System: RR3 Native Rehost",
+  "extensions": {
+    "colorMeta": {
+      "asphalt": {"role": "neutral", "displayName": "Asphalt", "canonical": "#111318", "tonalRamp": ["#070809", "#111318", "#252A31", "#3E454E", "#636C77", "#9299A2", "#C9CDD0", "#F4F4F2"]},
+      "rr3-blue": {"role": "primary", "displayName": "RR3 Selection Blue", "canonical": "#1F9FE5", "tonalRamp": ["#071E2B", "#0B3650", "#10567E", "#1879AE", "#1F9FE5", "#63BDF0", "#A6DCF7", "#E5F6FD"]},
+      "action-orange": {"role": "secondary", "displayName": "Action Orange", "canonical": "#FFA313", "tonalRamp": ["#2D1A00", "#573300", "#855100", "#B97200", "#FFA313", "#FFC15C", "#FFDEA4", "#FFF4DE"]},
+      "confirm-green": {"role": "success", "displayName": "Confirm Green", "canonical": "#6BCF48", "tonalRamp": ["#10280A", "#1C4A12", "#2E711E", "#459D2D", "#6BCF48", "#96E27D", "#C3F1B4", "#ECFAE7"]},
+      "danger-red": {"role": "danger", "displayName": "Danger Red", "canonical": "#ED3D3D", "tonalRamp": ["#310808", "#5A1111", "#881E1E", "#B92C2C", "#ED3D3D", "#F47B7B", "#F9B5B5", "#FDEAEA"]}
+    },
+    "typographyMeta": {
+      "headline": {"displayName": "Conduit Headline", "purpose": "Player-facing mode and screen titles."},
+      "body": {"displayName": "Conduit Body", "purpose": "Localized menu and compatibility copy."},
+      "telemetry": {"displayName": "Eurostile Telemetry", "purpose": "Numbers and hidden developer details."}
+    },
+    "shadows": [],
+    "motion": [
+      {"name": "menu-transition", "value": "40 frames at 60fps", "purpose": "Original map/menu and garage camera transition."},
+      {"name": "car-selection-transition", "value": "90 frames at 60fps", "purpose": "Original event-to-car-selection camera transition."}
+    ],
+    "breakpoints": [{"name": "switch-native", "value": "1280x720"}]
+  },
+  "components": [],
+  "narrative": {
+    "northStar": "The Original RR3 Garage",
+    "overview": "A continuation of the shipped Real Racing 3 interface using original assets, condensed motorsport type, hard diagonal planes and original timing.",
+    "keyCharacteristics": ["Original asset geometry", "Controller-first focus", "Chinese package localization", "Original frame timing", "Hidden diagnostics"],
+    "rules": [
+      {"name": "Original Roles", "body": "Each semantic color retains its decoded-atlas role.", "section": "colors"},
+      {"name": "Bodywork", "body": "Panels use hard edges and precise overlap, never rounded floating cards.", "section": "elevation"}
+    ],
+    "dos": ["Use original GUI, atlas, font, music and transition resources."],
+    "donts": ["Do not present the diagnostics dashboard as the game UI.", "Do not apply generic Switch, WebView or Material styling."]
+  }
+}

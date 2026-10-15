@@ -1,0 +1,4 @@
+interface:
+  display_name: "Native Source Porting"
+  short_description: "Plan and audit native source-recompile game ports"
+  default_prompt: "Use $source-recompile-porting to assess this codebase and define a verified native porting plan."

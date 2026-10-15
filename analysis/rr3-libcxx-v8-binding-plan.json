@@ -1,0 +1,38 @@
+{
+  "scope": "Android libc++_shared.so external dependency closure for Horizon/libnx",
+  "resolver_entries": 259,
+  "libcxx_external_symbols": 160,
+  "resolved_symbols": 154,
+  "deferred_symbols": 6,
+  "direct_target_additions": 79,
+  "explicit_shim_additions": 13,
+  "execution_state": "lookup and shim self-test only; guest relocations are not patched",
+  "shim_symbols": [
+    "__ctype_get_mb_cur_max",
+    "__open_2",
+    "__read_chk",
+    "__strlen_chk",
+    "android_set_abort_message",
+    "closelog",
+    "fchmodat",
+    "openlog",
+    "posix_memalign",
+    "sendfile",
+    "sysconf",
+    "syslog",
+    "utimensat"
+  ],
+  "deferred": {
+    "__cxa_atexit": "Needs a guest DSO lifecycle registry before constructors can run.",
+    "__cxa_finalize": "Must finalize only destructors owned by the guest DSO lifecycle registry.",
+    "__cxa_thread_atexit_impl": "Weak import; needs guest-thread destructor ownership and teardown.",
+    "__sF": "Bionic FILE object layout is not compatible with newlib FILE; requires a guest stdio object bridge.",
+    "dl_iterate_phdr": "Requires the retained multi-DSO loader to expose guest program headers.",
+    "syscall": "Android syscall numbers and futex/TID semantics cannot be forwarded to Horizon."
+  },
+  "warnings": [
+    "A resolved address is not proof that Android and newlib data-structure ABIs match.",
+    "Directory, stat, locale, and FILE-dependent calls need execution-path validation before constructors.",
+    "No unresolved symbol is replaced with a silent success stub."
+  ]
+}

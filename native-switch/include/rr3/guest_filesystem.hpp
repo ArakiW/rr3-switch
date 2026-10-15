@@ -29,7 +29,7 @@ void unmountExternalData();
 const ExternalDataStatus& externalDataStatus();
 bool externalDataReady();
 
-// Pure path-contract probe. Expected mask is 0xfff.
+// Pure path-contract probe. Expected mask is 0x1fff (bits 512/1024 added 2026-10-04:`r`n// for the leaf-scoped save exclusion -- see mapAppRootToContent).
 uint64_t guestFilesystemSelfTest();
 
 std::FILE* guestFopen(const char* path, const char* mode);
@@ -38,6 +38,13 @@ int guestOpen2(const char* path, int flags);
 int guestAccess(const char* path, int mode);
 int guestStat(const char* path, struct stat* output);
 int guestLstat(const char* path, struct stat* output);
+// Verifies that the bionic stat layout writes st_size at +0x30, the offset the
+// guest loads its mmap length from (ELF 0x12a4a24). Depends on nothing but the
+// converter, so it needs no volume and no guest run.
+bool bionicStatLayoutSelfTest();
+// The active stat-layout A/B mode, so the boot line reports the mask that is
+// actually true for the build instead of a constant that can go stale.
+int statBionicModeForLog();
 int guestMkdir(const char* path, mode_t mode);
 DIR* guestOpendir(const char* path);
 struct dirent* guestReaddir(DIR* directory);

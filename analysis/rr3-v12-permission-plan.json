@@ -1,0 +1,17 @@
+{
+  "base_loader_reference": "rr3-v11-loader-reference.json",
+  "primary_path": {
+    "api": "svcSetProcessMemoryPermission (SVC 0x73)",
+    "ranges": 34,
+    "real_device_v11_result": "0 verified, 34 failed"
+  },
+  "fallback_path": {
+    "api": "svcSetMemoryPermission (SVC 0x02)",
+    "executable_load_ranges_queried_without_change": 7,
+    "non_executable_load_ranges_changed": 14,
+    "gap_ranges_set_none": 2,
+    "relro_ranges_set_read_only": 6,
+    "total_ranges": 29
+  },
+  "safety": "Any failure leaves activationReady false; no guest constructor executes."
+}

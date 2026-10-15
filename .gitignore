@@ -1,39 +1,95 @@
-# Build artifacts
-*.o
-*.d
-*.elf
-*.nro
-*.nacp
-*.map
+# RR3 Switch port -- what is deliberately NOT in git.
+#
+# The working tree is ~57 GB. Almost all of it is either a downloaded toolchain,
+# a generated data volume, or a build product. None of it can be recovered from
+# a commit, and committing it would make the history unusable. Everything that
+# represents actual WORK -- source, scripts, docs, the guest binary, and the
+# experimental record -- is tracked.
+#
+# Rule of thumb used below: keep anything a person wrote; ignore anything a
+# tool produced.
+#
+# NOTE: git does not support trailing "# comment" on a pattern line. A line
+# like "dist/   # the release tree" is parsed as one long pattern that matches
+# nothing, and the directory silently gets committed. Every note here is on
+# its own comment line, and that is deliberate.
 
-# Editor
-.vscode/
-.idea/
-*.swp
-*.swo
+# --- toolchains and package caches -----------------------------------------
+# .tools/ is the project-local devkitPro / libnx tree (~12 GB).
+.tools/
 
-# OS
-.DS_Store
-Thumbs.db
+# --- downloaded asset packs ------------------------------------------------
+# Three texture-format variants of the same game, ~6.1-6.6 GB each. They are the
+# source data every romfs is generated from.
+*数据包*.zip
+*.7z
+*.7z.001
+*.7z.002
 
-# Python
-__pycache__/
-*.pyc
-*.pyo
-
-# Logs
-*.log
-*.log.*
-
-# Sensitive data
-*.key
-*.pem
-.env
-
-# Large binaries (not in repo)
+# --- generated data volumes -------------------------------------------------
+# Rebuilt by tools/prepare_rr3_external_data.py + build_romfs from the packs.
 *.romfs
+# dist/ is the release tree and holds all seven volumes (~9.7 GB).
 dist/
-reverse/native/arm64/*.so
+# reference/ holds the original container images, same volumes (~9.0 GB).
+reference/
+
+# --- build products ---------------------------------------------------------
+# .build/ holds intermediate objects AND the eden-runs archives (~8.4 GB).
+.build/
+native-switch/build/
+native-switch/*.nro
+native-switch/*.elf
+native-switch/*.map
+native-switch/*.nacp
+# The embedded romfs image is a build product; its source tree IS tracked.
+native-switch/rr3.romfs
+
+# --- reverse-engineering databases ------------------------------------------
+# Regenerable from reverse/native/arm64/libRealRacing3.so with Ghidra.
+ghidra-scratch/
+ghidra-work/
+reverse/ghidra-projects/
+
+# --- guest APK --------------------------------------------------------------
+# 112 MB, user-supplied and unmodified. The guest .so extracted from it IS
+# tracked, because the build links against it.
+*.apk
+
+# ===========================================================================
+# Everything below is EA / Apple proprietary material. The remote
+# (github.com/ArakiW/rr3-switch) is PUBLIC and already carries only the
+# port's own source, so this boundary must not be crossed.
+# ===========================================================================
+# The guest binary itself (33 MB, two working copies). The build needs it, so
+# it stays on disk and is simply never committed.
+native-switch/romfs/libRealRacing3.so
+reverse/native/
+# Decompiled Java from the guest APK (24,649 files). EA's source.
+reverse/java/
+# EA assets pulled back out of the depot textures/atlases.
 analysis/rr3-ui-source/
-tools/emulators/
-tools/devkitPro/
+# Third-party font pack, 0.33 GB, fetched not authored.
+AlibabaPuHuiTi-3/
+# Decoded texture dumps.
+*.pvr
+*.dds
+# native-switch/romfs/ holds the game's own text (text_en.txt / text_cn-Hans.txt,
+# ~5.8 MB of EA localisation), FMOD's libfmodex.so, and the Noto CJK font. The
+# remote already carries source only, so this stays out for the same reason.
+native-switch/romfs/
+# Vendored third-party runtime, pulled from the guest package rather than
+# authored here.
+native-switch/libNimble.so
+native-switch/libfmodex.so
+native-switch/libc++_shared.so
+
+# --- run-time scratch written by the port -----------------------------------
+crash_reports/
+*.log
+sdmc:/
+
+# --- OS noise ---------------------------------------------------------------
+Thumbs.db
+.DS_Store
+desktop.ini

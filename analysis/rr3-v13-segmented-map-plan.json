@@ -1,0 +1,23 @@
+{
+  "images": 7,
+  "guest_address_model": "one contiguous reserved range per DSO",
+  "merged_regions": 21,
+  "permissions": {
+    "RX": "CodeMemory slave at guest address; owner retained at a private RW alias",
+    "R": "CodeMemory slave at guest address; owner retained at a private RW alias",
+    "RW": "CodeMemory owner mapped directly at guest address",
+    "None": "guest range remains reserved but unmapped"
+  },
+  "relro": "page-rounded ranges override base LOAD permissions to R before regions are merged",
+  "relocation": "all 174187 slots are reapplied against final segmented guest bases; bytes are copied through each mapped RW owner after CreateCodeMemory and compared through the final guest mapping",
+  "expected_regions": {
+    "libRealRacing3.so": 3,
+    "libNimble.so": 3,
+    "libfmodex.so": 2,
+    "libarcore_sdk_c.so": 3,
+    "libarcore_sdk_jni.so": 3,
+    "libc++_shared.so": 3,
+    "libfuelmetrics.so": 4
+  },
+  "safety": "mapping failure unmaps every completed range, removes reservations, and leaves constructors gated"
+}

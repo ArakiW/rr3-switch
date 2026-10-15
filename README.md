@@ -1,189 +1,54 @@
-<div align="center">
+# Real Racing 3 -> Nintendo Switch
 
-# Real Racing 3 — Nintendo Switch 原生移植
+这个目录目前包含 Real Racing 3 14.0.1 的 Android APK 与 ATC、DXT、ETC 三套游戏数据，**不包含游戏源码**。
 
-**将 Android ARM64 版 Real Racing 3 移植到 Nintendo Switch Horizon OS**
+> 当前目标已改为 **Horizon OS 原生逆向移植**，明确不使用 Android。已生成的 Java 与 ARM64 伪 C 结果、原生工程入口和验证状态见 [REVERSE_ENGINEERING.md](REVERSE_ENGINEERING.md)。下面的 Switchroot Android 内容仅保留为早期兼容性调查记录，不再是实施路线。
 
-[English](README_EN.md) | 简体中文
+## 当前可行目标
 
-![Status](https://img.shields.io/badge/status-开发中-orange)
-![Platform](https://img.shields.io/badge/platform-Nintendo%20Switch-red)
-![Language](https://img.shields.io/badge/language-C%2B%2B-blue)
-![License](https://img.shields.io/badge/license-仅供学习-green)
+第一阶段采用 **Switchroot Android**：在 Switch 上运行原 Android ARM64 版本，并验证 Joy-Con、OpenGL ES、音频与数据加载。这是兼容部署，不是 Horizon OS 原生 `.nro/.nsp` 移植。
 
-</div>
+真正的 Horizon OS 原生版本需要满足以下任一条件：
 
----
+1. 获得 EA / Firemonkeys 的游戏源码、第三方中间件许可（尤其 FMOD）以及 Nintendo Switch SDK；或
+2. 从头实现 Android/JNI/EGL/GLES、Java 服务、输入、音频、文件系统和网络兼容层。仅凭现有 APK 无法直接重链接为 Switch 程序。
 
-## 项目简介
+## 已确认的包信息
 
-这是一个将 **Real Racing 3**（Android ARM64 APK）移植到 **Nintendo Switch** 的开源项目。通过自定义的 libnx NRO 加载器，在 Switch 上原生运行这款赛车游戏。
+- 包名：`com.ea.games.r3_row`
+- 版本：`14.0.1`（versionCode `14001`）
+- Android：minSdk 26，targetSdk 36
+- 原生 ABI：`arm64-v8a`、`armeabi-v7a`
+- 图形：OpenGL ES 2.0 / EGL
+- 主库：`libRealRacing3.so`，ARM64 ELF，依赖 Android `libandroid.so`、`liblog.so`、EGL/GLES、FMOD、Nimble、ARCore 等
+- 启动 Activity：`com.firemint.realracing.UnpackAssetsActivity`
+- 数据包：默认推荐 `DXT_960x640+2048x1536数据包-260530-7723.zip`，因为 Switch 的 Tegra GPU 对 DXT/S3TC（BCn）纹理路线最匹配
+- APK 能通过 v2/v3 签名结构校验，但证书主体为 `Depot S`，不能据此认定为 EA 官方发布包；部署前应把它视为第三方重签名 APK
+- 当前 APK SHA-256：`935FEE3124C8EAEFBF2EC1B1A6BD1A869812D2F0D1FA533E04539293075F455B`
 
-> ⚠️ **免责声明**：本项目仅供学习和研究目的。不绕过 DRM，不伪造账户，不分发 EA 版权数据。用户需自行拥有合法游戏副本。
+## 工具
 
----
+所有脚本默认只检查，不会修改 APK 或绕过游戏鉴权。
 
-## 主要特性
+```powershell
+# 1. 检查本地输入和数据包
+pwsh -File .\tools\Test-RR3Inputs.ps1
 
-### ✅ 已完成
+# 2. 把 DXT 数据解压到一个新的空目录（约需 9 GiB）
+pwsh -File .\tools\Prepare-SwitchAndroid.ps1 `
+  -Destination E:\RR3-SwitchAndroid-Stage `
+  -Extract
 
-| 特性 | 状态 |
-|------|------|
-| 4-DSO 加载器 | ✅ 完成 |
-| TLS/JNI 生命周期 | ✅ 完成 |
-| 181 个构造函数 | ✅ 完成 |
-| 7 个 ROMFS 数据卷挂载 | ✅ 完成 |
-| Guest View 回调 | ✅ 完成 |
-| GL 管线验证 | ✅ 完成 |
-| Joy-Con 输入桥接 | ✅ 完成 |
-| 帧循环运行 | ✅ 完成 |
+# 3. Switchroot Android 已启动并开启 USB 调试后，安装 APK
+pwsh -File .\tools\Install-SwitchAndroid.ps1 -Launch
 
-### 🚧 开发中
+# 4. 可选：只有设备的 adbd 明确允许 root 时，写入私有 files 目录
+pwsh -File .\tools\Deploy-RR3Data.ps1 `
+  -StagePath E:\RR3-SwitchAndroid-Stage `
+  -AllowRootAdb
 
-| 特性 | 状态 |
-|------|------|
-| 菜单资产加载 | 🚧 进行中 |
-| 离线比赛 | ⏳ 待开始 |
-| 音频输出 | ⏳ 待开始 |
-
----
-
-## 技术架构
-
-```
-┌─────────────────────────────────────────────┐
-│           Nintendo Switch Horizon OS         │
-├─────────────────────────────────────────────┤
-│              libnx NRO 加载器                │
-│  ┌─────────────────────────────────────┐   │
-│  │      4-DSO 动态加载器                │   │
-│  │  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐   │   │
-│  │  │libc++│ │Nimble│ │FMOD │ │RR3  │   │   │
-│  │  └─────┘ └─────┘ └─────┘ └─────┘   │   │
-│  └─────────────────────────────────────┘   │
-│  ┌─────────────────────────────────────┐   │
-│  │         JNI 桥接层                   │   │
-│  │    (233 slot JNIEnv 模拟)            │   │
-│  └─────────────────────────────────────┘   │
-│  ┌─────────────────────────────────────┐   │
-│  │       VFS 路径重映射                 │   │
-│  │    (7 个 ROMFS 数据卷)               │   │
-│  └─────────────────────────────────────┘   │
-└─────────────────────────────────────────────┘
+# 5. 启动后收集可验证的运行日志
+pwsh -File .\tools\Collect-RuntimeProof.ps1
 ```
 
-### 核心组件
-
-| 组件 | 说明 |
-|------|------|
-| `multi_dso_linker.cpp` | 4-DSO 动态加载器，支持 RELRO、TLS、重定位 |
-| `jni_bridge.cpp` | JNI 桥接层，233 个 JNIEnv slot 模拟 |
-| `guest_filesystem.cpp` | VFS 路径重映射，7 个 ROMFS 卷挂载 |
-| `guest_view_probe.cpp` | Guest View 生命周期探针 |
-| `symbol_resolver.cpp` | 符号解析与 shim 绑定 |
-
----
-
-## 快速开始
-
-### 环境要求
-
-- devkitPro (devkitA64)
-- libnx
-- Python 3.x (用于测试)
-
-### 构建
-
-```bash
-# 构建 NRO
-powershell -File tools/Build-NativeSwitch.ps1
-
-# 运行测试
-cd native-switch/tests
-python test_*.py
-```
-
-### 部署
-
-1. 将 `dist/rr3-native-rehost-complete-0.22.4/` 复制到 Switch SD 卡
-2. 通过 Homebrew Launcher 启动
-3. 按 ZR → ZL → ZL 进入 Guest View
-
----
-
-## 项目结构
-
-```
-rr3-switch/
-├── native-switch/          # Switch 原生代码
-│   ├── source/            # C++ 源文件
-│   ├── include/           # 头文件
-│   ├── tests/             # 契约测试
-│   └── romfs/             # ROMFS 资源
-├── reverse/               # 逆向工程材料
-│   ├── native/arm64/      # 原始 DSO
-│   └── decomp-calltree/   # 反编译结果
-├── analysis/              # 分析文档
-├── tools/                 # 构建工具
-├── docs/                  # 项目文档
-└── dist/                  # 发行包
-```
-
----
-
-## 当前进度
-
-### 已验证里程碑
-
-| 里程碑 | 真机测试 | 说明 |
-|--------|----------|------|
-| NRO 构建 | ✅ | 4 个 DSO 成功加载 |
-| TLS/JIT | ✅ | Guest TLS 作用域验证通过 |
-| JNI 生命周期 | ✅ | onCreate→onStart→onResume 全部返回 |
-| Guest View | ✅ | Created/Changed/Render + eGL 交换 |
-| GL 管线 | ✅ | Host 全屏四边形显示正常 |
-| 输入桥接 | ✅ | Joy-Con → ControllerManager |
-
-### 待解决
-
-| 问题 | 描述 |
-|------|------|
-| 菜单加载 | hideSplash 后菜单资产未加载 |
-| DSO 兼容性 | 模拟器上加载器受限 |
-
----
-
-## 文档
-
-- [中文文档](docs/zh-CN/README.md)
-- [English Documentation](docs/en-US/README.md)
-- [项目状态](PROJECT_STATUS.md)
-- [恢复计划](docs/RR3_Recovery_Package/rr3_recovery/RR3_RECOVERY_PLAN.md)
-
----
-
-## 贡献
-
-欢迎提交 Issue 和 Pull Request！
-
-### 开发规范
-
-1. 遵循现有代码风格
-2. 添加必要的测试
-3. 更新相关文档
-4. 确保 11 个契约测试全部通过
-
----
-
-## 许可证
-
-本项目代码采用 MIT 许可证。游戏数据版权归 Electronic Arts 所有。
-
----
-
-## 致谢
-
-- [devkitPro](https://devkitpro.org/) - Switch 开发工具链
-- [libnx](https://github.com/switchbrew/libnx) - Switch homebrew 库
-- [Mesa](https://mesa3d.org/) - GL 实现
-- 所有测试和反馈的用户
+详细边界与验证标准见 [PORTING.md](PORTING.md)。
