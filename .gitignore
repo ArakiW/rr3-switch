@@ -84,6 +84,23 @@ native-switch/libNimble.so
 native-switch/libfmodex.so
 native-switch/libc++_shared.so
 
+# --- unrelated third-party material -----------------------------------------
+# analysis/gta5-docx-struct/ and analysis/gta5-switch-bundle-report.json are a
+# 72-word Chinese how-to plus its screenshots for installing a pirated GTA V NSP,
+# and a file-level manifest of that pirated bundle (103 files / 103 GB, NCA
+# container offsets, a local E:\QLDownload crack-release path). Neither belongs
+# to this port and neither belongs on a public remote. skills/
+# source-recompile-porting/references/gta5-switch-case-study.md is the
+# self-limiting writeup that cites this evidence; it stays, these do not.
+analysis/gta5-docx-struct/
+analysis/gta5-switch-bundle-report.json
+
+# --- Python bytecode ---------------------------------------------------------
+# Regenerated on every test run. All 11 tests are source-tracked; the .pyc files
+# were the only reason __pycache__ showed up in the snapshot.
+__pycache__/
+*.pyc
+
 # --- run-time scratch written by the port -----------------------------------
 crash_reports/
 *.log
