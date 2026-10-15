@@ -6488,3 +6488,62 @@ The reason `--control` exists is that this file's third bug -- reading an ADRP's
 own operands when the memory operand belongs to the *next* instruction -- also
 reported a clean zero, and would have been reported as "nobody accesses the
 engine global" if no control had been required.
+
+### 2026-10-16: the `menugate=1` wedge is a host-side circular wait
+
+Full write-up, with the measurement tables and the corrected claims:
+`docs/compose/spec/unblock-menu-loading.md` §S4. The short version:
+
+The guest hands a `std::function` continuation to slot 2 of the Cloudcell
+endpoint object. `cloudcellEndpointStubRequest` captures it and returns without
+ever invoking it. The only code that invokes it, `cloudcellPumpCompletion()`,
+has exactly one call site -- inside `frameLoopDriver`, *after* the
+`renderTarget(...)` call. The guest blocks inside that `renderTarget(...)`, so
+frame 1 is never reached and the completion is structurally unreachable. The
+thread that has to deliver the answer is the thread waiting for it.
+
+Measured, two reproductions with identical numbers:
+
+* `cc-slot` counts are **0** with the gate closed and **47** with it open;
+* all 47 callers sit in `0xCD1xxx–0xCD3xxx` (Cloudcell init) and **none** in
+  `0x12aefc0` -- the guest never reaches the menu gate at all;
+* `path-req` is **120 vs 120**, zero difference, so the menu load is not
+  missing a resource.
+
+`ccmode=off|now|bg` (`065402e5`) moves the delivery point up to the capture
+site. The record stays all-zero: a denial the guest can decode, not a forged
+success. Default `off` leaves the verified-good config untouched. `bg` is not
+usable yet -- the alert-pump thread that would drain it is created lazily
+inside an anonymous namespace in `jni_bridge.cpp`.
+
+### RETRACTED (2026-10-16): four claims this file and the source carried as settled
+
+* "the frame loop never runs" -- `loop-top` fires once; `guest-activity=0` only
+  proves `frames < 30`, since it is emitted at `frames % 30 == 0`.
+* "one byte, two consumers, opposite polarity" -- `0xab2c94` also `cbz`s and
+  also needs non-zero. No opposite polarity exists.
+* "the guest never writes this byte" -- it does, at `0x1cbe218` in its own
+  Cloudcell constructor. The store cited as proof (`0x10f0990`, `strb wzr,
+  [sp]`) is a frame zero-init and undercuts the claim.
+* "a single byte test gates the menu" -- it is a four-way AND with two host
+  stub calls between the byte test and the `blr`.
+
+### RETRACTED (2026-10-16): two emulator runs that measured the same thing
+
+`readConf()` read the file once into `char buffer[256]`. The live
+`rr3-gfx.conf` is 2.7 KB, nearly all of it the comment block recording why Mesa
+and `nofb` are load-bearing, so **every setting past byte 256 was discarded
+silently**. `ccmode=now` sat at offset 674 and `menugate=1` after it; neither
+was ever parsed. Two runs meant to differ returned `frames=16080` and `15960`.
+
+A switch that silently does nothing is indistinguishable from a switch that
+does nothing useful, and nothing logged. Fixed in `568133f5`: buffer 4096, an
+explicit `conf_trunc` alarm, and the `gfx-backend` line now echoes `ccmode`,
+`menugate`, `ccdone`, `conf_trunc` and `conf_bytes` -- one line answers "which
+configuration did this run actually use".
+
+The generalisable form, since this file has now been bitten by three different
+instrument failures in a row: **before concluding a switch had no effect,
+prove it was delivered.** `IndexOf` will happily match a switch name inside a
+comment, so reproduce the parse from the parser's own point of view
+(`Substring(0, buffer)` then parse) rather than trusting a text search offset.
