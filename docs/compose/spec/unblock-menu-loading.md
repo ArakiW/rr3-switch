@@ -136,20 +136,32 @@ never parsed:  ccmode=now     menugate=1      ← the variable under test
 
 Two 5-minute emulator runs that were meant to differ came back with `frames=16080` and `15960`. They were the same configuration. A switch that silently does nothing is indistinguishable from a switch that does nothing useful, and nothing logged. Fixed in `568133f5`: buffer 4096, explicit `conf_trunc` alarm, and the `gfx-backend` summary line now echoes `ccmode` / `menugate` / `ccdone` / `conf_trunc` / `conf_bytes` — so the configuration of a run is readable from one line without going to the SD card.
 
-### The delivery fix is currently inert — and that was nearly a wasted run
+### The delivery fix was inert because the ABI was wrong — both now fixed
 
-An adversarial review of `065402e5` before the first measurement found a blocker that five archived runs had been hiding. Every run in which the capture site is reached logs:
+An adversarial review of `065402e5`, run before the first measurement, found that the fix had nothing to deliver. Every archived run that reaches the capture site logs:
 
 ```
-cc-endpoint-request: captured continuation vtable=0x0 invoker=0x0 manager=0x0 payload=0x0 blob=0x0 w2=10795
+cc-endpoint-request: captured continuation
+    vtable=0x0 invoker=0x0 manager=0x0 payload=0x0 blob=0x0 w2=10795
 cc-endpoint-request: fn was NULL
 ```
 
-**All five fields are zero, in every run.** `w2=10795` is stable and plausible, so x2 is mapped, but the continuation itself is empty.
+All five fields zero, in all five runs. `takePendingContinuation` fails its `vtable != nullptr` guard, `cloudcellPumpCompletion` returns before writing a line, and a run of `ccmode=now` would have produced one dead `cc-endpoint-request`, zero `cc-deliver`, and the identical wedge.
 
-So the delivery fix has no input to deliver: `takePendingContinuation` fails its `g_ccPending.vtable != nullptr` guard, returns `kNothing`, and `cloudcellPumpCompletion` returns *before writing any line*. A run of `menugate=1 ccmode=now` would have produced one `cc-endpoint-request` with `vtable=0x0`, zero `cc-deliver`, and the guest still wedged.
+**The stub was reading the wrong register.** Recovered from the binary and verified byte-for-byte with capstone against a control (`0x12aefd8` reads back `ldrb w8,[x0,#0x4c1]` from bytes `08045339`):
 
-**Correction to this document's own framing.** The "circular wait" account above is right about the delivery point and incomplete about the premise: the continuation is not merely *undeliverable*, it was never *captured*. `ccmode` remains necessary — a delivery path that cannot exist is still a defect — but it is not sufficient, and it is not the current blocker. **The blocker is the continuation ABI.**
+```
+0xcf1050  ldp  w8, w3, [x0, #8]   ; w2 = [obj+8], w3 = [obj+0xc], BOTH 32-bit
+0xcf105c  str  x21, [sp, #0x20]   ; x21 = sp, saved across the call
+0xcf1068  mov  x4, sp             ; <-- the continuation is in x4
+0xcf107c  blr  x9
+```
+
+x3 cannot hold a pointer at **any** of the 25 call sites of `0xcf1018`: `ldp w8, w3` encodes bits[31:30]=00, so w3 is a 32-bit scalar. The stub treated it as the continuation pointer. That is why the capture was all zeros at one site and `NULL` at another.
+
+The numbers confirm the reading rather than merely permitting it: call site `0xab2d1c` builds its object with `stur q0,[x0,#8]` from `.rodata:0x388280` = `2b2a0000 a01d0000 …`, so `w2 = 0x2a2b = 10795` — the logged `w2` exactly — and `w3 = 0x1da0`.
+
+**Delivery stays on vtable slot 6**, which is correct and was not part of the bug. After the call the guest does `ldr x0,[sp,#0x20] ; cmp x21,x0 ; b.eq #0xcf10a0` — a **frame-integrity dispatch**, not a self-comparison: `[sp+0x20]` held `sp` before the call, so equality means the callee left it alone and the guest takes `vptr[4]` (`0xcf11d0`, a bare `ret`, because the response has not arrived), while inequality means it was clobbered and the guest takes `vptr[5]` (`0xcf11d4` = `operator delete`). Neither delivers anything. `vptr[6]` is `0xcf11d8`, a real prologue, and the only entry with code. With the ABI fixed the stored `payload` is now the real object pointer, which is what that function needs to derive its callee.
 
 ### Why the outcome table below was ambiguous, and what replaced it
 
@@ -193,12 +205,12 @@ Two runs of the same configuration are required before any of this is believed.
 - [x] T8: Locate the `menugate=1` wedge — acceptance: every call site of the 47 host stub calls has a classified caller, and the delivery site is proven unreachable (covers: S4)
 - [x] T9: Make the captured continuation reachable (`ccmode`) — acceptance: build clean, 11/11, frozen hash intact (covers: S4)
 - [x] T10: Make `readConf` self-reporting — acceptance: `gfx-backend` line carries `conf_trunc`/`conf_bytes` and the live conf's settings appear in it (covers: S4)
-- [ ] T6: Unblock cloudcell→menu gate — acceptance: guest opens `MainMenu.gui` or `sprites_*` (covers: S2, S4; depends: T8-T10, T15)
-- [ ] T11: Measure `ccmode=now`, twice — acceptance: two archives with identical discriminators. **Blocked on T15**: with `vtable=0x0` the run cannot answer its own question (covers: S4; depends: T9, T10, **T15**)
+- [ ] T6: Unblock cloudcell→menu gate — acceptance: guest opens `MainMenu.gui` or `sprites_*` (covers: S2, S4; depends: T8-T10, T11, T15)
+- [ ] T11: Measure `ccmode=now`, twice — acceptance: two archives with identical discriminators. The ABI it depends on is fixed as of the commit below, so this is now runnable (covers: S4; depends: T9, T10, T15)
 - [ ] T12: Give `ccmode=bg` a drain that never touches `g_queue_lock` — a dedicated thread polling `g_ccPending` under its own lock, because the alert-pump thread measurably blocks on the lock the wedged game thread holds. Only worth building if T11 shows `now` fails (covers: S4; depends: T9, T11)
 - [x] T13: Fix 70 `vehicles/shaders/*.pvr.z` `Z_DATA_ERROR` — the `.z`-strip fallback served the uncompressed file to an unconditional `inflate()`. Removed; ENOENT now propagates and the guest walks its own format list (covers: S4)
 - [x] T14: Correct the `Mutex` is-handle-0 comment in `cloudcell_defer.cpp` — `_LOCK_T` holds the owning thread id, 0 means unowned, and `mutexCreate` must NOT be added (covers: S4)
-- [ ] T15: **Recover the guest's slot-2 continuation ABI** — every archived run captures `vtable=0x0 invoker=0x0 manager=0x0 payload=0x0 blob=0x0`, so there is nothing to deliver. Establish the real argument shape from the guest binary and fix `cloudcellEndpointStubRequest`'s parameter mapping. **This is the current blocker** (covers: S4)
+- [x] T15: Recover the guest's slot-2 continuation ABI — the stub read x3, a 32-bit scalar, as the continuation pointer; the record is in x4. Verified against a capstone control. `ccmode=now` is now runnable (covers: S4)
 
 ## [S5] Still open
 

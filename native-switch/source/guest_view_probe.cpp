@@ -477,59 +477,101 @@ static CcTake takePendingContinuation(CloudcellContinuation* out,
 
 void cloudcellPumpCompletion(const char* mode);
 
-// x1->vtable[2](x1, str, w2, std::function&&)  -- 0xcf1018's call site.
+// x1->vtable[2](x1, str, w2, w3, &record)  -- the guest's call at 0xcf107c.
+//
+// ABI, recovered from the binary and verified byte-for-byte with capstone
+// against a control (0x12aefd8 reads back `ldrb w8,[x0,#0x4c1]` from bytes
+// 08045339):
+//
+//   0xcf1050  ldp  w8, w3, [x0, #8]   ; w2 = [obj+8], w3 = [obj+0xc], BOTH 32-bit
+//   0xcf105c  str  x21, [sp, #0x20]   ; x21 = sp, saved across the call
+//   0xcf1068  mov  x4, sp             ; <-- THE CONTINUATION IS IN x4
+//   0xcf106c  mov  x0, x1             ; self
+//   0xcf1070  ldr  x9, [x9, #0x10]    ; slot 2
+//   0xcf1074  mov  x1, x2             ; const char* into a caller's std::string
+//   0xcf1078  mov  w2, w8
+//   0xcf107c  blr  x9
+//
+// So this stub used to read the WRONG REGISTER. It took x3 as the
+// continuation pointer, but x3 is a 32-bit scalar field loaded by `ldp w8,
+// w3` -- encoding bits[31:30]=00, which cannot carry a 64-bit pointer at ANY
+// of the 25 call sites of 0xcf1018. That is why every archived run logged
+//
+//   vtable=0x0 invoker=0x0 manager=0x0 payload=0x0 blob=0x0 w2=10795
+//
+// and why one of the two calls logged "fn was NULL": x3 was the small
+// constant 0x1da0 (7584) at the confirmed site and 0 at another.
+//
+// Corroboration that the numbers are the right ones and not coincidence:
+// call site 0xab2d1c builds its object with `stur q0,[x0,#8]` from
+// .rodata:0x388280 = 2b2a0000 a01d0000 ..., so w2 = 0x2a2b = 10795 -- the
+// logged w2 exactly -- and w3 = 0x1da0.
+//
+// The continuation record is the callee's incoming stack frame: x4 = sp, and
+// the five 64-bit words are vptr, invoker, manager, payload, &record, which is
+// what CloudcellContinuation above already declares.
+//
+// Delivery stays on vtable slot 6. After the call returns the guest does
+//   0xcf1084 ldr x0,[sp,#0x20] ; 0xcf1088 cmp x21,x0 ; 0xcf108c b.eq #0xcf10a0
+// which is a frame-integrity DISPATCH, not a self-comparison: [sp+0x20] held
+// sp before the call, so equality means the callee left it alone and the
+// guest takes vptr[4] (0xcf11d0 = a bare `ret`, because the response has not
+// arrived yet), while inequality means it was clobbered and the guest takes
+// vptr[5] (0xcf11d4 = operator delete). Neither delivers anything. vptr[6] is
+// 0xcf11d8, a real prologue, and it is the only entry with code -- which is
+// why the host stores the record and calls it later.
 extern "C" uint64_t cloudcellEndpointStubRequest(void* self, const void* str,
-                                                 uint32_t w2, void* fn) {
+                                                 uint32_t w2, uint32_t w3,
+                                                 const CloudcellContinuation* cont) {
     (void)self;
     (void)str;
-    (void)w2;
-    if (fn != nullptr) {
+    (void)w3;
+    if (cont != nullptr && cont->vtable != nullptr) {
         // Copied under the lock, not read out of the global for the log below:
-        // with "bg" set, the alert-pump thread can take and clear this record
-        // between the store above and the snprintf, and an unlocked read of it
-        // here would print the zeros the other thread just left behind -- i.e.
-        // a log line that contradicts itself.
+        // with "bg" set, a drain thread can take and clear this record between
+        // the store above and the snprintf, and an unlocked read of it here
+        // would print the zeros the other thread just left behind -- i.e. a log
+        // line that contradicts itself.
         CloudcellContinuation captured{};
         {
             mutexLock(&g_ccPendingLock);
-            std::memcpy(&g_ccPending, fn, sizeof(g_ccPending));
+            g_ccPending = *cont;
             g_ccRequestSeen = true;
             captured = g_ccPending;
             mutexUnlock(&g_ccPendingLock);
         }
-        char diag[224];
+        char diag[256];
         __builtin_snprintf(diag, sizeof(diag),
-            "cc-endpoint-request: captured continuation vtable=%p invoker=%p"
-            " manager=%p payload=%p blob=%p w2=%u",
+            "cc-endpoint-request: captured vtable=%p invoker=%p manager=%p"
+            " payload=%p blob=%p w2=%u w3=%u",
             captured.vtable, captured.invoker, captured.manager,
-            captured.payload, captured.blob, w2);
+            captured.payload, captured.blob, w2, w3);
         appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                             "cc-endpoint-request", 249, 0, diag);
 
         // Deliver from HERE, the only context on the capture path that is not
-        // downstream of the call the guest is wedged in. Read once per capture,
-        // not per mode branch, so the value the log line reports below and the
-        // value acted on here cannot disagree.
+        // downstream of the call the guest is wedged in.
         const char* mode = gfxCloudcellCompleteMode();
         if (std::strcmp(mode, "now") == 0) {
             // Inline. Re-entrant by construction -- the guest is still inside
             // the Cloudcell call that produced this request -- which is the
-            // hazard cloudcell_defer.h exists to prevent, so this mode is the
-            // diagnostic arm of the A/B and not the safe one.
+            // hazard cloudcell_defer.h exists to prevent, so this mode is a
+            // bounded A/B and not the safe one.
             cloudcellPumpCompletion("now");
         }
         else if (std::strcmp(mode, "bg") == 0) {
             // Deferred. Nothing is passed in: the record lives in
-            // g_ccPending, which the drain reads under g_ccPendingLock, so the
-            // callback stays a plain function call on whatever thread
-            // cloudcell_pump() happens to be running on. That is what lets the
-            // existing alert-pump tick take it with no edit to jni_bridge.cpp.
+            // g_ccPending, which the drain reads under g_ccPendingLock.
             cloudcell_defer([]() { cloudcellPumpCompletion("bg"); });
         }
     } else {
+        char diag[160];
+        __builtin_snprintf(diag, sizeof(diag),
+            "cc-endpoint-request: no continuation, cont=%p vtable=%p w2=%u w3=%u",
+            (const void*)cont,
+            (const void*)(cont != nullptr ? cont->vtable : nullptr), w2, w3);
         appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
-                            "cc-endpoint-request", 249, 0,
-                            "cc-endpoint-request: fn was NULL");
+                            "cc-endpoint-request", 249, 0, diag);
     }
     return 0;
 }
