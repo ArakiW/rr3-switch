@@ -571,13 +571,25 @@ void cloudcellPumpCompletion(const char* mode) {
         return;
     }
     if (take == CcTake::kUnusable) {
-        char diag[160];
-        __builtin_snprintf(diag, sizeof(diag),
-            "cc-complete: SKIPPED, mode=%s thread=0x%x pending_vtable=%p"
-            " slot6=%p", mode != nullptr ? mode : "(null)",
-            (unsigned)threadGetCurHandle(), saved.vtable, nullptr);
-        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
-                            "cc-complete", 249, 0, diag);
+        // ONE-SHOT, added 2026-10-16 after review. The frame-loop caller runs
+        // this once per frame under "ccdone=1", and the gate-closed baseline
+        // reaches ~46,000 frames, so an unconditional line here is ~46,000
+        // 160-byte appends to the SD card that bury the cc-deliver line they
+        // exist to explain. Same reason kNothing is silent; the difference is
+        // that this case is a finding worth stating once rather than a rate to
+        // report. The record is deliberately NOT consumed, so a later capture
+        // that is usable still delivers, and this stays spent.
+        static bool g_unusableReported = false;
+        if (!g_unusableReported) {
+            g_unusableReported = true;
+            char diag[160];
+            __builtin_snprintf(diag, sizeof(diag),
+                "cc-complete: SKIPPED, mode=%s thread=0x%x pending_vtable=%p"
+                " slot6=%p (one-shot; record kept, not consumed)", mode != nullptr ? mode : "(null)",
+                (unsigned)threadGetCurHandle(), saved.vtable, nullptr);
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                "cc-complete", 249, 0, diag);
+        }
         return;
     }
     // The one line per delivery actually attempted, and the one that makes the

@@ -2416,9 +2416,17 @@ void alertPumpWorker(void* opaque) {
         //
         // What this thread actually does next is the open question, and it is
         // not a wait: in 20261004-075549 it produced wait-result=1 and then
-        // reached-drain=0, which puts the block inside cloudcell_pump's
-        // std::lock_guard<std::mutex> on g_queue_lock -- held by the guest's
-        // main thread while it spins inside the render call.
+        // reached-drain=0, which puts the block inside cloudcell_pump's lock
+        // on g_queue_lock -- held by the guest's main thread while it spins
+        // inside the render call.
+        //
+        // CORRECTED 2026-10-16: this said "std::lock_guard<std::mutex>", which
+        // is wrong. cloudcell_defer.cpp:64 is `static Mutex g_queue_lock{}` --
+        // a libnx Mutex, try-locked at cloudcell_defer.cpp:236. Naming it a
+        // std::mutex invites the next reader to "port" the fix onto a Mutex
+        // that already is one. The measurement underneath is unaffected, and it
+        // is also why ccmode=bg cannot work: see
+        // docs/compose/spec/unblock-menu-loading.md S4.
 #ifndef RR3_ALERT_PUMP_CONDVAR
 #define RR3_ALERT_PUMP_CONDVAR 0
 #endif
