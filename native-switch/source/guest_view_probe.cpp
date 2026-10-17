@@ -636,9 +636,20 @@ RR3_CC_ENDPOINT_SLOT(7)
 // cc-slot histogram showed slot 12 "being called" four times -- those were the
 // second-level calls, and the first-level one is the one that jumped to zero.
 //
-// As with the endpoint slots this logs and returns 0 rather than guessing: a
-// legible fault that names itself is worth more than a plausible value that
-// corrupts state quietly. The index tells us exactly what to implement next.
+// As with the endpoint slots this logs, but it MUST return `self` and not 0.
+// An unpinned first-level slot is often a GETTER, and the caller dereferences
+// the RETURN VALUE as an object rather than calling it. That is exactly this:
+//
+//   0xb3bc30  ldr  x8, [x8, #0x28]  ; slot 5
+//   0xb3bc34  ldr  x9, [x8]         ; the RESULT, used as a vtable
+//   0xb3bc3c  ldr  x9, [x9, #0x80]
+//   0xb3bc40  blr  x9               ; <- wedged here, lr=0xb3bc44
+//
+// Returning 0 there makes the guest dereference address 0, read 0x80 bytes
+// past it and branch to whatever is found -- which is how the fill below
+// turned a working "returns self" into a new wedge in ccdeliver5. `self` is
+// the right answer because s_ccBuf[0] is s_ccVtable, so [self] is already a
+// valid vtable and index 16 of it is now a real function.
 #define RR3_CC_UNPINNED(n)                                                   \
     extern "C" uint64_t cloudcellUnpinned##n(void* self) {                   \
         char d[128];                                                         \
@@ -646,7 +657,7 @@ RR3_CC_ENDPOINT_SLOT(7)
                            "cc-slot-unpinned: slot=%d self=%p", (n), self);  \
         appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",  \
                             "cc-slot-unpinned", 249, 0, d);                   \
-        return 0;                                                            \
+        return reinterpret_cast<uint64_t>(self);                            \
     }
 RR3_CC_UNPINNED(0) RR3_CC_UNPINNED(1) RR3_CC_UNPINNED(2) RR3_CC_UNPINNED(3)
 RR3_CC_UNPINNED(4) RR3_CC_UNPINNED(5) RR3_CC_UNPINNED(6) RR3_CC_UNPINNED(7)
