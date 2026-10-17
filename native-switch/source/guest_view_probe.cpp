@@ -3221,37 +3221,37 @@ void* frameLoopDriver(void* opaque) {
                 pollGlobal != 0
                     ? *reinterpret_cast<const uintptr_t*>(pollGlobal)
                     : 0;
-            // TERM 1 OF THE MENU GATE HAS NEVER BEEN MEASURED.
+            // CORRECTION 2026-10-17. This poll used to read GOT 0x1f6d5f50 and
+            // reported 0 for 136 consecutive polls, which read as "term 1 is
+            // false". It was meaningless: 0x1f6d5f50 is ~494 MB ABOVE the guest
+            // image's upper bound 0x1fc7a99, so the poll was reading unmapped
+            // memory. The real slot is 0x1f6df50, which is adrp #0x1f6d000 +
+            // #0xf50 in the gate at 0x12aefb8, i.e. 0x980 above Cloudcell's
+            // 0x1f6d5d0, not 0x180.
             //
-            // Reading 0x12aef90..0x12af020 exactly:
+            // 0x00CBA93C is not new arithmetic: it is kMenuLoaderDelta, which
+            // this file has carried since 2026-10-12 with the comment "Menu
+            // loader: GOT entry at ELF 0x1f6df50". The address was transcribed
+            // wrong once and the wrong value was never range-checked.
             //
-            //   0x12aefb4  adrp x23, #0x1f6d000
-            //   0x12aefb8  ldr  x23, [x23, #0xf50]   <- a DIFFERENT global
-            //   0x12aefc0  ldr  x8, [x23]
-            //   0x12aefc4  cbz  x8, #0x12af014       ; term 1
-            //   0x12aecc   ldr  x8, [x8, #0x5d0]     ; Cloudcell global
-            //   0x12aefd4  cbz  x0, #0x12af014       ; term 2
-            //   0x12aefdc  cbz  w8, #0x12af014       ; term 3, the 0x4c1 byte
-            //   0x12aefe4  ldr  x8, [x8, #0x30]      ; Cloudcell vtable[6]
-            //   0x12aeff0  ldr  x8, [x8, #0x88]      ; Cloudcell vtable[17]
-            //   0x12aeff8  tbnz w0, #0, #0x12af014   ; term 4, the tag
-            //   0x12aeffc  ldr  x0, [x23]            ; x0 is the TERM-1 OBJECT
-            //   0x12af00c  ldr  x8, [x8, #0xa8]      ; its vtable[21]
-            //   0x12af010  blr  x8                   ; the menu loader
-            //
-            // So the menu loader is a method on the term-1 object, not on the
-            // Cloudcell, and term 1 comes from GOT slot 0x1f6d5f50 -- 0x180
-            // above the Cloudcell slot this poll has been reading. Terms 2, 3
-            // and 4 all read as satisfied in ccpoll3 and the menu still does
-            // not load, which makes term 1 the one unmeasured condition.
-            //
-            // 0x00CB9FBC is renderTarget's delta to 0x1f6d5d0; +0x180 gives
-            // 0x1f6d5f50.
+            // 0x00CBA93C is not new arithmetic: it is kMenuLoaderDelta, which
+            // this file has carried since 2026-10-12 with the comment "Menu
+            // loader: GOT entry at ELF 0x1f6df50". The address was transcribed
+            // wrong once and the wrong value was never range-checked. (That
+            // constant is declared inside the Cloudcell-install block below,
+            // out of scope here, so it is spelled out again.)
+            constexpr uint64_t kMenuLoaderGotDelta = 0x00CBA93CULL;
+            constexpr uintptr_t kGuestImageLow = 0x00100000ULL;
+            constexpr uintptr_t kGuestImageHigh = 0x001FC7A99ULL;
+            const uintptr_t t1Got = renderTarget + kMenuLoaderGotDelta;
+            const bool t1GotOk =
+                t1Got >= kGuestImageLow && t1Got <= kGuestImageHigh;
             const uintptr_t t1Global =
-                *reinterpret_cast<const uintptr_t*>(
-                    renderTarget + 0x00CBA13CULL);
+                t1GotOk ? *reinterpret_cast<const uintptr_t*>(t1Got) : 0;
+            const bool t1CellOk =
+                t1Global >= kGuestImageLow && t1Global <= kGuestImageHigh;
             const uintptr_t t1Obj =
-                t1Global != 0
+                t1CellOk
                     ? *reinterpret_cast<const uintptr_t*>(t1Global)
                     : 0;
             const uintptr_t sub280 =
