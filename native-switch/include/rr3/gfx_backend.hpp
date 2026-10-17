@@ -91,6 +91,10 @@ bool gfxCloudcellCompleteRequests();
 //   now -- invoke it inline inside the endpoint stub, right after the capture
 //   bg  -- cloudcell_defer() it and let the existing alert-pump thread drain it
 // Never returns anything but "off", "now" or "bg".
+// "ccsynth=0|1": install the host's synthetic Cloudcell object (1) or let the
+// guest build its own (0, the default). See gfxCloudcellSynthetic().
+bool gfxCloudcellSynthetic();
+
 const char* gfxCloudcellCompleteMode();
 
 // "mlstub=1": force menu-loader vtable slot 21 to the host stub even when the

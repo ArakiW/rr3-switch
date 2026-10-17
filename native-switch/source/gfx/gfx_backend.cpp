@@ -183,6 +183,16 @@ struct ConfState {
     // "ccmode=now|bg" -- WHERE the captured continuation is invoked from. See
     // gfxCloudcellCompleteMode() for why the default has to stay empty.
     char ccMode[8] = {0};
+    // "ccsynth=1" -- install the host's synthetic Cloudcell object. Default is
+    // 0, which LETS THE GUEST BUILD ITS OWN. The guest's constructor
+    // (0x1cbe03c) allocates 0x4d0 bytes, publishes the object into this very
+    // global at 0x1cbe094, sets its own first word to the cc::ICloudcell
+    // vtable 0x1f63b58 at 0x1cbe290, and sets its +0x4c1 availability byte to
+    // 1 at 0x1cbe218. Replacing that with a hand-built table means every
+    // entry the host guessed wrong is a null or a mis-typed pointer, and three
+    // successive fixes for that each cost a 5-minute emulator run and each
+    // was wrong. See docs/compose/spec/unblock-menu-loading.md S4.
+    bool cloudcellSynthetic = false;
     // "mlstub=1" -- take menu-loader vtable slot 21 even when the guest's own
     // vtable is legal. See guest_view_probe.cpp for the measurement.
     bool forceMenuStub = false;
@@ -359,6 +369,10 @@ void readConf() {
         else if (std::strcmp(key, "ccdone") == 0 ||
                  std::strcmp(key, "cc-done") == 0) {
             s_conf.cloudcellComplete = parseSwitch(value);
+        }
+        else if (std::strcmp(key, "ccsynth") == 0 ||
+                 std::strcmp(key, "cc-synth") == 0) {
+            s_conf.cloudcellSynthetic = parseSwitch(value);
         }
         else if (std::strcmp(key, "ccmode") == 0 ||
                  std::strcmp(key, "cc-mode") == 0 ||
@@ -637,6 +651,21 @@ bool gfxCloudcellCompleteRequests() {
 // so the default is this port's pre-switch behaviour and not an accident.
 // Read it from any thread; readConf() is one-shot and resolves under the same
 // guard as the backend selection.
+// "ccsynth=0|1": whether the host installs its own Cloudcell object over the
+// one the guest builds for itself. Default 0 -- let the guest build it.
+//
+// The guest's constructor publishes a fully constructed object into the same
+// global at 0x1cbe094, with the real cc::ICloudcell vtable at its first word
+// (0x1f63b58, confirmed by the RTTI typeinfo naming N2cc10ICloudcellE) and its
+// own +0x4c1 availability byte already set to 1 at 0x1cbe218. Every entry in
+// that table is the guest's own code, so nothing can be null and nothing can
+// be mis-typed -- which is exactly the class of bug the synthetic table kept
+// producing. Set 1 to restore the old substitution for comparison.
+bool gfxCloudcellSynthetic() {
+    ensureResolved();
+    return s_conf.cloudcellSynthetic;
+}
+
 const char* gfxCloudcellCompleteMode() {
     ensureResolved();
     return s_conf.ccMode[0] != '\0' ? s_conf.ccMode : "off";

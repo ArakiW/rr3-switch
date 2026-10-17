@@ -2628,7 +2628,8 @@ GuestViewProbe runGuestViewProbe(NWindow* window, const char* progressPath) {
                 "cc-ptr-diag", 111,
                 (static_cast<unsigned long long>(ccGlobal & 0xFFFFFFFFULL) << 32) |
                 (cloudcell & 0xFFFFFFFFULL));
-            if (cloudcell == 0 || cloudcell < 0x100000000ULL) {
+            if (gfxCloudcellSynthetic() &&
+                (cloudcell == 0 || cloudcell < 0x100000000ULL)) {
                 static uint64_t s_ccBuf[256] = {};
                 static uint64_t s_ccVtable[64] = {};
                 // The guest's Cloudcell init function (libRealRacing3.so
