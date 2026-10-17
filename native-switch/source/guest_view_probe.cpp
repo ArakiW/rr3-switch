@@ -3289,31 +3289,6 @@ void* frameLoopDriver(void* opaque) {
             // boundary -- which is also the only way to look at it that does
             // not do the very thing the gate exists to police.
             //
-            // The vtable base is logged too, so the table can be confirmed to
-            // be the real cc::ICloudcell one (0x1f63b58) rather than something
-            // else wearing the same object's first word.
-            const uintptr_t pollVt =
-                pollCell != 0
-                    ? *reinterpret_cast<const uintptr_t*>(pollCell)
-                    : 0;
-            const uintptr_t sub280 =
-                pollCell != 0
-                    ? *reinterpret_cast<const uintptr_t*>(pollCell + 0x280)
-                    : 0;
-            char cc[256];
-            __builtin_snprintf(
-                cc, sizeof(cc),
-                "cc-cell-poll: f=%llu cell=%p vt=%p sub280=%p tag=%d"
-                " gate_byte4c1=%s synth=%d",
-                static_cast<unsigned long long>(frames),
-                reinterpret_cast<void*>(pollCell),
-                reinterpret_cast<void*>(pollVt),
-                reinterpret_cast<void*>(sub280),
-                static_cast<int>(sub280 & 1ULL),
-                (pollCell != 0 &&
-                 *reinterpret_cast<const uint8_t*>(pollCell + 0x4C1) != 0)
-                    ? "1" : "0",
-                gfxCloudcellSynthetic() ? 1 : 0);
             appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                                 cc, 74, 0);
         }
