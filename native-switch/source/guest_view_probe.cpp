@@ -624,6 +624,48 @@ RR3_CC_ENDPOINT_SLOT(6)
 RR3_CC_ENDPOINT_SLOT(7)
 #undef RR3_CC_ENDPOINT_SLOT
 
+// Every UNPINNED first-level Cloudcell slot needs a real function too, for the
+// same reason the endpoint vtable needed one. s_ccVtable is 64 entries and only
+// ten of them ever had a target -- eight semantic pins plus slot 3 -- so any
+// guest call to one of the other 54 was `blr` to address 0.
+//
+// That is not hypothetical: ccdeliver4 wedged on exactly
+//   0xb44808  ldr x8,[x19] ; 0xb44814 ldr x8,[x8,#0x60] ; 0xb44818 blr x8
+// i.e. first-level index 12. The second-level table (s_cc2Vtable) is filled
+// from kCloudcell2SlotTable and does not have this problem, which is why the
+// cc-slot histogram showed slot 12 "being called" four times -- those were the
+// second-level calls, and the first-level one is the one that jumped to zero.
+//
+// As with the endpoint slots this logs and returns 0 rather than guessing: a
+// legible fault that names itself is worth more than a plausible value that
+// corrupts state quietly. The index tells us exactly what to implement next.
+#define RR3_CC_UNPINNED(n)                                                   \
+    extern "C" uint64_t cloudcellUnpinned##n(void* self) {                   \
+        char d[128];                                                         \
+        __builtin_snprintf(d, sizeof(d),                                     \
+                           "cc-slot-unpinned: slot=%d self=%p", (n), self);  \
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",  \
+                            "cc-slot-unpinned", 249, 0, d);                   \
+        return 0;                                                            \
+    }
+RR3_CC_UNPINNED(0) RR3_CC_UNPINNED(1) RR3_CC_UNPINNED(2) RR3_CC_UNPINNED(3)
+RR3_CC_UNPINNED(4) RR3_CC_UNPINNED(5) RR3_CC_UNPINNED(6) RR3_CC_UNPINNED(7)
+RR3_CC_UNPINNED(8) RR3_CC_UNPINNED(9) RR3_CC_UNPINNED(10) RR3_CC_UNPINNED(11)
+RR3_CC_UNPINNED(12) RR3_CC_UNPINNED(13) RR3_CC_UNPINNED(14) RR3_CC_UNPINNED(15)
+RR3_CC_UNPINNED(16) RR3_CC_UNPINNED(17) RR3_CC_UNPINNED(18) RR3_CC_UNPINNED(19)
+RR3_CC_UNPINNED(20) RR3_CC_UNPINNED(21) RR3_CC_UNPINNED(22) RR3_CC_UNPINNED(23)
+RR3_CC_UNPINNED(24) RR3_CC_UNPINNED(25) RR3_CC_UNPINNED(26) RR3_CC_UNPINNED(27)
+RR3_CC_UNPINNED(28) RR3_CC_UNPINNED(29) RR3_CC_UNPINNED(30) RR3_CC_UNPINNED(31)
+RR3_CC_UNPINNED(32) RR3_CC_UNPINNED(33) RR3_CC_UNPINNED(34) RR3_CC_UNPINNED(35)
+RR3_CC_UNPINNED(36) RR3_CC_UNPINNED(37) RR3_CC_UNPINNED(38) RR3_CC_UNPINNED(39)
+RR3_CC_UNPINNED(40) RR3_CC_UNPINNED(41) RR3_CC_UNPINNED(42) RR3_CC_UNPINNED(43)
+RR3_CC_UNPINNED(44) RR3_CC_UNPINNED(45) RR3_CC_UNPINNED(46) RR3_CC_UNPINNED(47)
+RR3_CC_UNPINNED(48) RR3_CC_UNPINNED(49) RR3_CC_UNPINNED(50) RR3_CC_UNPINNED(51)
+RR3_CC_UNPINNED(52) RR3_CC_UNPINNED(53) RR3_CC_UNPINNED(54) RR3_CC_UNPINNED(55)
+RR3_CC_UNPINNED(56) RR3_CC_UNPINNED(57) RR3_CC_UNPINNED(58) RR3_CC_UNPINNED(59)
+RR3_CC_UNPINNED(60) RR3_CC_UNPINNED(61) RR3_CC_UNPINNED(62) RR3_CC_UNPINNED(63)
+#undef RR3_CC_UNPINNED
+
 extern "C" void* cloudcellSlot3Endpoint(void* self) {
     (void)self;
     static uint64_t s_endpointVtable[8] = {};
@@ -2663,6 +2705,34 @@ GuestViewProbe runGuestViewProbe(NWindow* window, const char* progressPath) {
                 // first word. This returns a real endpoint object instead, and
                 // its slot 2 captures the continuation the caller hands over.
                 s_ccVtable[3] = reinterpret_cast<uint64_t>(&cloudcellSlot3Endpoint);
+                // Whatever is STILL zero after the pins is an entry the guest
+                // must not be able to `blr` to zero. See the note on
+                // RR3_CC_UNPINNED above for the measurement that forced this.
+                static const uint64_t kCloudcellSlotFallback[64] = {
+#define RR3_CSF(n) reinterpret_cast<uint64_t>(&cloudcellUnpinned##n)
+                    RR3_CSF(0),  RR3_CSF(1),  RR3_CSF(2),  RR3_CSF(3),
+                    RR3_CSF(4),  RR3_CSF(5),  RR3_CSF(6),  RR3_CSF(7),
+                    RR3_CSF(8),  RR3_CSF(9),  RR3_CSF(10), RR3_CSF(11),
+                    RR3_CSF(12), RR3_CSF(13), RR3_CSF(14), RR3_CSF(15),
+                    RR3_CSF(16), RR3_CSF(17), RR3_CSF(18), RR3_CSF(19),
+                    RR3_CSF(20), RR3_CSF(21), RR3_CSF(22), RR3_CSF(23),
+                    RR3_CSF(24), RR3_CSF(25), RR3_CSF(26), RR3_CSF(27),
+                    RR3_CSF(28), RR3_CSF(29), RR3_CSF(30), RR3_CSF(31),
+                    RR3_CSF(32), RR3_CSF(33), RR3_CSF(34), RR3_CSF(35),
+                    RR3_CSF(36), RR3_CSF(37), RR3_CSF(38), RR3_CSF(39),
+                    RR3_CSF(40), RR3_CSF(41), RR3_CSF(42), RR3_CSF(43),
+                    RR3_CSF(44), RR3_CSF(45), RR3_CSF(46), RR3_CSF(47),
+                    RR3_CSF(48), RR3_CSF(49), RR3_CSF(50), RR3_CSF(51),
+                    RR3_CSF(52), RR3_CSF(53), RR3_CSF(54), RR3_CSF(55),
+                    RR3_CSF(56), RR3_CSF(57), RR3_CSF(58), RR3_CSF(59),
+                    RR3_CSF(60), RR3_CSF(61), RR3_CSF(62), RR3_CSF(63),
+#undef RR3_CSF
+                };
+                for (int i = 0; i < 64; ++i) {
+                    if (s_ccVtable[i] == 0) {
+                        s_ccVtable[i] = kCloudcellSlotFallback[i];
+                    }
+                }
                 // Second-level object for the member at byte offset 0x10
                 // (s_ccBuf[2]). See the block comment above
                 // kCloudcell2SlotTable for the measured call sites.
