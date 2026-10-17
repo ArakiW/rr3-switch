@@ -3223,28 +3223,36 @@ void* frameLoopDriver(void* opaque) {
                     : 0;
             // The menu gate at 0x12aefc8 is a four-way AND whose terms are, in
             // order, [x23]!=0, [*ccGlobal]!=0, cc->[0x4c1]!=0, and
-            // (cc->vtable[17]() & 1)==0. The first three are now readable; the
-            // fourth is GUEST CODE and calling it from the poll thread would
-            // be both unsafe and, on a real device, the thing the whole gate
-            // exists to police. So record the address of vtable slot 17 and
-            // read it statically instead. With the guest's own object this
-            // should be 0x1f63b58 + 0x88; if the base differs, the gate is
-            // being evaluated against something else entirely.
+            // (vtable[17]() & 1)==0. The fourth is NOT a bool-returning method:
+            // vtable slot 17 is 0x1cbfad4, which is `ldr x0,[x0,#0x280] ; ret`
+            // -- an accessor returning the sub-object at Cloudcell+0x280, and
+            // `& 1` is a LOW-BIT TAG test on that pointer. So the fourth term
+            // asks whether that sub-object is present, and the host can read
+            // the word directly instead of calling guest code across a thread
+            // boundary -- which is also the only way to look at it that does
+            // not do the very thing the gate exists to police.
+            //
+            // The vtable base is logged too, so the table can be confirmed to
+            // be the real cc::ICloudcell one (0x1f63b58) rather than something
+            // else wearing the same object's first word.
             const uintptr_t pollVt =
                 pollCell != 0
                     ? *reinterpret_cast<const uintptr_t*>(pollCell)
                     : 0;
-            const uintptr_t pollSlot17 = pollVt != 0
-                ? *reinterpret_cast<const uintptr_t*>(pollVt + 17 * sizeof(uintptr_t))
-                : 0;
-            char cc[224];
+            const uintptr_t sub280 =
+                pollCell != 0
+                    ? *reinterpret_cast<const uintptr_t*>(pollCell + 0x280)
+                    : 0;
+            char cc[256];
             __builtin_snprintf(
                 cc, sizeof(cc),
-                "cc-cell-poll: f=%llu cell=%p vt=%p vt17=%p gate_byte4c1=%s synth=%d",
+                "cc-cell-poll: f=%llu cell=%p vt=%p sub280=%p tag=%d"
+                " gate_byte4c1=%s synth=%d",
                 static_cast<unsigned long long>(frames),
                 reinterpret_cast<void*>(pollCell),
                 reinterpret_cast<void*>(pollVt),
-                reinterpret_cast<void*>(pollSlot17),
+                reinterpret_cast<void*>(sub280),
+                static_cast<int>(sub280 & 1ULL),
                 (pollCell != 0 &&
                  *reinterpret_cast<const uint8_t*>(pollCell + 0x4C1) != 0)
                     ? "1" : "0",
