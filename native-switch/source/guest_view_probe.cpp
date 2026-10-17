@@ -3199,6 +3199,41 @@ void* frameLoopDriver(void* opaque) {
             appendGuestBootLine(
                 "sdmc:/switch/rr3-native-rehost.guest-view.log", pd, 279, 0);
         }
+        // Does the Cloudcell cell ever become non-zero, and when?
+        //
+        // cc-ptr-diag reads it ONCE, early, before the guest has had a chance to
+        // publish, so a null there says nothing about the rest of the run. The
+        // guest's constructor (0x1cbe028) writes the cell at 0x1cbe094, and
+        // reverse-engineering says the only route to it is a virtual call on a
+        // CloudcellService instance the guest does construct -- so the open
+        // question is purely WHEN that call happens, if ever. Polling is the
+        // cheapest way to answer it: one 4-secondly line, and the first
+        // transition to non-zero names the frame in which it happened.
+        //
+        // Only meaningful when the host is not substituting its own object
+        // (ccsynth=0, the default); with ccsynth=1 the cell holds s_ccBuf and
+        // the line just confirms that.
+        if ((frames % 240) == 0) {
+            const uintptr_t pollGot = renderTarget + 0x00CB9FBCULL;
+            const uintptr_t pollGlobal =
+                *reinterpret_cast<const uintptr_t*>(pollGot);
+            const uintptr_t pollCell =
+                pollGlobal != 0
+                    ? *reinterpret_cast<const uintptr_t*>(pollGlobal)
+                    : 0;
+            char cc[144];
+            __builtin_snprintf(
+                cc, sizeof(cc),
+                "cc-cell-poll: f=%llu cell=%p gate_byte4c1=%s synth=%d",
+                static_cast<unsigned long long>(frames),
+                reinterpret_cast<void*>(pollCell),
+                (pollCell != 0 &&
+                 *reinterpret_cast<const uint8_t*>(pollCell + 0x4C1) != 0)
+                    ? "1" : "0",
+                gfxCloudcellSynthetic() ? 1 : 0);
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                cc, 74, 0);
+        }
         padUpdate(&framePad);
         // --- wedge breadcrumbs -------------------------------------------
         // The progress marker truncates, and frame-loop-heartbeat (below,
