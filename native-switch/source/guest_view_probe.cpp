@@ -2279,6 +2279,35 @@ GuestViewProbe runGuestViewProbe(NWindow* window, const char* progressPath) {
     // Bind the trace only around guest callbacks. The resolver target remains
     // transparent everywhere else, including the independent renderer NRO.
     enableGuestViewGlTrace(progressPath);
+    // LIFECYCLE ORDER. onCreateJNI must run BEFORE onViewCreatedJNI.
+    //
+    // The guest's exported onViewCreatedJNI (0x12b35e4) is four instructions:
+    //
+    //   0x12b35e4  adrp x8, #0x1f6e000
+    //   0x12b35e8  ldr  x8, [x8, #0x540]      ; the MainActivity singleton cell
+    //   0x12b35ec  ldr  x0, [x8]
+    //   0x12b35f0  cbz  x0, #0x12b35f8        ; NULL -> silent return
+    //   0x12b35f4  b    #0x12ad504            ; otherwise build the term-1 object
+    //
+    // and func 0x12ad504 is a ONE-SHOT: `ldrb w8,[x19,#0x4a4] ; cbz` builds the
+    // object on first entry, and every later entry dereferences it with no null
+    // check. That object's vtable[21] is 0x14851e8 -- the menu loader the
+    // per-frame gate at 0x12af010 calls:
+    //
+    //   0x12aefb8  ldr  x23, [x23, #0xf50]   ; GOT 0x1f6df50, the term-1 cell
+    //   0x12aefc4  cbz  x8, #0x12af014        ; TERM 1 of the four-way AND
+    //   ... cc->[0x4c1], the vtable[17] tag ...
+    //   0x12af010  blr  x8                   ; vtable[21] = menu loader
+    //
+    // The host called onViewCreatedJNI from runGuestViewProbe (main.cpp:1176)
+    // while onCreateJNI only runs later, from runGuestEntryProbe (main.cpp:
+    // 1276). So the singleton was null at that moment, the cbz fired, and term
+    // 1 stayed false for the whole run -- 136/136 polls reading 0x0. Everything
+    // downstream of the gate was never entered.
+    //
+    // This is a host ordering bug, not a guest limitation, and it is not an
+    // anti-cheat gate: no credential is involved, only a null check on an
+    // object this same process is responsible for creating first.
     cloudcell_pump("before-created");
     appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "view-call-created", 261, 0);
     if (progressPath != nullptr) {
@@ -2288,6 +2317,54 @@ GuestViewProbe runGuestViewProbe(NWindow* window, const char* progressPath) {
     }
     void* jniEnvironment = guestJniEnvironment();
     void* activityObject = guestActivityObject();
+    // LIFECYCLE ORDER. onCreateJNI must run BEFORE onViewCreatedJNI.
+    //
+    // The guest's exported onViewCreatedJNI (0x12b35e4) is four instructions:
+    //
+    //   0x12b35e4  adrp x8, #0x1f6e000
+    //   0x12b35e8  ldr  x8, [x8, #0x540]      ; the MainActivity singleton cell
+    //   0x12b35ec  ldr  x0, [x8]
+    //   0x12b35f0  cbz  x0, #0x12b35f8        ; NULL -> silent return
+    //   0x12b35f4  b    #0x12ad504            ; otherwise build the term-1 object
+    //
+    // and func 0x12ad504 is a ONE-SHOT: `ldrb w8,[x19,#0x4a4] ; cbz` builds the
+    // object on first entry, and every later entry dereferences it with no null
+    // check. That object's vtable[21] is 0x14851e8 -- the menu loader the
+    // per-frame gate at 0x12af010 calls:
+    //
+    //   0x12aefb8  ldr  x23, [x23, #0xf50]   ; GOT 0x1f6df50, the term-1 cell
+    //   0x12aefc4  cbz  x8, #0x12af014        ; TERM 1 of the four-way AND
+    //   ... cc->[0x4c1], the vtable[17] tag ...
+    //   0x12af010  blr  x8                   ; vtable[21] = menu loader
+    //
+    // The host called onViewCreatedJNI from runGuestViewProbe (main.cpp:1176)
+    // while onCreateJNI only ran later, from runGuestEntryProbe (main.cpp:
+    // 1276). So the singleton was null at that moment, the cbz fired, and term
+    // 1 stayed false for the whole run -- 136/136 polls reading 0x0. Everything
+    // downstream of the gate was never entered.
+    //
+    // This is a host ordering bug, not a guest limitation, and it is not an
+    // anti-cheat gate: no credential is involved, only a null check on an
+    // object this same process is responsible for creating first.
+    //
+    // Both call sites are direct branches, confirmed by scanning every bl/b in
+    // .text: 0x12ad504 is reached only from 0x12b35f4, and the per-frame
+    // function 0x12aea7c only from 0x12b3624. An earlier reverse pass reported
+    // both as having zero direct callers; that was a scanner defect (capstone
+    // yields the already-scaled displacement, so comparing it against an
+    // unscaled imm12 silently matches nothing).
+    const uintptr_t createTarget =
+        resolveMainImageExport(
+            "Java_com_firemint_realracing_MainActivity_onCreateJNI");
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "onCreateJNI-pre", 110,
+                        static_cast<unsigned long long>(createTarget));
+    if (createTarget != 0) {
+        reinterpret_cast<void (*)(void*, void*)>(createTarget)(
+            jniEnvironment, activityObject);
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "onCreateJNI-ret", 110, 0);
+    }
     probe.createdCalled = true;
     reinterpret_cast<void (*)(void*, void*)>(createdTarget)(
         jniEnvironment, activityObject);
