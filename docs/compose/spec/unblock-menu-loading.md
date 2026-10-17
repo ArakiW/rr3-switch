@@ -180,7 +180,44 @@ An analyst following the old table would start auditing vtable wiring instead of
 
 Only the last row makes the delivery pair meaningful. That is what T15 is for.
 
-### Acceptance, fixed before running
+### ccdeliver3 (2026-10-17): both fixes confirmed, and a real stack
+
+First run with a working config parser and the corrected ABI. The run states its own configuration:
+
+```
+gfx-backend ... ccmode=now menugate=1 ccdone=0 conf_trunc=0 conf_bytes=2542
+```
+
+**The ABI fix is confirmed by the numbers the guest produced**, not just by our reasoning:
+
+```
+cc-endpoint-request: captured vtable=0x21072a8448 invoker=0x210613e0d4
+    manager=0x0 payload=0x210f970060 blob=0x1082cfbdb0 w2=10795 w3=7584
+```
+
+`w3=7584` is `0x1da0` and `w2=10795` is `0x2a2b` — exactly the two values the binary predicted from `.rodata:0x388280`. A second capture at a different call site shows `w2=10765 w3=0 manager=0x20`.
+
+| metric | before | after |
+|---|---|---|
+| `cc-deliver` | 0 (inert) | **2** |
+| `cc-complete-returned` | 0 | **2** |
+| `Z_DATA_ERROR` | 70 | **0** |
+| `frames` | 1 | **1** |
+
+So the continuation is delivered, it returns, and the shader decompression failures are gone — **and the guest still wedges.** The wedge is therefore *not* the pending/response wait. Two blockers removed, blocker remains.
+
+### The stack at the wedge
+
+The host's frame-pointer walk captured it. Innermost first:
+
+```
+0x009f28e0 → 0x00cd33a4 → 0x0138de68 → 0x013c3bf4 → 0x014046e8
+          → 0x01404998 → 0x01405898 → 0x012aeebc → host
+```
+
+`0x12aeebc` is inside the per-frame function `0x12aea7c`; `0xcd33a4` is in the Cloudcell region, and matches the caller addresses seen in `cc-slot` lines (`0xcd32b0`, `0xcd32c8`, `0xcd32d8`). Timeline in the same run: `view-render-ret` → `create-cloudcell` → `render-call-pre` → `cc-endpoint-request` ×2 → `cc-deliver` ×2 → silence.
+
+**Why the import ring could never have found this.** The main thread is `inbridge=0` with `delta=0` — pure guest code making no import calls at all. Classifying the ring this run: 6 of 8 entries are host import-stub bridges, and the 2 that are inside the guest image (`0x15aa19c` = `FMCryptFile::openRead`, `0xba8474` = a stack-canary check followed by a function epilogue) are both **functions that had already returned**. A spin makes no imports, so the ring's guest entries are always stale. The frame-pointer walk is the instrument that works, because it does not depend on the guest calling out.
 
 `ccmode=now` has **not yet been measured**, and until T15 lands it cannot answer its own question.
 
