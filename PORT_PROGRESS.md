@@ -6547,3 +6547,69 @@ instrument failures in a row: **before concluding a switch had no effect,
 prove it was delivered.** `IndexOf` will happily match a switch name inside a
 comment, so reproduce the parse from the parser's own point of view
 (`Substring(0, buffer)` then parse) rather than trusting a text search offset.
+
+### RETRACTED (2026-10-16, later the same day): the continuation is never captured
+
+The 2026-10-16 entry above says the guest hands over a continuation, the host
+captures it, and the only thing wrong is that the delivery point sits inside the
+frame loop. The second half is right. The first half was never verified, and it
+is false:
+
+```
+cc-endpoint-request: captured continuation vtable=0x0 invoker=0x0 manager=0x0 payload=0x0 blob=0x0 w2=10795
+cc-endpoint-request: fn was NULL
+```
+
+**All five fields zero, in all five archived runs that reach the capture site.**
+`w2=10795` is stable and plausible, so x2 is mapped; the continuation is not.
+
+Consequences, and they are the reason this is written down rather than quietly
+fixed:
+
+* `ccmode=now` is **inert**. `takePendingContinuation` fails its
+  `vtable != nullptr` guard and `cloudcellPumpCompletion` returns before writing
+  a line, so the run would have logged one `cc-endpoint-request` with
+  `vtable=0x0`, zero `cc-deliver`, and the same wedge. A review caught this
+  before the run; without it, a 5-minute round and an afternoon of
+  interpretation would have been spent on a fix that has nothing to deliver.
+* The outcome table this file pointed at was **ambiguous**: "no `cc-deliver` →
+  nothing was captured" cannot tell "capture site never reached" from
+  "capture site reached, continuation degenerate". Two different worlds, two
+  byte-identical logs. The discriminator is `cc-endpoint-request` itself and its
+  `vtable=` field.
+* The real blocker is the **argument ABI of the continuation**, not where it is
+  delivered. `ccmode` stays: a delivery path that cannot exist is still a
+  defect. It just is not the thing standing between here and the menu.
+
+The pattern is the same one as the `readConf` truncation: I had a mechanism that
+explained the symptom perfectly, so the investigation stopped one link short of
+the thing that was actually broken. "The delivery point is unreachable" is a
+complete-sounding story that survives until someone asks *what is being
+delivered*.
+
+### FIXED (2026-10-16): 70 permanent shader load failures
+
+```
+deScrambleDataDecompression error: Z_DATA_ERROR      x70, every run
+```
+
+`withReadFallback` stripped `.z` and served the plain file. A `.z` container is a
+4-byte LE32 size prefix followed by zlib, and the guest inflates
+**unconditionally** -- `ldrsw x9,[x1]` / `add x2,x0,#4` / `sub x3,x9,#4` /
+`bl inflate`. So the fallback could never satisfy the request; it only turned an
+honest `ENOENT` into a certain `Z_DATA_ERROR`. The premise comment ("the .z file
+is the same bytes as the plain one") was simply false.
+
+`files/.depot/vehicles/shaders/` holds 72 files, every one an uncompressed
+`.rgb.pvr`, zero `.z`, while the guest asks for 69 of them as `.z`. Everywhere
+else `.z` is the norm (2,668 in vehicles-classic), which is why only this subtree
+ever failed and why it looked like a data problem.
+
+Removing the strip is strictly better: the guest enumerates textures as a format
+list, issues **separate** requests per spelling (both `...etc.dds.z` and
+`...etc.dds` appear as distinct path lines in one log) and walks them in order,
+so an honest `ENOENT` lets it proceed to the plain name, which exists.
+
+Ruled out: truncation (0 corrupt `.z` across the volumes), route mismatch
+(`rr3veh0` is correct), missing descramble (the 4-byte skip *is* the
+de-containerisation).
