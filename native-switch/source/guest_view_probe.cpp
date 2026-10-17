@@ -3335,12 +3335,43 @@ void* frameLoopDriver(void* opaque) {
                 pollCell != 0
                     ? *reinterpret_cast<const uintptr_t*>(pollCell + 0x280)
                     : 0;
-            char cc[288];
+            // THE GATE'S OWN PRECONDITION.
+            //
+            // onViewCreatedJNI does:
+            //   0x12b35e4  adrp x8, #0x1f6e000
+            //   0x12b35e8  ldr  x8, [x8, #0x540]      ; GOT 0x1f6e540
+            //   0x12b35ec  ldr  x0, [x8]
+            //   0x12b35f0  cbz  x0, #0x12b35f8        ; NULL -> silent return
+            //   0x12b35f4  b    #0x12ad504            ; else build term-1
+            //
+            // Calling onCreateJNI first did NOT make this non-null (cclife1:
+            // onCreateJNI-pre/ret both logged, t1 still 0x0 across the run), so
+            // either that export is not the producer or it needs something the
+            // host has still not run. The host runs JNI_OnLoad (main.cpp:1239)
+            // and initializeGuestMainConstructors (main.cpp:1269) AFTER
+            // runGuestViewProbe (main.cpp:1176), so both are candidates for
+            // whatever has to precede it. Read it rather than keep guessing.
+            //
+            // 0x1f6e540 - 0x1f6d5d0 = 0xf70, hence the delta below.
+            const uintptr_t singletonGot = renderTarget + 0x00CBAF7CULL;
+            const bool singletonGotOk =
+                singletonGot >= kGuestImageLow && singletonGot <= kGuestImageHigh;
+            const uintptr_t singletonCell =
+                singletonGotOk
+                    ? *reinterpret_cast<const uintptr_t*>(singletonGot)
+                    : 0;
+            const uintptr_t singleton =
+                (singletonCell >= kGuestImageLow &&
+                 singletonCell <= kGuestImageHigh)
+                    ? *reinterpret_cast<const uintptr_t*>(singletonCell)
+                    : 0;
+            char cc[320];
             __builtin_snprintf(
                 cc, sizeof(cc),
-                "cc-cell-poll: f=%llu t1=%p t1vt=%p cell=%p sub280=%p tag=%d"
-                " gate_byte4c1=%s synth=%d",
+                "cc-cell-poll: f=%llu singleton=%p t1=%p t1vt=%p cell=%p"
+                " sub280=%p tag=%d gate_byte4c1=%s synth=%d",
                 static_cast<unsigned long long>(frames),
+                reinterpret_cast<void*>(singleton),
                 reinterpret_cast<void*>(t1Obj),
                 reinterpret_cast<void*>(
                     t1Obj != 0
