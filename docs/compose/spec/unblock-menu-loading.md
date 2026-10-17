@@ -98,14 +98,32 @@ Opening the Cloudcell availability byte (`menugate=1`) used to be recorded as "t
 | Value | Delivery site | Character |
 |---|---|---|
 | `off` (default, absent) | frame loop only | unchanged; the verified-good config keeps its exact behaviour |
-| `now` | inline at the capture | removes the circularity; **re-entrant by construction** — diagnostic arm |
-| `bg` | `cloudcell_defer()` → drained by the existing `alert-pump` tick | preserves "never run guest code inline inside a Cloudcell lock" |
+| `now` | inline at the capture | removes the circularity; **re-entrant by construction** — and, see below, **the only arm that can work** |
+| `bg` | `cloudcell_defer()` → drained by the existing `alert-pump` tick | **not viable while the game thread is wedged** |
 
 The record stays **all-zero**. No authentication, no response body and no success bit is invented: the guest receives a denial it can decode, clears `pending`, and takes its own offline branch. Forging a success is the one thing this port must not do, and the all-zero record is what keeps it honest.
 
-`g_ccPending` is now guarded by a libnx `Mutex`, not `std::mutex` — a `std::mutex` on this guest-visible path measured 13.7 s → 80.7 s of host CPU by dragging the guest's pthread shim into a host lock. Discipline is take → copy → drop, and the lock is **never held across the `blr`** into guest code.
+`g_ccPending` is guarded by a libnx `Mutex`, not `std::mutex` — a `std::mutex` on this guest-visible path measured 13.7 s → 80.7 s of host CPU by dragging the guest's pthread shim into a host lock. Discipline is take → copy → drop, and the lock is **never held across the `blr`** into guest code.
 
-**`bg` is currently unusable**: the alert-pump thread that would drain it is created lazily by `startAlertPump()` and lives inside an anonymous namespace in `jni_bridge.cpp`. If the wedge precedes the first alert answer, `bg` enqueues and is never drained. One line in `jni_bridge.cpp` fixes it; it has not been added.
+### `bg` cannot work, and it is not a one-line fix
+
+The design premise was that the alert-pump thread — a raw `threadCreate` host thread that calls `cloudcell_pump("alert-pump", false)` every 80 ms — would take the deferred delivery while the game thread is stuck. It does not, and the reason was already measured on 2026-10-04 and written down at `jni_bridge.cpp`:
+
+> MEASURED: the alert-pump thread reaches its wait and then stops before `reached-drain` — `cloudcell_pump`'s first act is the lock on `g_queue_lock`, which **the spinning guest main thread is holding**.
+
+So the drain blocks on the very thread we are trying to rescue. Starting the pump earlier does not help; it would just block earlier. `bg` needs a delivery path that never touches `g_queue_lock` at all — for example a dedicated thread polling `g_ccPending` under its own lock. That is a design, not a patch, and it is not built, because it is only worth building if `now` fails first.
+
+**`now` is therefore the only arm currently testable**, and it is not merely the "diagnostic" one.
+
+### A wrong comment that would have caused a future break
+
+`cloudcell_defer.cpp` carried this:
+
+> Mutex IS a bare u32 handle in this libnx. Every `Mutex x{}` in this project is therefore the handle 0, and nothing in this project ever calls mutexCreate.
+
+Both the premise and the conclusion were wrong. `libnx/kernel/mutex.h` says `typedef _LOCK_T Mutex;` and documents "A mutex can also be statically initialized by assigning 0 to it" — `_LOCK_T` is newlib's low-level lock holding the **owning thread's id**, so `0` means *unowned*, i.e. the free state. The decisive evidence was already in the tree: writing `.handle` does not compile and casting one to `unsigned` always has, and C++ will not cast a struct to an integral type. The runtime evidence agrees — the alert-pump thread measurably *blocks* on these locks, which a lock that does not exclude could not do.
+
+All 15 `Mutex` declarations in the project are fine and must **not** be given a `mutexCreate`. The comment is corrected in `568133f5`'s successor so nobody "fixes" a working lock.
 
 ### A separate landmine, found while running the A/B
 
@@ -144,8 +162,9 @@ Two runs of the same configuration are required before any of these is believed.
 - [x] T10: Make `readConf` self-reporting — acceptance: `gfx-backend` line carries `conf_trunc`/`conf_bytes` and the live conf's settings appear in it (covers: S4)
 - [ ] T6: Unblock cloudcell→menu gate — acceptance: guest opens `MainMenu.gui` or `sprites_*` (covers: S2, S4; depends: T8-T10, and on T11)
 - [ ] T11: Measure `ccmode=now`, twice — acceptance: two archives with identical discriminators (covers: S4; depends: T9, T10)
-- [ ] T12: Make `ccmode=bg` usable — acceptance: `startAlertPump()` starts at init, gated on `ccmode=bg` (covers: S4; depends: T9)
+- [ ] T12: Give `ccmode=bg` a drain that never touches `g_queue_lock` — a dedicated thread polling `g_ccPending` under its own lock, because the alert-pump thread measurably blocks on the lock the wedged game thread holds. Only worth building if T11 shows `now` fails (covers: S4; depends: T9, T11)
 - [ ] T13: Fix 70 `vehicles/shaders/*.pvr.z` `Z_DATA_ERROR` — acceptance: `Z_DATA_ERROR` count is 0 (independent of S4; identical in both arms, so it is not the wedge)
+- [x] T14: Correct the `Mutex` is-handle-0 comment in `cloudcell_defer.cpp` — acceptance: the comment states `_LOCK_T` holds the owning thread id, 0 means unowned, and that `mutexCreate` must NOT be added (covers: S4)
 
 ## [S5] Still open
 

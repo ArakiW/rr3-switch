@@ -102,15 +102,41 @@ static std::atomic<bool> g_drain_lock_probe_spent{false};
  * that push_back only ever rewrites and never destroys, so it cannot fault and
  * cannot be anything but a slightly stale yes/no on a line that prints once.
  *
- * handle= is here because it is free and it is decisive. Compiler-verified in
- * this tree, not remembered: writing g_queue_lock.handle fails to compile with
- * "request for member 'handle' in 'g_queue_lock', which is of non-class type
- * 'Mutex' {aka 'unsigned int'}", so Mutex IS a bare u32 handle in this libnx.
- * Every `Mutex x{}` in this project is therefore the handle 0, and nothing in
- * this project ever calls mutexCreate. A try-failure printed alongside
- * handle=0x0 names an object that was never made, which is a different defect
- * from a try-failure with a real handle, and only one of the two is a lock that
- * somebody is holding. */
+ * handle= is here because it is free and it is decisive.
+ *
+ * CORRECTION 2026-10-16. The comment that used to stand here was:
+ *
+ *   "Mutex IS a bare u32 handle in this libnx. Every `Mutex x{}` in this
+ *    project is therefore the handle 0, and nothing in this project ever
+ *    calls mutexCreate."
+ *
+ * Every clause of that is either wrong or irrelevant, and the conclusion it
+ * invited -- that these locks provide no mutual exclusion and need a
+ * mutexCreate -- was wrong. They do provide exclusion, and they must NOT be
+ * given a mutexCreate.
+ *
+ * libnx/kernel/mutex.h says `typedef _LOCK_T Mutex;` and, in mutexInit,
+ * "A mutex can also be statically initialized by assigning 0 to it."
+ * _LOCK_T is newlib's low-level lock: an integer holding the OWNING THREAD's
+ * id. 0 therefore means *unowned*, which is the free state, not an invalid
+ * kernel handle. mutexCreate belongs to libnx's kernel Mutex API, which this
+ * type is not.
+ *
+ * The premise that settled it is in this file, not in a header: writing
+ * `.handle` fails to compile, so `Mutex` has no members, and line 123 casts
+ * one to `unsigned` and has always compiled -- C++ will not cast a struct to
+ * an integral type. An integer owner field is exactly what newlib expects.
+ *
+ * The runtime evidence agrees and was never ambiguous: the 2026-10-04 note at
+ * jni_bridge.cpp records the alert-pump thread BLOCKING on this very lock
+ * while the guest main thread held it. A lock that does not exclude does not
+ * block. That measurement is what made the "handle 0" reading look true.
+ *
+ * Left alone deliberately: the field prints the owner id, which is 0 when free
+ * and the owning thread id when held -- still the cheapest way to tell "free"
+ * from "held by somebody". Do not add mutexCreate to make it look like a
+ * kernel handle; that would replace a working lock with a broken one.
+ */
 static void reportDrainLockProbe(const char *site, const char *outcome,
                                  bool locked)
 {
