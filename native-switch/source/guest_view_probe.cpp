@@ -3221,12 +3221,30 @@ void* frameLoopDriver(void* opaque) {
                 pollGlobal != 0
                     ? *reinterpret_cast<const uintptr_t*>(pollGlobal)
                     : 0;
-            char cc[144];
+            // The menu gate at 0x12aefc8 is a four-way AND whose terms are, in
+            // order, [x23]!=0, [*ccGlobal]!=0, cc->[0x4c1]!=0, and
+            // (cc->vtable[17]() & 1)==0. The first three are now readable; the
+            // fourth is GUEST CODE and calling it from the poll thread would
+            // be both unsafe and, on a real device, the thing the whole gate
+            // exists to police. So record the address of vtable slot 17 and
+            // read it statically instead. With the guest's own object this
+            // should be 0x1f63b58 + 0x88; if the base differs, the gate is
+            // being evaluated against something else entirely.
+            const uintptr_t pollVt =
+                pollCell != 0
+                    ? *reinterpret_cast<const uintptr_t*>(pollCell)
+                    : 0;
+            const uintptr_t pollSlot17 = pollVt != 0
+                ? *reinterpret_cast<const uintptr_t*>(pollVt + 17 * sizeof(uintptr_t))
+                : 0;
+            char cc[224];
             __builtin_snprintf(
                 cc, sizeof(cc),
-                "cc-cell-poll: f=%llu cell=%p gate_byte4c1=%s synth=%d",
+                "cc-cell-poll: f=%llu cell=%p vt=%p vt17=%p gate_byte4c1=%s synth=%d",
                 static_cast<unsigned long long>(frames),
                 reinterpret_cast<void*>(pollCell),
+                reinterpret_cast<void*>(pollVt),
+                reinterpret_cast<void*>(pollSlot17),
                 (pollCell != 0 &&
                  *reinterpret_cast<const uint8_t*>(pollCell + 0x4C1) != 0)
                     ? "1" : "0",
