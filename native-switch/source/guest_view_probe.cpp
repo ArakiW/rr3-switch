@@ -579,12 +579,67 @@ extern "C" uint64_t cloudcellEndpointStubRequest(void* self, const void* str,
 // slot 3 must return an OBJECT, not a scalar: the caller does `ldr x9,[x1]`
 // and treats the result as a vtable. Returning `self` (the default stub
 // behaviour) makes it dereference the Cloudcell object's own first word.
+//
+// EVERY entry of that vtable must be populated, or the guest branches to zero.
+// This object used to have exactly one --
+//
+//   009f2a60  ldr  x0, [x21]        ; Cloudcell object
+//   009f2a64  ldr  x8, [x0]
+//   009f2a68  ldr  x8, [x8, #0x18]  ; slot 3 -> here
+//   009f2a6c  blr  x8               ; returns the endpoint
+//   009f2a70  ldr  x8, [x0]
+//   009f2a74  ldr  x8, [x8, #0x20]  ; endpoint vtable index 4  == 0
+//   009f2a78  blr  x8               ; *** branch to 0
+//   009f2a7c  add  x0, sp, #8       ; never reached
+//
+// and that single instruction was the whole "hang": the thread jumped to
+// address 0, which is inside the guest space, so it made no imports, held no
+// host lock, and consumed no CPU -- exactly the signature the run showed
+// (inbridge=0, delta=0, idle_ms=280239). The census agrees independently:
+// the wedged thread's x30 is 0x2105e3fa7c in 66 of 66 guest-classified
+// samples, which is mainBias+0x9f2a7c -- the return address of that blr.
+//
+// Every index below 8 gets a real function that logs which index was asked
+// for. That is deliberately not an implementation: we do not yet know what
+// the guest wants from indices other than 2, and a legible fault that names
+// itself is worth more than a plausible-looking value that corrupts state
+// quietly. Returning 0 here turns "hangs forever with no output" into either
+// progress or a crash report that points straight at the next index.
+#define RR3_CC_ENDPOINT_SLOT(n)                                              \
+    extern "C" uint64_t cloudcellEndpointSlot##n(void* self) {               \
+        char diag[128];                                                      \
+        __builtin_snprintf(diag, sizeof(diag),                               \
+                            "cc-endpoint-slot: index=%d self=%p", (n), self);\
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",  \
+                            "cc-endpoint-slot", 249, 0, diag);               \
+        return 0;                                                            \
+    }
+
+RR3_CC_ENDPOINT_SLOT(0)
+RR3_CC_ENDPOINT_SLOT(1)
+RR3_CC_ENDPOINT_SLOT(3)
+RR3_CC_ENDPOINT_SLOT(4)
+RR3_CC_ENDPOINT_SLOT(5)
+RR3_CC_ENDPOINT_SLOT(6)
+RR3_CC_ENDPOINT_SLOT(7)
+#undef RR3_CC_ENDPOINT_SLOT
+
 extern "C" void* cloudcellSlot3Endpoint(void* self) {
     (void)self;
     static uint64_t s_endpointVtable[8] = {};
     static uint64_t s_endpointObject[4] = {};
     if (s_endpointVtable[2] == 0) {
+        s_endpointVtable[0] = reinterpret_cast<uint64_t>(&cloudcellEndpointSlot0);
+        s_endpointVtable[1] = reinterpret_cast<uint64_t>(&cloudcellEndpointSlot1);
+        // 2 is the request capture, installed by cloudcellEndpointStubRequest
+        // below's own registration; keep it last so the check above still
+        // distinguishes "first call" from "already built".
         s_endpointVtable[2] = reinterpret_cast<uint64_t>(&cloudcellEndpointStubRequest);
+        s_endpointVtable[3] = reinterpret_cast<uint64_t>(&cloudcellEndpointSlot3);
+        s_endpointVtable[4] = reinterpret_cast<uint64_t>(&cloudcellEndpointSlot4);
+        s_endpointVtable[5] = reinterpret_cast<uint64_t>(&cloudcellEndpointSlot5);
+        s_endpointVtable[6] = reinterpret_cast<uint64_t>(&cloudcellEndpointSlot6);
+        s_endpointVtable[7] = reinterpret_cast<uint64_t>(&cloudcellEndpointSlot7);
     }
     s_endpointObject[0] = reinterpret_cast<uint64_t>(s_endpointVtable);
     return s_endpointObject;
