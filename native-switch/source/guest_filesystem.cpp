@@ -1108,10 +1108,23 @@ bool resolvePath(const char* path, bool writing, Resolution& resolution) {
 // stored UNCOMPRESSED (.rgb.pvr with no ".z"). Every texture therefore missed,
 // which is what an 11.5% stat hit rate with a 6-draw-call scene looks like.
 //
-// Stripping ".z" is transparent rather than lossy: the ".z" file is the same
-// bytes as the plain one, and a request that wanted compressed content is
-// satisfied by the uncompressed bytes. It is applied to both candidates, so it
-// composes with the primary/fallback pair instead of replacing either.
+// RETRACTED 2026-10-16: the comment that used to follow is the premise that
+// caused 70 permanent load failures, and it was wrong on its first sentence --
+//     "Stripping .z is transparent rather than lossy: the .z file is the same
+//      bytes as the plain one, and a request that wanted compressed content is
+//      satisfied by the uncompressed bytes."
+// It is not the same bytes. A .z container is a 4-byte LE32 uncompressed-size
+// prefix followed by a zlib stream, and the guest inflates unconditionally
+// (ldrsw x9,[x1] / add x2,x0,#4 / sub x3,x9,#4 / bl inflate at 0x15c0b18).
+// Serving the plain file to a .z request therefore cannot satisfy it; it can
+// only turn an honest ENOENT into a certain Z_DATA_ERROR. Verified against a
+// real container: vehicles/1951_ferrari_f1_f375/...cab.dxt.dds.z is 99,549 B
+// beginning 38 ab 02 00 78 da, and zlib.decompress(blob[4:]) yields exactly
+// 174,904 bytes, matching the prefix.
+//
+// The format-list reasoning above was right, and it is why the fix is to
+// return ENOENT rather than keep probing: the guest already asks for both
+// spellings separately and walks them in order.
 // Unbudgeted candidate trace for one subtree, 2026-10-11.
 //
 // Why it exists: 71 loads fail in a row as
@@ -1171,18 +1184,28 @@ int withReadFallback(const Resolution& resolution, Callback callback) {
             // will come back identical from the next candidate.
             break;
         }
-        const size_t len = std::strlen(candidate);
-        if (len > 2 && candidate[len - 2] == '.' && candidate[len - 1] == 'z') {
-            char plain[0x500]{};
-            if (len - 2 < sizeof(plain)) {
-                std::snprintf(plain, sizeof(plain), "%.*s",
-                              static_cast<int>(len - 2), candidate);
-                result = attempt(plain);
-                if (result == 0) {
-                    return 0;
-                }
-            }
-        }
+        // RETRACTED 2026-10-16: the ".z means try the plain name" fallback that
+        // used to stand here. It did not help, it silently corrupted: 70 files
+        // under files/.depot/vehicles/shaders/ come back
+        //   deScrambleDataDecompression error: Z_DATA_ERROR
+        // every run, and the host trace shows exactly why --
+        //   try[1] rc=-1 errno=2  vehicles/shaders/fresnel_gloss.rgb.pvr.z
+        //   try[2] rc=0  errno=0  vehicles/shaders/fresnel_gloss.rgb.pvr
+        // The volume has 72 files there and every one is an uncompressed .rgb.pvr
+        // with no .z sibling, while the guest asks for 69 of them as .z. Handing
+        // back an uncompressed file for a .z request is a FALSE SUCCESS: the
+        // guest feeds those bytes straight to inflate() unconditionally
+        // (ldrsw x9,[x1]; add x2,x0,#4; sub x3,x9,#4; bl inflate at 0x15c0b18),
+        // and a .z container is a 4-byte LE32 size followed by zlib. So the
+        // fallback replaced an honest ENOENT with a guaranteed Z_DATA_ERROR.
+        //
+        // An honest ENOENT is strictly better: the guest enumerates each texture
+        // as a format list and issues SEPARATE requests for the spellings it
+        // wants -- both ...etc.dds.z and ...etc.dds appear as distinct path
+        // lines in the same log -- and walks dxt.dds -> etc.dds -> rgb.pvr. A
+        // true miss on .z lets it proceed to the plain name, which exists.
+        // Truncation and routing were both ruled out: 0 corrupt .z files across
+        // the volumes, and rr3veh0 is the correct device.
     }
     // THIRD CANDIDATE: the same content, taken off the SD card.
     //
@@ -1201,20 +1224,13 @@ int withReadFallback(const Resolution& resolution, Callback callback) {
             const int n = std::snprintf(card, sizeof(card),
                                        "sdmc:/switch/rr3-native-rehost/%s", rel);
             if (n > 0 && static_cast<size_t>(n) < sizeof(card)) {
-                const size_t cardLen = std::strlen(card);
                 result = callback(card);
                 if (result == 0) {
                     return 0;
                 }
-                if (cardLen > 2 && card[cardLen - 2] == '.' && card[cardLen - 1] == 'z') {
-                    char plain[0x500]{};
-                    std::snprintf(plain, sizeof(plain), "%.*s",
-                                  static_cast<int>(cardLen - 2), card);
-                    result = callback(plain);
-                    if (result == 0) {
-                        return 0;
-                    }
-                }
+                // Same retraction as the volume candidate above, and for the
+                // same reason: a ".z" request must not be answered with the
+                // uncompressed file. The guest inflates unconditionally.
             }
         }
     }
