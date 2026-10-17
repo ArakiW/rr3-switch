@@ -254,4 +254,47 @@ Two runs of the same configuration are required before any of this is believed.
 - Guest PC sampling is structurally unavailable in the emulator: `svcGetThreadContext3` returns the *host* NRO program counter, so every `census-pc` line reads `pc_img=host-nro`. The census import-ring is the only working substitute, and an import ring cannot distinguish "spinning on a flag" from "walking a corrupt structure" — both are pure guest code with zero imports.
 - `0x12aea7c` (the per-frame function) has **zero `bl` callers, zero `adrp` references, and appears as no constant in either the guest or the host ELF**. It is reached through a runtime-computed pointer, so the ordered boot chain to it is not recoverable statically. Do not spend time on a static caller search for it.
 - `0x12E1600` (network/event thread) computes its `poll` timeout from a `fmov d9,#-1.0` sentinel, giving −1,000,000 ms, i.e. an infinite wait. That is by design, but it means the cloud state machine can never advance offline.
+- The guest's Cloudcell constructor never publishes. This is now the blocker (see below).
+
+## [S6] The real blocker: `*ccGlobal == 0`
+
+`ccsynth0` (2026-10-17) stopped the host replacing the guest's Cloudcell object, and the run got further than any run in this project's history:
+
+```
+create-cloudcell = 0     the host installed nothing
+cc-slot = 0   cc-deliver = 0   no stub was involved at all
+frames = 16200          not 1
+```
+
+Wedge eliminated, not patched around. Three successive repairs of individual vtable entries had failed; removing the substitution fixed the class.
+
+**And that made the real blocker visible.** The object pointer, logged packed as `(addr & 0xFFFFFFFF) << 32 | value`:
+
+```
+phase=cc-got-diag  target=073ba5d0 07413e98   -> GOT slot valid, *GOT = 0x07413e98
+phase=cc-ptr-diag  target=07413e98 00000000   -> the object pointer is 0
+```
+
+`*ccGlobal == 0`. The menu gate at `0x12aefd8` is the third term of a four-way AND:
+
+```
+[x23]!=0  &&  [*ccGlobal]!=0  &&  cc->[0x4c1]!=0  &&  (vtable[17]()&1)==0
+                        ^ the second term
+```
+
+**With the object pointer null the gate can never pass, whatever `0x4c1` says.** The guest logs `Cloudcell initializing with environment: Development`, then renders 16,200 frames against a null Cloudcell: it does not crash, it simply never becomes available.
+
+So the remaining work is not a byte and not a vtable. **It is getting the guest's own constructor (`0x1cbe03c`) to publish.** That constructor allocates 0x4d0 bytes, publishes at `0x1cbe094`, installs the real `cc::ICloudcell` vtable `0x1f63b58` at `0x1cbe290` (RTTI at `0x1f63d58` names `N2cc10ICloudcellE`), and sets its own `+0x4c1 = 1` at `0x1cbe218`. If it runs, the menu gate opens with no host involvement at all.
+
+### The three failed repairs, recorded because the pattern is the lesson
+
+| Attempt | What level-1 entry 5 was made | Result |
+|---|---|---|
+| 1 | a logging function | guest read the first 8 bytes of code as a pointer |
+| 2 | `return self` | same |
+| 3 | a pointer to a real sub-object | **worse** — broke the 7 sites that genuinely *call* index 5; `cc-deliver` 3 → 0 |
+
+Entry 5 was called from seven places and dereferenced from one. **That is only possible if the table is not a vtable but a struct mixing method and data pointers**, and whether an entry is invoked or dereferenced depends on the call site. No amount of per-entry guessing resolves that; only reading the code that builds the table does.
+
+The tell was in the log throughout, and was read backwards twice: `cc-slot-unpinned=0` does not mean the stub worked — it means **the guest never reached the stub**.
 
