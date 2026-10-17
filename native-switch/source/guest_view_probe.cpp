@@ -677,44 +677,6 @@ RR3_CC_UNPINNED(56) RR3_CC_UNPINNED(57) RR3_CC_UNPINNED(58) RR3_CC_UNPINNED(59)
 RR3_CC_UNPINNED(60) RR3_CC_UNPINNED(61) RR3_CC_UNPINNED(62) RR3_CC_UNPINNED(63)
 #undef RR3_CC_UNPINNED
 
-// Level-1 slot 5 is NOT a method. The guest dereferences the ENTRY itself:
-//
-//   0xb3bc2c  ldr  x8, [x21]        ; cloudcell->vtable
-//   0xb3bc30  ldr  x8, [x8, #0x28]  ; slot 5
-//   0xb3bc34  ldr  x9, [x8]         ; *slot5  -- used as a vtable
-//   0xb3bc38  mov  x0, x8
-//   0xb3bc3c  ldr  x9, [x9, #0x80]  ; its index 16
-//   0xb3bc40  blr  x9               ; wedged here, lr=0xb3bc44 in every sample
-//
-// So the entry must hold a pointer to an object whose first word is a
-// vtable. Putting a function address there -- which is what both the zero
-// default and the unpinned fallback did -- makes the guest read the first
-// eight bytes of CODE as a pointer and branch to garbage. That is why
-// ccdeliver5 and ccdeliver6 wedged identically at 0xb3bc44 with
-// cc-slot-unpinned=0: the stub was never entered, because the guest reads
-// the entry instead of calling it.
-//
-// The sub-object below answers that shape. Its entries return the sub-object
-// itself, so a further getter-style dereference inside it keeps working.
-#define RR3_CC_SUB_SLOT(n)                                                   \
-    extern "C" uint64_t cloudcellSubSlot##n(void* self) {                    \
-        char d[128];                                                         \
-        __builtin_snprintf(d, sizeof(d), "cc-sub-slot: index=%d self=%p",     \
-                           (n), self);                                        \
-        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",  \
-                            "cc-sub-slot", 249, 0, d);                        \
-        return reinterpret_cast<uint64_t>(self);                            \
-    }
-RR3_CC_SUB_SLOT(0)  RR3_CC_SUB_SLOT(1)  RR3_CC_SUB_SLOT(2)  RR3_CC_SUB_SLOT(3)
-RR3_CC_SUB_SLOT(4)  RR3_CC_SUB_SLOT(5)  RR3_CC_SUB_SLOT(6)  RR3_CC_SUB_SLOT(7)
-RR3_CC_SUB_SLOT(8)  RR3_CC_SUB_SLOT(9)  RR3_CC_SUB_SLOT(10) RR3_CC_SUB_SLOT(11)
-RR3_CC_SUB_SLOT(12) RR3_CC_SUB_SLOT(13) RR3_CC_SUB_SLOT(14) RR3_CC_SUB_SLOT(15)
-RR3_CC_SUB_SLOT(16) RR3_CC_SUB_SLOT(17) RR3_CC_SUB_SLOT(18) RR3_CC_SUB_SLOT(19)
-RR3_CC_SUB_SLOT(20) RR3_CC_SUB_SLOT(21) RR3_CC_SUB_SLOT(22) RR3_CC_SUB_SLOT(23)
-RR3_CC_SUB_SLOT(24) RR3_CC_SUB_SLOT(25) RR3_CC_SUB_SLOT(26) RR3_CC_SUB_SLOT(27)
-RR3_CC_SUB_SLOT(28) RR3_CC_SUB_SLOT(29) RR3_CC_SUB_SLOT(30) RR3_CC_SUB_SLOT(31)
-#undef RR3_CC_SUB_SLOT
-
 extern "C" void* cloudcellSlot3Endpoint(void* self) {
     (void)self;
     static uint64_t s_endpointVtable[8] = {};
@@ -2781,38 +2743,6 @@ GuestViewProbe runGuestViewProbe(NWindow* window, const char* progressPath) {
                     if (s_ccVtable[i] == 0) {
                         s_ccVtable[i] = kCloudcellSlotFallback[i];
                     }
-                }
-                // Slot 5 is the one entry that is an OBJECT POINTER rather than
-                // a function pointer; see RR3_CC_SUB_SLOT above for the
-                // instruction sequence that proves it and what it costs when it
-                // is wrong.
-                {
-                    static uint64_t s_ccSubVtable[32];
-                    static uint64_t s_ccSubObject[4] = {};
-                    static bool s_ccSubBuilt = false;
-                    if (!s_ccSubBuilt) {
-                        s_ccSubBuilt = true;
-#define RR3_CSS(n) reinterpret_cast<uint64_t>(&cloudcellSubSlot##n)
-                        s_ccSubVtable[0] = RR3_CSS(0);  s_ccSubVtable[1] = RR3_CSS(1);
-                        s_ccSubVtable[2] = RR3_CSS(2);  s_ccSubVtable[3] = RR3_CSS(3);
-                        s_ccSubVtable[4] = RR3_CSS(4);  s_ccSubVtable[5] = RR3_CSS(5);
-                        s_ccSubVtable[6] = RR3_CSS(6);  s_ccSubVtable[7] = RR3_CSS(7);
-                        s_ccSubVtable[8] = RR3_CSS(8);  s_ccSubVtable[9] = RR3_CSS(9);
-                        s_ccSubVtable[10] = RR3_CSS(10); s_ccSubVtable[11] = RR3_CSS(11);
-                        s_ccSubVtable[12] = RR3_CSS(12); s_ccSubVtable[13] = RR3_CSS(13);
-                        s_ccSubVtable[14] = RR3_CSS(14); s_ccSubVtable[15] = RR3_CSS(15);
-                        s_ccSubVtable[16] = RR3_CSS(16); s_ccSubVtable[17] = RR3_CSS(17);
-                        s_ccSubVtable[18] = RR3_CSS(18); s_ccSubVtable[19] = RR3_CSS(19);
-                        s_ccSubVtable[20] = RR3_CSS(20); s_ccSubVtable[21] = RR3_CSS(21);
-                        s_ccSubVtable[22] = RR3_CSS(22); s_ccSubVtable[23] = RR3_CSS(23);
-                        s_ccSubVtable[24] = RR3_CSS(24); s_ccSubVtable[25] = RR3_CSS(25);
-                        s_ccSubVtable[26] = RR3_CSS(26); s_ccSubVtable[27] = RR3_CSS(27);
-                        s_ccSubVtable[28] = RR3_CSS(28); s_ccSubVtable[29] = RR3_CSS(29);
-                        s_ccSubVtable[30] = RR3_CSS(30); s_ccSubVtable[31] = RR3_CSS(31);
-#undef RR3_CSS
-                        s_ccSubObject[0] = reinterpret_cast<uint64_t>(s_ccSubVtable);
-                    }
-                    s_ccVtable[5] = reinterpret_cast<uint64_t>(s_ccSubObject);
                 }
                 // Second-level object for the member at byte offset 0x10
                 // (s_ccBuf[2]). See the block comment above
