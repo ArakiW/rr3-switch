@@ -3221,6 +3221,63 @@ void* frameLoopDriver(void* opaque) {
                 pollGlobal != 0
                     ? *reinterpret_cast<const uintptr_t*>(pollGlobal)
                     : 0;
+            // TERM 1 OF THE MENU GATE HAS NEVER BEEN MEASURED.
+            //
+            // Reading 0x12aef90..0x12af020 exactly:
+            //
+            //   0x12aefb4  adrp x23, #0x1f6d000
+            //   0x12aefb8  ldr  x23, [x23, #0xf50]   <- a DIFFERENT global
+            //   0x12aefc0  ldr  x8, [x23]
+            //   0x12aefc4  cbz  x8, #0x12af014       ; term 1
+            //   0x12aecc   ldr  x8, [x8, #0x5d0]     ; Cloudcell global
+            //   0x12aefd4  cbz  x0, #0x12af014       ; term 2
+            //   0x12aefdc  cbz  w8, #0x12af014       ; term 3, the 0x4c1 byte
+            //   0x12aefe4  ldr  x8, [x8, #0x30]      ; Cloudcell vtable[6]
+            //   0x12aeff0  ldr  x8, [x8, #0x88]      ; Cloudcell vtable[17]
+            //   0x12aeff8  tbnz w0, #0, #0x12af014   ; term 4, the tag
+            //   0x12aeffc  ldr  x0, [x23]            ; x0 is the TERM-1 OBJECT
+            //   0x12af00c  ldr  x8, [x8, #0xa8]      ; its vtable[21]
+            //   0x12af010  blr  x8                   ; the menu loader
+            //
+            // So the menu loader is a method on the term-1 object, not on the
+            // Cloudcell, and term 1 comes from GOT slot 0x1f6d5f50 -- 0x180
+            // above the Cloudcell slot this poll has been reading. Terms 2, 3
+            // and 4 all read as satisfied in ccpoll3 and the menu still does
+            // not load, which makes term 1 the one unmeasured condition.
+            //
+            // 0x00CB9FBC is renderTarget's delta to 0x1f6d5d0; +0x180 gives
+            // 0x1f6d5f50.
+            const uintptr_t t1Global =
+                *reinterpret_cast<const uintptr_t*>(
+                    renderTarget + 0x00CBA13CULL);
+            const uintptr_t t1Obj =
+                t1Global != 0
+                    ? *reinterpret_cast<const uintptr_t*>(t1Global)
+                    : 0;
+            const uintptr_t sub280 =
+                pollCell != 0
+                    ? *reinterpret_cast<const uintptr_t*>(pollCell + 0x280)
+                    : 0;
+            char cc[288];
+            __builtin_snprintf(
+                cc, sizeof(cc),
+                "cc-cell-poll: f=%llu t1=%p t1vt=%p cell=%p sub280=%p tag=%d"
+                " gate_byte4c1=%s synth=%d",
+                static_cast<unsigned long long>(frames),
+                reinterpret_cast<void*>(t1Obj),
+                reinterpret_cast<void*>(
+                    t1Obj != 0
+                        ? *reinterpret_cast<const uintptr_t*>(t1Obj)
+                        : 0),
+                reinterpret_cast<void*>(pollCell),
+                reinterpret_cast<void*>(sub280),
+                static_cast<int>(sub280 & 1ULL),
+                (pollCell != 0 &&
+                 *reinterpret_cast<const uint8_t*>(pollCell + 0x4C1) != 0)
+                    ? "1" : "0",
+                gfxCloudcellSynthetic() ? 1 : 0);
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                cc, 74, 0);
             // The menu gate at 0x12aefc8 is a four-way AND whose terms are, in
             // order, [x23]!=0, [*ccGlobal]!=0, cc->[0x4c1]!=0, and
             // (vtable[17]() & 1)==0. The fourth is NOT a bool-returning method:
