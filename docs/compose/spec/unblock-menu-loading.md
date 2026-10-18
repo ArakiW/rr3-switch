@@ -448,3 +448,61 @@ the boot sequence.
 
 Nothing here touches Cloudcell credentials, authentication or responses. The guest is
 asking the driver what GL version it is, and the host had not given it a context yet.
+
+
+## [S11] GLVER=3.2 -- the fix works; the gate's function is never entered
+
+GLVER=3.2: the fix works, and the gate's function is never entered
+
+ccdeliver14 answers the question ccdeliver13 raised. One line, 132 polls,
+identical every time:
+
+  GLVER=3.2  S6c=1  Sobj=0x2102d582c0
+
+  S->0xc  = 3   the OpenGL ES MAJOR VERSION the guest recorded
+  S->0x6c = 1
+
+So the root-cause fix did exactly what it was built to do. The guest
+sampled glGetString(GL_VERSION) with a context present, sscanf("3.2") into
+S->0xc, and the field is now 3 instead of 0.
+
+It also refutes a sub-agent's claim. That pass reported that S->0x6c "is
+read once and never written, so it is 0 from .bss and the assert's second
+branch is dead by construction". S->0x6c is 1. Something writes it, and the
+scan missed it -- the same class of miss this project has hit repeatedly,
+where a scanner's negative is trusted without a runtime check.
+
+What the two numbers now decide. The guard at 0x14851e8:
+
+  S->0xc >= 3                     -> assert
+  S->0xc < 3 and S->0x6c != 0      -> assert
+  S->0xc < 3 and S->0x6c == 0      -> return silently
+
+S->0xc is 3, so the FIRST branch applies and it must assert. And the run
+logged zero asserts and did not die -- bionicAssert2 is [[noreturn]] and
+calls std::abort(), so if that branch had been taken the process would be
+gone.
+
+The guard's arithmetic is unconditional within its function: the code
+immediately before it is two calls with no branch, and immediately after is
+the tail. So the function containing the gate, 0x12aea7c, is never entered.
+
+That is the remaining blocker, and it is now a question about the guest's
+own control flow rather than about anything the host supplies:
+
+  onViewRenderJNI IS called -- render-call-pre is present, and the run
+  reaches ~15,700 frames -- but the code path that contains the GL assert
+  guard never executes.
+
+0x12aea7c has zero bl callers and appears as no constant in either ELF, so
+it is entered through a runtime-computed pointer. Finding who is supposed
+to dispatch it is the next question, and it is a static one.
+
+The deltas are computed and printed next to the vaddrs they come from,
+because Python caught a 0x60 transcription error before the build:
+
+  0x1f6d5d0 -> 0x00CB9FBC   Cloudcell cell
+  0x1f6df50 -> 0x00CBA93C   term-1 cell
+  0x1f6e540 -> 0x00CBAF2C   singleton
+  0x1f6f970 -> 0x00CBC35C   mtGLWrapper S
+
