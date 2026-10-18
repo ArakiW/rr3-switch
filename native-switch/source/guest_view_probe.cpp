@@ -3374,12 +3374,17 @@ void* frameLoopDriver(void* opaque) {
             const bool baseOk =
                 (base % 0x1000) == 0 && base >= kGuestImageLow &&
                 base <= kGuestImageHigh;
-            // A runtime pointer: non-zero and page-aligned is the only claim
-            // that can honestly be made about it, and it is the safe one.
+            // After a dereference the only defensible claim is "non-zero".
+            //
+            // An earlier revision also required page alignment, which is wrong
+            // for exactly the values being read here: GOT slot 0x1F6E540 sits
+            // at page offset 0x540 and the term-1 cell at 0x5F8, so neither is
+            // a mapping base and both were rejected. That is why
+            // 'singleton = 0x0' and 't1 = 0x0' survived a fixed delta AND a
+            // fixed range check. Page alignment is a property of mappings,
+            // not of pointers.
             auto deref = [](uintptr_t p) -> uintptr_t {
-                return (p != 0 && (p % 0x1000) == 0)
-                           ? *reinterpret_cast<const uintptr_t*>(p)
-                           : 0;
+                return p != 0 ? *reinterpret_cast<const uintptr_t*>(p) : 0;
             };
             const uintptr_t t1Global = baseOk ? deref(renderTarget + 0x00CBA93CULL) : 0;
             const uintptr_t t1Obj = deref(t1Global);
