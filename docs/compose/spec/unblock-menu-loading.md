@@ -359,3 +359,30 @@ loader does on entry is already costing frames.
 
 That is a different kind of question from every one before it, and it is the first one
 that can be asked with the gate's own terms satisfied.
+
+## [S9] RETRACTED: `0x12af010` is an ASSERT, not a menu loader
+
+**Every premise in S1-S8 rested on one unverified claim, and it is false.**
+
+`0x12af010: blr x8` was read as `obj->vtable[21](obj, 2, 0x60)` loading `ESportsMainMenu.xml`. That came from a comment written into the source on 2026-10-12 and never checked against the code. Disassembling `0x14851e8` settles it:
+
+```
+0x45c6e8  E:\dev\builds\r3_update_a\source\src\mt3D\OpenGL/mtRenderGL.h
+          with line numbers 730 (0x2da) and 753 (0x2f1)
+```
+
+**It is a compiler-emitted assert reporter from the GL renderer.** It ignores `this`, touches no file, constructs no path, and its only side effect is one indirect call. `mode` selects the assert variant id (`0 → 0x8ca9`, `1 → 0x8ca8`, `>=2 → 0x8d40` — so `mode=2` picks the always-on/release family); `0x60` is a **bitmask of extra condition-string ids** for the report, not a size or an enum. Its only early return is `S->0xc < 3 && S->0x6c == 0`, where `S` is the app singleton; otherwise it **fires the assert**.
+
+Corroboration: `vtable[4]=0x148462c`, `[5]=0x1484640`, `[6]=0x1484654` are five-instruction tails to `0x128b55c` carrying `(id, "mtRenderGL.cpp", line)` — sibling reporters, same family. A scan of every `ldr xN,[xM,#0xa8]; blr xN` in `.text` yields 150 dispatch sites and **exactly one** with `w2=0x60`: the one at `0x12af00c`.
+
+So the block at `0x12aefa8..0x12af014` is **a GL-renderer assertion guard**, and `vtable[6]` and `vtable[17]` immediately before it are themselves a sibling assert (`0x1484654`, `mtRenderGL.cpp:54`) and a real query on `[this+0x5a0]`. **Two asserts can fire per frame.** The guest is not refusing to open a menu; it is telling us the renderer is not in the state its code expects.
+
+The class is the GL renderer, not a UI/menu object. There is no RTTI on `0x1ed7fe0` to confirm it, but three independent strings say `mtRenderGL`.
+
+**What this retires.** The whole `0x4C1` line of reasoning -- "the menu gate byte" -- was chasing a comment. The fixes along the way were still real bugs (a wrong continuation ABI, two vtables with null entries, a lifecycle ordering mistake, a 256-byte conf truncation, a `.z`-strip that turned ENOENT into Z_DATA_ERROR), but none of them was the menu gate, because there is no menu gate there.
+
+**What replaces it.** Two concrete questions, both about the renderer rather than a menu:
+1. `S->0xc` and `S->0x6c` on the app singleton at GOT `0x1f6f970` (addend `0x1f97c88`) -- what sets them, and which value does this environment reach. These decide silent-return vs assert-fire.
+2. `vtable[6]` (`0x1484654`) fires one assert *before* this one, every frame. Its condition may be the upstream cause.
+
+The import table carries `__assert2`, `__android_log_print`, `raise`, `ptrace`, `abort`, `sigaction` -- the canonical EA assert-to-crash-report chain. **A host that stubs `raise`/`abort`/`ptrace` into a sink would let the run continue, and it would also be the difference between "an assert fired every frame" and "the guest made progress".** That is the next thing to look at.
