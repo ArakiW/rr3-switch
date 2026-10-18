@@ -3381,8 +3381,23 @@ void* frameLoopDriver(void* opaque) {
             // runGuestViewProbe (main.cpp:1176), so both are candidates for
             // whatever has to precede it. Read it rather than keep guessing.
             //
-            // 0x1f6e540 - 0x1f6d5d0 = 0xf70, hence the delta below.
-            const uintptr_t singletonGot = renderTarget + 0x00CBAF7CULL;
+            // CORRECTED, and the correction is arithmetic-only. renderTarget is
+            // base + 0x12B3614, so the delta for any guest vaddr is
+            // vaddr - 0x12B3614. Computed rather than done by hand, because
+            // doing it by hand is how this poll ended up reading 0x1F6E590
+            // instead of 0x1F6E540 -- a 0x50 slip that stayed inside the image
+            // and so was not caught by any range check:
+            //
+            //   0x00CB9FBC -> 0x1F6D5D0   Cloudcell cell  (0x12aecc8)  ok
+            //   0x00CBA93C -> 0x1F6DF50   term-1 cell     (0x12aefb8)  ok
+            //   0x00CBAF7C -> 0x1F6E590   WRONG by 0x50
+            //   0x00CBAF2C -> 0x1F6E540   the onViewCreatedJNI singleton
+            //
+            // This is the one number that separates the two readings still
+            // open for term 1: "the singleton was null so the builder never
+            // ran" and "the singleton was fine so the builder ran but the
+            // object did not appear". Both produce t1 = 0x0.
+            const uintptr_t singletonGot = renderTarget + 0x00CBAF2CULL;
             const bool singletonGotOk =
                 singletonGot >= kGuestImageLow && singletonGot <= kGuestImageHigh;
             const uintptr_t singletonCell =
