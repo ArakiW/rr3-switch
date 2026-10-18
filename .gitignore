@@ -107,6 +107,12 @@ __pycache__/
 # tools/guest-analysis/ and must not be confused with this directory.
 native-switch/guest-analysis/scratch/
 guest-analysis/scratch/
+# 20 throwaway probe scripts an agent left in tools/. Untracked 2026-10-19.
+# They are all "_test_*" one-offs (chacha/decrypt/keys/sections/so_inspect/
+# so_search, several numbered retries of the same idea). None is referenced by
+# any tracked script or by Build-NativeSwitch.ps1 -- the real tooling lives in
+# tools/guest-analysis/. Checked before ignoring, not after.
+tools/_test_*.ps1
 
 # --- run-time scratch written by the port -----------------------------------
 crash_reports/
