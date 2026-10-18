@@ -3291,45 +3291,61 @@ void* frameLoopDriver(void* opaque) {
         // (ccsynth=0, the default); with ccsynth=1 the cell holds s_ccBuf and
         // the line just confirms that.
         if ((frames % 240) == 0) {
-            const uintptr_t pollGot = renderTarget + 0x00CB9FBCULL;
-            const uintptr_t pollGlobal =
-                *reinterpret_cast<const uintptr_t*>(pollGot);
-            const uintptr_t pollCell =
-                pollGlobal != 0
-                    ? *reinterpret_cast<const uintptr_t*>(pollGlobal)
-                    : 0;
-            // CORRECTION 2026-10-17. This poll used to read GOT 0x1f6d5f50 and
-            // reported 0 for 136 consecutive polls, which read as "term 1 is
-            // false". It was meaningless: 0x1f6d5f50 is ~494 MB ABOVE the guest
-            // image's upper bound 0x1fc7a99, so the poll was reading unmapped
-            // memory. The real slot is 0x1f6df50, which is adrp #0x1f6d000 +
-            // #0xf50 in the gate at 0x12aefb8, i.e. 0x980 above Cloudcell's
-            // 0x1f6d5d0, not 0x180.
+            // ADDRESSING, DONE ONCE AND ANCHORED.
             //
-            // 0x00CBA93C is not new arithmetic: it is kMenuLoaderDelta, which
-            // this file has carried since 2026-10-12 with the comment "Menu
-            // loader: GOT entry at ELF 0x1f6df50". The address was transcribed
-            // wrong once and the wrong value was never range-checked.
+            // Every earlier version of this poll derived its GOT addresses as
+            // renderTarget + <hand-computed delta>, and got it wrong four times.
+            // The last one was 0x00CBAF7C for the onViewCreatedJNI singleton,
+            // whose delta is 0x00CBAF2C -- a 0x50 slip that landed INSIDE the
+            // image, so the range assertion added to stop exactly this class of
+            // mistake could not catch it.
             //
-            // 0x00CBA93C is not new arithmetic: it is kMenuLoaderDelta, which
-            // this file has carried since 2026-10-12 with the comment "Menu
-            // loader: GOT entry at ELF 0x1f6df50". The address was transcribed
-            // wrong once and the wrong value was never range-checked. (That
-            // constant is declared inside the Cloudcell-install block below,
-            // out of scope here, so it is spelled out again.)
-            constexpr uint64_t kMenuLoaderGotDelta = 0x00CBA93CULL;
+            // So there are no deltas here any more. renderTarget is the
+            // resolved onViewRenderJNI export, whose ELF vaddr is a checked-in
+            // constant that can be confirmed against .dynsym; everything else
+            // is an absolute vaddr from the gate's own disassembly. One
+            // subtraction, anchored, plus an assertion that the subtraction
+            // landed page-aligned -- which fails loudly instead of silently
+            // reading a neighbouring symbol.
+            constexpr uintptr_t kRenderExportVaddr = 0x12B3614ULL;
             constexpr uintptr_t kGuestImageLow = 0x00100000ULL;
             constexpr uintptr_t kGuestImageHigh = 0x001FC7A99ULL;
-            const uintptr_t t1Got = renderTarget + kMenuLoaderGotDelta;
-            const bool t1GotOk =
-                t1Got >= kGuestImageLow && t1Got <= kGuestImageHigh;
-            const uintptr_t t1Global =
-                t1GotOk ? *reinterpret_cast<const uintptr_t*>(t1Got) : 0;
-            const bool t1CellOk =
-                t1Global >= kGuestImageLow && t1Global <= kGuestImageHigh;
+            constexpr uintptr_t kCloudcellGotVaddr = 0x1F6D5D0ULL;  // 0x12aecc8
+            constexpr uintptr_t kTerm1GotVaddr = 0x1F6DF50ULL;      // 0x12aefb8
+            constexpr uintptr_t kSingletonGotVaddr = 0x1F6E540ULL;  // 0x12b35e8
+
+            const uintptr_t base =
+                renderTarget >= kRenderExportVaddr
+                    ? renderTarget - kRenderExportVaddr
+                    : 0;
+            const bool baseOk = (base % 0x1000) == 0 &&
+                                base >= kGuestImageLow &&
+                                base <= kGuestImageHigh;
+            auto got = [&](uintptr_t vaddr) -> uintptr_t {
+                return baseOk ? *reinterpret_cast<const uintptr_t*>(
+                                   base + vaddr)
+                             : 0;
+            };
+            auto cell = [&](uintptr_t vaddr) -> uintptr_t {
+                const uintptr_t c = got(vaddr);
+                return (c >= kGuestImageLow && c <= kGuestImageHigh) ? c : 0;
+            };
+
+            const uintptr_t singletonCell = baseOk ? got(kSingletonGotVaddr) : 0;
+            const uintptr_t singleton =
+                (singletonCell >= kGuestImageLow &&
+                 singletonCell <= kGuestImageHigh)
+                    ? *reinterpret_cast<const uintptr_t*>(singletonCell)
+                    : 0;
+            const uintptr_t t1Global = baseOk ? got(kTerm1GotVaddr) : 0;
             const uintptr_t t1Obj =
-                t1CellOk
+                (t1Global >= kGuestImageLow && t1Global <= kGuestImageHigh)
                     ? *reinterpret_cast<const uintptr_t*>(t1Global)
+                    : 0;
+            const uintptr_t pollGlobal = baseOk ? got(kCloudcellGotVaddr) : 0;
+            const uintptr_t pollCell =
+                (pollGlobal >= kGuestImageLow && pollGlobal <= kGuestImageHigh)
+                    ? *reinterpret_cast<const uintptr_t*>(pollGlobal)
                     : 0;
             const uintptr_t sub280 =
                 pollCell != 0
@@ -3344,27 +3360,13 @@ void* frameLoopDriver(void* opaque) {
             //   0x12b35f0  cbz  x0, #0x12b35f8        ; NULL -> silent return
             //   0x12b35f4  b    #0x12ad504            ; else build term-1
             //
-            // Calling onCreateJNI first did NOT make this non-null (cclife1:
-            // onCreateJNI-pre/ret both logged, t1 still 0x0 across the run), so
-            // either that export is not the producer or it needs something the
-            // host has still not run. The host runs JNI_OnLoad (main.cpp:1239)
-            // and initializeGuestMainConstructors (main.cpp:1269) AFTER
+            // cclife1 called onCreateJNI first (onCreateJNI-pre/ret both
+            // logged) and this value was still 0. So either that export is not
+            // the producer, or it needs something the host has still not run.
+            // The host runs JNI_OnLoad (main.cpp:1239) and
+            // initializeGuestMainConstructors (main.cpp:1269) AFTER
             // runGuestViewProbe (main.cpp:1176), so both are candidates for
             // whatever has to precede it. Read it rather than keep guessing.
-            //
-            // 0x1f6e540 - 0x1f6d5d0 = 0xf70, hence the delta below.
-            const uintptr_t singletonGot = renderTarget + 0x00CBAF7CULL;
-            const bool singletonGotOk =
-                singletonGot >= kGuestImageLow && singletonGot <= kGuestImageHigh;
-            const uintptr_t singletonCell =
-                singletonGotOk
-                    ? *reinterpret_cast<const uintptr_t*>(singletonGot)
-                    : 0;
-            const uintptr_t singleton =
-                (singletonCell >= kGuestImageLow &&
-                 singletonCell <= kGuestImageHigh)
-                    ? *reinterpret_cast<const uintptr_t*>(singletonCell)
-                    : 0;
             char cc[320];
             __builtin_snprintf(
                 cc, sizeof(cc),
