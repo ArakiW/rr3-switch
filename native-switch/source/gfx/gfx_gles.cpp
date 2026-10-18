@@ -217,6 +217,54 @@ extern "C" GLenum __wrap_glGetError(void) {
     return __real_glGetError();
 }
 
+// GL identity as the GUEST is told to see it.
+//
+// This host has always answered the guest with an Android GPU identity rather
+// than the Switch's real driver strings -- these constants are not new. What
+// changed is that under the Mesa backend __wrap_glGetString forwards to
+// __real_glGetString, so the guest read the real thing ("nouveau" / "NV120")
+// and the constants were bypassed.
+//
+// That mattered because the guest classifies the renderer string. At
+// 0x12afd94 it takes GL_RENDERER, copies it into an SSO string and walks a
+// chain of substring searches:
+//
+//   "GC" -> 1   "Immersion" -> 2   "PowerVR" -> 4   "Adreno" -> 5
+//   "Mali" -> 6 "Intel" -> 7       "VideoCore" -> 8     no match -> 0
+//
+// first match wins, and the result lands at [rend+0x4fc]. The render loop
+// then does `cmp w9,#4 / b.ne 0x12aebac` at 0x12af190 -- it WAITS FOR ID 4.
+// "NV120" matches nothing, so the id is 0, and every frame leaves before the
+// one post-frame transition that advances the game state. That is the whole
+// reason the loading screen never clears.
+//
+// Only GL_RENDERER feeds that chain; GL_VENDOR is fetched by the game
+// elsewhere (0x1484640, 0x128a26c) and never reaches it. GL_VERSION is left
+// reporting the real Mesa string, because the guest parses it
+// (strstr "OpenGL ES" + sscanf "%d.%d") and the real answer is the right
+// one; the device name is the only thing being substituted, and the renderer
+// string says so.
+//
+// Profiles, selected by "gpuid" in rr3-gfx.conf:
+//   powervr (default) -> id 4, the one the loop waits for
+//   adreno            -> id 5, the original constants
+//   native            -> the real driver strings, id 0, loading screen forever
+//
+// The substitution is a device-profile statement, not a claim about what the
+// hardware is: this really is Mesa on a Switch, and the renderer string says
+// "Mesa" inside it. `native` is one config line away if that trade is not
+// wanted.
+static const char* glVendorString() {
+    return gfxGpuIdProfile() == GpuIdProfile::kNative ? nullptr : "Imagination Technologies";
+}
+static const char* glRendererString() {
+    switch (gfxGpuIdProfile()) {
+    case GpuIdProfile::kNative:  return nullptr;
+    case GpuIdProfile::kAdreno:  return kGlRenderer;
+    default:                     return "PowerVR Rogue GE8320 (Mesa 20.1.0-rc3)";
+    }
+}
+
 extern "C" const GLubyte* __wrap_glGetString(GLenum name) {
     if (gfxNullActive()) {
         gfxNoteVoidCall();
@@ -230,6 +278,22 @@ extern "C" const GLubyte* __wrap_glGetString(GLenum name) {
             return reinterpret_cast<const GLubyte*>(kGlExtensions);
         default: return reinterpret_cast<const GLubyte*>("");
         }
+    }
+    // The guest's GPU tier comes from GL_RENDERER, so the identity has to be
+    // substituted even on the real backend. See the block comment above.
+    switch (name) {
+    case GL_VENDOR: {
+        const char* v = glVendorString();
+        if (v != nullptr) return reinterpret_cast<const GLubyte*>(v);
+        break;
+    }
+    case GL_RENDERER: {
+        const char* r = glRendererString();
+        if (r != nullptr) return reinterpret_cast<const GLubyte*>(r);
+        break;
+    }
+    default:
+        break;
     }
     return __real_glGetString(name);
 }

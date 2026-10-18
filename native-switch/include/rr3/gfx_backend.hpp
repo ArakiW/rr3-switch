@@ -95,6 +95,12 @@ bool gfxCloudcellCompleteRequests();
 // guest build its own (0, the default). See gfxCloudcellSynthetic().
 bool gfxCloudcellSynthetic();
 
+// Which GL identity the guest is told it is running on. The guest classifies
+// GL_RENDERER into a numeric id and the render loop waits for id 4, which is
+// "renderer string contains PowerVR". See gfx_gles.cpp.
+enum class GpuIdProfile { kPowerVR, kAdreno, kNative };
+GpuIdProfile gfxGpuIdProfile();
+
 // "glctxearly=1": bring a GL context up before the guest's early init, so the
 // guest's one-shot glGetString(GL_VERSION) sample returns a real number. Default
 // 1. See ensureEarlyGuestGlContext() for why this is not optional.

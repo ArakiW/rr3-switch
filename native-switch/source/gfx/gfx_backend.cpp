@@ -208,6 +208,12 @@ struct ConfState {
     // view probe's own ladder is untouched and cannot end up with two surfaces
     // on one window.
     bool earlyGlContext = true;
+    // "gpuid=powervr|adreno|native" -- which GL identity the guest is told it
+    // is running on. Default powervr because that is the one whose guest-side id
+    // is 4, and the render loop at 0x12af190 does `cmp #4 / b.ne` and will not
+    // advance the game state until the id reaches 4. See gfx_gles.cpp for the
+    // substring table and for what the substitution does and does not claim.
+    GpuIdProfile gpuIdProfile = GpuIdProfile::kPowerVR;
     // "mlstub=1" -- take menu-loader vtable slot 21 even when the guest's own
     // vtable is legal. See guest_view_probe.cpp for the measurement.
     bool forceMenuStub = false;
@@ -392,6 +398,17 @@ void readConf() {
         else if (std::strcmp(key, "glctxearly") == 0 ||
                  std::strcmp(key, "gl-context-early") == 0) {
             s_conf.earlyGlContext = parseSwitch(value);
+        }
+        else if (std::strcmp(key, "gpuid") == 0 ||
+                 std::strcmp(key, "gpu-id") == 0 ||
+                 std::strcmp(key, "gpu-profile") == 0) {
+            if (std::strcmp(value, "native") == 0 || std::strcmp(value, "real") == 0) {
+                s_conf.gpuIdProfile = GpuIdProfile::kNative;
+            } else if (std::strcmp(value, "adreno") == 0) {
+                s_conf.gpuIdProfile = GpuIdProfile::kAdreno;
+            } else {
+                s_conf.gpuIdProfile = GpuIdProfile::kPowerVR;
+            }
         }
         else if (std::strcmp(key, "ccmode") == 0 ||
                  std::strcmp(key, "cc-mode") == 0 ||
@@ -688,6 +705,11 @@ bool gfxCloudcellSynthetic() {
 // "glctxearly=1": bring a GL context up before the guest's early init. Default
 // 1 -- the guest samples glGetString(GL_VERSION) during
 // initializeGuestDependencies and needs a current context to do it.
+GpuIdProfile gfxGpuIdProfile() {
+    ensureResolved();
+    return s_conf.gpuIdProfile;
+}
+
 bool gfxEarlyGlContext() {
     ensureResolved();
     return s_conf.earlyGlContext;
