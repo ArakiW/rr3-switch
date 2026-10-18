@@ -325,3 +325,37 @@ A ctor that cannot skip its store, called twice, logged `CREATE` before the view
 2. **a clear lands between `onCreateJNI` and the first poll.** There are four stores to that cell and three of them are clears: `0x12acd90` (in the dtor at `0x12acbc4`), `0x12b3f14`, and `0x12b3f24` (`str xzr` then `b operator delete`). The last two have no direct `bl`/`b` callers and no vtable pointer found in `.rodata`, `.data.rel.ro` or `.data` — **how they are reached is undetermined**, and that is where to look next.
 
 Note the earlier apparent contradiction is not one: `onWindowFocusChangedJNI` reads the same cell, and its log line is reachable only past a null check — so the cell is non-null at *some* point. A store-then-clear-then-rebuild sequence fits both observations; a never-stored cell does not.
+
+## [S8] The gate is OPEN (2026-10-18) — the blocker moved
+
+The first fully unfiltered reading. `baseOk` — which tested `renderTarget - 0x12B3614`
+against ELF vaddr bounds, and was therefore permanently false, manufacturing every
+previous zero by construction — is gone. Both chains print all three levels.
+
+```
+f=0     ss_got=0x75e4030  ss_obj=0x21033a3500   t1_got=0x7602bf8  t1_obj=0x210e3e93c0  cc1=0  sub280=0x0
+f=8880  ss_got=0x75e4030  ss_obj=0x21033a3500   t1_got=0x7602bf8  t1_obj=0x210e3e93c0  cc1=1  sub280=0x2110e825a0
+```
+
+| term | condition | measured | |
+|---|---|---|---|
+| 1 | `[*GOT 0x1f6df50] != 0` | `0x210e3e93c0` | ok |
+| 2 | `[*GOT 0x1f6d5d0] != 0` | `0x21033a3500` | ok |
+| 3 | `Cloudcell + 0x4c1 != 0` | 0, then 1 | ok |
+| 4 | `(sub280 & 1) == 0` | tag = 0 | ok |
+
+**All four are satisfied, and the guest still never opens the main menu.** `MainMenu`
+and `ESportsMainMenu` stay at zero occurrences and `path-req` stays at its usual 120.
+So `0x12af010: blr x8` — the menu loader, `vtable[21] = 0x14851e8` — **is being called
+and doing nothing observable.** The gate was never the story. Everything from
+`0x12aefd8` onward is now closed: it was the Cloudcell availability byte, then the
+lifecycle order, then the continuation ABI, then two vtables with null entries, then
+the singleton. Each was real; none was the last one.
+
+The new lead is **content or service, not control flow**: the loader is reached and
+either returns early or asks for something that is not there. Note also that this run
+reached `frames=8880` where the previous ones reached 16080-16320, so whatever the
+loader does on entry is already costing frames.
+
+That is a different kind of question from every one before it, and it is the first one
+that can be asked with the gate's own terms satisfied.
