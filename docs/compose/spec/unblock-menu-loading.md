@@ -694,3 +694,53 @@ value rather than on the call chain); what `GC` is meant to catch; and
 indirect or aliased writes to `+0x4fc`, which a direct-encoding scan cannot
 exclude.
 
+
+
+## [S15] The GPU gate opens; the guest then waits on Cloudcell
+
+ccdeliver19: the GPU gate opens, and the guest then waits on Cloudcell
+
+  GPU id '4', model '8320', renderer string 'PowerVR Rogue GE8320 (Mesa 20.1.0-rc3)'
+  t4fc=4  p500=8320
+
+The gate at 0x12af190 now passes exactly as intended. ccdeliver19 is the
+first run whose blocker moved for the right reason rather than by accident.
+
+The menu still does not load -- MainMenu 0, path-req still 120, sa9 still
+0 -- and the guest says why, in its own log:
+
+  [FileManager::CreateDir] Error creating directory:
+      sdmc:/switch/rr3-native-rehost/.depot/CC_Data
+  CC: Server Environment Updated. SyncManager updating SyncDomain to:
+      connect-dev-ss.cloudcell.com
+  CC: Invalid DeviceId! Have we connected to cloudcell yet?
+  CC: Sub Sync Queued: 13
+  CC: Unable to send Sync, Social Media not initialised.
+
+Three readings, in order of certainty:
+
+1. **The CreateDir error is not the blocker.** `.depot/CC_Data` exists on
+   the card now and the host has guestMkdir (guest_filesystem.cpp:2177).
+   Whatever failed, it is not what stops the boot.
+
+2. **The guest wants a Cloudcell session.** SyncDomain is set to a real
+   host, connect-dev-ss.cloudcell.com, and it never connects; there is no
+   DeviceId, so "Social Media not initialised" repeats forever.
+
+3. **That is the same boundary the port started with.** Reaching the main
+   menu requires a live Cloudcell backend session. A GPU renderer string is
+   a device profile; this is the game's backend service, and the whole
+   reason the session began with a rule about not faking Cloudcell.
+
+So the honest position after this round is short. The host-side defects
+along the way were real and are fixed:
+
+  frames 1 -> ~16,000        the wedge is gone
+  Z_DATA_ERROR 70 -> 0       70 permanently failing shader loads
+  GPU id 0 -> 4              the frame loop now advances past its own gate
+
+and the remaining blocker is not a defect in this port. It is that the game
+does not reach its main menu without a Cloudcell session, and there is no
+such session here. Everything the harness is responsible for is either
+fixed or measured.
+
