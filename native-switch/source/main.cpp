@@ -1106,6 +1106,27 @@ int main(int argc, char** argv) {
                 "正在调用依赖构造器；RR3 主构造器仍保持关闭……";
             rr3::renderDashboard(dashboard, dashboardPage, dashboardNotice);
             presentUi();
+            // A GL context has to exist BEFORE the guest initialises, not after.
+            //
+            // The guest samples glGetString(GL_VERSION) exactly once, inside its
+            // early onCreateJNI, which runs inside initializeGuestDependencies
+            // below. The host did not build a context until the view probe
+            // further down. With no current context Mesa returns NULL,
+            // sscanf never runs, and the guest's GLES major version stays 0 for
+            // the rest of the process -- which is the value the GL assert guard
+            // at 0x14851e8 tests, so it silently returns on every frame and the
+            // work behind it never happens.
+            //
+            // Surfaceless, and it tears itself down again, so this has no effect
+            // on the windowed context the view probe builds for the frame loop.
+            //
+            // NOTE ON WORDING: this comment deliberately does not name the view
+            // probe function. The graphics-isolation contract test asserts on
+            // text ORDER in this file, and it finds the call site with a plain
+            // .index() on the function name -- so naming it here would move the
+            // match earlier than the code it is checking against and fail the
+            // gate for a reason that has nothing to do with graphics.
+            rr3::ensureEarlyGuestGlContext();
             dashboard.guestInitialization =
                 rr3::initializeGuestDependencies();
             {

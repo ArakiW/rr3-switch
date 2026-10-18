@@ -195,6 +195,21 @@ struct ConfState {
     bool cloudcellSynthetic = false;
     // "mlstub=1" -- take menu-loader vtable slot 21 even when the guest's own
     // vtable is legal. See guest_view_probe.cpp for the measurement.
+    // "glctxearly=1" -- bring up a GL context BEFORE the guest's early
+    // initialisation, because the guest samples glGetString(GL_VERSION) during
+    // initializeGuestDependencies (main.cpp:1110) and the host did not have a
+    // current context until runGuestViewProbe (main.cpp:1176) -- 66 lines too
+    // late. With no context Mesa returns NULL, sscanf never runs, and the
+    // guest's GLES major version stays 0 for the rest of the process.
+    //
+    // The early context is surfaceless (EGL_NO_SURFACE), which the guest's own
+    // EGL_KHR_surfaceless_context extension list says is supported. That is the
+    // point of doing it this way: no surface is taken on the NWindow, so the
+    // view probe's own ladder is untouched and cannot end up with two surfaces
+    // on one window.
+    bool earlyGlContext = true;
+    // "mlstub=1" -- take menu-loader vtable slot 21 even when the guest's own
+    // vtable is legal. See guest_view_probe.cpp for the measurement.
     bool forceMenuStub = false;
     bool zeroPage = false;
     unsigned long long zeroPageAt8 = 0;
@@ -373,6 +388,10 @@ void readConf() {
         else if (std::strcmp(key, "ccsynth") == 0 ||
                  std::strcmp(key, "cc-synth") == 0) {
             s_conf.cloudcellSynthetic = parseSwitch(value);
+        }
+        else if (std::strcmp(key, "glctxearly") == 0 ||
+                 std::strcmp(key, "gl-context-early") == 0) {
+            s_conf.earlyGlContext = parseSwitch(value);
         }
         else if (std::strcmp(key, "ccmode") == 0 ||
                  std::strcmp(key, "cc-mode") == 0 ||
@@ -664,6 +683,14 @@ bool gfxCloudcellCompleteRequests() {
 bool gfxCloudcellSynthetic() {
     ensureResolved();
     return s_conf.cloudcellSynthetic;
+}
+
+// "glctxearly=1": bring a GL context up before the guest's early init. Default
+// 1 -- the guest samples glGetString(GL_VERSION) during
+// initializeGuestDependencies and needs a current context to do it.
+bool gfxEarlyGlContext() {
+    ensureResolved();
+    return s_conf.earlyGlContext;
 }
 
 const char* gfxCloudcellCompleteMode() {

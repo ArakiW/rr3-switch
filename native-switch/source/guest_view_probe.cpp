@@ -4910,4 +4910,106 @@ void* frameLoopDriver(void* opaque) {
 
 } // namespace
 
+// Bring a GL context up BEFORE the guest's early initialisation gets a chance
+// to ask what GL it is running on.
+//
+// Why this exists. The guest samples glGetString(GL_VERSION) exactly once, in
+// 0x128a17c: glGetString -> strstr("OpenGL ES") -> sscanf("%d.%d") into
+// this->0xc (major) and this->0x10 (minor), on an object of class
+// 11ndSingletonI11mtGLWrapperE. That sample happens during the guest's early
+// onCreateJNI, which runs inside initializeGuestDependencies at
+// main.cpp:1110. The host did not build or make current an EGL context until
+// runGuestViewProbe at main.cpp:1176 -- 66 lines later. With no current
+// context Mesa returns NULL, sscanf never runs, and the major version stays 0
+// for the rest of the process. Every later check of that field -- including
+// the GL assert guard at 0x14851e8, whose silent-return branch is
+// "major < 3" -- is therefore permanently on the wrong side.
+//
+// Why it is a no-op for the view probe. The context here is SURFACELESS:
+// EGL_NO_SURFACE for draw and read. The guest's own EGL extension list
+// includes EGL_KHR_surfaceless_context, and nothing about the frame loop needs
+// a window here -- it exists only so that glGetString answers. No surface is
+// taken on the NWindow, so runGuestViewProbe's own ladder is untouched and
+// cannot end up with two surfaces on one window. This function unbinds and
+// destroys what it made, leaving the process exactly as it found it.
+bool ensureEarlyGuestGlContext() {
+    if (!gfxEarlyGlContext()) {
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "gl-ctx-early", 110, 0, "disabled by conf");
+        return false;
+    }
+    if (eglGetCurrentContext() != EGL_NO_CONTEXT) {
+        // Something already made one current. Do not stack a second context on
+        // top of it; the version sample that follows will be answered anyway.
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "gl-ctx-early", 110, 0, "already current, skipped");
+        return true;
+    }
+
+    EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (display == EGL_NO_DISPLAY) {
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "gl-ctx-early", 110, 0, "failed: no display");
+        return false;
+    }
+    EGLint major = 0;
+    EGLint minor = 0;
+    if (eglInitialize(display, &major, &minor) != EGL_TRUE) {
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "gl-ctx-early", 110, 0, "failed: initialize");
+        return false;
+    }
+    constexpr EGLint configAttributes[] = {
+        EGL_RED_SIZE, 8,   EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
+        EGL_ALPHA_SIZE, 8, EGL_DEPTH_SIZE, 24, EGL_STENCIL_SIZE, 8,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_NONE,
+    };
+    EGLConfig config{};
+    EGLint configCount = 0;
+    if (eglChooseConfig(display, configAttributes, &config, 1, &configCount) != EGL_TRUE ||
+        configCount == 0) {
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "gl-ctx-early", 110, 0, "failed: chooseConfig");
+        eglTerminate(display);
+        return false;
+    }
+    constexpr EGLint contextAttributes[] = {
+        EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE,
+    };
+    EGLContext context = eglCreateContext(display, config, EGL_NO_CONTEXT,
+                                         contextAttributes);
+    if (context == EGL_NO_CONTEXT) {
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "gl-ctx-early", 110, 0, "failed: createContext");
+        eglTerminate(display);
+        return false;
+    }
+    // Surfaceless on purpose -- see the header comment.
+    if (eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, context) != EGL_TRUE) {
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "gl-ctx-early", 110, 0, "failed: makeCurrent");
+        eglDestroyContext(display, context);
+        eglTerminate(display);
+        return false;
+    }
+
+    // Answer the question the guest is about to ask, while a context exists,
+    // so the failure is visible here rather than as a mystery 0 later.
+    const char* version = reinterpret_cast<const char*>(
+        glGetString(GL_VERSION));
+    char diag[192];
+    __builtin_snprintf(diag, sizeof(diag), "surfaceless ok, glGetString=%s",
+                       version != nullptr ? version : "(null)");
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "gl-ctx-early", 110, 0, diag);
+
+    // Leave the process as we found it: the view probe builds its own
+    // windowed context for the frame loop, and it must not inherit this one.
+    eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    eglDestroyContext(display, context);
+    eglTerminate(display);
+    return true;
+}
+
 } // namespace rr3

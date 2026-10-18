@@ -141,6 +141,19 @@ GuestEntryProbe runGuestEntryProbe(const char* progressPath = nullptr);
 // Runs the first guest view lifecycle callbacks with a live EGL context in the
 // same process that owns the guest mappings. The caller must have completed
 // JNI_OnLoad and the activity lifecycle probe before invoking this function.
+// Brings up a SURFACELESS GL context, asks glGetString(GL_VERSION) on it, and
+// tears it down again. Called before the guest's early initialisation, which
+// samples the GL version once and never re-samples it -- so if the host has no
+// context at that moment the guest records major=0 for the rest of the process
+// and every later check of that field is permanently on the wrong side.
+//
+// No surface is taken on the NWindow, so the view probe's own windowed ladder
+// is unaffected. Controlled by "glctxearly" in rr3-gfx.conf; default on.
+bool ensureEarlyGuestGlContext();
+
+// Runs the first guest view lifecycle callbacks with a live EGL context in the
+// same process that owns the guest mappings. The caller must have completed
+// JNI_OnLoad and the activity lifecycle probe before invoking this function.
 GuestViewProbe runGuestViewProbe(NWindow* window,
                                  const char* progressPath = nullptr);
 

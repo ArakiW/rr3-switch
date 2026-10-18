@@ -95,6 +95,11 @@ bool gfxCloudcellCompleteRequests();
 // guest build its own (0, the default). See gfxCloudcellSynthetic().
 bool gfxCloudcellSynthetic();
 
+// "glctxearly=1": bring a GL context up before the guest's early init, so the
+// guest's one-shot glGetString(GL_VERSION) sample returns a real number. Default
+// 1. See ensureEarlyGuestGlContext() for why this is not optional.
+bool gfxEarlyGlContext();
+
 const char* gfxCloudcellCompleteMode();
 
 // "mlstub=1": force menu-loader vtable slot 21 to the host stub even when the
