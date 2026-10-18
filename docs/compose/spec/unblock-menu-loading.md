@@ -617,3 +617,80 @@ only way to reach tier 4 is to answer with a string from a different device.
 That is ordinary porting work for most engines and a misrepresentation for
 this one, and it is a judgement the port owner should make, not the harness.
 
+
+
+## [S14] The GPU id table, read from the code
+
+The GPU id table, read from the code
+
+`0x12afd94`..`0x12b0378`, two callers (`0x12ad650`, `0x12adbc0`). It fetches
+exactly one C string from a singleton (vtable slot `+0x20`, `strlen`, copied
+into an SSO string at `sp+0x18`), then walks an inlined chain of substring
+searches -- `memchr` for the first character, then byte-compare against
+immediates built with `mov`/`movk`.
+
+| # | substring | id | site |
+|---|-----------|----|------|
+| 1 | `GC` | 1 | `0x12afe78` |
+| 2 | `Immersion` | 2 | `0x12afee8` |
+| 3 | `PowerVR` | 4 | `0x12aff68` |
+| 4 | `Adreno` | 5 | `0x12affe4` |
+| 5 | `Mali` | 6 | `0x12b005c` |
+| 6 | `VideoCore` | 8 | `0x12b0114` |
+| 7 | `Intel` | 7 | `0x12b00c8` |
+| -- | no match | 0 | `bl 0x12b49b0` |
+
+First match wins, case-sensitive. The bound is `len - strlen(pattern)`, so a
+pattern with nothing after it still matches; `VideoCore` yields 8 only if it
+is not at offset 0, otherwise it falls through to the `Intel` test.
+
+**The default 0 is a real default, not an "unknown GPU" constant.**
+`0x12afdd0` seeds `stp w9, wzr, [x29,#-0x10]` with `w9 = -1` -- id 0,
+model -1 -- and the no-match path calls `0x12b49b0`, which stores `wzr` for
+the id and `w9 = -1` for the model. That reproduces the observed
+`GPU id '0', model '-1'` exactly.
+
+**id 3 is never produced.** So the value is not a monotone quality tier: it
+mixes GPU families (PowerVR, Adreno, Mali, Intel) with setting names
+(`GC`, `Immersion`). **`id == 4` means "the renderer string contains
+`PowerVR`"** and nothing else.
+
+`model` is a decimal digit-run parsed from the same string, but only when
+`id != 0 && model == -1` (`0x12b01b0 cbz w1`; `0x12b01b4 cmn w2,#1`), which
+is why this run prints `-1` even though `NV120` contains digits.
+
+Chain proven end to end, same base register and same field:
+
+  0x12b0280  str  w1, [x19, #0x4fc]
+  0x12af184  ldr  w9, [x19, #0x4fc]
+  0x12af190  cmp  w9, #4
+
+**Only `GL_RENDERER` feeds the lookup.** `GL_VENDOR` is fetched by the game
+elsewhere (`0x1484640`, `0x128a26c`) but never reaches this chain. The string
+is the same one the guest prints as `renderer string '%s'`, and this run
+printed `NV120`, which is exactly the host's `GL_RENDERER`.
+
+**Therefore there is no honest string that also yields 4.** `NV120`, or any
+real nouveau or NVIDIA renderer string, matches none of
+`GC`/`Immersion`/`PowerVR`/`Adreno`/`Mali`/`VideoCore`/`Intel`.
+
+A correction to a guess made earlier in this investigation: the initial
+reading of the string pool -- three words, `Adreno`, `Mali`, `PowerVR`,
+appearing once each -- was used to assert that the table held phone GPUs
+only. That inference was not supported: the three words sit in unrelated
+parts of `.rodata` (`0x4755d1` beside `texHeight` and `doc Path: %s`,
+`0x496e46`, `0x3f82fc`) and are ordinary pool entries. The table above is
+the one that was read out of the code, and it maps **id 4 to `PowerVR`, not
+to Adreno** -- which the string-pool guess had wrong in the part that
+mattered most.
+
+No second route to the id was found: the only direct 32-bit writer of
+`this+0x4fc` in `.text` is `0x12b0280`. The two other hits (`0x12dec6c`,
+`0x12df0a4`) target a `adrp 0x1f89000` global, a different object.
+
+Not determined: which enum the singleton accessor passes to `glGetString`
+(the vtable is runtime-initialised, so `GL_RENDERER` rests on the observed
+value rather than on the call chain); what `GC` is meant to catch; and
+indirect or aliased writes to `+0x4fc`, which a direct-encoding scan cannot
+exclude.
+
