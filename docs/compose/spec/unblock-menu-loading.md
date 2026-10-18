@@ -563,3 +563,57 @@ failing shader loads are fixed, both of which stand on their own.
 
 Gates for this round: build 0, inputs 0, frozen hash 32a3e014..., 11/11.
 
+
+
+## [S13] ROOT CAUSE: the guest waits for GPU id 4 and gets 0
+
+ROOT CAUSE: the guest waits for GPU id 4 and gets 0
+
+    GPU id '0', model '-1', renderer string 'NV120'
+
+The render loop's exit test, read from the binary:
+
+  0x12af180  ... f_4a0 rotation
+  0x12af190  cmp   w9, #4
+  0x12af194  b.ne  0x12aebac        ; id != 4 -> leave, skipping the tail
+  0x12af19c  ...                    ; the function's ONLY post-frame transition
+
+`[rend+0x4fc]` is the engine's GPU id -- its own field name, from the guest's
+format string "GPU id '%d', model '%d', renderer string '%s'" at 0x46cd70.
+`sa9` is `renderer+0x1f5a9`, the splash->menu one-shot, still 0.
+
+Measured this run: t4fc=0, sa9=0. The host has carried a note on exactly
+this since 2026-10-04 (archive 20261004-053820-tier2): "MEASURED ...
+render-call-pre ... t4fc=5 ... the render loop's exit test is cmp #4 / b.ne
+... it waits for id == 4 while the id is 5". So this was seen five days ago,
+noted, and never chased. On this run the id is 0 rather than 5.
+
+The guest derives the id from the GL identity strings. The host serves
+GL_RENDERER as "NV120" and GL_VENDOR as "nouveau" -- an NVIDIA string the
+Android-era compatibility tiers have no entry for -- so the lookup yields 0.
+
+This also CORRECTS S12. Two of that section's claims were wrong:
+
+  - 0x12aea7c has exactly ONE ret, at 0x12aebd4. The other five "exits"
+    listed there (0x12af218/248/2ac/304/354) are branches into tail code
+    and __stack_chk_fail, not returns.
+  - 0x12aefa8 is NOT a rare diagnostic path. With the measured pre-state
+    f_4d8=0, f_4dc=2, `cmp #6 / b.lt` sends control to 0x12aef54, f_4dc
+    becomes 3, `2 > 4` is false, and the GL arm falls straight INTO
+    0x12aefa8. Every successful frame passes through it. The guard runs
+    every frame; its four terms read satisfied (136/136 polls); and the
+    reporter it calls is installed and live (repA/repB non-null, 120/120).
+
+So the guard was never the blocker, and neither was any value behind it. The
+frame runs to completion every time -- it just leaves before the one place
+that advances the game state.
+
+The remaining question is what the guest's id lookup accepts. That decides
+whether the honest answer is "nothing, report 0 and the game declines" or a
+platform translation. It is worth being explicit that this is a different
+kind of question from the Cloudcell boundary: there, faking would mean
+claiming to be authenticated. Here the guest asks which GPU it is, and the
+only way to reach tier 4 is to answer with a string from a different device.
+That is ordinary porting work for most engines and a misrepresentation for
+this one, and it is a judgement the port owner should make, not the harness.
+
