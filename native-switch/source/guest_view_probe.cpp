@@ -3428,24 +3428,35 @@ void* frameLoopDriver(void* opaque) {
             // open for term 1: "the singleton was null so the builder never
             // ran" and "the singleton was fine so the builder ran but the
             // object did not appear". Both produce t1 = 0x0.
-            char cc[320];
+            //
+            // LOG EVERY LEVEL OF BOTH CHAINS. A two-step dereference printed
+            // only its final result, so "the cell is 0x0" could not say WHICH
+            // level was zero -- the GOT slot, the cell, or the object. That is
+            // exactly where a silent failure hides: the poll looked
+            // trustworthy and still could not answer the question it was
+            // written for. Three numbers per chain, no extra dereference of
+            // anything not already read.
+            const uintptr_t gotValue =
+                baseOk ? deref(renderTarget + 0x00CBAF2CULL) : 0;
+            const uintptr_t t1GotValue = baseOk ? deref(renderTarget + 0x00CBA93CULL) : 0;
+            char cc[352];
             __builtin_snprintf(
                 cc, sizeof(cc),
-                "cc-cell-poll: f=%llu singleton=%p t1=%p t1vt=%p cell=%p"
-                " sub280=%p tag=%d gate_byte4c1=%s synth=%d",
+                "cc-cell-poll: f=%llu ss_got=0x%x ss_cell=0x%x ss_obj=%p"
+                " t1_got=0x%x t1_cell=0x%x t1_obj=%p cc1=%s sub280=%p tag=%d"
+                " synth=%d",
                 static_cast<unsigned long long>(frames),
+                (unsigned)gotValue,
+                (unsigned)singletonCell,
                 reinterpret_cast<void*>(singleton),
+                (unsigned)t1GotValue,
+                (unsigned)t1Global,
                 reinterpret_cast<void*>(t1Obj),
-                reinterpret_cast<void*>(
-                    t1Obj != 0
-                        ? *reinterpret_cast<const uintptr_t*>(t1Obj)
-                        : 0),
-                reinterpret_cast<void*>(pollCell),
-                reinterpret_cast<void*>(sub280),
-                static_cast<int>(sub280 & 1ULL),
                 (pollCell != 0 &&
                  *reinterpret_cast<const uint8_t*>(pollCell + 0x4C1) != 0)
                     ? "1" : "0",
+                reinterpret_cast<void*>(sub280),
+                static_cast<int>(sub280 & 1ULL),
                 gfxCloudcellSynthetic() ? 1 : 0);
             appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                                 cc, 74, 0);
