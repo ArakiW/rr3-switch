@@ -3428,12 +3428,38 @@ void* frameLoopDriver(void* opaque) {
             const uintptr_t gotValue =
                 deref(renderTarget + 0x00CBAF2CULL);
             const uintptr_t t1GotValue = deref(renderTarget + 0x00CBA93CULL);
-            char cc[352];
+            // THE NUMBER THAT CLOSES THE LOOP.
+            //
+            // S is the mtGLWrapper singleton, reached through GOT 0x1f6f970
+            // (addend 0x1f97c88). S->0xc is the OpenGL ES MAJOR VERSION, written
+            // once by 0x128a17c from glGetString(GL_VERSION) + sscanf("%d.%d").
+            // The assert guard at 0x14851e8 silently returns when S->0xc < 3 and
+            // asserts otherwise.
+            //
+            // ccdeliver13 proves the early context now answers
+            // "OpenGL ES 3.2", so if S->0xc were 3 the run would die inside
+            // bionicAssert2 ([[noreturn]], std::abort()). It did not die and it
+            // logged no assert -- so S->0xc is evidently still below 3. Read it.
+            // S->0x6c comes along because it is the guard's second term and
+            // nothing in .text writes it.
+            //
+            // Same shape as the chains above, no guard of its own, and the delta
+            // is computed rather than transcribed:
+            //   0x1f6f970 - 0x1f6d5d0 = 0x23a0, so 0x00CB9FBC + 0x23a0
+            const uintptr_t sObj =
+                deref(deref(renderTarget + 0x00CBC35CULL));
+            const unsigned glMajor =
+                sObj != 0 ? *reinterpret_cast<const unsigned char*>(sObj + 0x0c) : 0;
+            const unsigned glMinor =
+                sObj != 0 ? *reinterpret_cast<const unsigned char*>(sObj + 0x10) : 0;
+            const unsigned glFlag6c =
+                sObj != 0 ? *reinterpret_cast<const unsigned char*>(sObj + 0x6c) : 0;
+            char cc[440];
             __builtin_snprintf(
                 cc, sizeof(cc),
                 "cc-cell-poll: f=%llu ss_got=0x%x ss_cell=0x%x ss_obj=%p"
                 " t1_got=0x%x t1_cell=0x%x t1_obj=%p cc1=%s sub280=%p tag=%d"
-                " synth=%d",
+                " synth=%d GLVER=%u.%u S6c=%u Sobj=%p",
                 static_cast<unsigned long long>(frames),
                 (unsigned)gotValue,
                 (unsigned)singletonCell,
@@ -3446,7 +3472,9 @@ void* frameLoopDriver(void* opaque) {
                     ? "1" : "0",
                 reinterpret_cast<void*>(sub280),
                 static_cast<int>(sub280 & 1ULL),
-                gfxCloudcellSynthetic() ? 1 : 0);
+                gfxCloudcellSynthetic() ? 1 : 0,
+                glMajor, glMinor, glFlag6c,
+                reinterpret_cast<void*>(sObj));
             appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                                 cc, 74, 0);
             // The menu gate at 0x12aefc8 is a four-way AND whose terms are, in
