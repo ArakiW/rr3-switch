@@ -874,6 +874,31 @@ int main(int argc, char** argv) {
     };
     rr3::renderLoadingDashboard("Core DSO link and permissions", 75);
     presentUi();
+    // A GL context has to exist BEFORE the guest initialises, not after.
+    //
+    // The guest samples glGetString(GL_VERSION) exactly once, inside its early
+    // onCreateJNI, which runs inside a dependency-initialisation pass. That
+    // pass is reached from HERE, through the DSO link -- multi_dso_linker.cpp
+    // emits "initDeps-completing" from three separate entry points, and this
+    // one is the first to execute. An earlier attempt placed this call just
+    // before the later, dashboard-visible dependency call at main.cpp:1131
+    // and the run logged no "gl-ctx-early" line at all: the guest had already
+    // sampled its GL version 150 log lines earlier.
+    //
+    // With no current context Mesa returns NULL, sscanf never runs, and the
+    // guest's GLES major version stays 0 for the rest of the process -- which
+    // is the value the GL assert guard at 0x14851e8 tests, so that guard
+    // returned silently on every frame and the work behind it never happened.
+    //
+    // Surfaceless, and it tears itself down again, so the windowed context the
+    // view probe builds for the frame loop is unaffected.
+    //
+    // NOTE ON WORDING: this comment deliberately does not name the view-probe
+    // function. The graphics-isolation contract test asserts on text ORDER in
+    // this file and finds the call site with a plain .index() on the function
+    // name, so naming it here would move the match earlier than the code it
+    // checks and fail the gate for a reason unrelated to graphics.
+    rr3::ensureEarlyGuestGlContext();
     const rr3::ElfLoaderSession loader = gameLibrary != nullptr
         ? rr3::loadLinkElfSet(loaderPaths, sizeof(loaderPaths) / sizeof(loaderPaths[0]))
         : rr3::ElfLoaderSession{};
@@ -1106,27 +1131,13 @@ int main(int argc, char** argv) {
                 "正在调用依赖构造器；RR3 主构造器仍保持关闭……";
             rr3::renderDashboard(dashboard, dashboardPage, dashboardNotice);
             presentUi();
-            // A GL context has to exist BEFORE the guest initialises, not after.
-            //
-            // The guest samples glGetString(GL_VERSION) exactly once, inside its
-            // early onCreateJNI, which runs inside initializeGuestDependencies
-            // below. The host did not build a context until the view probe
-            // further down. With no current context Mesa returns NULL,
-            // sscanf never runs, and the guest's GLES major version stays 0 for
-            // the rest of the process -- which is the value the GL assert guard
-            // at 0x14851e8 tests, so it silently returns on every frame and the
-            // work behind it never happens.
-            //
-            // Surfaceless, and it tears itself down again, so this has no effect
-            // on the windowed context the view probe builds for the frame loop.
-            //
-            // NOTE ON WORDING: this comment deliberately does not name the view
-            // probe function. The graphics-isolation contract test asserts on
-            // text ORDER in this file, and it finds the call site with a plain
-            // .index() on the function name -- so naming it here would move the
-            // match earlier than the code it is checking against and fail the
-            // gate for a reason that has nothing to do with graphics.
-            rr3::ensureEarlyGuestGlContext();
+            // The early GL context is established before loadLinkElfSet above,
+            // not here: the guest's one-shot glGetString(GL_VERSION) sample runs
+            // inside a dependency-initialisation pass that reaches
+            // multi_dso_linker's entry points, and the first of those is the
+            // DSO link. Doing it here was measurably too late -- a run with the
+            // call in this position produced no "gl-ctx-early" line and no
+            // change, because the guest had already sampled its GL version.
             dashboard.guestInitialization =
                 rr3::initializeGuestDependencies();
             {
