@@ -386,3 +386,65 @@ The class is the GL renderer, not a UI/menu object. There is no RTTI on `0x1ed7f
 2. `vtable[6]` (`0x1484654`) fires one assert *before* this one, every frame. Its condition may be the upstream cause.
 
 The import table carries `__assert2`, `__android_log_print`, `raise`, `ptrace`, `abort`, `sigaction` -- the canonical EA assert-to-crash-report chain. **A host that stubs `raise`/`abort`/`ptrace` into a sink would let the run continue, and it would also be the difference between "an assert fired every frame" and "the guest made progress".** That is the next thing to look at.
+
+## [S10] ROOT CAUSE: the guest samples the GL version before the host has a context
+
+This is the whole thing, verified end to end. It is a host ordering bug, it is
+not Cloudcell, and it is not a gate.
+
+**`S->0xc` is the OpenGL ES major version.** Class `11ndSingletonI11mtGLWrapperE`
+(RTTI at `0x518675`), object 200 bytes, vtable address point `0x1ec8bd0`. It is
+written exactly once, in `0x128a17c`:
+
+```
+0x128a31c  bl  glGetString     ; w0 = 0x1F02 = GL_VERSION
+0x128a340  bl  strstr(s, "OpenGL ES")        ; string at 0x3a195b
+0x128a350  add  x2, x19, #0xc               ; &major
+0x128a354  add  x3, x19, #0x10              ; &minor
+0x128a35c  bl  sscanf(p+0xa, "%d.%d", &major, &minor)   ; fmt at 0x415461
+```
+
+`0xc` = major, `0x10` = minor. `S->0x6c` is read once and **never written**, so it
+is 0 from `.bss` and the assert's second branch is dead by construction.
+
+**That leaves exactly one branch, and it is the one we are in.** The assert reporter
+`0x14851e8` returns silently when `S->0xc < 3 && S->0x6c == 0`. The other two branches
+call `0x128c054` / `0x128c4c4`, which reach the EA assert chain ending in
+`bionicAssert2` -- which is `[[noreturn]]` and calls `std::abort()`. Three 300-second
+runs produced **zero** asserts and did not die, so the assert branches were not taken.
+**The guard at `0x12aefc8..0x12af014` silently returns every frame, and whatever it was
+protecting never runs.**
+
+**Why `S->0xc` is 0 — the log settles it.** Two `onCreateJNI` invocations exist:
+
+```
+line  50  initDeps-completing
+line  91  CREATE                    <- the GUEST's own early call
+line 183  view-egl-init-begin
+line 189  view-egl-current-ok       <- context is current only here
+line 193  view-call-created
+line 194  onCreateJNI-pre          <- OURS, after the context
+line 207  OpenGL ES 3.2 Mesa 20.1.0-rc3   <- glGetString works here
+```
+
+The version is sampled during the guest's early `onCreateJNI`, which runs inside
+`initializeGuestDependencies` at **main.cpp:1110** -- and the host only builds and
+makes current the EGL context later, inside `runGuestViewProbe` at **main.cpp:1176**.
+With no current context Mesa returns NULL from `glGetString`, `strstr`/`sscanf` never
+produce a number, and `S->0xc` stays 0.
+
+Our second `onCreateJNI` at main.cpp-equivalent line 194 is correctly ordered -- the
+context *is* current and `glGetString` does answer. But `onCreateJNI` is a **get-or-create**
+(`cbz` on the cell branches to the constructor, non-null branches to a plain return at
+`0x12b3154`), so the second call never reaches `0x128a17c`. **The version is never
+re-sampled.** That is why reordering the lifecycle alone did not help, and why calling
+`onCreateJNI` twice did not help either.
+
+**The fix**: the EGL context has to exist before `initializeGuestDependencies`, i.e.
+before the guest gets its first chance to ask what GL it is running on. On a real
+device the app creates its GL surface first; here the host does it 66 lines too late.
+This is the same class of bug as the lifecycle-order fix in T11, one level earlier in
+the boot sequence.
+
+Nothing here touches Cloudcell credentials, authentication or responses. The guest is
+asking the driver what GL version it is, and the host had not given it a context yet.
