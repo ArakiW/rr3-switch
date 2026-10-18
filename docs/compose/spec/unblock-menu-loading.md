@@ -298,3 +298,30 @@ Entry 5 was called from seven places and dereferenced from one. **That is only p
 
 The tell was in the log throughout, and was read backwards twice: `cc-slot-unpinned=0` does not mean the stub worked — it means **the guest never reached the stub**.
 
+
+## [S7] The sharpest open contradiction (2026-10-18)
+
+Static analysis and runtime measurement now disagree, and the disagreement is narrow enough to be useful.
+
+**Static, from bytes, with validated instruments:**
+
+- `func 0x12ac2dc` (the MainActivity ctor) is **branch-free** from entry to `0x12ac330`. Prologue, TLS canary, three `mov`s, one call to `0x12b62c8`, then straight into `adrp/ldr/add` and the store. No `cbz`, `cbnz`, `b.` or `ret` in between.
+- `0x12b62c8` is a JNIObject constructor, not an error path. Four of its JNIEnv offsets match the standard `JNINativeInterface_` table exactly: `0xf8`=GetObjectClass, `0xa8`=NewGlobalRef, `0xb8`=DeleteLocalRef, `0x20`=GetVersion. Its "fatal" callee `0x109fbb0` is `__android_log_assert`-style: it logs and then **`ret`**s. Both null paths log and **fall through**.
+- The ctor's FDE (`0x801f30`, covering `0x12ac2dc..0x12acbc4`) resolves to the `zR` CIE — **no LSDA, therefore no landing pad anywhere in it**. Nothing can catch between the call and the store.
+- `x8` at `0x12ac330` is exactly `*(GOT 0x1f6e540)`, addend `0x1f97030`, and is never clobbered between `0x12ac31c` and the store.
+
+**So the store executes. Unconditionally.**
+
+**Runtime, from a probe whose guards are now each justified by the failure mode they prevent:**
+
+```
+singleton = 0x0   t1 = 0x0   (136 polls across 16,320 frames)
+cell      = 0x2110e95d00   gate_byte4c1 = 1
+```
+
+A ctor that cannot skip its store, called twice, logged `CREATE` before the view callback, and yet the cell reads zero for the whole run. Exactly two candidates survive:
+
+1. **the poller is reading a different address than it thinks** (PIE bias), or
+2. **a clear lands between `onCreateJNI` and the first poll.** There are four stores to that cell and three of them are clears: `0x12acd90` (in the dtor at `0x12acbc4`), `0x12b3f14`, and `0x12b3f24` (`str xzr` then `b operator delete`). The last two have no direct `bl`/`b` callers and no vtable pointer found in `.rodata`, `.data.rel.ro` or `.data` — **how they are reached is undetermined**, and that is where to look next.
+
+Note the earlier apparent contradiction is not one: `onWindowFocusChangedJNI` reads the same cell, and its log line is reachable only past a null check — so the cell is non-null at *some* point. A store-then-clear-then-rebuild sequence fits both observations; a never-stored cell does not.
