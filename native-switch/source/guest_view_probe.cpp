@@ -3346,20 +3346,46 @@ void* frameLoopDriver(void* opaque) {
             // wrong once and the wrong value was never range-checked. (That
             // constant is declared inside the Cloudcell-install block below,
             // out of scope here, so it is spelled out again.)
-            constexpr uint64_t kMenuLoaderGotDelta = 0x00CBA93CULL;
+            // Deltas, computed rather than done by hand. renderTarget is
+            // base + 0x12B3614, so a guest vaddr's delta is vaddr - 0x12B3614:
+            //
+            //   0x00CB9FBC -> 0x1F6D5D0   Cloudcell cell  (0x12aecc8)
+            //   0x00CBA93C -> 0x1F6DF50   term-1 cell     (0x12aefb8)
+            //   0x00CBAF2C -> 0x1F6E540   onViewCreatedJNI singleton (0x12b35e8)
+            //
+            // 0x00CBA93C is also kMenuLoaderDelta, which this file has carried
+            // since 2026-10-12 with the comment "Menu loader: GOT entry at ELF
+            // 0x1f6df50" -- that comment was right and the poll's transcription
+            // of it was not.
+            //
+            // THE BOUNDS CHECK IS ON THE ELF BASE, NEVER ON A DEREFERENCED
+            // POINTER. Every value obtained by dereferencing is a RUNTIME
+            // address (base + vaddr, roughly 0x211xxxxxx); the earlier
+            // revision range-checked those against [0x100000, 0x1fc7a99], which
+            // are ELF vaddr bounds, so every one of them failed the check and
+            // was reported as 0x0. That is where "singleton = 0x0" came from --
+            // not from the guest. Two address spaces, one threshold.
             constexpr uintptr_t kGuestImageLow = 0x00100000ULL;
             constexpr uintptr_t kGuestImageHigh = 0x001FC7A99ULL;
-            const uintptr_t t1Got = renderTarget + kMenuLoaderGotDelta;
-            const bool t1GotOk =
-                t1Got >= kGuestImageLow && t1Got <= kGuestImageHigh;
-            const uintptr_t t1Global =
-                t1GotOk ? *reinterpret_cast<const uintptr_t*>(t1Got) : 0;
-            const bool t1CellOk =
-                t1Global >= kGuestImageLow && t1Global <= kGuestImageHigh;
-            const uintptr_t t1Obj =
-                t1CellOk
-                    ? *reinterpret_cast<const uintptr_t*>(t1Global)
+            const uintptr_t base =
+                renderTarget >= 0x12B3614ULL
+                    ? renderTarget - 0x12B3614ULL
                     : 0;
+            const bool baseOk =
+                (base % 0x1000) == 0 && base >= kGuestImageLow &&
+                base <= kGuestImageHigh;
+            // A runtime pointer: non-zero and page-aligned is the only claim
+            // that can honestly be made about it, and it is the safe one.
+            auto deref = [](uintptr_t p) -> uintptr_t {
+                return (p != 0 && (p % 0x1000) == 0)
+                           ? *reinterpret_cast<const uintptr_t*>(p)
+                           : 0;
+            };
+            const uintptr_t t1Global = baseOk ? deref(renderTarget + 0x00CBA93CULL) : 0;
+            const uintptr_t t1Obj = deref(t1Global);
+            const uintptr_t singletonCell =
+                baseOk ? deref(renderTarget + 0x00CBAF2CULL) : 0;
+            const uintptr_t singleton = deref(singletonCell);
             const uintptr_t sub280 =
                 pollCell != 0
                     ? *reinterpret_cast<const uintptr_t*>(pollCell + 0x280)
@@ -3397,18 +3423,6 @@ void* frameLoopDriver(void* opaque) {
             // open for term 1: "the singleton was null so the builder never
             // ran" and "the singleton was fine so the builder ran but the
             // object did not appear". Both produce t1 = 0x0.
-            const uintptr_t singletonGot = renderTarget + 0x00CBAF2CULL;
-            const bool singletonGotOk =
-                singletonGot >= kGuestImageLow && singletonGot <= kGuestImageHigh;
-            const uintptr_t singletonCell =
-                singletonGotOk
-                    ? *reinterpret_cast<const uintptr_t*>(singletonGot)
-                    : 0;
-            const uintptr_t singleton =
-                (singletonCell >= kGuestImageLow &&
-                 singletonCell <= kGuestImageHigh)
-                    ? *reinterpret_cast<const uintptr_t*>(singletonCell)
-                    : 0;
             char cc[320];
             __builtin_snprintf(
                 cc, sizeof(cc),
