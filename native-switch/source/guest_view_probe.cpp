@@ -2360,10 +2360,39 @@ GuestViewProbe runGuestViewProbe(NWindow* window, const char* progressPath) {
                         "onCreateJNI-pre", 110,
                         static_cast<unsigned long long>(createTarget));
     if (createTarget != 0) {
-        reinterpret_cast<void (*)(void*, void*)>(createTarget)(
-            jniEnvironment, activityObject);
-        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
-                            "onCreateJNI-ret", 110, 0);
+        // Twice, deliberately. onCreateJNI is a get-or-create:
+        //
+        //   0x12b3150  cbz  x8, #0x12b3160     ; NULL -> allocate + construct
+        //   0x12b3154  ...                       ; NON-NULL -> return, skip
+        //   0x12b3160  mov  w0, #0x540
+        //   0x12b3178  b    #0x12ac2dc           ; tail-call MainActivity ctor
+        //
+        // so a second call is a cheap no-op when the cell is already set, and
+        // a retry when it is not. Static analysis of the constructor
+        // (0x12ac2dc) found exactly four stores to the cell at 0x1f97030 and
+        // only one of them produces: 0x12ac330, which sits AFTER
+        // `bl #0x12b62c8` at 0x12ac310 -- a call that dereferences x1 through a
+        // JNIEnv vtable. A first call that does not reach that store leaves the
+        // cell null, and onViewCreatedJNI then takes its silent
+        // `cbz #0x12b35f8` and the term-1 object is never built.
+        //
+        // The archived logs show the guest itself calling onCreateJNI a second
+        // time (CREATE at log line 195, right after view-call-created at 193),
+        // and later logging "onWindowFocusChanged: hasFocus true", which is only
+        // reachable past the same cell's null check at 0x12b3514. So the cell
+        // does get populated -- just not in time for the first onViewCreatedJNI.
+        //
+        // Calling it twice here closes that window without changing guest
+        // semantics: it is the same export, the same arguments, and the same
+        // idempotent contract.
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            reinterpret_cast<void (*)(void*, void*)>(createTarget)(
+                jniEnvironment, activityObject);
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                attempt == 0 ? "onCreateJNI-ret-a"
+                                             : "onCreateJNI-ret-b",
+                                110, 0);
+        }
     }
     probe.createdCalled = true;
     reinterpret_cast<void (*)(void*, void*)>(createdTarget)(
