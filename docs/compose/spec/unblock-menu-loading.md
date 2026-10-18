@@ -506,3 +506,60 @@ because Python caught a 0x60 transcription error before the build:
   0x1f6e540 -> 0x00CBAF2C   singleton
   0x1f6f970 -> 0x00CBC35C   mtGLWrapper S
 
+
+
+## [S12] WITHDRAWN: the guard is a side path
+
+The guard is a side path: the guest exits before ever reaching it
+
+This dissolves the last contradiction, and it does so without any new bug.
+
+ccdeliver16 established that both assert-report pointers are installed and
+stable -- repA=0x210952d138, repB=0x210952d340, 120/120 polls. So if
+0x14851e8 were reached, it would report something, and the zero asserts
+plus the zero '[A...' lines in the whole log meant it was not reached.
+
+The guard's four terms all read satisfied. That looked like a
+contradiction. It is not: func 0x12aea7c has at least SIX exits that
+bypass the guard entirely, and every target is past the guard's own tail:
+
+  0x12aebd4  ret
+  0x12aed88  cbz  x9, #0x12af218
+  0x12aed50  cbz  x8, #0x12af248
+  0x12aebe4  tbz  w8, #0, #0x12af2ac
+  0x12aec00  tbz  w8, #0, #0x12af304
+  0x12aebb8  b.ne #0x12af354
+
+0x12af014 is the guard's skip target. Every one of those is beyond it.
+Only three instructions reach the guard at 0x12aefa8 -- 0x12aef50
+(b #0x12aefa8), 0x12aef6c (b.hi #0x12aefa8) and fall-through from
+0x12aef74. So the guard is a rarely-taken diagnostic path, not the
+frame's main line.
+
+CONSEQUENCE, and it is the part that matters:
+
+  The "menu gate" at 0x12aefc8 was never the frame's gate. It is not
+  reachable on the path this guest actually takes, so no value of
+  Cloudcell+0x4c1, no value of S->0xc, and no state of the singleton can
+  open it. Every conclusion drawn from that block over the past several
+  rounds -- including "the gate's four terms are satisfied but the menu
+  still does not load" -- was measuring a path the guest does not walk.
+
+  The early-GL-context change (2ec4953e) is not the root cause of the
+  menu never loading. It does make glGetString(GL_VERSION) answerable
+  earlier, which is defensible on its own merits and harmless, but it
+  cannot be credited with anything.
+
+  S11 and the surrounding narrative are therefore withdrawn. The honest
+  position: the guest reaches roughly 16,400 frames, the GL and content
+  defects found along the way are real and fixed, and the reason the main
+  menu never opens is still unknown -- and it is now a question about the
+  guest's own frame state machine, with no host-side gate standing in the
+  way that anyone has yet identified.
+
+The value of the last several rounds was not the conclusion. It was that
+the wedge is gone (frames 1 -> ~16,400) and that seventy permanently
+failing shader loads are fixed, both of which stand on their own.
+
+Gates for this round: build 0, inputs 0, frozen hash 32a3e014..., 11/11.
+
