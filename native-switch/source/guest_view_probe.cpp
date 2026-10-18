@@ -3358,38 +3358,27 @@ void* frameLoopDriver(void* opaque) {
             // 0x1f6df50" -- that comment was right and the poll's transcription
             // of it was not.
             //
-            // THE BOUNDS CHECK IS ON THE ELF BASE, NEVER ON A DEREFERENCED
-            // POINTER. Every value obtained by dereferencing is a RUNTIME
-            // address (base + vaddr, roughly 0x211xxxxxx); the earlier
-            // revision range-checked those against [0x100000, 0x1fc7a99], which
-            // are ELF vaddr bounds, so every one of them failed the check and
-            // was reported as 0x0. That is where "singleton = 0x0" came from --
-            // not from the guest. Two address spaces, one threshold.
-            constexpr uintptr_t kGuestImageLow = 0x00100000ULL;
-            constexpr uintptr_t kGuestImageHigh = 0x001FC7A99ULL;
-            const uintptr_t base =
-                renderTarget >= 0x12B3614ULL
-                    ? renderTarget - 0x12B3614ULL
-                    : 0;
-            const bool baseOk =
-                (base % 0x1000) == 0 && base >= kGuestImageLow &&
-                base <= kGuestImageHigh;
-            // After a dereference the only defensible claim is "non-zero".
+            // NO RANGE CHECK AT RUNTIME, ON ANYTHING.
             //
-            // An earlier revision also required page alignment, which is wrong
-            // for exactly the values being read here: GOT slot 0x1F6E540 sits
-            // at page offset 0x540 and the term-1 cell at 0x5F8, so neither is
-            // a mapping base and both were rejected. That is why
-            // 'singleton = 0x0' and 't1 = 0x0' survived a fixed delta AND a
-            // fixed range check. Page alignment is a property of mappings,
-            // not of pointers.
+            // A previous revision computed base = renderTarget - 0x12B3614 and
+            // tested it against [0x100000, 0x1FC7A99]. That is the same mistake
+            // one level down: `base` is itself a RUNTIME address
+            // (0x2105xxxxxx), so the test could never pass, baseOk was
+            // permanently false, and every GOT read behind it was reported as
+            // 0x0 BY CONSTRUCTION. That is the true source of the last several
+            // rounds of "singleton = 0x0" and "t1 = 0x0" -- not the guest.
+            //
+            // Nothing in this program is an ELF vaddr at run time, so there is
+            // nothing here to check against ELF bounds. renderTarget + delta is
+            // simply an address; if it is readable it is readable. After a
+            // dereference the only defensible claim is non-zero.
             auto deref = [](uintptr_t p) -> uintptr_t {
                 return p != 0 ? *reinterpret_cast<const uintptr_t*>(p) : 0;
             };
-            const uintptr_t t1Global = baseOk ? deref(renderTarget + 0x00CBA93CULL) : 0;
+            const uintptr_t t1Global = deref(renderTarget + 0x00CBA93CULL);
             const uintptr_t t1Obj = deref(t1Global);
             const uintptr_t singletonCell =
-                baseOk ? deref(renderTarget + 0x00CBAF2CULL) : 0;
+                deref(renderTarget + 0x00CBAF2CULL);
             const uintptr_t singleton = deref(singletonCell);
             const uintptr_t sub280 =
                 pollCell != 0
@@ -3437,8 +3426,8 @@ void* frameLoopDriver(void* opaque) {
             // written for. Three numbers per chain, no extra dereference of
             // anything not already read.
             const uintptr_t gotValue =
-                baseOk ? deref(renderTarget + 0x00CBAF2CULL) : 0;
-            const uintptr_t t1GotValue = baseOk ? deref(renderTarget + 0x00CBA93CULL) : 0;
+                deref(renderTarget + 0x00CBAF2CULL);
+            const uintptr_t t1GotValue = deref(renderTarget + 0x00CBA93CULL);
             char cc[352];
             __builtin_snprintf(
                 cc, sizeof(cc),
