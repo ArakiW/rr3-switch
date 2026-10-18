@@ -3446,20 +3446,38 @@ void* frameLoopDriver(void* opaque) {
             // Same shape as the chains above, no guard of its own, and the delta
             // is computed rather than transcribed:
             //   0x1f6f970 - 0x1f6d5d0 = 0x23a0, so 0x00CB9FBC + 0x23a0
-            const uintptr_t sObj =
-                deref(deref(renderTarget + 0x00CBC35CULL));
+            // ONE dereference, not two. This was wrong for several rounds and it
+            // produced a confident, wrong 3.2. The assert reporter reads:
+            //
+            //   0x148521c  adrp x9, #0x1f6f000
+            //   0x1485220  ldr  x9, [x9, #0x970]     ; x9 = the cell address
+            //   0x148524c  ldr  x10, [x9]            ; ONE deref -> S
+            //   0x1485250  ldr  w10, [x10, #0xc]     ; S->0xc  (GLES major)
+            //   0x1485254  cmp  w10, #3
+            //   0x1485258  b.lt #0x1485274           ; skips ONE condition string,
+            //                                             NOT the assert itself
+            //
+            // So 'S' is deref(renderTarget + 0x00CBC35C), full stop. Reading
+            // deref(S) instead produced GLVER=3.2 from a different object, and
+            // that wrong number is what made the early-context fix look proven.
+            // Both S and S+1 are logged so the two can no longer be confused.
+            const uintptr_t sOne = deref(renderTarget + 0x00CBC35CULL);
             const unsigned glMajor =
-                sObj != 0 ? *reinterpret_cast<const unsigned char*>(sObj + 0x0c) : 0;
+                sOne != 0 ? *reinterpret_cast<const unsigned char*>(sOne + 0x0c) : 0;
             const unsigned glMinor =
-                sObj != 0 ? *reinterpret_cast<const unsigned char*>(sObj + 0x10) : 0;
+                sOne != 0 ? *reinterpret_cast<const unsigned char*>(sOne + 0x10) : 0;
             const unsigned glFlag6c =
-                sObj != 0 ? *reinterpret_cast<const unsigned char*>(sObj + 0x6c) : 0;
+                sOne != 0 ? *reinterpret_cast<const unsigned char*>(sOne + 0x6c) : 0;
+            const unsigned glMajorDeeper =
+                sOne != 0 ? *reinterpret_cast<const unsigned char*>(
+                                deref(sOne) + 0x0c)
+                           : 0;
             char cc[440];
             __builtin_snprintf(
                 cc, sizeof(cc),
                 "cc-cell-poll: f=%llu ss_got=0x%x ss_cell=0x%x ss_obj=%p"
                 " t1_got=0x%x t1_cell=0x%x t1_obj=%p cc1=%s sub280=%p tag=%d"
-                " synth=%d GLVER=%u.%u S6c=%u Sobj=%p",
+                " synth=%d GLVER=%u.%u S6c=%u S=%p Sdeep=%u",
                 static_cast<unsigned long long>(frames),
                 (unsigned)gotValue,
                 (unsigned)singletonCell,
@@ -3474,7 +3492,8 @@ void* frameLoopDriver(void* opaque) {
                 static_cast<int>(sub280 & 1ULL),
                 gfxCloudcellSynthetic() ? 1 : 0,
                 glMajor, glMinor, glFlag6c,
-                reinterpret_cast<void*>(sObj));
+                reinterpret_cast<void*>(sOne),
+                glMajorDeeper);
             appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                                 cc, 74, 0);
             // The menu gate at 0x12aefc8 is a four-way AND whose terms are, in
