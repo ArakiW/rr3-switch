@@ -3472,12 +3472,29 @@ void* frameLoopDriver(void* opaque) {
                 sOne != 0 ? *reinterpret_cast<const unsigned char*>(
                                 deref(sOne) + 0x0c)
                            : 0;
+            // THE LAST UNEXPLAINED OBSERVATION.
+            //
+            // The guard's four terms all read satisfied (measured, 136/136
+            // polls), yet 0x14851e8 leaves no trace: no assert, no crash, and
+            // the whole log contains ZERO '[A...' lines, so the guest never
+            // routes anything to the host's __android_log_vprint either.
+            //
+            // The reporter's only side effect is two INDIRECT calls:
+            //   0x128c054 -> GOT 0x1f77fd8 -> addend 0x1faa138  (.bss)
+            //   0x128c4c4 -> GOT 0x1f781d0 -> addend 0x1faa340  (.bss)
+            // A .bss function pointer is installed at run time. If either is
+            // still zero the call would fault; the process does not fault, so
+            // either they are valid or the call is never made. Reading them
+            // settles which, and the addends say where they live.
+            const uintptr_t repA = deref(renderTarget + 0x00CC49C4ULL);
+            const uintptr_t repB = deref(renderTarget + 0x00CC4BBCULL);
             char cc[440];
             __builtin_snprintf(
                 cc, sizeof(cc),
                 "cc-cell-poll: f=%llu ss_got=0x%x ss_cell=0x%x ss_obj=%p"
                 " t1_got=0x%x t1_cell=0x%x t1_obj=%p cc1=%s sub280=%p tag=%d"
-                " synth=%d GLVER=%u.%u S6c=%u S=%p Sdeep=%u",
+                " synth=%d GLVER=%u.%u S6c=%u S=%p Sdeep=%u"
+                " repA=0x%lx repB=0x%lx",
                 static_cast<unsigned long long>(frames),
                 (unsigned)gotValue,
                 (unsigned)singletonCell,
@@ -3493,7 +3510,9 @@ void* frameLoopDriver(void* opaque) {
                 gfxCloudcellSynthetic() ? 1 : 0,
                 glMajor, glMinor, glFlag6c,
                 reinterpret_cast<void*>(sOne),
-                glMajorDeeper);
+                glMajorDeeper,
+                static_cast<unsigned long>(repA),
+                static_cast<unsigned long>(repB));
             appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                                 cc, 74, 0);
             // The menu gate at 0x12aefc8 is a four-way AND whose terms are, in
