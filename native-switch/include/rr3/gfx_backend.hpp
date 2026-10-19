@@ -97,6 +97,21 @@ bool gfxCloudcellCompleteRequests();
 // zero execution.
 int gfxCloudcellDispatch();
 
+// "objid=1": jniNewObjectV hands out one real handle per call, each carrying its
+// class and enough instance space for the facade to write into, instead of the
+// single shared &g_fakeObjectObject.
+//
+// Two things follow from the shared sentinel, and both are live defects:
+// jniGetObjectClass cannot name an object's class (so instance methods arrive
+// with no class and only reach a facade through a name-only guess), and any
+// facade that writes instance fields writes into one byte of globals --
+// aam_constructor alone stores 16.
+//
+// This changes every object address the guest sees, and this file records the
+// guest spinning on repeated identical returns, so it is measured rather than
+// assumed. jniCallVoidMethodV refuses to run at ccdisp=2 while this is off.
+bool gfxObjectIdentity();
+
 // "ccmode=off|now|bg": WHICH context invokes that continuation, as opposed to
 // whether it is invoked at all (ccdone). The only delivery site that existed is
 // the frame loop, and the guest blocks inside frame 0 before reaching it, so:

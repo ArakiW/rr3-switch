@@ -195,6 +195,22 @@ struct ConfState {
     // answers "which methods would fire, and would the name match" for a full
     // 300 s run without ever executing one.
     int ccDispatch = 0;
+    // "objid=1" -- hand out one real handle per NewObjectV call instead of the
+    // single shared &g_fakeObjectObject. Default 0, which is the pre-2026-10-19
+    // behaviour and the reason two separate defects exist:
+    //
+    //   * jniGetObjectClass answers the class sentinel for every non-Font
+    //     object, so instance methods (login, setUserIdentifier) arrive with
+    //     no class at all and only reach a facade through a name-only guess.
+    //   * any ManagedMethod that writes instance fields writes into that ONE
+    //     byte-wide global. aam_constructor stores two jlongs, so executing it
+    //     would put 16 bytes into 1 byte of host globals.
+    //
+    // This changes every object address the guest sees. jni_bridge.cpp records
+    // at line ~1290 that the guest spins on repeated identical returns, so this
+    // is measured A/B rather than assumed safe, and ccdisp=2 refuses to run
+    // while this is off.
+    bool objectIdentity = false;
     // "ccsynth=1" -- install the host's synthetic Cloudcell object. Default is
     // 0, which LETS THE GUEST BUILD ITS OWN. The guest's constructor
     // (0x1cbe03c) allocates 0x4d0 bytes, publishes the object into this very
@@ -442,6 +458,11 @@ void readConf() {
                 s_conf.ccDispatch = 0;
             }
         }
+        else if (std::strcmp(key, "objid") == 0 ||
+                 std::strcmp(key, "object-id") == 0 ||
+                 std::strcmp(key, "obj-identity") == 0) {
+            s_conf.objectIdentity = parseSwitch(value);
+        }
         else if (std::strcmp(key, "zeropage") == 0) {
             s_conf.zeroPage = parseSwitch(value);
         }
@@ -686,6 +707,14 @@ bool gfxCloudcellCompleteRequests() {
 int gfxCloudcellDispatch() {
     ensureResolved();
     return s_conf.ccDispatch;
+}
+
+// "objid=1": one real handle per NewObjectV, carrying its class and instance
+// space. Gated separately from ccdisp because it changes guest-visible
+// addresses, and because ccdisp=2 is unsafe without it.
+bool gfxObjectIdentity() {
+    ensureResolved();
+    return s_conf.objectIdentity;
 }
 
 // "ccmode=now|bg": WHICH CONTEXT invokes the Cloudcell continuation the guest

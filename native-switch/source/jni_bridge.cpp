@@ -128,6 +128,85 @@ char g_fakeMethodId{};
 char g_fakeFieldId{};
 char g_fakeObjectObject{};
 
+// --- per-object handles, enabled by "objid=1" -------------------------------
+//
+// The header sits immediately BEFORE the instance storage the guest sees. That
+// placement is what keeps both halves working at once: the ManagedMethods do
+// `(CCAccountManager *)self` and write at +0 and +8, so `self` has to BE the
+// instance base; and the class has to be reachable from `self`, so it lives
+// just behind it.
+//
+// Sized against Class::instance_size with headroom -- the largest registered
+// facade is CCUserInterfaceManager, which holds a handful of jlong callback
+// slots. 512 B per instance is an order of magnitude over that and costs
+// nothing, the pool being static.
+struct FakeObjectHeader {
+    uint32_t magic;     // 'FOBJ'
+    uint32_t reserved;
+    uintptr_t clazz;
+};
+constexpr uint32_t kFakeObjectMagic = 0x4A424F46;  // FOBJ
+constexpr size_t kFakeObjectSlots = 512;
+constexpr size_t kFakeObjectInstance = 512;
+constexpr size_t kFakeObjectStride = sizeof(FakeObjectHeader) + kFakeObjectInstance;
+static_assert(sizeof(FakeObjectHeader) == 16, "header must stay 16 bytes");
+static_assert(kFakeObjectStride % 8 == 0, "instances must stay 8-aligned");
+
+alignas(8) unsigned char g_fakeObjectPool[kFakeObjectSlots * kFakeObjectStride];
+std::atomic<size_t> g_fakeObjectUsed{0};
+std::atomic<size_t> g_fakeObjectOverflow{0};
+std::atomic<size_t> g_fakeObjectReused{0};
+
+// Accepts a jobject only if it is exactly an instance base in this pool AND
+// the header behind it carries our magic. Anything else -- the Font, the
+// sentinels, a real guest pointer -- returns null and keeps the old path.
+FakeObjectHeader* fakeObjectHeaderFor(uintptr_t object) {
+    if (object == 0) {
+        return nullptr;
+    }
+    const uintptr_t start = reinterpret_cast<uintptr_t>(g_fakeObjectPool);
+    if (object < start + sizeof(FakeObjectHeader)) {
+        return nullptr;
+    }
+    const uintptr_t rel = object - start - sizeof(FakeObjectHeader);
+    if (rel % kFakeObjectStride != 0 || rel / kFakeObjectStride >= kFakeObjectSlots) {
+        return nullptr;
+    }
+    FakeObjectHeader* header =
+        reinterpret_cast<FakeObjectHeader*>(object - sizeof(FakeObjectHeader));
+    return header->magic == kFakeObjectMagic ? header : nullptr;
+}
+
+uintptr_t newFakeObject(uintptr_t clazz) {
+    size_t index = g_fakeObjectUsed.fetch_add(1);
+    bool recycled = false;
+    if (index >= kFakeObjectSlots) {
+        index %= kFakeObjectSlots;
+        recycled = true;
+        const size_t over = ++g_fakeObjectOverflow;
+        if (over <= 4) {
+            char details[192];
+            __builtin_snprintf(details, sizeof(details),
+                               "object pool exhausted at %u slots; recycling "
+                               "(overflow #%u, recycled %u)",
+                               (unsigned)kFakeObjectSlots, (unsigned)over,
+                               (unsigned)g_fakeObjectReused.load(
+                                   std::memory_order_relaxed) + 1);
+            guestViewWideLog("jni-object-pool", (unsigned long long)over,
+                             (unsigned long long)index, details);
+        }
+    }
+    if (recycled) {
+        g_fakeObjectReused.fetch_add(1);
+    }
+    FakeObjectHeader* header =
+        reinterpret_cast<FakeObjectHeader*>(g_fakeObjectPool + index * kFakeObjectStride);
+    __builtin_memset(g_fakeObjectPool + index * kFakeObjectStride, 0, kFakeObjectStride);
+    header->magic = kFakeObjectMagic;
+    header->clazz = clazz;
+    return reinterpret_cast<uintptr_t>(header + 1);
+}
+
 // Mirrors com.firemint.realracing.TextureInfo (defined after raw* helpers).
 struct FakeTextureInfo {
     uint32_t magic; // 'TEXI'
@@ -1534,6 +1613,15 @@ uintptr_t jniGetObjectClass(uintptr_t /*env*/, uintptr_t object) {
             return fontClass;
         }
     }
+    // objid=1: the object was built by newFakeObject and carries its class in
+    // the header behind it. Without this, every non-Font instance method --
+    // login, setUserIdentifier, the ones the "Invalid DeviceId!" line is
+    // about -- arrives with class=(none) and only reaches a facade through a
+    // name-only guess.
+    const FakeObjectHeader* header = fakeObjectHeaderFor(object);
+    if (header != nullptr && header->clazz != 0) {
+        return header->clazz;
+    }
     return reinterpret_cast<uintptr_t>(&g_fakeClassObject);
 }
 
@@ -1632,12 +1720,15 @@ uintptr_t jniGetStringUTFChars(uintptr_t /*env*/, uintptr_t string,
 uintptr_t jniNewObjectV(uintptr_t /*env*/, uintptr_t clazz,
                         uintptr_t /*methodId*/, void* /*args*/) {
     // The one class the guest constructs and then calls instance methods on.
-    // Everything else keeps the shared sentinel.
+    // Everything else keeps the shared sentinel unless objid=1.
     const uintptr_t fontClass = fontClassHandle();
     if (fontClass != 0 && clazz == fontClass) {
         g_fakeFont.initialised = 0;
         g_fakeFont.bmpData = 0;  // re-made on demand, pool may have recycled
         return reinterpret_cast<uintptr_t>(&g_fakeFont);
+    }
+    if (::rr3::gfxObjectIdentity()) {
+        return newFakeObject(clazz);
     }
     return reinterpret_cast<uintptr_t>(&g_fakeObjectObject);
 }
@@ -3058,7 +3149,21 @@ void jniCallVoidMethodV(uintptr_t env, uintptr_t object,
             guestViewWideLog("cc-dispatch", static_cast<unsigned long long>(methodId),
                              static_cast<unsigned long long>(object), dd);
 
-            if (dispatchLevel >= 2 && method != nullptr && !method->takes_class) {
+            // INTERLOCK: ccdisp=2 with objid=0 is not merely discouraged, it
+            // is refused. aam_constructor stores two jlongs at self+0 and
+            // self+8, and with objid=0 that self is &g_fakeObjectObject, one
+            // byte wide at jni_bridge.cpp:129. Executing would put 16 bytes
+            // into 1 byte of host globals. The refusal is logged rather than
+            // silent, so a run that thinks it dispatched something did not.
+            if (dispatchLevel >= 2 && !::rr3::gfxObjectIdentity()) {
+                guestViewWideLog("cc-dispatch",
+                                 static_cast<unsigned long long>(methodId),
+                                 static_cast<unsigned long long>(object),
+                                 "REFUSED ccdisp=2 while objid=0: the shared "
+                                 "one-byte object handle cannot hold instance "
+                                 "fields. Set objid=1 first.");
+            } else if (dispatchLevel >= 2 && method != nullptr &&
+                       !method->takes_class) {
                 if (rawEquals(t_jniVoidEntry, "62") && args != nullptr) {
                     // Slot 62 hands over an array of 8-byte slots, which is
                     // exactly the jvalue array the array-form dispatcher reads.
