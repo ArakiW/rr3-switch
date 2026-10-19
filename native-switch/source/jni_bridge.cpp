@@ -177,8 +177,16 @@ HostHandle g_hostHandles[kHostHandleSlots]{};
 std::atomic<size_t> g_hostHandleCount{0};
 std::atomic<size_t> g_hostHandleOverflow{0};
 
+const char* hostHandleProducer(uintptr_t address);
+
 void registerHostHandle(uintptr_t address, const char* producer) {
     if (address == 0 || producer == nullptr) {
+        return;
+    }
+    // Re-registration is a no-op, not an append. The registry is keyed by
+    // handle, so registering the same address twice would consume two slots and
+    // make the table fill at half the real handle count.
+    if (hostHandleProducer(address) != nullptr) {
         return;
     }
     const size_t index = g_hostHandleCount.fetch_add(1);
@@ -969,8 +977,12 @@ uintptr_t classHandleFor(const char* name) {
     for (size_t index = 0; index < g_fakeClassCount; ++index) {
         if (g_fakeClasses[index].magic == kFakeClassMagic &&
             rawEquals(g_fakeClasses[index].name, name)) {
-            registerHostHandle(reinterpret_cast<uintptr_t>(&g_fakeClasses[index]),
-                               "classHandleFor/reuse");
+            // Deliberately NOT registered again. The guest issues 16,230
+            // FindClass calls for 34 distinct names, so registering on reuse
+            // filled all 8192 slots early and every later handle came back
+            // "unattributed" -- the registry became useless in the first
+            // second of the run (archive 20261019-122844-hreg1). A handle is
+            // registered once, where it is created.
             return reinterpret_cast<uintptr_t>(&g_fakeClasses[index]);
         }
     }
@@ -1333,8 +1345,7 @@ uintptr_t namedObjectFor(const char* key) {
     for (size_t index = 0; index < g_namedObjectCount; ++index) {
         if (g_namedObjects[index].magic == kNamedObjectMagic &&
             rawEquals(g_namedObjects[index].key, key)) {
-            registerHostHandle(reinterpret_cast<uintptr_t>(&g_namedObjects[index]),
-                               "namedObjectFor/reuse");
+            // Registered once at creation; see the note in classHandleFor.
             return reinterpret_cast<uintptr_t>(&g_namedObjects[index]);
         }
     }
