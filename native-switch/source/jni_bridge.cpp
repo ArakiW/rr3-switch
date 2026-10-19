@@ -750,7 +750,31 @@ struct FakeClass {
 };
 
 constexpr uint32_t kFakeClassMagic = 0x53534C43;  // CLSS
-constexpr size_t kMaxFakeClasses = 32;
+
+// RAISED 32 -> 256 on 2026-10-19, with a measurement behind it.
+//
+// MEASURED on archive 20261019-100814-ccjni01: the guest issues 16,230
+// FindClass calls for 34 DISTINCT class names in a 300 s run, and the first
+// 34 in first-seen order end at exactly:
+//
+//     #31  com/firemonkeys/cloudcellapi/FacebookWorker
+//     #32  com/firemonkeys/cloudcellapi/GooglePlayWorker   <-- overflowed the old 32
+//     #33  com/firemonkeys/cloudcellapi/HttpRequest       <-- overflowed the old 32
+//
+// So the old capacity dropped the two classes off the end by a margin of one.
+// AndroidAccountManager (#27) and FacebookWorker (#31) still fit and still
+// resolve by name; HttpRequest -- the class behind the load-bar blocker -- did
+// not.
+//
+// Overflow used to return &g_fakeClassObject, the same sentinel every other
+// unanswered class gets. That is the worst possible failure shape here: the
+// guest could not tell two different classes apart, but nothing in the host
+// said so. Six of the sixteen void calls in that run logged class=(none) for
+// exactly this reason. 256 leaves ~7x headroom over what is actually observed;
+// the counter below is what catches the next overflow, because a silent alias
+// reads exactly like a class the guest never asked for.
+constexpr size_t kMaxFakeClasses = 256;
+std::atomic<size_t> g_fakeClassOverflow{0};
 FakeClass g_fakeClasses[kMaxFakeClasses]{};
 size_t g_fakeClassCount = 0;
 
@@ -795,6 +819,25 @@ uintptr_t classHandleFor(const char* name) {
         }
     }
     if (g_fakeClassCount >= kMaxFakeClasses) {
+        // Say so. The old form aliased to g_fakeClassObject with no trace, and
+        // the only way it was noticed was class=(none) appearing on unrelated
+        // call sites six rounds later. A silent alias is indistinguishable from
+        // "the guest never asked", which is the whole problem.
+        //
+        // Rate-limited to the first 4 because this sits on a path the guest
+        // takes 16,230 times per run; g_fakeClassOverflow carries the real
+        // total and is reported at census time.
+        const size_t overflow = ++g_fakeClassOverflow;
+        if (overflow <= 4) {
+            char details[192];
+            __builtin_snprintf(details, sizeof(details),
+                               "class table full at %u entries; %s aliased to the "
+                               "shared sentinel (overflow #%u)",
+                               (unsigned)kMaxFakeClasses, name,
+                               (unsigned)overflow);
+            guestViewWideLog("jni-fakeclass-overflow", (unsigned long long)overflow,
+                             (unsigned long long)g_fakeClassCount, details);
+        }
         return reinterpret_cast<uintptr_t>(&g_fakeClassObject);
     }
     FakeClass& record = g_fakeClasses[g_fakeClassCount++];
