@@ -3164,7 +3164,37 @@ void jniCallVoidMethodV(uintptr_t env, uintptr_t object,
                                  "fields. Set objid=1 first.");
             } else if (dispatchLevel >= 2 && method != nullptr &&
                        !method->takes_class) {
-                if (rawEquals(t_jniVoidEntry, "62") && args != nullptr) {
+                // INTERLOCK 2: the receiver must be one of OUR objects.
+                //
+                // A ManagedMethod casts its jobject to the facade type and
+                // writes instance fields through it, so `object` has to point
+                // at storage we own. The ccdisp=2 run on 2026-10-19
+                // (archive 20261019-115624-ccdisp7) shows what happens without
+                // this: setUserIdentifier arrived with obj=0x80fae3f1, an odd
+                // address that cannot be a 16-byte-aligned slot of our pool,
+                // and the stub stored 8 bytes there anyway. Frames went 16320
+                // -> 15 and Sub Sync Queued 13 -> 10790.
+                //
+                // Not asserted as the cause -- the wedge was also blamed on a
+                // census enters/exits pair this very file documents as an
+                // artifact. It is a reachable write into an address we did not
+                // allocate, which is worth refusing regardless of whether it
+                // was the thing that broke the run.
+                const FakeObjectHeader* owned = fakeObjectHeaderFor(object);
+                if (owned == nullptr) {
+                    char why[192];
+                    __builtin_snprintf(why, sizeof(why),
+                                       "REFUSED %s.%s: receiver %p is not an object "
+                                       "from this pool, and the stub would write "
+                                       "instance fields through it",
+                                       method->clazz != nullptr && method->clazz->classname
+                                               ? method->clazz->classname
+                                               : "?",
+                                       name, (void *)object);
+                    guestViewWideLog("cc-dispatch",
+                                     static_cast<unsigned long long>(methodId),
+                                     static_cast<unsigned long long>(object), why);
+                } else if (rawEquals(t_jniVoidEntry, "62") && args != nullptr) {
                     // Slot 62 hands over an array of 8-byte slots, which is
                     // exactly the jvalue array the array-form dispatcher reads.
                     // This is the form that matches; passing the array to the
