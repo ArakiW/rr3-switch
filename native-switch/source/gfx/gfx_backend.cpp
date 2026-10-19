@@ -211,6 +211,12 @@ struct ConfState {
     // is measured A/B rather than assumed safe, and ccdisp=2 refuses to run
     // while this is off.
     bool objectIdentity = false;
+    // "mkdiridem=1" -- guest mkdir returns success when the directory already
+    // exists. The guest logs "[FileManager::CreateDir] Error creating
+    // directory: .../.depot/CC_Data" because the HOST staged that directory
+    // from the data packs, where on real hardware the game would create it
+    // itself and succeed. Default 0: plain POSIX mkdir, EEXIST and all.
+    bool mkdirIdempotent = false;
     // "ccsynth=1" -- install the host's synthetic Cloudcell object. Default is
     // 0, which LETS THE GUEST BUILD ITS OWN. The guest's constructor
     // (0x1cbe03c) allocates 0x4d0 bytes, publishes the object into this very
@@ -458,10 +464,14 @@ void readConf() {
                 s_conf.ccDispatch = 0;
             }
         }
-        else if (std::strcmp(key, "objid") == 0 ||
-                 std::strcmp(key, "object-id") == 0 ||
+        else if (std::strcmp(key, "objid") == 0 ||                 std::strcmp(key, "object-id") == 0 ||
                  std::strcmp(key, "obj-identity") == 0) {
             s_conf.objectIdentity = parseSwitch(value);
+        }
+        else if (std::strcmp(key, "mkdiridem") == 0 ||
+                 std::strcmp(key, "mkdir-idempotent") == 0 ||
+                 std::strcmp(key, "mkdirx") == 0) {
+            s_conf.mkdirIdempotent = parseSwitch(value);
         }
         else if (std::strcmp(key, "zeropage") == 0) {
             s_conf.zeroPage = parseSwitch(value);
@@ -715,6 +725,12 @@ int gfxCloudcellDispatch() {
 bool gfxObjectIdentity() {
     ensureResolved();
     return s_conf.objectIdentity;
+}
+
+// "mkdiridem=1": guest mkdir treats an existing directory as success.
+bool gfxMkdirIdempotent() {
+    ensureResolved();
+    return s_conf.mkdirIdempotent;
 }
 
 // "ccmode=now|bg": WHICH CONTEXT invokes the Cloudcell continuation the guest

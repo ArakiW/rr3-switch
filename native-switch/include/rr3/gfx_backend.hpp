@@ -112,6 +112,17 @@ int gfxCloudcellDispatch();
 // assumed. jniCallVoidMethodV refuses to run at ccdisp=2 while this is off.
 bool gfxObjectIdentity();
 
+// "mkdiridem=1": guest mkdir returns success when the directory already exists.
+//
+// The guest logs "[FileManager::CreateDir] Error creating directory:
+// .../.depot/CC_Data" because the host staged that directory out of the game
+// data packs. On real hardware the game creates it itself on first run and
+// mkdir succeeds, so the shape mismatch is the host's.
+//
+// Idempotent, not silent: EEXIST is counted, and a mkdir failing for any other
+// reason still returns its error.
+bool gfxMkdirIdempotent();
+
 // "ccmode=off|now|bg": WHICH context invokes that continuation, as opposed to
 // whether it is invoked at all (ccdone). The only delivery site that existed is
 // the frame loop, and the guest blocks inside frame 0 before reaching it, so:

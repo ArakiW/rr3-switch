@@ -1,6 +1,7 @@
 #include "rr3/guest_filesystem.hpp"
 
 #include "rr3/bionic_misc_shims.hpp"
+#include "rr3/gfx_backend.hpp"
 #include "rr3/recovery_guard.hpp"
 #include "bionic_errno.hpp"
 
@@ -2217,11 +2218,34 @@ int guestLstat(const char* path, struct stat* output) {
     return rc;
 }
 
-int guestMkdir(const char* path, mode_t mode) {
-    gResolveApi = "guestMkdir";
+// Counts the EEXIST that mkdiridem=1 converts into success, so the conversion
+// is auditable rather than invisible. Reported on the mkdir-eexist line.
+unsigned gGuestMkdirEexist = 0;
+
+int guestMkdir(const char* path, mode_t mode) {    gResolveApi = "guestMkdir";
     Resolution resolution{};
     if (!resolvePath(path, true, resolution) || rejectReadOnlyWrite(resolution, true)) return -1;
-    return ::mkdir(resolution.primary, mode);
+    const int rc = ::mkdir(resolution.primary, mode);
+    // "mkdiridem=1": an existing directory is success, not EEXIST.
+    //
+    // MEASURED 2026-10-19, archive 20261019-170132-distinct. The guest logs
+    //     [FileManager::CreateDir] Error creating directory:
+    //     sdmc:/switch/rr3-native-rehost/.depot/CC_Data
+    // and CC_Data is 55 files that the HOST staged out of the game data packs.
+    // On real hardware the game creates that directory itself on first run and
+    // mkdir succeeds; here the directory is already there, mkdir returns EEXIST,
+    // and the guest reads that as a failure. The shape mismatch is the host's,
+    // not the guest's.
+    //
+    // Idempotent, not silent: the EEXIST is still counted and reported, so a
+    // mkdir that fails for any other reason stays visible.
+    if (rc != 0 && errno == EEXIST && ::rr3::gfxMkdirIdempotent()) {
+        gGuestMkdirEexist++;
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "mkdir-eexist", gGuestMkdirEexist, 0, path);
+        return 0;
+    }
+    return rc;
 }
 
 DIR* guestOpendir(const char* path) {
