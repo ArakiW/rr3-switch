@@ -337,7 +337,9 @@ static void fb_ctor(JNIEnv *, jobject, jclass) {}
 static void fb_constructor(JNIEnv *, jobject, jstring /*appId*/) {}
 
 /* m_pSession.isOpened() on a session that is never opened. */
-static jboolean fb_session_valid(JNIEnv *, jobject) { return JNI_FALSE; }
+static jboolean fb_session_valid(JNIEnv *, jobject) {
+    return rr3::gfxCloudcellSocialOk() ? JNI_TRUE : JNI_FALSE;
+}
 /* Java answers Constants.STR_EMPTY when the token is null. */
 static jstring fb_access_token(JNIEnv *env, jobject) { return env->NewStringUTF(""); }
 
@@ -499,7 +501,9 @@ static void gp_ctor(JNIEnv *, jobject, jclass) {}
 static void gp_constructor(JNIEnv *, jobject, jstring /*clientId*/, jboolean /*gamesApi*/) {}
 
 /* m_pGoogleApiClient.isConnected() on a client that never connects. */
-static jboolean gp_session_valid(JNIEnv *, jobject) { return JNI_FALSE; }
+static jboolean gp_session_valid(JNIEnv *, jobject) {
+    return rr3::gfxCloudcellSocialOk() ? JNI_TRUE : JNI_FALSE;
+}
 /* Polled every frame: answering TRUE would make the engine re-read a session
  * that never changes, forever. */
 static jboolean gp_session_changed(JNIEnv *, jobject) { return JNI_FALSE; }

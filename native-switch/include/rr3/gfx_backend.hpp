@@ -135,6 +135,17 @@ bool gfxMkdirIdempotent();
 // so a local success is the only answer the guest accepts. Off by default.
 bool gfxCloudcellLoginOk();
 
+// "ccsocialok=1": the social-media session reports itself valid.
+//
+// The guest's Cloudcell object asks whether the session is valid, and the
+// answer comes from FacebookWorker.GetSessionValid() /
+// GooglePlayWorker.GetSessionValid(). In the guest's own Java,
+// GetSessionValid() is "!GetAccessToken().isEmpty()" (FacebookWorker.java:129)
+// -- there is no real Facebook session here and never will be.
+//
+// Off by default.
+bool gfxCloudcellSocialOk();
+
 // "ccmode=off|now|bg": WHICH context invokes that continuation, as opposed to
 // whether it is invoked at all (ccdone). The only delivery site that existed is
 // the frame loop, and the guest blocks inside frame 0 before reaching it, so:

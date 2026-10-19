@@ -2171,8 +2171,36 @@ bool gateScalarNameInteresting(const char* name);
 void gateTraceScalar(const char* kind, const char* name, long long result,
                      uintptr_t methodId);
 
-int32_t jniCallBooleanMethodV(uintptr_t /*env*/, uintptr_t object,
-                              uintptr_t methodId, void* /*args*/) {
+// The ManagedMethod lookup helpers are defined further down, next to the void
+// slot's dispatch. Declared here because the BOOLEAN slot needs them too, and
+// that is the whole point of this change: FacebookWorker.GetSessionValid() and
+// GooglePlayWorker.GetSessionValid() are boolean-returning, so they were
+// answered by platformBoolForMethod's name table and never reached the
+// registered stub -- which is why the guest kept saying "Social Media not
+// initialised" no matter what the stub said.
+const Class* managedClassFor(const char* classpath);
+const ManagedMethod* managedMethodFor(const Class* clazz, const char* name);
+const ManagedMethod* managedMethodByNameAlone(const char* name,
+                                              const char** whichClass);
+
+// Which JNI slot entered a call handler.
+//
+// Slots 61 (CallVoidMethod) and 62 (CallVoidMethodV) share one handler but
+// pass DIFFERENT arg layouts: 62 hands over a `jobject*` array, while 61 hands
+// over a `va_list*` (see the wrapper below). Indexing one as the other yields
+// garbage that still looks like a pointer -- the same failure shape as the old
+// baseOk probe, which manufactured confident zeros for six rounds. The entry
+// site therefore rides on every Cloudcell line instead of being inferred.
+//
+// The boolean slots (37/38) join the same scheme, because the boolean
+// dispatch added on 2026-10-19 has to know which layout it is holding too.
+//
+// thread_local, not a plain static: the guest drives this from several threads
+// and a shared flag would stamp one thread's entry site onto another's line.
+thread_local const char* t_jniVoidEntry = "62";
+
+int32_t jniCallBooleanMethodV(uintptr_t env, uintptr_t object,
+                              uintptr_t methodId, void* args) {
     const char* name = jniMethodName(methodId);
     // Scoped by the receiver, not by the name. init / loadGlyph / loadBitmap /
     // loadBitmapDynamic are ordinary method names that other classes may also
@@ -2217,6 +2245,77 @@ int32_t jniCallBooleanMethodV(uintptr_t /*env*/, uintptr_t object,
     if (name != nullptr && gateScalarNameInteresting(name)) {
         gateTraceScalar("gate-obj-bool", name, platformBoolForMethod(name), methodId);
     }
+
+    // ManagedMethod dispatch, for the boolean slot.
+    //
+    // MEASURED 2026-10-19, archive 20261019-212333-loginok2. The guest's
+    // Cloudcell object asks whether the social-media session is valid, and the
+    // answer comes from FacebookWorker.GetSessionValid() /
+    // GooglePlayWorker.GetSessionValid() -- both registered in cc_services.cpp
+    // and both BOOLEAN-returning, so they went to this slot. This slot answered
+    // from platformBoolForMethod's name table, which knows nothing of them, and
+    // returned false. The guest then logged "Unable to send Sync, Social Media
+    // not initialised." and spun its sync queue to 10765.
+    //
+    // Same interlock as the void slot: only a receiver this port allocated may
+    // be dispatched to, because a managed method may write through it.
+    if (name != nullptr) {
+        const JniMethodRecord* rec = findJniMethod(methodId);
+        const char* cls = rec != nullptr ? className(rec->clazz) : nullptr;
+        const char* guessClass = nullptr;
+        const ManagedMethod* method = nullptr;
+        if (cls != nullptr) {
+            const Class* clazz = managedClassFor(cls);
+            method = managedMethodFor(clazz, name);
+        } else {
+            method = managedMethodByNameAlone(name, &guessClass);
+        }
+        if (method != nullptr && !method->takes_class) {
+            const FakeObjectHeader* owned = fakeObjectHeaderFor(object);
+            if (owned == nullptr) {
+                char why[224];
+                __builtin_snprintf(why, sizeof(why),
+                                   "REFUSED %s.%s: receiver %p is not an object from "
+                                   "this pool",
+                                   method->clazz != nullptr &&
+                                           method->clazz->classname
+                                       ? method->clazz->classname
+                                       : "?",
+                                   name, (void *)object);
+                guestViewWideLog("cc-dispatch-bool",
+                                 static_cast<unsigned long long>(methodId),
+                                 static_cast<unsigned long long>(object), why);
+            } else {
+                using Fn = jboolean (*)(JNIEnv*, jobject, jvalue*);
+                jboolean result = 0;
+                if (rawEquals(t_jniVoidEntry, "62") && args != nullptr) {
+                    result = reinterpret_cast<Fn>(method->addr_array)(
+                        reinterpret_cast<JNIEnv*>(env),
+                        reinterpret_cast<jobject>(object),
+                        static_cast<jvalue*>(args));
+                } else {
+                    using VFn = jboolean (*)(JNIEnv*, jobject, va_list);
+                    va_list forwarded;
+                    va_copy(forwarded, *static_cast<va_list*>(args));
+                    result = reinterpret_cast<VFn>(method->addr_variadic)(
+                        reinterpret_cast<JNIEnv*>(env),
+                        reinterpret_cast<jobject>(object), forwarded);
+                    va_end(forwarded);
+                }
+                char detail[224];
+                __builtin_snprintf(detail, sizeof(detail),
+                                   "class=%s method=%s -> %d",
+                                   cls != nullptr
+                                       ? cls
+                                       : (guessClass != nullptr ? guessClass : "(none)"),
+                                   name, (int)result);
+                guestViewWideLog("cc-dispatch-bool",
+                                 static_cast<unsigned long long>(methodId),
+                                 static_cast<unsigned long long>(object), detail);
+                return result ? 1 : 0;
+            }
+        }
+    }
     return platformBoolForMethod(name) ? 1u : 0u;
 }
 
@@ -2226,6 +2325,11 @@ int32_t jniCallBooleanMethod(uintptr_t env, uintptr_t object,
                              uintptr_t methodId, ...) {
     va_list arguments;
     va_start(arguments, methodId);
+    // Same entry-site marker as the void slot: slot 37 passes a va_list* and
+    // slot 38 passes a jvalue array, and the boolean dispatch below has to
+    // know which one it is holding.
+    const char* previousEntry = t_jniVoidEntry;
+    t_jniVoidEntry = "37";
     int32_t result = jniCallBooleanMethodV(env, object, methodId, &arguments);
     va_end(arguments);
     return result;
@@ -3008,9 +3112,9 @@ void gateAnswerShowMessage(const ShowMessageCall& call, uintptr_t env,
 // baseOk probe, which manufactured confident zeros for six rounds. The entry
 // site therefore rides on every Cloudcell line instead of being inferred.
 //
-// thread_local, not a plain static: the guest drives this from several threads
-// and a shared flag would stamp one thread's entry site onto another's line.
-thread_local const char* t_jniVoidEntry = "62";
+// The definition lives next to the boolean slot, which needs it first; this
+// site just refers to it.
+extern thread_local const char* t_jniVoidEntry;
 
 // The Cloudcell HttpRequest facade's Java classpath, as the GUEST spells it.
 //

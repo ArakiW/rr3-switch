@@ -230,6 +230,19 @@ struct ConfState {
     // "授权，直接开做") and EA's service is gone, so a local success is the
     // only outcome the guest will accept. Off by default.
     bool cloudcellLoginOk = false;
+    // "ccsocialok=1" -- the social-media session reports itself valid.
+    //
+    // MEASURED 2026-10-19, archive 20261019-212333-loginok2. The guest's
+    // Cloudcell object asks whether the social-media session is valid and the
+    // answer is FacebookWorker.GetSessionValid() /
+    // GooglePlayWorker.GetSessionValid(), which are registered in
+    // cc_services.cpp and return false. The guest then logs "Unable to send
+    // Sync, Social Media not initialised." and spins its sync queue to 10765.
+    //
+    // In the guest's own Java, GetSessionValid() is "!GetAccessToken().isEmpty()"
+    // (FacebookWorker.java:129) -- there is no real Facebook session here and
+    // never will be. Off by default.
+    bool cloudcellSocialOk = false;
     // "ccsynth=1" -- install the host's synthetic Cloudcell object. Default is
     // 0, which LETS THE GUEST BUILD ITS OWN. The guest's constructor
     // (0x1cbe03c) allocates 0x4d0 bytes, publishes the object into this very
@@ -490,6 +503,11 @@ void readConf() {
                  std::strcmp(key, "cc-login-ok") == 0 ||
                  std::strcmp(key, "loginsuccess") == 0) {
             s_conf.cloudcellLoginOk = parseSwitch(value);
+        }
+        else if (std::strcmp(key, "ccsocialok") == 0 ||
+                 std::strcmp(key, "cc-social-ok") == 0 ||
+                 std::strcmp(key, "socialok") == 0) {
+            s_conf.cloudcellSocialOk = parseSwitch(value);
         }
         else if (std::strcmp(key, "zeropage") == 0) {
             s_conf.zeroPage = parseSwitch(value);
@@ -755,6 +773,12 @@ bool gfxMkdirIdempotent() {
 bool gfxCloudcellLoginOk() {
     ensureResolved();
     return s_conf.cloudcellLoginOk;
+}
+
+// "ccsocialok=1": the social-media session reports itself valid.
+bool gfxCloudcellSocialOk() {
+    ensureResolved();
+    return s_conf.cloudcellSocialOk;
 }
 
 // "ccmode=now|bg": WHICH CONTEXT invokes the Cloudcell continuation the guest
