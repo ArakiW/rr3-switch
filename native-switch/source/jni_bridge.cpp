@@ -1507,6 +1507,56 @@ uintptr_t fakeObjectHandle(const char* name) {
     const unsigned i = next.fetch_add(1, std::memory_order_relaxed);
     return reinterpret_cast<uintptr_t>(&pool[i % 256]);
 #else
+    // MEASURED 2026-10-19, archive 20261019-163212-callsite. The
+    // jni-sentinel-return probe shows every one of put / keySet / iterator /
+    // getCustomProperties / createAnalytics / createGluAds /
+    // createCustomerSupport handing the guest this one byte from guest call
+    // site rr3+0x10f3f0c. The consequence is exactly what the comment above
+    // this function predicted years earlier and nobody tested: three different
+    // services receive the SAME object, the guest cannot tell them apart, and
+    // it later calls AndroidAccountManager.login on that shared byte. The
+    // dispatch interlock has been refusing that write ever since, which is why
+    // login is reachable and yet never executes.
+    //
+    // The fix is keyed pool objects, not fresh ones. Fresh-per-call breaks the
+    // other direction -- the guest stores these handles and hands them back, so
+    // a new address each time is strictly worse than a shared constant. Same
+    // name, same object, every time.
+    //
+    // clazz is 0 on purpose. There is no class to attach at this point in the
+    // file, and GetObjectClass already treats a zero clazz as "unknown" and
+    // falls back to the sentinel, which is what the name-only method lookup in
+    // jniCallVoidMethodV then resolves against. What this buys is the thing
+    // that was actually missing: storage the facade can safely write into.
+    if (::rr3::gfxObjectIdentity()) {
+        struct Keyed {
+            char name[64];
+            uintptr_t handle;
+        };
+        static Keyed table[64];
+        static std::atomic<unsigned> count{0};
+        const unsigned slots =
+            sizeof(table) / sizeof(table[0]);
+        const unsigned used = count.load(std::memory_order_relaxed);
+        const unsigned limit = used < slots ? used : slots;
+        for (unsigned i = 0; i < limit; ++i) {
+            if (rawEquals(table[i].name, name)) {
+                return table[i].handle;
+            }
+        }
+        const uintptr_t handle = newFakeObject(0);
+        if (used < slots) {
+            rawCopy(table[used].name, sizeof(table[used].name), name);
+            table[used].handle = handle;
+            count.store(used + 1, std::memory_order_relaxed);
+            registerHostHandle(handle, "fakeObjectHandle/keyed-pool");
+        } else {
+            // Table full: recycle rather than fall back to the sentinel, which
+            // is the one handle this function exists to stop returning.
+            registerHostHandle(handle, "fakeObjectHandle/keyed-pool-overflow");
+        }
+        return handle;
+    }
     return reinterpret_cast<uintptr_t>(&g_fakeObjectObject);
 #endif
 }
