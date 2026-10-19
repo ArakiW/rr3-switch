@@ -231,8 +231,22 @@ if (Test-Path $guestLog -PathType Leaf) {
                      'phase=guest-thread ', 'phase=guest-thread-start ')) {
         $probes["guest:$p"] = ([regex]::Matches($guestText, [regex]::Escape($p))).Count
     }
-    $frames = [regex]::Match($guestText, 'frames=(\d+)')
-    if ($frames.Success) { $summary.frames = [int]$frames.Groups[1].Value }
+    # frames= appears many times in a run and only the LAST one is the total.
+    # CORRECTED 2026-10-19: this used [regex]::Match, which returns the FIRST hit,
+    # and the first hit in a real archive is "fpwalk-end ... frames=1" -- the
+    # stack walker's own frame count, not the render loop's. Every census since
+    # the field existed therefore reported frames=1 while the run was actually
+    # at ~16,000, which reads exactly like "the guest wedged on frame one" and
+    # has already been mistaken for that more than once.
+    #
+    # framesFirst is kept so the artifact that caused the confusion stays
+    # visible in the archive instead of being quietly corrected in place.
+    $allFrames = [regex]::Matches($guestText, 'frames=(\d+)')
+    if ($allFrames.Count -gt 0) {
+        $summary.frames = [int]$allFrames[$allFrames.Count - 1].Groups[1].Value
+        $summary.framesFirst = [int]$allFrames[0].Groups[1].Value
+        $summary.framesMatches = $allFrames.Count
+    }
 }
 if (Test-Path (Join-Path $archive 'eden_log.txt.tail') -PathType Leaf) {
     $edenText = [IO.File]::ReadAllText((Join-Path $archive 'eden_log.txt.tail'))

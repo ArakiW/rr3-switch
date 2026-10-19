@@ -2653,13 +2653,170 @@ void gateAnswerShowMessage(const ShowMessageCall& call, uintptr_t env,
     alertAnswerPositiveImpl(env, call.idPositive, guestX1);
 }
 
-void jniCallVoidMethodV(uintptr_t /*env*/, uintptr_t /*object*/,
-                       uintptr_t methodId, void* /*args*/) {
+// Which JNI slot entered jniCallVoidMethodV.
+//
+// Slots 61 (CallVoidMethod) and 62 (CallVoidMethodV) share one handler but pass
+// DIFFERENT arg layouts: 62 hands over a `jobjject*` array, while 61 hands over
+// a `va_list*` (see the wrapper below). Indexing one as the other yields
+// garbage that still looks like a pointer -- the same failure shape as the old
+// baseOk probe, which manufactured confident zeros for six rounds. The entry
+// site therefore rides on every Cloudcell line instead of being inferred.
+//
+// thread_local, not a plain static: the guest drives this from several threads
+// and a shared flag would stamp one thread's entry site onto another's line.
+thread_local const char* t_jniVoidEntry = "62";
+
+// The Cloudcell HttpRequest facade's Java classpath, as the GUEST spells it.
+//
+// MEASURED 2026-10-19 against reverse/native/arm64/libRealRacing3.so
+// (33,110,472 B): the guest's .rodata carries
+// "com/firemonkeys/cloudcellapi/HttpRequest" and the string
+// "com/firemonkeys/cloudcellapi/CC_HttpRequest_Class" appears ZERO times. The
+// same holds for the natives: Java_..._HttpRequest_{error,complete,data,header}
+// Callback are all present, Java_..._CC_1HttpRequest_1Class_errorCallback is
+// not.
+//
+// That contradicts cc_http_request.cpp, which registers
+// "com/firemonkeys/cloudcellapi/CC_HttpRequest_Class" and resolves
+// "..._CC_1HttpRequest_1Class_errorCallback", and whose header claims the
+// opposite was "Verified against the disassembly ... at 0x957bd0". 0x957bd0 is
+// below this binary's .text (which starts at 0x988000). There is only one
+// guest in use -- three byte-identical 33,110,472 B copies plus an unrelated
+// 2013 PS Vita build that is not loaded -- so this is not an armhf/arm64 mixup.
+//
+// Matched by suffix, not equality, because FindClass may hand back a spelling
+// that differs in the package prefix while the leaf class is the same.
+const char* cloudcellHttpRequestClass(uintptr_t methodId) {
+    const JniMethodRecord* method = findJniMethod(methodId);
+    if (method == nullptr) {
+        return nullptr;
+    }
+    const char* cls = className(method->clazz);
+    if (cls == nullptr) {
+        return nullptr;
+    }
+    static const char kLeaf[] = "cloudcellapi/HttpRequest";
+    const size_t leafLen = sizeof(kLeaf) - 1;
+    size_t clsLen = 0;
+    while (cls[clsLen] != '\0') {
+        ++clsLen;
+    }
+    if (clsLen < leafLen) {
+        return nullptr;
+    }
+    const char* tail = cls + (clsLen - leafLen);
+    for (size_t i = 0; i < leafLen; ++i) {
+        if (tail[i] != kLeaf[i]) {
+            return nullptr;
+        }
+    }
+    return cls;
+}
+
+// Cloudcell HttpRequest callback state, keyed by the JNI object handle the
+// guest passes on each call. A request object's callback arrives on init() and
+// is needed again on post(); the guest owns the object's lifetime, so this
+// table only ever holds a borrowed handle and never frees anything.
+struct CloudcellHttpRequestSlot {
+    uintptr_t object;
+    uint64_t callback;
+};
+constexpr size_t kCloudcellHttpRequestSlots = 8;
+CloudcellHttpRequestSlot g_ccHttpSlots[kCloudcellHttpRequestSlots]{};
+
+void jniCallVoidMethodV(uintptr_t env, uintptr_t object,
+                       uintptr_t methodId, void* args) {
+    // `env` is the JNIEnv the guest passed. Nothing below needs it yet: the
+    // Cloudcell fast-fail lands on a later change, and taking it here would mean
+    // carrying a live pointer through this path with no reader.
+    (void)env;
     const char* name = jniMethodName(methodId);
     jniPairMark("enter", name, methodId, 0);
     if (name == nullptr) {
         return;
     }
+
+    // --- Cloudcell HttpRequest fast-fail, added 2026-10-19 ------------------
+    //
+    // Why here and not in jni_compat/classes/cc_http_request.cpp: that file's
+    // logic is already right (it answers "the transfer failed", which is what
+    // HttpThread.java emits when openConnection() throws and responseCode is
+    // still 0). It is unreachable. jniGetMethodID returns a JniMethodRecord*,
+    // not a ManagedMethod*, nothing dispatches into ClassRegistry, and the
+    // [jni] GetMethodID marker only exists in this file's rawLog. So editing
+    // names there would have produced code that looks correct and never runs.
+    //
+    // UNBUDGETED on purpose: HttpRequest methods are a handful of calls per run,
+    // and this line is the only thing that can say whether the guest calls
+    // post() at all, through which slot, and with what callback. Under the
+    // shared 64-line per-call budget it would have been the first thing dropped.
+    const char* ccClass = cloudcellHttpRequestClass(methodId);
+    if (ccClass != nullptr) {
+        const bool isInit = rawEquals(name, "init");
+        const bool isPost = rawEquals(name, "post");
+        char detail[256];
+        __builtin_snprintf(detail, sizeof(detail),
+                           "entry=%s class=%s method=%s static=%d obj=%p args=%p",
+                           t_jniVoidEntry, ccClass, name,
+                           findJniMethod(methodId)->isStatic ? 1 : 0,
+                           (void *)object, args);
+        guestViewWideLog("cc-http-void", static_cast<unsigned long long>(methodId),
+                         static_cast<unsigned long long>(object), detail);
+
+        if (isInit) {
+            // Only slot 62 gives an indexable array. Slot 61's args are a
+            // va_list* and reading it as one would be undefined; the line above
+            // records which entry happened, so a slot-61 run is visible instead
+            // of silently mis-parsed.
+            if (rawEquals(t_jniVoidEntry, "62") && args != nullptr) {
+                const jobject* argv = static_cast<const jobject*>(args);
+                // init(String url, String method, String userAgent,
+                //      byte[] body, int readCapacity, long callback,
+                //      boolean failOnErrorStatus)
+                const uint64_t callback =
+                    reinterpret_cast<uintptr_t>(argv[7]);
+                CloudcellHttpRequestSlot* slot = nullptr;
+                for (size_t i = 0; i < kCloudcellHttpRequestSlots; ++i) {
+                    if (g_ccHttpSlots[i].object == object ||
+                        g_ccHttpSlots[i].object == 0) {
+                        slot = &g_ccHttpSlots[i];
+                        break;
+                    }
+                }
+                if (slot != nullptr) {
+                    slot->object = object;
+                    slot->callback = callback;
+                    char got[128];
+                    __builtin_snprintf(got, sizeof(got),
+                                       "init-captured callback=0x%llx slot=%d",
+                                       (unsigned long long)callback,
+                                       (int)(slot - g_ccHttpSlots));
+                    guestViewWideLog("cc-http-callback",
+                                     static_cast<unsigned long long>(callback),
+                                     static_cast<unsigned long long>(object), got);
+                }
+            } else {
+                guestViewWideLog("cc-http-callback",
+                                 static_cast<unsigned long long>(object),
+                                 static_cast<unsigned long long>(methodId),
+                                 "init seen but args NOT indexed (entry is not 62)");
+            }
+        } else if (isPost) {
+            uint64_t callback = 0;
+            for (size_t i = 0; i < kCloudcellHttpRequestSlots; ++i) {
+                if (g_ccHttpSlots[i].object == object) {
+                    callback = g_ccHttpSlots[i].callback;
+                    break;
+                }
+            }
+            guestViewWideLog("cc-http-callback",
+                             static_cast<unsigned long long>(callback),
+                             static_cast<unsigned long long>(object),
+                             callback != 0 ? "post has a callback"
+                                           : "post has NO callback (init never seen)");
+        }
+    }
+
     if (rawEquals(name, "showMessage") || rawEquals(name, "displayDialog") ||
         rawEquals(name, "ShowDialogBox")) {
         // Guest VA = load bias + ELF virtual address, so the difference is the
@@ -2678,9 +2835,17 @@ void jniCallVoidMethodV(uintptr_t /*env*/, uintptr_t /*object*/,
     // plain function-local static that several guest threads could race on.
     // Effective cap is now kPerCallLogBudget (64) across the file, not 40 here.
     if (perCallLogAllow("jni-void")) {
+        // Class name added 2026-10-19: a bare method name cannot be attributed
+        // when several classes define the same one, and "did the guest ever call
+        // HttpRequest.post" is unanswerable without it.
+        const JniMethodRecord* rec = findJniMethod(methodId);
+        const char* cls = rec != nullptr ? className(rec->clazz) : nullptr;
+        char line[256];
+        __builtin_snprintf(line, sizeof(line), "%s class=%s", name,
+                           cls != nullptr ? cls : "(none)");
         appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                             "jni-void", 0,
-                            static_cast<unsigned long long>(methodId), name);
+                            static_cast<unsigned long long>(methodId), line);
     }
     ::rr3::censusNoteImportFrom(__builtin_return_address(0), "jni:CallVoidMethod");
     jniPairMark("exit", name, methodId, 0);
@@ -2768,7 +2933,13 @@ void jniCallVoidMethod(uintptr_t env, uintptr_t object,
                        uintptr_t methodId, ...) {
     va_list arguments;
     va_start(arguments, methodId);
+    // Mark the entry site so the shared body knows its `args` is a va_list*, not
+    // a jobject array. Restored rather than reset to "62" on the way out, so a
+    // nested call on this thread cannot be mislabelled as slot 62.
+    const char* previousEntry = t_jniVoidEntry;
+    t_jniVoidEntry = "61";
     jniCallVoidMethodV(env, object, methodId, &arguments);
+    t_jniVoidEntry = previousEntry;
     va_end(arguments);
 }
 
