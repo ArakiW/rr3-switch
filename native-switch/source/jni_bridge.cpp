@@ -183,11 +183,39 @@ void registerHostHandle(uintptr_t address, const char* producer) {
     if (address == 0 || producer == nullptr) {
         return;
     }
-    // Re-registration is a no-op, not an append. The registry is keyed by
-    // handle, so registering the same address twice would consume two slots and
-    // make the table fill at half the real handle count.
-    if (hostHandleProducer(address) != nullptr) {
-        return;
+    // Same address AND same producer is a no-op. Same address with a DIFFERENT
+    // producer updates the label: the shared sentinel is registered at install
+    // as "sentinel/...", and if that first registration were final, every
+    // producer that returns it later would be masked and the diagnostic would
+    // go back to reporting "sentinel/" forever.
+    //
+    // That is not hypothetical. Registering the sentinels at install is what
+    // made archive 20261019-125345-ccreal1 still read "belongs to
+    // sentinel/g_fakeObjectObject" after jniObjectForMethod's catch-all had
+    // already been changed -- the fix may well be correct, the instrument
+    // could not report it. An instrument that cannot see a change is worse
+    // than no instrument.
+    //
+    // Dedup still matters, but only against the SAME producer: registering on
+    // every reuse filled all 8192 slots in one second (hreg1).
+    const char* existing = hostHandleProducer(address);
+    if (existing != nullptr) {
+        bool same = true;
+        for (size_t i = 0; producer[i] != '\0' || existing[i] != '\0'; ++i) {
+            if (producer[i] != existing[i]) {
+                same = false;
+                break;
+            }
+        }
+        if (same) {
+            return;
+        }
+        for (size_t i = kHostHandleSlots; i-- > 0;) {
+            if (g_hostHandles[i].address == address) {
+                g_hostHandles[i].producer = producer;
+                return;
+            }
+        }
     }
     const size_t index = g_hostHandleCount.fetch_add(1);
     if (index >= kHostHandleSlots) {
