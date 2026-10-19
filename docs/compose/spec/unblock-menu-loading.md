@@ -1761,3 +1761,62 @@ never started. Test-OnEden.ps1 now takes -EmulatorRoot/-EmulatorExe/
 -EmulatorName, puts the emulator in the archive label, discovers the emulator
 log by name instead of assuming eden_log.txt, and CITRON's config now points at
 E:/Citron/user.
+### S20 -- the profile file: the format is known, the PATH is the blocker
+
+Date: 2026-10-19. Archives 20261019-231913-eden-profile1, -234548-eden-profile2,
+-235324-eden-magic1, 20261020-000130-eden-clean1, 20261020-0001xx-eden-prof3.
+
+### What the guest wants
+
+    Loading Settings [profile] from [player_profile.2.dat]
+    Loading Settings [profile] from [player_profile.2.dat.bak]
+    LoadReadOnlyMappedFile failed getting full path: profile.dat
+    Asset::LoadFile unable to load file: 'profile.dat'
+    ...
+    startMusic disabled during download
+
+### The format (MEASURED, from the guest's own parser)
+
+The guest's profile parser is at guest 0x15ac4b4. Its first check is a magic
+compare, not a small version number:
+
+    0x015ac500  mov  w8, #0xfcba
+    0x015ac504  movk w8, #0xabcf, lsl #16     ; w8 = 0xABCF_FCBA
+    0x015ac508  cmp  w21, w8
+    0x015ac510  b.ne #0x15accc0               ; mismatch -> fail
+
+and the load at 0x15aa080 sizes its buffer with `mov w1, #0x80` -- 128 bytes.
+The predecessor port used version 13 and a 124-byte struct, which is a
+DIFFERENT build: the guest here wants a 128-byte file whose first four bytes
+are 0xABCF_FCBA (little-endian: BA FC CF AB). ControlMethods_e sits at
+offset 20, the "flipped" flag at 24 -- the same offsets the predecessor used.
+
+### The path is the blocker, not the file
+
+`rr3core:/files/.depot/profile.dat` EXISTS: with a profile.dat in place the
+sidecar trace shows it opened rc=0 size=124 from the content volume
+(archive 20261019-235324-eden-magic1). The guest asks for it by BARE name.
+
+Adding "profile.dat" to isAssetRelative()'s prefix list did NOT change the
+outcome (prof3): "failed getting full path: profile.dat" persists. That
+predicate selects the volume for a path that ALREADY carries a recognisable
+prefix -- the same trace shows the ".depot/"-prefixed form maps to
+rr3core:/files/.depot/profile.dat, and the bare form does not. So the fix is
+in resolvePath's candidate chain, not in that list.
+
+### Also settled here
+
+* The guest does NOT create a profile. Every write attempt is absent; the
+  fopen-fail lines for player_profile.2.dat carry errno=2 (ENOENT), which is a
+  read miss, not EROFS. All the guest's mkdirs succeed.
+* contentroot-gate reads gatebyte=0x01 (SET-ok) -- that gate is already open.
+* The menu loader is the guest's own: "menu-loader slot21=... (guest own=1)".
+
+### State
+
+Every Cloudcell complaint is zero (login executes, GetSessionValid=1, no sync
+storm) and the guest renders 15,720 frames, but it never asks the GUI volume
+for anything and stays in "startMusic disabled during download".
+
+NEXT: make the bare name resolve to rr3core:/files/.depot/profile.dat in
+resolvePath's candidate chain.

@@ -503,6 +503,20 @@ bool isAssetRelative(const char* relative) {
         "audio/", "gui/", "Shaders/", "data/", "gamemodes/", "hud/",
         "vector_images/", "effects/", "feats/", "driver/", "sponsorship/",
         "text_", "MenuTransitions.xml", "langs.utf8", "res/",
+        // "profile.dat" -- the player profile, asked for by BARE name.
+        //
+        // MEASURED 2026-10-19. Without it the guest logs
+        //   LoadReadOnlyMappedFile failed getting full path: profile.dat
+        //   Asset::LoadFile unable to load file: 'profile.dat'
+        // and then sits in "startMusic disabled during download" forever,
+        // never asking the GUI volume for anything. The file is NOT missing:
+        // with a profile.dat present the sidecar trace shows it opened
+        // rc=0 size=124 from rr3core:/files/.depot/profile.dat (archive
+        // 20261019-235324-eden-magic1). The guest asks for the bare name and
+        // this predicate is what decides whether a bare name is an asset
+        // relative to the content root -- "gui/" was already in the list,
+        // "profile.dat" was not.
+        "profile.dat",
     };
     for (const char* prefix : kPrefixes) {
         if (startsWith(relative, prefix)) return true;
