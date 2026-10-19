@@ -2898,6 +2898,76 @@ struct CloudcellHttpRequestSlot {
 constexpr size_t kCloudcellHttpRequestSlots = 8;
 CloudcellHttpRequestSlot g_ccHttpSlots[kCloudcellHttpRequestSlots]{};
 
+// Which host table, if any, an address belongs to.
+//
+// Answers "who handed the guest this handle", which a refusal alone does not.
+// The ccdisp=2 run refused setUserIdentifier and login with the SAME receiver
+// 0x80f703f1 -- an odd address, so not a slot of g_fakeObjectPool (those are
+// 16-byte aligned by construction). Every other producer in this file has its
+// own table, and which one it is decides whether the receiver can be trusted
+// to carry instance fields at all.
+//
+// Returns a static string, never allocates. Range-then-magic, in both
+// directions: the magic alone would accept a stray pointer that happens to
+// collide, and the range alone would accept any interior pointer.
+const char* hostHandleOwner(uintptr_t address) {
+    if (address == 0) {
+        return nullptr;
+    }
+    struct Range {
+        const void* base;
+        size_t bytes;
+    };
+    const Range ranges[] = {
+        {g_fakeObjectPool, sizeof(g_fakeObjectPool)},
+        {g_namedObjects, sizeof(g_namedObjects)},
+        {g_textureInfos, sizeof(g_textureInfos)},
+        {g_byteArrays, sizeof(g_byteArrays)},
+        {g_jniStrings, sizeof(g_jniStrings)},
+        {g_fakeClasses, sizeof(g_fakeClasses)},
+        {g_jniMethods, sizeof(g_jniMethods)},
+        {&g_fakeFont, sizeof(g_fakeFont)},
+        {&g_fakeObjectObject, 1},
+    };
+    for (const Range& range : ranges) {
+        const uintptr_t low = reinterpret_cast<uintptr_t>(range.base);
+        const uintptr_t high = low + range.bytes;
+        if (address < low || address >= high) {
+            continue;
+        }
+        const uintptr_t offset = address - low;
+        (void)offset;
+        // Not a switch: switch over a pointer has no integer promotion to case
+        // on, and this failed to compile exactly once.
+        if (range.base == static_cast<const void*>(g_fakeObjectPool)) {
+            return "g_fakeObjectPool/FOBJ";
+        }
+        if (range.base == static_cast<const void*>(g_namedObjects)) {
+            return "g_namedObjects/CMPO";
+        }
+        if (range.base == static_cast<const void*>(g_textureInfos)) {
+            return "g_textureInfos/TEXI";
+        }
+        if (range.base == static_cast<const void*>(g_byteArrays)) {
+            return "g_byteArrays/ARRB";
+        }
+        if (range.base == static_cast<const void*>(g_jniStrings)) {
+            return "g_jniStrings/RR3S";
+        }
+        if (range.base == static_cast<const void*>(g_fakeClasses)) {
+            return "g_fakeClasses/CLSS";
+        }
+        if (range.base == static_cast<const void*>(g_jniMethods)) {
+            return "g_jniMethods/RR3M";
+        }
+        if (range.base == static_cast<const void*>(&g_fakeFont)) {
+            return "g_fakeFont/FNTO";
+        }
+        return "host range, unknown table";
+    }
+    return nullptr;
+}
+
 // Resolve a guest classpath against the ManagedMethod registry.
 //
 // Matched on the tail, for the same reason cloudcellHttpRequestClass does:
@@ -3182,15 +3252,17 @@ void jniCallVoidMethodV(uintptr_t env, uintptr_t object,
                 // was the thing that broke the run.
                 const FakeObjectHeader* owned = fakeObjectHeaderFor(object);
                 if (owned == nullptr) {
-                    char why[192];
+                    const char* owner = hostHandleOwner(object);
+                    char why[256];
                     __builtin_snprintf(why, sizeof(why),
-                                       "REFUSED %s.%s: receiver %p is not an object "
-                                       "from this pool, and the stub would write "
-                                       "instance fields through it",
+                                       "REFUSED %s.%s: receiver %p is not a pool "
+                                       "object; it belongs to %s, which carries no "
+                                       "class and no room for instance fields",
                                        method->clazz != nullptr && method->clazz->classname
                                                ? method->clazz->classname
                                                : "?",
-                                       name, (void *)object);
+                                       name, (void *)object,
+                                       owner != nullptr ? owner : "nothing in this file");
                     guestViewWideLog("cc-dispatch",
                                      static_cast<unsigned long long>(methodId),
                                      static_cast<unsigned long long>(object), why);
