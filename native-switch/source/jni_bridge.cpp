@@ -2996,15 +2996,18 @@ void jniCallVoidMethodV(uintptr_t env, uintptr_t object,
                              callback != 0 ? "post has a callback"
                                            : "post has NO callback (init never seen)");
         }
+    }
 
-        // --- ManagedMethod dispatch (ccdisp) --------------------------------
-        //
-        // Every Cloudcell void call the guest makes lands here, and none of
-        // them reached jni_compat/classes/ before this. The stubs in there
-        // (aam_login, aam_is_logged_in, ...) were written, registered and never
-        // executed; cc_services.cpp:116 registers CCAccountManager under the
-        // very classpath the guest asks for, so the registration was right and
-        // only the wiring was missing.
+    // --- ManagedMethod dispatch (ccdisp) ------------------------------------
+    //
+    // Kept OUTSIDE the ccClass block, and that placement is the whole fix.
+    // login and setUserIdentifier arrive with ccClass == nullptr -- they are
+    // instance methods resolved through jniGetObjectClass, which answers the
+    // shared class sentinel for every object that is not a Font. They are the
+    // calls worth dispatching most: login is what the "Invalid DeviceId!"
+    // line is about. Two earlier attempts put this block inside the ccClass
+    // test, where the name-only fallback below could never be reached.
+    {
         //
         // Skipped deliberately:
         //   * takes_class methods. RegisterNonVirtual wants a jclass between
@@ -3015,9 +3018,7 @@ void jniCallVoidMethodV(uintptr_t env, uintptr_t object,
         //   * any class outside Cloudcell, for now.
         //
         // The name match is reported whether or not it succeeds. A miss here is
-        // the interesting case, not a non-event: cc_services registers "Login"
-        // and the guest asks for "login", which is invisible in every other
-        // readout this port has.
+        // the interesting case, not a non-event.
         const int dispatchLevel = ::rr3::gfxCloudcellDispatch();
         if (dispatchLevel > 0) {
             // The class this call resolved to, and -- when it resolved to
