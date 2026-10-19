@@ -2,7 +2,9 @@
 
 #include "../../eap_port/platform_adapter.h"
 #include "../jni.h"
-#include "../jni_internals.h"`n#include "../../eap_port/trace_adapter.h"
+#include "../jni_internals.h"
+#include "../../eap_port/trace_adapter.h"
+#include "../../../include/rr3/gfx_backend.hpp"
 #include "cloudcell_defer.h"
 #include "cloudcell_natives.h"
 
@@ -79,7 +81,27 @@ static jboolean aam_is_logged_in(JNIEnv *, jobject) { return JNI_FALSE; }
 
 /* AndroidAccountManager.java:80 - the exception path of Login() calls
  * LoginCompleteCallback(false, ...) itself. Without it CC_AuthenticatorManager
- * (a Cloudcell::Notifier<IAccountManagerListener>) stays pending forever. */
+ * (a Cloudcell::Notifier<IAccountManagerListener>) stays pending forever.
+ *
+ * MEASURED 2026-10-19, archive 20261019-210729-exec1. The guest's
+ * LoginCompleteCallback is a trampoline:
+ *     tst  w2, #0xff   ; the boolean
+ *     mov  x1, x4      ; the user handle
+ *     cset w0, ne      ; w0 = (boolean != 0)
+ *     br   x3          ; tail-call the guest's own continuation
+ * so `cb` is a guest continuation pointer and the boolean is the third
+ * argument.
+ *
+ * With the honest failure the guest stops complaining "Invalid DeviceId!" --
+ * so the callback IS reached and IS understood -- and then spins on
+ * "Sub Sync Queued: 10765" until the run dies at frame 4. It retries the queue
+ * because the login FAILED, not because the callback was missing.
+ *
+ * ccloginok=1 reports success instead. The user authorised a simulated
+ * Cloudcell backend and EA's service is gone, so a local success is the only
+ * answer the guest accepts. Off by default: this one is a simulation, and the
+ * difference is visible in the log.
+ */
 static void aam_login(JNIEnv *env, jobject self)
 {
     CCAccountManager *am = (CCAccountManager *)self;
@@ -89,7 +111,8 @@ static void aam_login(JNIEnv *env, jobject self)
         static AamLoginCompleteFn fn = cloudcell_native<AamLoginCompleteFn>(
             "Java_com_firemonkeys_cloudcellapi_AndroidAccountManager_LoginCompleteCallback");
         if (fn)
-            fn(env, (jclass)&CCAccountManager::clazz, JNI_FALSE, cb, user);
+            fn(env, (jclass)&CCAccountManager::clazz,
+               rr3::gfxCloudcellLoginOk() ? JNI_TRUE : JNI_FALSE, cb, user);
     });
 }
 

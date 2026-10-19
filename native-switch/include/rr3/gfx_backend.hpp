@@ -123,6 +123,18 @@ bool gfxObjectIdentity();
 // reason still returns its error.
 bool gfxMkdirIdempotent();
 
+// "ccloginok=1": the Cloudcell account manager answers LoginCompleteCallback
+// with success instead of an honest failure.
+//
+// The honest failure stops the "Invalid DeviceId!" complaint -- the callback
+// is reached and understood -- but the guest then spins on the sync queue
+// ("Sub Sync Queued: 10765") and the run dies. It retries because the login
+// failed, not because the callback was missing.
+//
+// The user authorised a simulated Cloudcell backend, and EA's service is gone,
+// so a local success is the only answer the guest accepts. Off by default.
+bool gfxCloudcellLoginOk();
+
 // "ccmode=off|now|bg": WHICH context invokes that continuation, as opposed to
 // whether it is invoked at all (ccdone). The only delivery site that existed is
 // the frame loop, and the guest blocks inside frame 0 before reaching it, so:

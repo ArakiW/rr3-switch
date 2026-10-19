@@ -217,6 +217,19 @@ struct ConfState {
     // from the data packs, where on real hardware the game would create it
     // itself and succeed. Default 0: plain POSIX mkdir, EEXIST and all.
     bool mkdirIdempotent = false;
+    // "ccloginok=1" -- the Cloudcell account manager answers LoginCompleteCallback
+    // with SUCCESS rather than with an honest failure.
+    //
+    // MEASURED 2026-10-19, archive 20261019-210729-exec1. With the failure
+    // answer the guest stopped complaining "Invalid DeviceId!" -- so the
+    // callback is reached and is understood -- but then it spun on
+    // "Sub Sync Queued: 10765" and the run died at frame 4. It retries the
+    // queue because the login failed, not because the callback was missing.
+    //
+    // The user authorised a simulated Cloudcell backend ("只要能玩，没有限制",
+    // "授权，直接开做") and EA's service is gone, so a local success is the
+    // only outcome the guest will accept. Off by default.
+    bool cloudcellLoginOk = false;
     // "ccsynth=1" -- install the host's synthetic Cloudcell object. Default is
     // 0, which LETS THE GUEST BUILD ITS OWN. The guest's constructor
     // (0x1cbe03c) allocates 0x4d0 bytes, publishes the object into this very
@@ -472,6 +485,11 @@ void readConf() {
                  std::strcmp(key, "mkdir-idempotent") == 0 ||
                  std::strcmp(key, "mkdirx") == 0) {
             s_conf.mkdirIdempotent = parseSwitch(value);
+        }
+        else if (std::strcmp(key, "ccloginok") == 0 ||
+                 std::strcmp(key, "cc-login-ok") == 0 ||
+                 std::strcmp(key, "loginsuccess") == 0) {
+            s_conf.cloudcellLoginOk = parseSwitch(value);
         }
         else if (std::strcmp(key, "zeropage") == 0) {
             s_conf.zeroPage = parseSwitch(value);
@@ -731,6 +749,12 @@ bool gfxObjectIdentity() {
 bool gfxMkdirIdempotent() {
     ensureResolved();
     return s_conf.mkdirIdempotent;
+}
+
+// "ccloginok=1": the Cloudcell account manager reports a successful login.
+bool gfxCloudcellLoginOk() {
+    ensureResolved();
+    return s_conf.cloudcellLoginOk;
 }
 
 // "ccmode=now|bg": WHICH CONTEXT invokes the Cloudcell continuation the guest
