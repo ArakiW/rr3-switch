@@ -183,6 +183,18 @@ struct ConfState {
     // "ccmode=now|bg" -- WHERE the captured continuation is invoked from. See
     // gfxCloudcellCompleteMode() for why the default has to stay empty.
     char ccMode[8] = {0};
+    // "ccdisp=0|1|2" -- how far the JNI call slots go toward the ManagedMethod
+    // table. 0 (default) = no dispatch at all, the pre-2026-10-19 behaviour.
+    // 1 = resolve the class and method and LOG the match without calling it.
+    // 2 = actually invoke it.
+    //
+    // Default 0 and the middle rung both exist because the managed stubs blr
+    // back into guest code (aam_login runs LoginCompleteCallback through
+    // cloudcell_defer), and a run on 2026-10-04 recorded entered_total=1 with
+    // drained_total=0 -- a callback that went in and never came back. Level 1
+    // answers "which methods would fire, and would the name match" for a full
+    // 300 s run without ever executing one.
+    int ccDispatch = 0;
     // "ccsynth=1" -- install the host's synthetic Cloudcell object. Default is
     // 0, which LETS THE GUEST BUILD ITS OWN. The guest's constructor
     // (0x1cbe03c) allocates 0x4d0 bytes, publishes the object into this very
@@ -416,6 +428,20 @@ void readConf() {
                  std::strcmp(key, "cc-deliver") == 0) {
             parseCompleteMode(value, s_conf.ccMode, sizeof(s_conf.ccMode));
         }
+        else if (std::strcmp(key, "ccdisp") == 0 ||
+                 std::strcmp(key, "cc-dispatch") == 0) {
+            // Closed vocabulary 0/1/2 and an unrecognised value RESOLVES to 0
+            // rather than being ignored, for the reason parseCompleteMode gives:
+            // a typo in a hand-edited SD-card file is otherwise
+            // indistinguishable from the default in the log.
+            if (std::strcmp(value, "2") == 0) {
+                s_conf.ccDispatch = 2;
+            } else if (std::strcmp(value, "1") == 0) {
+                s_conf.ccDispatch = 1;
+            } else {
+                s_conf.ccDispatch = 0;
+            }
+        }
         else if (std::strcmp(key, "zeropage") == 0) {
             s_conf.zeroPage = parseSwitch(value);
         }
@@ -506,13 +532,14 @@ void resolveBackend() {
     char details[256];
     std::snprintf(details, sizeof(details),
                   " backend=%s source=%s value=%s dumpdir=%s zeropage=%d"
-                  " ccmode=%s menugate=%d ccdone=%d conf_trunc=%d conf_bytes=%zu",
+                  " ccmode=%s menugate=%d ccdone=%d ccdisp=%d conf_trunc=%d conf_bytes=%zu",
                   gfxBackendName(), s_backendSource,
                   chosen[0] != '\0' ? chosen : "(unset)", kDumpDir,
                   s_conf.zeroPage ? 1 : 0,
                   s_conf.ccMode[0] != '\0' ? s_conf.ccMode : "off",
                   s_conf.menuGate ? 1 : 0,
                   s_conf.cloudcellComplete ? 1 : 0,
+                  s_conf.ccDispatch,
                   s_confTruncated ? 1 : 0, s_confBytes);
     writeLine("gfx-backend", 300, static_cast<unsigned long long>(s_backend), details);
 }
@@ -652,6 +679,13 @@ bool gfxMenuGateOpen() {
 bool gfxCloudcellCompleteRequests() {
     ensureResolved();
     return s_conf.cloudcellComplete;
+}
+
+// "ccdisp=0|1|2" -- how far the JNI call slots reach into the ManagedMethod
+// table. See the ConfState field for why the middle rung exists at all.
+int gfxCloudcellDispatch() {
+    ensureResolved();
+    return s_conf.ccDispatch;
 }
 
 // "ccmode=now|bg": WHICH CONTEXT invokes the Cloudcell continuation the guest

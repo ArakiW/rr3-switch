@@ -84,6 +84,19 @@ bool gfxMenuGateOpen();
 // -- the record it decodes carries an assert whose accepted shape is unproven.
 bool gfxCloudcellCompleteRequests();
 
+// "ccdisp=0|1|2": how far the JNI call slots in jni_bridge.cpp go toward the
+// ManagedMethod table in jni_compat/classes/.
+//   0 (default) -- no dispatch; the call slots log and return, which is what
+//                  they have always done.
+//   1           -- resolve class and method, log the match, DO NOT call.
+//   2           -- call it.
+//
+// The middle rung exists because the managed stubs blr back into guest code and
+// a 2026-10-04 run recorded a callback that entered and never drained. Level 1
+// answers "would this fire, and does the name even match" for a whole run with
+// zero execution.
+int gfxCloudcellDispatch();
+
 // "ccmode=off|now|bg": WHICH context invokes that continuation, as opposed to
 // whether it is invoked at all (ccdone). The only delivery site that existed is
 // the frame loop, and the guest blocks inside frame 0 before reaching it, so:

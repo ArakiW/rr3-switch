@@ -49,6 +49,7 @@
 #include <cstdarg>
 
 #include "rr3/elf_preflight.hpp"
+#include "rr3/gfx_backend.hpp"
 #include "rr3/guest_view_trace.hpp"
 #include "rr3/recovery_guard.hpp"
 #include "rr3/tls_probe.hpp"
@@ -63,6 +64,15 @@
 #include "eap_port/trace_adapter.h"
 #include "jni_compat/classes/cloudcell_defer.h"
 #include "jni_compat/classes/cloudcell_natives.h"
+
+// For ClassRegistry / ManagedMethod, so the call slots can be pointed at the
+// stubs in jni_compat/classes/. Nothing from that directory is currently
+// reachable from here: jniGetMethodID hands back a JniMethodRecord and every
+// call slot stops at "log and return", so a class the guest resolves and a
+// method it then calls are both real and both completely unanswered.
+//
+// Added 2026-10-19, behind ccdisp. See dispatchManagedVoid below.
+#include "jni_compat/jni_internals.h"
 
 namespace rr3 {
 
@@ -2767,12 +2777,64 @@ struct CloudcellHttpRequestSlot {
 constexpr size_t kCloudcellHttpRequestSlots = 8;
 CloudcellHttpRequestSlot g_ccHttpSlots[kCloudcellHttpRequestSlots]{};
 
+// Resolve a guest classpath against the ManagedMethod registry.
+//
+// Matched on the tail, for the same reason cloudcellHttpRequestClass does:
+// FindClass may hand back a spelling that differs in the package prefix while
+// the leaf class is the same. Matching the FULL path would silently miss
+// anything registered without its package, and matching only the leaf would
+// collide across packages.
+const Class* managedClassFor(const char* classpath) {
+    if (classpath == nullptr) {
+        return nullptr;
+    }
+    for (const Class* clazz : ClassRegistry::get_class_registry()) {
+        if (clazz == nullptr) {
+            continue;
+        }
+        if (rawEquals(clazz->classpath, classpath) ||
+            rawEquals(clazz->classname, classpath)) {
+            return clazz;
+        }
+        const char* leaf = clazz->classname;
+        size_t leafLen = 0;
+        while (leaf[leafLen] != '\0') {
+            ++leafLen;
+        }
+        size_t pathLen = 0;
+        while (classpath[pathLen] != '\0') {
+            ++pathLen;
+        }
+        if (pathLen > leafLen) {
+            const char* tail = classpath + (pathLen - leafLen);
+            if (rawEquals(tail, leaf)) {
+                return clazz;
+            }
+        }
+    }
+    return nullptr;
+}
+
+// Resolve a method inside a Class. Tables are NULL-terminated, not length-
+// counted: every one of them ends with a {NULL} entry (cc_services.cpp:105,
+// cc_http_request.cpp:140, and so on), so the loop has to stop on a null name
+// rather than on a count.
+const ManagedMethod* managedMethodFor(const Class* clazz, const char* name) {
+    if (clazz == nullptr || clazz->managed_methods == nullptr) {
+        return nullptr;
+    }
+    for (const ManagedMethod* method = clazz->managed_methods; method->name != nullptr;
+         ++method) {
+        if (rawEquals(method->name, name)) {
+            return method;
+        }
+    }
+    return nullptr;
+}
+
 void jniCallVoidMethodV(uintptr_t env, uintptr_t object,
                        uintptr_t methodId, void* args) {
-    // `env` is the JNIEnv the guest passed. Nothing below needs it yet: the
-    // Cloudcell fast-fail lands on a later change, and taking it here would mean
-    // carrying a live pointer through this path with no reader.
-    (void)env;
+    // `env` is the JNIEnv the guest passed.
     const char* name = jniMethodName(methodId);
     jniPairMark("enter", name, methodId, 0);
     if (name == nullptr) {
@@ -2857,6 +2919,70 @@ void jniCallVoidMethodV(uintptr_t env, uintptr_t object,
                              static_cast<unsigned long long>(object),
                              callback != 0 ? "post has a callback"
                                            : "post has NO callback (init never seen)");
+        }
+
+        // --- ManagedMethod dispatch (ccdisp) --------------------------------
+        //
+        // Every Cloudcell void call the guest makes lands here, and none of
+        // them reached jni_compat/classes/ before this. The stubs in there
+        // (aam_login, aam_is_logged_in, ...) were written, registered and never
+        // executed; cc_services.cpp:116 registers CCAccountManager under the
+        // very classpath the guest asks for, so the registration was right and
+        // only the wiring was missing.
+        //
+        // Skipped deliberately:
+        //   * takes_class methods. RegisterNonVirtual wants a jclass between
+        //     the object and the argument block and there is none to hand it;
+        //     calling the four-argument dispatcher with three reads one
+        //     register past the va_list (jni_internals.h says so about
+        //     AudioTrack.write). That covers <init>.
+        //   * any class outside Cloudcell, for now.
+        //
+        // The name match is reported whether or not it succeeds. A miss here is
+        // the interesting case, not a non-event: cc_services registers "Login"
+        // and the guest asks for "login", which is invisible in every other
+        // readout this port has.
+        const int dispatchLevel = ::rr3::gfxCloudcellDispatch();
+        if (dispatchLevel > 0) {
+            const Class* clazz = managedClassFor(ccClass);
+            const ManagedMethod* method =
+                clazz != nullptr ? managedMethodFor(clazz, name) : nullptr;
+            const char* verdict = method == nullptr
+                                      ? (clazz == nullptr ? "no class" : "no method")
+                                      : (method->takes_class ? "skipped takes_class"
+                                                             : "MATCH");
+            char dd[256];
+            __builtin_snprintf(dd, sizeof(dd),
+                               "level=%d class=%s method=%s -> %s static=%d obj=%p",
+                               dispatchLevel, ccClass, name, verdict,
+                               method != nullptr ? (method->is_static_method ? 1 : 0) : -1,
+                               (void *)object);
+            guestViewWideLog("cc-dispatch", static_cast<unsigned long long>(methodId),
+                             static_cast<unsigned long long>(object), dd);
+
+            if (dispatchLevel >= 2 && method != nullptr && !method->takes_class) {
+                if (rawEquals(t_jniVoidEntry, "62") && args != nullptr) {
+                    // Slot 62 hands over an array of 8-byte slots, which is
+                    // exactly the jvalue array the array-form dispatcher reads.
+                    // This is the form that matches; passing the array to the
+                    // va_list-form dispatcher would read one word too few.
+                    using Fn = void (*)(JNIEnv*, jobject, jvalue*);
+                    reinterpret_cast<Fn>(method->addr_array)(
+                        reinterpret_cast<JNIEnv*>(env),
+                        reinterpret_cast<jobject>(object),
+                        static_cast<jvalue*>(args));
+                } else {
+                    // Slot 61's args really are a va_list*, so the variadic
+                    // form is correct there. Deliberately NOT indexed.
+                    using Fn = void (*)(JNIEnv*, jobject, va_list);
+                    va_list forwarded;
+                    va_copy(forwarded, *static_cast<va_list*>(args));
+                    reinterpret_cast<Fn>(method->addr_variadic)(
+                        reinterpret_cast<JNIEnv*>(env),
+                        reinterpret_cast<jobject>(object), forwarded);
+                    va_end(forwarded);
+                }
+            }
         }
     }
 
