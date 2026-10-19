@@ -744,3 +744,67 @@ does not reach its main menu without a Cloudcell session, and there is no
 such session here. Everything the harness is responsible for is either
 fixed or measured.
 
+
+## S16 -- the menu blocker is a texture-resolution mismatch, not a Cloudcell problem
+
+Date: 2026-10-19. Archives: 20261019-170132-distinct, 20261019-212333-loginok2,
+20261019-214856-social1.
+
+### What was ruled out, and with what evidence
+
+Five Cloudcell hypotheses were closed with measurements, not reasoning:
+
+| Hypothesis | Verdict | Evidence |
+|---|---|---|
+| TLS/certificates block the login | false | the guest links OpenSSL 3.3.0, and Cloudcell's TLS is in the Android Java layer the port already replaced. `mbedtls_*`/`SSL_*` exports: 0 |
+| the HttpRequest facade is the blocker | false | 16 void calls per run; `HttpRequest` appears 0 times in the whole guest log |
+| 23 of 25 Cloudcell callback names are wrong | true, fixed | `cloudcell_natives.h` said so and nobody acted: the guest exports the flat spelling. Resolvable names 26 -> 35 |
+| the class table is too small | true, fixed | 34 distinct classes, 32 slots; `HttpRequest` fell off the end by one |
+| the login stub cannot be reached | true, fixed | the JNI table the guest binds is `jni_bridge.cpp`'s, which never dispatches to `ClassRegistry` |
+
+### The gate order that actually worked
+
+1. symbol names -> 2. class names -> 3. class-table capacity -> 4. the dispatch
+block's placement -> 5. the receiver's storage -> 6. the boolean slot.
+
+Step 6 is the one that is easy to miss: `GetSessionValid()` returns a boolean, so
+it goes to slot 37/38, and the dispatch added for the void slot never reached
+it. The stub was registered, correctly named, and unreachable because of its
+RETURN TYPE. `Sub Sync Queued` went 10765 -> 10 and `Invalid DeviceId!` went to
+zero when the boolean slot was wired.
+
+Step 5 needed the third shape. Two were tried and both are wrong: the one-byte
+shared sentinel (a facade writing instance fields corrupts the host) and one
+object per service (the guest dies at frame 4 -- it depends on getting the same
+address back). The shape that works is one address, allocated -- which is what
+the predecessor port had, because its `jni/jni.cpp` `NewObjectV` allocates and
+this port's `jni_bridge.cpp` does not.
+
+### The remaining blocker
+
+`path-req` stops at 120 = 4 candidate paths x 30 attempts, all for
+`fresnel_gloss` / `spec_gloss`. The last request is
+`spec_gloss.dxt.dds.z` and the guest stops there.
+
+The same logical file exists in two places with DIFFERENT sizes:
+
+| source | `fresnel_gloss.rgb.pvr` |
+|---|---|
+| ATC / DXT / ETC data packs | 3124 B (all three agree) |
+| the `rr3veh0` content device (`vehicles-classic.romfs`) | 3124 B -- what the guest stats |
+| the SD-side `.depot/vehicles/shaders/` | 4148 B -- what the guest reads |
+
+4148 - 44 = 4104 against 3124 in the packs, a ratio of 1.31, and the data packs
+are named `960x640+2048x1536` -- two resolutions in one pack. The SD-side copy
+also has a 44-byte prefix before the `PVR!` magic, which the pack's copy does
+not.
+
+So the content device and the SD-side staged copy hold DIFFERENT RESOLUTIONS of
+the same texture, and the guest rejects the one it gets. Every other vehicle
+shader loads fine; only the `*_gloss` set is affected.
+
+### Next
+
+Find out which resolution the guest's asset manifest expects, and which one the
+ROMFS volume actually carries for the `*_gloss` shaders. If the content device
+is the one that is wrong, the fix is in the ROMFS build, not in code.
