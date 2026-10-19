@@ -1870,3 +1870,64 @@ its content at first run from there. So it solved the download phase somehow
 WITHOUT a server. Find out how -- reference/realracing3-native-arm is the
 same lineage and its src/ is readable. That is the next thing to look at, and
 it is a question about a KNOWN-WORKING implementation rather than a guess.
+### S22 -- the download phase: the complete mechanism, and the fix the sibling port used
+
+Date: 2026-10-20.
+
+The last unexplained symptom -- "startMusic disabled during download", forever,
+with every Cloudcell complaint already at zero -- is fully explained by the
+sibling port, which is the same lineage and has the answer in its own source.
+
+reference/realracing3-native-arm/src/rr3_asset_patch.cpp:
+
+    The consequence is not a slow download, it is a permanent freeze:
+    OnUpdate (0x3276b8) sees a non-zero queued download size, asks for Wi-Fi,
+    gets none, and calls ShowNoWifiMessage (0x323534), which sets
+    CC_AssetManager+0x8d = 1 - the byte OnUpdate tests at its first
+    instruction.
+
+    The fix here is to make SkipAsset answer the question the port can answer
+    exactly: "is this file actually on the card?" Anything not present is
+    skipped from the accounting, so the download queue comes out empty, no
+    Wi-Fi gate is reached, and the asset lists complete into OnAssetListsComplete
+    (0x3272a8) -> OnDownloadingComplete (0x320e20).
+
+    Why file-existence and not a blanket "skip everything": a blanket skip also
+    empties the list of assets the game knows it has, and LoadAssetList's output
+    is more than a counter.
+
+Mechanism, as stated there:
+
+  1. CC_AssetManager_Class::LoadAssetList (0x94f374) asks its agent
+     SkipAsset() per entry through vtable+8 (the call at 0x94f57a) BEFORE
+     counting it.
+  2. AssetDownloadService::SkipAssetImpl (0x322d9c) is
+     isTextureFilename(name) && !isPrimaryFilename(name) -> skip. In that port
+     mtTextureManager::isPrimaryFilename (0x81d280) early-returns 1 when the
+     render singleton pointer is null, so NOTHING is ever skipped and all three
+     foreign texture encodings are counted as missing.
+  3. A non-zero queued download size -> OnUpdate asks for Wi-Fi -> none ->
+     ShowNoWifiMessage sets CC_AssetManager+0x8d = 1 -> permanent freeze.
+     "startMusic disabled during download" is exactly this.
+
+The fix there is a code hook on the guest's SkipAssetImpl, by symbol
+("_ZN20AssetDownloadService13SkipAssetImplEPKc"), answering by file existence.
+
+OUR GUEST DOES NOT EXPORT IT. A scan of .dynsym in
+reverse/native/arm64/libRealRacing3.so finds only two symbols containing
+"Download":
+
+    0x01643804  Java_csdk_glucentralservices_util_AndroidPlatform_onDownloadResponse
+    0x01c64f2c  Java_com_firemonkeys_cloudcellapi_AndroidAssetManagerService_ProcessDownloadsJNI
+
+SkipAsset / AssetDownloadService / OnDownloadingComplete / OnAssetListsComplete /
+ShowNoWifiMessage / isPrimaryFilename / LoadAssetList are all absent from
+.dynsym, and the image has no .symtab.
+
+NEXT: locate the equivalent in the arm64 image by PATTERN rather than by name --
+the LoadAssetList call site through the agent's vtable+8, and the
+isPrimaryFilename early-return on the null render singleton. This port already
+replaces a guest vtable slot (guest_view_probe.cpp:2414 does exactly that), so
+the mechanism to answer SkipAsset by file existence is available; what is
+missing is the address, and it has to be found by disassembly rather than by
+symbol.
