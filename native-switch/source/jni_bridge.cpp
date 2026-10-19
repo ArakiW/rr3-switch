@@ -1936,6 +1936,27 @@ uintptr_t jniCallObjectMethodV(uintptr_t /*env*/, uintptr_t /*object*/,
         result = jniObjectForMethod(methodId);
     }
     ::rr3::censusNoteImportFrom(__builtin_return_address(0), "jni:CallObjectMethod");
+    // WHO RETURNED THE SENTINEL, AND FROM WHERE.
+    //
+    // Three rounds of guessing the producer all failed (owner1, ccreal1,
+    // ccreal3), because the registry answers "what is this address" and not
+    // "which call site produced it". This is the second half.
+    //
+    // Gated on the value rather than budgeted, so it costs one compare on the
+    // hot path and logs nothing at all until the sentinel is actually handed
+    // over. ra is the guest's own return address, minus the load bias, which is
+    // what turns "somewhere in 33 MB" into a callable site.
+    if (result == reinterpret_cast<uintptr_t>(&g_fakeObjectObject)) {
+        const uintptr_t bias = resolveMainImageLoadBias();
+        const uintptr_t ra = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+        char details[192];
+        __builtin_snprintf(details, sizeof(details),
+                           "method=%s ra=rr3+%llx", name != nullptr ? name : "(null)",
+                           (unsigned long long)(ra > bias ? ra - bias : ra));
+        guestViewWideLog("jni-sentinel-return",
+                         static_cast<unsigned long long>(methodId),
+                         static_cast<unsigned long long>(ra), details);
+    }
     jniPairMark("exit", name, methodId, result);
     // The census call above is the cheaper per-call tracer and it stays: it is a
     // per-thread ring, no SD card, and it is what attributes a wedge to this
@@ -2023,6 +2044,19 @@ uintptr_t jniCallStaticObjectMethodV(uintptr_t /*env*/, uintptr_t /*clazz*/,
         }
     }
     ::rr3::censusNoteImportFrom(__builtin_return_address(0), "jni:CallStaticObjectMethod");
+    // Same probe as jniCallObjectMethodV: a sentinel return here names its own
+    // guest call site, which is the half of the answer the registry cannot give.
+    if (result == reinterpret_cast<uintptr_t>(&g_fakeObjectObject)) {
+        const uintptr_t bias = resolveMainImageLoadBias();
+        const uintptr_t ra = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+        char details[192];
+        __builtin_snprintf(details, sizeof(details),
+                           "static method=%s ra=rr3+%llx", name,
+                           (unsigned long long)(ra > bias ? ra - bias : ra));
+        guestViewWideLog("jni-sentinel-return",
+                         static_cast<unsigned long long>(methodId),
+                         static_cast<unsigned long long>(ra), details);
+    }
 
     // EXIT MARKER, own budget again. The entry log above says a call started;
     // this says it finished. Without the pair, "the last method named was X"
