@@ -1820,3 +1820,53 @@ for anything and stays in "startMusic disabled during download".
 
 NEXT: make the bare name resolve to rr3core:/files/.depot/profile.dat in
 resolvePath's candidate chain.
+### S21 -- the profile loads; what remains is the DOWNLOAD phase, and the file is not missing
+
+Date: 2026-10-20. Archive 20261020-0*prof4.
+
+Shipping a valid profile to the six candidates the guest actually probes
+(measured from its own stat-path trace) clears the profile gate:
+
+    before:  Asset::LoadFile unable to load file: 'profile.dat'      (1)
+    after:   'unable to load file'                                  (0)
+
+The guest's own log then reads:
+
+    Loading Settings [profile] from [player_profile.2.dat.0]
+    Data file load failed.  Unknown file or version.  player_profile.2.dat.0
+    Loading Settings [profile] from [player_profile.2.dat.0.bak]
+    RESUME SYSTEM START / END
+    onWindowFocusChanged: hasFocus true
+    startMusic disabled during download
+
+So profile.dat is ACCEPTED, and the one remaining "unknown file or version" is
+about player_profile.2.dat.0, a DIFFERENT file with a different serialization
+(not the 128-byte profile). It is not what the menu waits on.
+
+### The candidates the guest probes (from its own stat-path trace)
+
+    doc//player_profile.2.dat.0
+    doc//player_profile.2.dat
+    doc//player_profile.dat
+    .depot/profile.dat      -> primary rr3core:/files/.depot/profile.dat
+    apk/res/profile.dat     -> primary rr3core:/files/apk/res/profile.dat
+    doc/profile.dat
+
+The resolver is already correct: the trace shows primary=rr3core:/files/.depot/
+profile.dat and fallback=sdmc:/.../.depot/profile.dat. The file simply is not
+in the volumes -- core.romfs contains no "profile.dat" string at all.
+
+### The download phase is not a missing-file problem
+
+Everything the download phase names is present, twice over:
+data.bin (1184 B), dataoffsets.txt (1805 B), no3g.xml (162 B),
+materials.bin (58023 B) -- in .depot/ AND apk/res/, and the first three are
+in core.romfs as well. Yet the guest stays in "startMusic disabled during
+download" and never asks the GUI volume for anything.
+
+NEXT (the question to answer): the PREDECESSOR port got the menu open with
+0037-connect.cloudcell.com unresolvable, and its README says the game fetched
+its content at first run from there. So it solved the download phase somehow
+WITHOUT a server. Find out how -- reference/realracing3-native-arm is the
+same lineage and its src/ is readable. That is the next thing to look at, and
+it is a question about a KNOWN-WORKING implementation rather than a guess.
