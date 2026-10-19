@@ -95,12 +95,42 @@ static void aam_login(JNIEnv *env, jobject self)
 
 static void aam_on_resume(JNIEnv *, jobject) {}
 
+/*
+ * setUserIdentifier and logout, added 2026-10-19.
+ *
+ * Both are requested by the guest and neither was registered. The method names
+ * are the guest's own spellings, checked against the image rather than
+ * assumed: "login", "logout" and "setUserIdentifier" appear there as standalone
+ * literals and "SetUserIdentifier" does not appear at all.
+ *
+ * setUserIdentifier stores the handle as handed over. It is not decoded to a
+ * char* because nothing reads it back: aam_login passes user_ptr straight to
+ * LoginCompleteCallback as the opaque long the native side expects, and
+ * decoding it would mean allocating a string the guest never asked for.
+ */
+static void aam_set_user_identifier(JNIEnv *, jobject self, jobject identifier)
+{
+    ((CCAccountManager *)self)->user_ptr =
+        reinterpret_cast<jlong>(identifier);
+}
+
+static void aam_logout(JNIEnv *, jobject self)
+{
+    CCAccountManager *am = (CCAccountManager *)self;
+    am->login_cb = 0;
+    am->user_ptr = 0;
+}
+
 static const ManagedMethod aam_methods[] = {
     ManagedMethod::RegisterNonVirtual<&aam_ctor>(CCAccountManager::clazz, "<init>", "()V"),
     ManagedMethod::Register<&aam_constructor>(CCAccountManager::clazz, "Constructor", "(JJ)V"),
     ManagedMethod::Register<&aam_destructor>(CCAccountManager::clazz, "Destructor", "()V"),
     ManagedMethod::Register<&aam_is_logged_in>(CCAccountManager::clazz, "IsLoggedIn", "()Z"),
-    ManagedMethod::Register<&aam_login>(CCAccountManager::clazz, "Login", "()V"),
+    ManagedMethod::Register<&aam_login>(CCAccountManager::clazz, "login", "()V"),
+    ManagedMethod::Register<&aam_logout>(CCAccountManager::clazz, "logout", "()V"),
+    ManagedMethod::Register<&aam_set_user_identifier>(CCAccountManager::clazz,
+                                                      "setUserIdentifier",
+                                                      "(Ljava/lang/String;)V"),
     ManagedMethod::Register<&aam_on_resume>(CCAccountManager::clazz, "onResume", "()V"),
     {NULL},
 };

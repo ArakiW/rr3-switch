@@ -2862,6 +2862,51 @@ const ManagedMethod* managedMethodFor(const Class* clazz, const char* name) {
     return nullptr;
 }
 
+// Fallback for a method whose class could not be resolved.
+//
+// WHY THIS EXISTS
+// ---------------
+// login, setUserIdentifier, writeWithTitle, createControllerManager and
+// setThresholdLevel all arrive with class=(none), because they are instance
+// methods resolved through jniGetObjectClass, and that answers the shared
+// g_fakeClassObject sentinel for every object that is not a Font
+// (jniGetObjectClass, the Font branch is the only special case). So the class
+// half of the lookup is unavailable for exactly the calls that matter most --
+// login is the one the "Invalid DeviceId!" line is about.
+//
+// WHAT THIS IS NOT
+// ----------------
+// This does NOT make the object identity question go away. It sidesteps it:
+// the class stays unknown, the object stays the shared sentinel, and the method
+// is found by its name alone. Any ManagedMethod that writes instance fields is
+// still writing into that one-byte global, so ccdisp=2 must stay off until
+// jniNewObjectV hands out real per-object storage.
+//
+// Only a name that resolves in EXACTLY ONE registered class is accepted. An
+// ambiguous name is reported and skipped rather than guessed at.
+const ManagedMethod* managedMethodByNameAlone(const char* name,
+                                              const char** whichClass) {
+    const ManagedMethod* only = nullptr;
+    const Class* onlyClass = nullptr;
+    int hits = 0;
+    for (const Class* clazz : ClassRegistry::get_class_registry()) {
+        const ManagedMethod* method = managedMethodFor(clazz, name);
+        if (method == nullptr) {
+            continue;
+        }
+        ++hits;
+        only = method;
+        onlyClass = clazz;
+    }
+    if (hits == 1 && onlyClass != nullptr) {
+        if (whichClass != nullptr) {
+            *whichClass = onlyClass->classpath;
+        }
+        return only;
+    }
+    return nullptr;
+}
+
 void jniCallVoidMethodV(uintptr_t env, uintptr_t object,
                        uintptr_t methodId, void* args) {
     // `env` is the JNIEnv the guest passed.
@@ -2975,17 +3020,38 @@ void jniCallVoidMethodV(uintptr_t env, uintptr_t object,
         // readout this port has.
         const int dispatchLevel = ::rr3::gfxCloudcellDispatch();
         if (dispatchLevel > 0) {
-            const Class* clazz = managedClassFor(ccClass);
+            // The class this call resolved to, and -- when it resolved to
+            // nothing -- a lookup by method name alone. login and
+            // setUserIdentifier arrive here with class=(none) because they are
+            // instance methods resolved through jniGetObjectClass, which
+            // answers the shared g_fakeClassObject sentinel for every non-Font
+            // object. Those are exactly the calls worth dispatching, so a
+            // unique name match is accepted and the guessed class is printed.
+            //
+            // Only a name present in EXACTLY ONE registered class qualifies;
+            // managedMethodByNameAlone returns null for an ambiguous one.
+            const char* guessClass = nullptr;
+            const ManagedMethod* byNameOnly = nullptr;
+            const Class* clazz = ccClass != nullptr ? managedClassFor(ccClass) : nullptr;
             const ManagedMethod* method =
                 clazz != nullptr ? managedMethodFor(clazz, name) : nullptr;
+            if (method == nullptr && clazz == nullptr) {
+                byNameOnly = managedMethodByNameAlone(name, &guessClass);
+                method = byNameOnly;
+            }
             const char* verdict = method == nullptr
-                                      ? (clazz == nullptr ? "no class" : "no method")
+                                      ? (clazz == nullptr ? "no class, no unique name"
+                                                          : "no method")
                                       : (method->takes_class ? "skipped takes_class"
                                                              : "MATCH");
             char dd[256];
             __builtin_snprintf(dd, sizeof(dd),
                                "level=%d class=%s method=%s -> %s static=%d obj=%p",
-                               dispatchLevel, ccClass, name, verdict,
+                               dispatchLevel,
+                               ccClass != nullptr
+                                   ? ccClass
+                                   : (guessClass != nullptr ? guessClass : "(none)"),
+                               name, verdict,
                                method != nullptr ? (method->is_static_method ? 1 : 0) : -1,
                                (void *)object);
             guestViewWideLog("cc-dispatch", static_cast<unsigned long long>(methodId),
