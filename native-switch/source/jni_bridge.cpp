@@ -1671,6 +1671,31 @@ uintptr_t jniObjectForMethod(uintptr_t methodId) {
     if (RR3_NULL_UNKNOWN_OBJECTS != 0) {
         return 0;
     }
+    // objid=1: give the guest an object that at least knows its class.
+    //
+    // MEASURED 2026-10-19 (archive 20261019-124506-hreg3). The handle the
+    // dispatch interlock keeps refusing for AndroidAccountManager.login and
+    // setUserIdentifier is sentinel/g_fakeObjectObject -- not a slot of the
+    // pool. So the guest never constructs that object through NewObjectV; it
+    // comes back from one of the object-returning fallbacks, and this line is
+    // the one that produced it. jniNewObjectV's pool work was therefore never
+    // on this path, which is why its A/B showed no frame change.
+    //
+    // The methodId is right here, so the class is recoverable. Returning a pool
+    // object keyed to it is the difference between the guest holding an opaque
+    // byte and holding an object whose GetObjectClass answers, which is what
+    // made login unreachable in the first place.
+    //
+    // Under objid=0 nothing here changes; the sentinel stands.
+    if (::rr3::gfxObjectIdentity()) {
+        const JniMethodRecord* record = findJniMethod(methodId);
+        const char* cls = record != nullptr ? className(record->clazz) : nullptr;
+        if (cls != nullptr) {
+            return newFakeObject(record->clazz);
+        }
+    }
+    registerHostHandle(reinterpret_cast<uintptr_t>(&g_fakeObjectObject),
+                       "jniObjectForMethod/catch-all-sentinel");
     return reinterpret_cast<uintptr_t>(&g_fakeObjectObject);
 }
 
