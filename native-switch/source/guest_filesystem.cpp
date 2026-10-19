@@ -1783,10 +1783,47 @@ int guestAccess(const char* path, int mode) {
 // true size, so the two can be compared directly. This is the control for the
 // fix: before it, o30_is_size was 0 on every file; after it, it must be 1 on
 // every non-empty file, and the mmap probe must stop reporting zero-length.
-constexpr unsigned kStatLayoutBudget = 200;
+constexpr unsigned kStatLayoutBudget = 4000;
 constexpr unsigned kStatProbeOffsets[] = {0x18, 0x28, 0x30, 0x38, 0x40};
 unsigned gStatLayoutLogged = 0;
 unsigned gStatLayoutMismatched = 0;
+
+// Distinct paths, so "is the guest making progress or looping" is answerable
+// without reading thousands of near-identical lines.
+//
+// MEASURED 2026-10-19, archive 20261019-165014-rollback2. With the old budget
+// of 200 the census read exactly 200 -- the cap, not a fact about the guest --
+// and the tail was three consecutive repeats of fresnel_dash_matte_dull.rgb.pvr
+// then three of spec_dash_matte_dull.rgb.pvr. Whether the guest was walking
+// forward through vehicle assets or spinning on the same two files could not be
+// told, because the instrument counted requests and the question is about
+// distinct files.
+//
+// Stored as a 64-bit FNV-1a of the path rather than the path itself: this runs
+// on the stat path, and a miss only costs one distinct count, never a wrong
+// line. gStatLayoutDistinct is the number to read -- if it is still climbing at
+// the end of a run the guest is progressing; if it flatlined, it is looping.
+constexpr size_t kStatSeenSlots = 4096;
+uint64_t gStatSeen[kStatSeenSlots]{};
+
+unsigned statNoteDistinctPath(const char* path) {
+    uint64_t hash = 1469598103934665603ull;
+    for (const char* p = path; *p != '\0'; ++p) {
+        hash ^= static_cast<uint8_t>(*p);
+        hash *= 1099511628211ull;
+    }
+    if (hash == 0) {
+        hash = 1;
+    }
+    const size_t slot = static_cast<size_t>(hash % kStatSeenSlots);
+    if (gStatSeen[slot] == hash) {
+        return 0;
+    }
+    gStatSeen[slot] = hash;
+    return 1;
+}
+
+unsigned gStatLayoutDistinct = 0;
 
 void logStatLayout(const char* resolvedPath, const void* guestBuffer,
                    const struct stat& host) {
@@ -1798,11 +1835,17 @@ void logStatLayout(const char* resolvedPath, const void* guestBuffer,
     }
     const bool o30IsSize = values[2] == trueSize;
     // Never budgeted away when it disagrees: the whole point of the probe is
-    // the case where the guest's offset does not hold the size.
-    if (gStatLayoutLogged < kStatLayoutBudget || !o30IsSize) {
+    // the case where the guest's offset does not hold the size. Repeats of a
+    // path already seen are dropped for the same reason the distinct counter
+    // exists: N lines for one file says nothing about progress.
+    const unsigned fresh = statNoteDistinctPath(resolvedPath);
+    gStatLayoutDistinct += fresh;
+    if ((fresh != 0 || !o30IsSize) &&
+        (gStatLayoutLogged < kStatLayoutBudget || !o30IsSize)) {
         char details[320];
         int n = __builtin_snprintf(details, sizeof(details),
-                                   "true=%llu size_at=[", trueSize);
+                                   "true=%llu distinct=%u repeat=%u size_at=[", trueSize,
+                                   gStatLayoutDistinct, fresh != 0 ? 0u : 1u);
         for (size_t i = 0;
              i < sizeof(kStatProbeOffsets) / sizeof(*kStatProbeOffsets) &&
              n > 0 && n < static_cast<int>(sizeof(details)); ++i) {
