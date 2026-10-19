@@ -1507,20 +1507,34 @@ uintptr_t fakeObjectHandle(const char* name) {
     const unsigned i = next.fetch_add(1, std::memory_order_relaxed);
     return reinterpret_cast<uintptr_t>(&pool[i % 256]);
 #else
-    // REVERTED 2026-10-19. Keyed pool objects were tried here, per the shape
-    // the jni-sentinel-return probe pointed at, and the guest did not survive
-    // them: archive 20261019-164120-keyed1 rendered 4 frames (baseline 16320)
-    // with zero sentinel returns left anywhere. The shared byte is LOAD
-    // BEARING, not merely lazy -- the guest relies on getting the same address
-    // back from these services, which is the spin jni_bridge.cpp records at
-    // line ~1290.
+    // The shared service object: ONE object, but with real storage.
     //
-    // So the premise this function's own comment warned about is confirmed and
-    // is also the constraint: the three services must be indistinguishable.
-    // Which means the Cloudcell facade cannot be made to run on this handle by
-    // giving it storage. The write is unsafe, and distinct handles break the
-    // guest, so aam_constructor / aam_login stay refused and the Cloudcell login
-    // path stays unreachable by dispatch.
+    // This is the shape the predecessor port had, and the shape the guest is
+    // written against. Two earlier shapes were tried and both are wrong:
+    //
+    //   * the one-byte &g_fakeObjectObject (what this used to be): the guest
+    //     cannot tell the services apart -- which it depends on -- but any
+    //     facade that writes instance fields corrupts the host, because the
+    //     object is one byte wide. The dispatch interlock has been refusing
+    //     exactly that write ever since.
+    //   * one object per service (archive 20261019-164120-keyed1): storage
+    //     solved, and the guest died at frame 4, because it relies on getting
+    //     the same address back.
+    //
+    // The third shape satisfies both: one address, allocated. The predecessor
+    // got this for free from jni/jni.cpp's NewObjectV, which allocates; this
+    // port's jni_bridge.cpp does not, and the difference is the whole gap.
+    //
+    // Allocated once and reused, so identity is stable, and through
+    // newFakeObject so the dispatch interlock recognises it as ours.
+    static uintptr_t shared = 0;
+    if (::rr3::gfxObjectIdentity()) {
+        if (shared == 0) {
+            shared = newFakeObject(0);
+        }
+        return shared;
+    }
+    // objid=0 restores the one-byte sentinel exactly.
     return reinterpret_cast<uintptr_t>(&g_fakeObjectObject);
 #endif
 }
