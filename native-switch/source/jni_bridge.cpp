@@ -3658,6 +3658,23 @@ void ensureInitialized() {
     g_jniTable[215] = reinterpret_cast<void*>(&jniReturnZero);        // RegisterNatives
     g_jniTable[228] = reinterpret_cast<void*>(&jniReturnZero);        // ExceptionCheck
 
+    // The one-byte sentinels are handles too, and the one the dispatch
+    // interlock keeps rejecting is at an ODD address -- so it cannot be the
+    // start of any struct array element, whose alignment is at least 4. That
+    // leaves exactly this set. Registering them here means a receiver that
+    // happens to be one is attributed instead of coming back "unattributed"
+    // (archive 20261019-123742-hreg2, receiver 0x80c0e401).
+    registerHostHandle(reinterpret_cast<uintptr_t>(&g_fakeActivityObject),
+                       "sentinel/g_fakeActivityObject");
+    registerHostHandle(reinterpret_cast<uintptr_t>(&g_fakeClassObject),
+                       "sentinel/g_fakeClassObject");
+    registerHostHandle(reinterpret_cast<uintptr_t>(&g_fakeMethodId),
+                       "sentinel/g_fakeMethodId");
+    registerHostHandle(reinterpret_cast<uintptr_t>(&g_fakeFieldId),
+                       "sentinel/g_fakeFieldId");
+    registerHostHandle(reinterpret_cast<uintptr_t>(&g_fakeObjectObject),
+                       "sentinel/g_fakeObjectObject");
+
     for (size_t slot = 0; slot < 8; ++slot) {
         g_vmTable[slot] = reinterpret_cast<void*>(&jniSlotStub<0>);
     }
