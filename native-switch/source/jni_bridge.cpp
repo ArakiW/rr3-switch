@@ -157,6 +157,67 @@ std::atomic<size_t> g_fakeObjectUsed{0};
 std::atomic<size_t> g_fakeObjectOverflow{0};
 std::atomic<size_t> g_fakeObjectReused{0};
 
+// --- handle registry --------------------------------------------------------
+//
+// REPLACES the hand-written range table this file used to answer "who handed
+// the guest this pointer". That table listed nine arrays and reported "host
+// range, unknown table" for an address that was in fact a static global nobody
+// had listed -- and a list that can silently miss is the same defect as a
+// capacity that silently aliases. Producers register instead; the question
+// "who gave out this handle" then has one answer that cannot drift.
+//
+// Sized well past what a run produces; a duplicate registration is cheap and
+// harmless, so several producers register the same shared sentinel.
+struct HostHandle {
+    uintptr_t address;
+    const char* producer;
+};
+constexpr size_t kHostHandleSlots = 8192;
+HostHandle g_hostHandles[kHostHandleSlots]{};
+std::atomic<size_t> g_hostHandleCount{0};
+std::atomic<size_t> g_hostHandleOverflow{0};
+
+void registerHostHandle(uintptr_t address, const char* producer) {
+    if (address == 0 || producer == nullptr) {
+        return;
+    }
+    const size_t index = g_hostHandleCount.fetch_add(1);
+    if (index >= kHostHandleSlots) {
+        // Out of table: NOT silent. A handle that cannot be attributed is
+        // exactly the case this registry exists to surface.
+        const size_t over = ++g_hostHandleOverflow;
+        if (over <= 4) {
+            char details[160];
+            __builtin_snprintf(details, sizeof(details),
+                               "handle registry full at %u entries; %p from %s "
+                               "unattributed (overflow #%u)",
+                               (unsigned)kHostHandleSlots, (void *)address, producer,
+                               (unsigned)over);
+            guestViewWideLog("jni-handle-registry", (unsigned long long)over,
+                             (unsigned long long)address, details);
+        }
+        return;
+    }
+    g_hostHandles[index].address = address;
+    g_hostHandles[index].producer = producer;
+}
+
+// Last registration wins, which is right: a shared sentinel produced by a
+// later path should report that later path.
+const char* hostHandleProducer(uintptr_t address) {
+    if (address == 0) {
+        return nullptr;
+    }
+    const size_t count = g_hostHandleCount.load(std::memory_order_relaxed);
+    const size_t limit = count < kHostHandleSlots ? count : kHostHandleSlots;
+    for (size_t i = limit; i-- > 0;) {
+        if (g_hostHandles[i].address == address) {
+            return g_hostHandles[i].producer;
+        }
+    }
+    return nullptr;
+}
+
 // Accepts a jobject only if it is exactly an instance base in this pool AND
 // the header behind it carries our magic. Anything else -- the Font, the
 // sentinels, a real guest pointer -- returns null and keeps the old path.
@@ -204,7 +265,9 @@ uintptr_t newFakeObject(uintptr_t clazz) {
     __builtin_memset(g_fakeObjectPool + index * kFakeObjectStride, 0, kFakeObjectStride);
     header->magic = kFakeObjectMagic;
     header->clazz = clazz;
-    return reinterpret_cast<uintptr_t>(header + 1);
+    const uintptr_t instance = reinterpret_cast<uintptr_t>(header + 1);
+    registerHostHandle(instance, "jniNewObjectV/pool");
+    return instance;
 }
 
 // Mirrors com.firemint.realracing.TextureInfo (defined after raw* helpers).
@@ -899,11 +962,15 @@ bool nameIsFontClass(const char* name) {
 // inventing an identity that never existed.
 uintptr_t classHandleFor(const char* name) {
     if (name == nullptr || name[0] == '\0') {
+        registerHostHandle(reinterpret_cast<uintptr_t>(&g_fakeClassObject),
+                           "classHandleFor/empty-sentinel");
         return reinterpret_cast<uintptr_t>(&g_fakeClassObject);
     }
     for (size_t index = 0; index < g_fakeClassCount; ++index) {
         if (g_fakeClasses[index].magic == kFakeClassMagic &&
             rawEquals(g_fakeClasses[index].name, name)) {
+            registerHostHandle(reinterpret_cast<uintptr_t>(&g_fakeClasses[index]),
+                               "classHandleFor/reuse");
             return reinterpret_cast<uintptr_t>(&g_fakeClasses[index]);
         }
     }
@@ -932,6 +999,7 @@ uintptr_t classHandleFor(const char* name) {
     FakeClass& record = g_fakeClasses[g_fakeClassCount++];
     record.magic = kFakeClassMagic;
     rawCopy(record.name, sizeof(record.name), name);
+    registerHostHandle(reinterpret_cast<uintptr_t>(&record), "classHandleFor/new");
     return reinterpret_cast<uintptr_t>(&record);
 }
 
@@ -1187,9 +1255,13 @@ uintptr_t makeJniString(const char* value) {
             g_jniStrings[index].magic = kJniStringMagic;
             rawCopy(g_jniStrings[index].value,
                     sizeof(g_jniStrings[index].value), value);
-            return reinterpret_cast<uintptr_t>(&g_jniStrings[index]);
+            const uintptr_t handle = reinterpret_cast<uintptr_t>(&g_jniStrings[index]);
+            registerHostHandle(handle, "makeJniString/table");
+            return handle;
         }
     }
+    registerHostHandle(reinterpret_cast<uintptr_t>(&g_fakeStringObject),
+                       "makeJniString/sentinel");
     return reinterpret_cast<uintptr_t>(&g_fakeStringObject);
 }
 
@@ -1254,22 +1326,29 @@ const char* namedObjectKey(uintptr_t handle) {
 
 uintptr_t namedObjectFor(const char* key) {
     if (key == nullptr || key[0] == '\0') {
+        registerHostHandle(reinterpret_cast<uintptr_t>(&g_fakeObjectObject),
+                           "namedObjectFor/empty-sentinel");
         return reinterpret_cast<uintptr_t>(&g_fakeObjectObject);
     }
     for (size_t index = 0; index < g_namedObjectCount; ++index) {
         if (g_namedObjects[index].magic == kNamedObjectMagic &&
             rawEquals(g_namedObjects[index].key, key)) {
+            registerHostHandle(reinterpret_cast<uintptr_t>(&g_namedObjects[index]),
+                               "namedObjectFor/reuse");
             return reinterpret_cast<uintptr_t>(&g_namedObjects[index]);
         }
     }
     if (g_namedObjectCount >= kMaxNamedObjects) {
         // Table full: fall back to the shared sentinel rather than hand out a
         // duplicate, so identity stays consistent with the earlier request.
+        registerHostHandle(reinterpret_cast<uintptr_t>(&g_fakeObjectObject),
+                           "namedObjectFor/table-full-sentinel");
         return reinterpret_cast<uintptr_t>(&g_fakeObjectObject);
     }
     FakeNamedObject& object = g_namedObjects[g_namedObjectCount++];
     object.magic = kNamedObjectMagic;
     rawCopy(object.key, sizeof(object.key), key);
+    registerHostHandle(reinterpret_cast<uintptr_t>(&object), "namedObjectFor/new");
     return reinterpret_cast<uintptr_t>(&object);
 }
 
@@ -1730,6 +1809,8 @@ uintptr_t jniNewObjectV(uintptr_t /*env*/, uintptr_t clazz,
     if (::rr3::gfxObjectIdentity()) {
         return newFakeObject(clazz);
     }
+    registerHostHandle(reinterpret_cast<uintptr_t>(&g_fakeObjectObject),
+                       "jniNewObjectV/shared-sentinel");
     return reinterpret_cast<uintptr_t>(&g_fakeObjectObject);
 }
 
@@ -2914,6 +2995,13 @@ const char* hostHandleOwner(uintptr_t address) {
     if (address == 0) {
         return nullptr;
     }
+    // Registry first. It is authoritative because producers write to it.
+    if (const char* producer = hostHandleProducer(address)) {
+        return producer;
+    }
+    // Range table second, and only as a fallback that says "unattributed" --
+    // its previous version named a table and was wrong, which is worse than
+    // admitting it does not know.
     struct Range {
         const void* base;
         size_t bytes;
@@ -2963,9 +3051,9 @@ const char* hostHandleOwner(uintptr_t address) {
         if (range.base == static_cast<const void*>(&g_fakeFont)) {
             return "g_fakeFont/FNTO";
         }
-        return "host range, unknown table";
+        return "host range, unattributed";
     }
-    return nullptr;
+    return "not a handle from this file";
 }
 
 // Resolve a guest classpath against the ManagedMethod registry.
