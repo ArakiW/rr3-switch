@@ -2222,10 +2222,43 @@ int guestLstat(const char* path, struct stat* output) {
 // is auditable rather than invisible. Reported on the mkdir-eexist line.
 unsigned gGuestMkdirEexist = 0;
 
-int guestMkdir(const char* path, mode_t mode) {    gResolveApi = "guestMkdir";
+// Every mkdir the guest makes, with the reason it failed.
+//
+// The mkdir-eexist line turned out to be the wrong instrument: it never fired
+// in the run that mattered (20261019-203213-mkdir1, zero lines), because the
+// guest's "[FileManager::CreateDir] Error creating directory: .../CC_Data" is
+// NOT an EEXIST from ::mkdir. The failure happens earlier -- resolvePath
+// refused the path, or rejectReadOnlyWrite did -- and both of those return
+// before mkdir is ever called, so nothing downstream could tell them apart.
+//
+// Bounded: the guest mkdirs a lot, and this is a diagnostic. The first 64
+// outcomes are written; the rest are counted.
+constexpr unsigned kMkdirLogBudget = 64;
+unsigned gGuestMkdirLogged = 0;
+
+void logMkdirOutcome(const char* path, int rc, int err, const char* why) {
+    if (gGuestMkdirLogged >= kMkdirLogBudget) {
+        return;
+    }
+    ++gGuestMkdirLogged;
+    char details[256];
+    __builtin_snprintf(details, sizeof(details),
+                       "rc=%d errno=%d why=%s path=%s", rc, err, why,
+                       path != nullptr ? path : "(null)");
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "mkdir", gGuestMkdirLogged,
+                        static_cast<unsigned long long>(err), details);
+}
+
+int guestMkdir(const char* path, mode_t mode) {
+    gResolveApi = "guestMkdir";
     Resolution resolution{};
-    if (!resolvePath(path, true, resolution) || rejectReadOnlyWrite(resolution, true)) return -1;
+    if (!resolvePath(path, true, resolution) || rejectReadOnlyWrite(resolution, true)) {
+        logMkdirOutcome(path, -1, 0, "no-resolve");
+        return -1;
+    }
     const int rc = ::mkdir(resolution.primary, mode);
+    const int err = rc != 0 ? errno : 0;
     // "mkdiridem=1": an existing directory is success, not EEXIST.
     //
     // MEASURED 2026-10-19, archive 20261019-170132-distinct. The guest logs
@@ -2233,18 +2266,17 @@ int guestMkdir(const char* path, mode_t mode) {    gResolveApi = "guestMkdir";
     //     sdmc:/switch/rr3-native-rehost/.depot/CC_Data
     // and CC_Data is 55 files that the HOST staged out of the game data packs.
     // On real hardware the game creates that directory itself on first run and
-    // mkdir succeeds; here the directory is already there, mkdir returns EEXIST,
-    // and the guest reads that as a failure. The shape mismatch is the host's,
-    // not the guest's.
+    // mkdir succeeds; here the directory is already there, so the shape the
+    // guest sees differs from the one it was written against.
     //
-    // Idempotent, not silent: the EEXIST is still counted and reported, so a
-    // mkdir that fails for any other reason stays visible.
-    if (rc != 0 && errno == EEXIST && ::rr3::gfxMkdirIdempotent()) {
+    // Idempotent, not silent: the conversion is counted and reported, and a
+    // mkdir failing for any other reason still returns its error.
+    if (rc != 0 && err == EEXIST && ::rr3::gfxMkdirIdempotent()) {
         gGuestMkdirEexist++;
-        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
-                            "mkdir-eexist", gGuestMkdirEexist, 0, path);
+        logMkdirOutcome(path, 0, EEXIST, "eexist-as-success");
         return 0;
     }
+    logMkdirOutcome(path, rc, err, rc == 0 ? "ok" : "failed");
     return rc;
 }
 
