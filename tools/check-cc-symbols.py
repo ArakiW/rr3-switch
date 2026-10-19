@@ -26,10 +26,14 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GUEST = os.path.join(ROOT, "reverse", "native", "arm64", "libRealRacing3.so")
 CLASSES = os.path.join(ROOT, "native-switch", "source", "jni_compat", "classes")
 
-# A Java_ name starts here and runs to the closing quote; if the very next
-# non-space character is another quote, the literal continues on the next line
-# and the two halves form one symbol.
-SYMBOL = re.compile(r'"(Java_[A-Za-z0-9_]+)("\s*\n\s*")')
+# A Java_ name starts here and runs to the closing quote. If a second quote
+# follows on the next non-space line, the literal continues and the two halves
+# form one symbol.
+#
+# The continuation group is OPTIONAL on purpose. Making it mandatory once made
+# this checker match only the 9 continued literals, report "9 resolved, 0
+# unexpected" and exit 0 -- a green run that had checked a quarter of the file.
+SYMBOL = re.compile(r'"(Java_[A-Za-z0-9_]+)("\s*\n\s*"(?=[A-Za-z0-9_]*"))?')
 
 # The image exports no GoogleStore or GoogleAd symbols at all. These facades
 # cannot work against this guest; leaving them visible is the point.
@@ -53,8 +57,9 @@ def main():
         text = raw.decode("latin-1")
         for match in SYMBOL.finditer(text):
             symbol = match.group(1)
-            tail = re.match(r'"([^"]*)"', match.group(2)[1:])
-            symbol += tail.group(1) if tail else ""
+            if match.group(2):          # continued on the following line
+                tail = re.match(r'"([^"]*)"', match.group(2)[1:])
+                symbol += tail.group(1) if tail else ""
             line = text.count("\n", 0, match.start()) + 1
             entry = (name, line, symbol)
             if symbol in blob:
