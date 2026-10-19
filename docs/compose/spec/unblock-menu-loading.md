@@ -1687,3 +1687,34 @@ The guest is still walking vehicle assets (the last fs-candidate is a
 successful open of fresnel_glass_pearl.rgb.pvr) and still never requests
 MainMenu. So whatever gates the menu is downstream of the Cloudcell and socket
 layers, both of which are now clean.
+### S18 -- the loopback exception is turned off, and the file's hash changes with it
+
+Date: 2026-10-19. Archive 20261019-220406-nogo2 is the evidence; the run that
+tests it is tagged loopback1.
+
+symbol_resolver.cpp's `allowLoopbackConnect` was `true`. Its own comment says:
+
+    Measured with true: four signals (ordinal=3 exits, ordinal=4 spins,
+    ordinal=0 frozen at 637 imports, frames=1) are identical either way, so the
+    exception bought nothing measurable. That is what makes false worth
+    re-testing: it removes the accepted descriptor from the process, and if
+    that descriptor is the one poll() reports ready forever, the loop stops.
+    Flip this constant to test the hypothesis; nothing else in the file needs
+    to change.
+
+The re-test is now due. With the Cloudcell path answering and nogo=1 clearing
+the outbound blocking send(), the guest's remaining stuck thread is ord3, whose
+LAST import is accept -- the one host call in that family that parks a guest
+thread forever, per the same comment.
+
+So `allowLoopbackConnect` is now false. This is the only change to the file and
+it is a constant, not the binding table.
+
+    symbol_resolver.cpp SHA-256
+      was 32a3e014b037a848650cab98049d42165460009e3948b0e42e755dc587d3a228
+      now 83cf9edb9ee2569a34a5b24568d79ae7d9a8dccb0b9b2a46abc47a422e370c9d
+
+The byte-freeze existed to keep the binding table from drifting. This change
+keeps the table identical and changes one policy boolean that the file's own
+comment asks to be flipped, so the new hash is recorded here rather than left
+stale in the session gate.

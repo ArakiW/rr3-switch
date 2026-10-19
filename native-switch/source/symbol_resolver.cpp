@@ -670,7 +670,24 @@ int censusBind(int sockfd, const struct sockaddr* address, socklen_t length) {
 // removes the accepted descriptor from the process, and if that descriptor is
 // the one poll() reports ready forever, the loop stops. Flip this constant to
 // test the hypothesis; nothing else in the file needs to change.
-constexpr bool allowLoopbackConnect = true;
+//
+// FLIPPED TO false on 2026-10-19. The re-test it asks for is now due, and the
+// evidence has moved: with the Cloudcell path answering (login executing,
+// GetSessionValid returning 1) and nogo=1 clearing the outbound socket
+// blocking send(), the guest's remaining stuck thread is ord3, whose LAST
+// import is accept (archive 20261019-220406-nogo2) -- exactly the call this
+// comment says parks a guest thread forever. The guest builds a server, dials
+// its own listener, and the descriptor it accepted is the one poll() reports
+// ready, so the loop never ends.
+//
+// With false, that descriptor never enters the process, and the hypothesis
+// this comment states -- "if that descriptor is the one poll() reports ready
+// forever, the loop stops" -- is finally measurable.
+//
+// This is the only change to this file, and it is a constant, not the binding
+// table. The file's byte hash changes with it; the new value is recorded in
+// docs/compose/spec/unblock-menu-loading.md (S18) and in the session gate.
+constexpr bool allowLoopbackConnect = false;
 
 int censusConnect(int sockfd, const struct sockaddr* address, socklen_t length) {
     CENSUS_IMPORT("connect");
