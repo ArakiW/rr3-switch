@@ -107,6 +107,11 @@ __pycache__/
 # tools/guest-analysis/ and must not be confused with this directory.
 native-switch/guest-analysis/scratch/
 guest-analysis/scratch/
+# .local/ holds one-shot repair and probe scripts written during an
+# investigation. Durable checks live in tools/ instead -- see
+# tools/check-cc-symbols.py, which verifies every Cloudcell JNI symbol against
+# the guest image and should be run after touching any Java_* literal.
+.local/
 # 20 throwaway probe scripts an agent left in tools/. Untracked 2026-10-19.
 # They are all "_test_*" one-offs (chacha/decrypt/keys/sections/so_inspect/
 # so_search, several numbered retries of the same idea). None is referenced by
