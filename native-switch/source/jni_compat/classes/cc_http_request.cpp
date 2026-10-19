@@ -10,7 +10,7 @@
 #include "cloudcell_natives.h"
 
 /*
- * com.firemonkeys.cloudcellapi.CC_HttpRequest_Class - the load-bar blocker.
+ * com.firemonkeys.cloudcellapi.HttpRequest - the load-bar blocker.
  *
  * Measured before writing this: over a 3.89 M-line run the engine created
  * exactly two of these (emulator.log:11598 and :11988) and neither ever
@@ -45,7 +45,7 @@ public:
 
 /* Java: public native void errorCallback(long j, int i) - an instance method,
  * so the second parameter is the object. Verified against the disassembly of
- * Java_com_firemonkeys_cloudcellapi_CC_1HttpRequest_1Class_errorCallback at
+ * Java_com_firemonkeys_cloudcellapi_HttpRequest_errorCallback at
  * 0x957bd0, which ignores r1 entirely and does:
  *     mov r0, r2          ; low half of the jlong = the worker
  *     ldr r3, [r0]        ; worker vtable
@@ -86,9 +86,9 @@ static void http_post(JNIEnv *env, jobject self)
         req->pending = JNI_FALSE;
 
         static CCHttpErrorFn error_callback = cloudcell_native<CCHttpErrorFn>(
-            "Java_com_firemonkeys_cloudcellapi_CC_1HttpRequest_1Class_errorCallback");
+            "Java_com_firemonkeys_cloudcellapi_HttpRequest_errorCallback");
         if (!error_callback) {
-            warning("CC_HttpRequest_Class: errorCallback export missing; "
+            warning("HttpRequest: errorCallback export missing; "
                     "request %p stays pending\n", (void *)req);
             return;
         }
@@ -134,8 +134,8 @@ static const ManagedMethod http_methods[] = {
 };
 
 Class CCHttpRequest::clazz = {
-    .classpath = "com/firemonkeys/cloudcellapi/CC_HttpRequest_Class",
-    .classname = "CC_HttpRequest_Class",
+    .classpath = "com/firemonkeys/cloudcellapi/HttpRequest",
+    .classname = "HttpRequest",
     .managed_methods = http_methods,
     .native_methods = {NULL},
     .fields = {NULL},

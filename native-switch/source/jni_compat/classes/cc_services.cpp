@@ -116,7 +116,7 @@ Class CCAccountManager::clazz = {
 static const int aam_registered = ClassRegistry::register_class(CCAccountManager::clazz);
 
 /* ------------------------------------------------------------------------ */
-/* UserInterfaceManager_Class                                                 */
+/* UserInterfaceManager                                                 */
 /* ------------------------------------------------------------------------ */
 
 class CCUserInterfaceManager : public Object {
@@ -125,7 +125,7 @@ public:
     Class *_getClass() { return &clazz; }
 
     /* WebBrowserCreate's trailing JJJJJ, in Java argument order
-     * (UserInterfaceManager_Class.java:219). WebBrowserOpenUrl carries no
+     * (UserInterfaceManager.java:219). WebBrowserOpenUrl carries no
      * callback pointers of its own, so without keeping these the stub has no
      * way to answer the page load at all. */
     jlong wb_should_start = 0;
@@ -204,7 +204,7 @@ static void uim_web_browser_open_url(JNIEnv *env, jobject self, jobject /*webVie
 
     cloudcell_defer([env, self, fail, user]() {
         static UimWebFailFn fn = cloudcell_native<UimWebFailFn>(
-            "Java_com_firemonkeys_cloudcellapi_UserInterfaceManager_1Class_"
+            "Java_com_firemonkeys_cloudcellapi_UserInterfaceManager_"
             "WebBrowserLoadFailCallback");
         if (fn)
             fn(env, self, fail, user);
@@ -254,8 +254,8 @@ static const ManagedMethod uim_methods[] = {
 };
 
 Class CCUserInterfaceManager::clazz = {
-    .classpath = "com/firemonkeys/cloudcellapi/UserInterfaceManager_Class",
-    .classname = "UserInterfaceManager_Class",
+    .classpath = "com/firemonkeys/cloudcellapi/UserInterfaceManager",
+    .classname = "UserInterfaceManager",
     .managed_methods = uim_methods,
     .native_methods = {NULL},
     .fields = {NULL},
@@ -264,7 +264,7 @@ Class CCUserInterfaceManager::clazz = {
 static const int uim_registered = ClassRegistry::register_class(CCUserInterfaceManager::clazz);
 
 /* ------------------------------------------------------------------------ */
-/* CC_FacebookWorker_Class                                                   */
+/* FacebookWorker                                                   */
 /* ------------------------------------------------------------------------ */
 
 class CCFacebookWorker : public Object {
@@ -289,7 +289,7 @@ static jboolean fb_session_valid(JNIEnv *, jobject) { return JNI_FALSE; }
 static jstring fb_access_token(JNIEnv *env, jobject) { return env->NewStringUTF(""); }
 
 /*
- * SessionStatusCallback.call() (CC_FacebookWorker_Class.java:78) is the
+ * SessionStatusCallback.call() (FacebookWorker.java:78) is the
  * authoritative failure path and it passes literally "0" as the user id with
  * four empty name strings. The native side tests against that "0"; an empty id
  * is a different case that this build never reaches.
@@ -299,7 +299,7 @@ static void fb_login(JNIEnv *env, jobject self, jobjectArray, jboolean,
 {
     cloudcell_defer([env, self, cb, user]() {
         static FbLoginFn fn = cloudcell_native<FbLoginFn>(
-            "Java_com_firemonkeys_cloudcellapi_CC_1FacebookWorker_1Class_LoginCallback");
+            "Java_com_firemonkeys_cloudcellapi_FacebookWorker_LoginCallback");
         if (!fn)
             return;
         jstring zero  = env->NewStringUTF("0");
@@ -312,7 +312,7 @@ static void fb_logout(JNIEnv *env, jobject self, jlong cb, jlong user)
 {
     cloudcell_defer([env, self, cb, user]() {
         static FbPairFn fn = cloudcell_native<FbPairFn>(
-            "Java_com_firemonkeys_cloudcellapi_CC_1FacebookWorker_1Class_LogoutCallback");
+            "Java_com_firemonkeys_cloudcellapi_FacebookWorker_LogoutCallback");
         if (fn)
             fn(env, self, cb, user);
     });
@@ -331,25 +331,25 @@ static void fb_defer_bool(JNIEnv *env, jobject self, const char *symbol,
 static void fb_permission_check(JNIEnv *env, jobject self, jobjectArray, jlong cb, jlong user)
 {
     fb_defer_bool(env, self,
-                  "Java_com_firemonkeys_cloudcellapi_CC_1FacebookWorker_1Class_"
+                  "Java_com_firemonkeys_cloudcellapi_FacebookWorker_"
                   "PermissionCheckCallback", cb, user);
 }
 
 static void fb_permission_grant(JNIEnv *env, jobject self, jobjectArray, jlong cb, jlong user)
 {
     fb_defer_bool(env, self,
-                  "Java_com_firemonkeys_cloudcellapi_CC_1FacebookWorker_1Class_"
+                  "Java_com_firemonkeys_cloudcellapi_FacebookWorker_"
                   "PermissionGrantCallback", cb, user);
 }
 
-/* CC_FacebookWorker_Class.java:265 passes null, null on failure - unlike Google
+/* FacebookWorker.java:265 passes null, null on failure - unlike Google
  * Plus, whose equivalent path passes new String[0]. Both native sides were
  * written against their own Java, so the two must not be made uniform. */
 static void fb_load_friend_vector(JNIEnv *env, jobject self, jlong cb, jlong user)
 {
     cloudcell_defer([env, self, cb, user]() {
         static FbFriendsFn fn = cloudcell_native<FbFriendsFn>(
-            "Java_com_firemonkeys_cloudcellapi_CC_1FacebookWorker_1Class_"
+            "Java_com_firemonkeys_cloudcellapi_FacebookWorker_"
             "LoadFriendVectorCallback");
         if (fn)
             fn(env, self, JNI_FALSE, NULL, NULL, cb, user);
@@ -360,21 +360,21 @@ static void fb_feed_post(JNIEnv *env, jobject self, jstring, jstring, jstring, j
                          jstring, jstring, jboolean, jlong cb, jlong user)
 {
     fb_defer_bool(env, self,
-                  "Java_com_firemonkeys_cloudcellapi_CC_1FacebookWorker_1Class_"
+                  "Java_com_firemonkeys_cloudcellapi_FacebookWorker_"
                   "FeedPostCallback", cb, user);
 }
 
 static void fb_photo_post(JNIEnv *env, jobject self, jstring, jbyteArray, jlong cb, jlong user)
 {
     fb_defer_bool(env, self,
-                  "Java_com_firemonkeys_cloudcellapi_CC_1FacebookWorker_1Class_"
+                  "Java_com_firemonkeys_cloudcellapi_FacebookWorker_"
                   "PhotoPostCallback", cb, user);
 }
 
 static void fb_friend_invite(JNIEnv *env, jobject self, jstring, jstring, jlong cb, jlong user)
 {
     fb_defer_bool(env, self,
-                  "Java_com_firemonkeys_cloudcellapi_CC_1FacebookWorker_1Class_"
+                  "Java_com_firemonkeys_cloudcellapi_FacebookWorker_"
                   "FriendInviteCallback", cb, user);
 }
 
@@ -411,13 +411,13 @@ static const ManagedMethod fb_methods[] = {
         "(Ljava/lang/String;Ljava/lang/String;JJ)V"),
     ManagedMethod::Register<&fb_decode_avatar>(
         CCFacebookWorker::clazz, "DecodeAvatar",
-        "([BI)Lcom/firemonkeys/cloudcellapi/CC_FacebookWorker_Class$AvatarInfo;"),
+        "([BI)Lcom/firemonkeys/cloudcellapi/FacebookWorker$AvatarInfo;"),
     {NULL},
 };
 
 Class CCFacebookWorker::clazz = {
-    .classpath = "com/firemonkeys/cloudcellapi/CC_FacebookWorker_Class",
-    .classname = "CC_FacebookWorker_Class",
+    .classpath = "com/firemonkeys/cloudcellapi/FacebookWorker",
+    .classname = "FacebookWorker",
     .managed_methods = fb_methods,
     .native_methods = {NULL},
     .fields = {NULL},
@@ -426,7 +426,7 @@ Class CCFacebookWorker::clazz = {
 static const int fb_registered = ClassRegistry::register_class(CCFacebookWorker::clazz);
 
 /* ------------------------------------------------------------------------ */
-/* CC_GooglePlusWorker_Class                                                 */
+/* GooglePlayWorker                                                 */
 /* ------------------------------------------------------------------------ */
 
 class CCGooglePlusWorker : public Object {
@@ -453,7 +453,7 @@ static jboolean gp_session_changed(JNIEnv *, jobject) { return JNI_FALSE; }
 static jstring gp_person_id(JNIEnv *env, jobject) { return env->NewStringUTF(""); }
 static jstring gp_person_name(JNIEnv *env, jobject) { return env->NewStringUTF(""); }
 
-/* onConnectionFailed (CC_GooglePlusWorker_Class.java:468) answers
+/* onConnectionFailed (GooglePlayWorker.java:468) answers
  * LoginCallback(STR_EMPTY, STR_EMPTY). An empty person id is this class's
  * "not signed in" - Facebook uses "0" for the same state, which is why the two
  * logins do not share a helper. */
@@ -461,7 +461,7 @@ static void gp_login(JNIEnv *env, jobject self, jlong cb, jlong user, jboolean)
 {
     cloudcell_defer([env, self, cb, user]() {
         static GpLoginFn fn = cloudcell_native<GpLoginFn>(
-            "Java_com_firemonkeys_cloudcellapi_CC_1GooglePlusWorker_1Class_LoginCallback");
+            "Java_com_firemonkeys_cloudcellapi_GooglePlayWorker_NativeLoginCallback");
         if (!fn)
             return;
         jstring empty = env->NewStringUTF("");
@@ -473,7 +473,7 @@ static void gp_logout(JNIEnv *env, jobject self, jlong cb, jlong user)
 {
     cloudcell_defer([env, self, cb, user]() {
         static GpPairFn fn = cloudcell_native<GpPairFn>(
-            "Java_com_firemonkeys_cloudcellapi_CC_1GooglePlusWorker_1Class_LogoutCallback");
+            "Java_com_firemonkeys_cloudcellapi_GooglePlayWorker_LogoutCallback");
         if (fn)
             fn(env, self, cb, user);
     });
@@ -485,7 +485,7 @@ static void gp_load_friend_vector(JNIEnv *env, jobject self, jlong cb, jlong use
 {
     cloudcell_defer([env, self, cb, user]() {
         static GpFriendsFn fn = cloudcell_native<GpFriendsFn>(
-            "Java_com_firemonkeys_cloudcellapi_CC_1GooglePlusWorker_1Class_"
+            "Java_com_firemonkeys_cloudcellapi_GooglePlayWorker_"
             "LoadFriendVectorCallback");
         if (fn)
             fn(env, self, JNI_FALSE, cc_empty_string_array(env),
@@ -498,7 +498,7 @@ static void gp_load_profile(JNIEnv *env, jobject self, jstring, jlong cb, jlong 
 {
     cloudcell_defer([env, self, cb, user]() {
         static GpProfileFn fn = cloudcell_native<GpProfileFn>(
-            "Java_com_firemonkeys_cloudcellapi_CC_1GooglePlusWorker_1Class_"
+            "Java_com_firemonkeys_cloudcellapi_GooglePlayWorker_"
             "LoadProfileCallback");
         if (fn)
             fn(env, self, JNI_FALSE, NULL, cb, user);
@@ -511,7 +511,7 @@ static void gp_share(JNIEnv *env, jobject self, jstring, jstring, jstring, jstri
 {
     cloudcell_defer([env, self, cb, user]() {
         static GpBoolFn fn = cloudcell_native<GpBoolFn>(
-            "Java_com_firemonkeys_cloudcellapi_CC_1GooglePlusWorker_1Class_ShareCallback");
+            "Java_com_firemonkeys_cloudcellapi_GooglePlayWorker_ShareCallback");
         if (fn)
             fn(env, self, JNI_FALSE, cb, user);
     });
@@ -556,8 +556,8 @@ static const ManagedMethod gp_methods[] = {
 };
 
 Class CCGooglePlusWorker::clazz = {
-    .classpath = "com/firemonkeys/cloudcellapi/CC_GooglePlusWorker_Class",
-    .classname = "CC_GooglePlusWorker_Class",
+    .classpath = "com/firemonkeys/cloudcellapi/GooglePlayWorker",
+    .classname = "GooglePlayWorker",
     .managed_methods = gp_methods,
     .native_methods = {NULL},
     .fields = {NULL},
@@ -881,7 +881,7 @@ Class CCGcmHelper::clazz = {
 static const int gcm_registered = ClassRegistry::register_class(CCGcmHelper::clazz);
 
 /* ------------------------------------------------------------------------ */
-/* CC_AppPromptManager_Class                                                 */
+/* AppPromptManager                                                 */
 /* ------------------------------------------------------------------------ */
 
 class CCAppPromptManager : public Object {
@@ -909,7 +909,7 @@ static void prompt_display_rate_app(JNIEnv *env, jobject self, jstring, jstring,
 {
     cloudcell_defer([env, self]() {
         static PromptFn fn = cloudcell_native<PromptFn>(
-            "Java_com_firemonkeys_cloudcellapi_CC_1AppPromptManager_1Class_OnDontRate");
+            "Java_com_firemonkeys_cloudcellapi_AppPromptManager_OnDontRate");
         if (fn)
             fn(env, self);
     });
@@ -931,8 +931,8 @@ static const ManagedMethod prompt_methods[] = {
 };
 
 Class CCAppPromptManager::clazz = {
-    .classpath = "com/firemonkeys/cloudcellapi/CC_AppPromptManager_Class",
-    .classname = "CC_AppPromptManager_Class",
+    .classpath = "com/firemonkeys/cloudcellapi/AppPromptManager",
+    .classname = "AppPromptManager",
     .managed_methods = prompt_methods,
     .native_methods = {NULL},
     .fields = {NULL},
