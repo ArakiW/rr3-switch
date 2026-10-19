@@ -2739,7 +2739,7 @@ thread_local const char* t_jniVoidEntry = "62";
 //
 // Matched by suffix, not equality, because FindClass may hand back a spelling
 // that differs in the package prefix while the leaf class is the same.
-const char* cloudcellHttpRequestClass(uintptr_t methodId) {
+const char* cloudcellClass(uintptr_t methodId) {
     const JniMethodRecord* method = findJniMethod(methodId);
     if (method == nullptr) {
         return nullptr;
@@ -2748,6 +2748,26 @@ const char* cloudcellHttpRequestClass(uintptr_t methodId) {
     if (cls == nullptr) {
         return nullptr;
     }
+    // Any Cloudcell class, not just HttpRequest. The first cut of this helper
+    // matched the HttpRequest leaf only, which quietly put the dispatch block
+    // below out of reach of every other Cloudcell call -- AndroidAccountManager
+    // included -- so the whole switch looked dead. Widened to the package.
+    static const char kPkg[] = "cloudcellapi/";
+    const size_t pkgLen = sizeof(kPkg) - 1;
+    for (size_t i = 0; cls[i] != '\0'; ++i) {
+        if (i >= pkgLen) {
+            break;
+        }
+        if (cls[i] != kPkg[i]) {
+            return nullptr;
+        }
+    }
+    return cls;
+}
+
+// True when `cls` names the HttpRequest facade specifically, i.e. the leaf past
+// the package is HttpRequest.
+bool cloudcellClassIsHttpRequest(const char* cls) {
     static const char kLeaf[] = "cloudcellapi/HttpRequest";
     const size_t leafLen = sizeof(kLeaf) - 1;
     size_t clsLen = 0;
@@ -2755,15 +2775,14 @@ const char* cloudcellHttpRequestClass(uintptr_t methodId) {
         ++clsLen;
     }
     if (clsLen < leafLen) {
-        return nullptr;
+        return false;
     }
-    const char* tail = cls + (clsLen - leafLen);
     for (size_t i = 0; i < leafLen; ++i) {
-        if (tail[i] != kLeaf[i]) {
-            return nullptr;
+        if (cls[clsLen - leafLen + i] != kLeaf[i]) {
+            return false;
         }
     }
-    return cls;
+    return true;
 }
 
 // Cloudcell HttpRequest callback state, keyed by the JNI object handle the
@@ -2855,8 +2874,9 @@ void jniCallVoidMethodV(uintptr_t env, uintptr_t object,
     // and this line is the only thing that can say whether the guest calls
     // post() at all, through which slot, and with what callback. Under the
     // shared 64-line per-call budget it would have been the first thing dropped.
-    const char* ccClass = cloudcellHttpRequestClass(methodId);
+    const char* ccClass = cloudcellClass(methodId);
     if (ccClass != nullptr) {
+        const bool isHttpRequest = cloudcellClassIsHttpRequest(ccClass);
         const bool isInit = rawEquals(name, "init");
         const bool isPost = rawEquals(name, "post");
         char detail[256];
@@ -2868,7 +2888,7 @@ void jniCallVoidMethodV(uintptr_t env, uintptr_t object,
         guestViewWideLog("cc-http-void", static_cast<unsigned long long>(methodId),
                          static_cast<unsigned long long>(object), detail);
 
-        if (isInit) {
+        if (isHttpRequest && isInit) {
             // Only slot 62 gives an indexable array. Slot 61's args are a
             // va_list* and reading it as one would be undefined; the line above
             // records which entry happened, so a slot-61 run is visible instead
@@ -2906,7 +2926,7 @@ void jniCallVoidMethodV(uintptr_t env, uintptr_t object,
                                  static_cast<unsigned long long>(methodId),
                                  "init seen but args NOT indexed (entry is not 62)");
             }
-        } else if (isPost) {
+        } else if (isHttpRequest && isPost) {
             uint64_t callback = 0;
             for (size_t i = 0; i < kCloudcellHttpRequestSlots; ++i) {
                 if (g_ccHttpSlots[i].object == object) {
