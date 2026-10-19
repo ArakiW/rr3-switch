@@ -34,7 +34,14 @@ param(
     [ValidateRange(10, 1800)]
     [int]$Seconds = 120,
     [string]$Tag = '',
-    [switch]$NoDeploy
+    [switch]$NoDeploy,
+    # Which emulator to drive. Eden is the default; CITRON (E:\Citron) is the
+    # cross-check, because the guest's socket behaviour -- accept, poll, thread
+    # scheduling -- lives in the emulator's HLE and a second implementation is
+    # the only honest way to answer "is this the emulator's fault?".
+    [string]$EmulatorRoot = 'E:\Eden',
+    [string]$EmulatorExe = 'eden.exe',
+    [string]$EmulatorName = 'eden'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -43,8 +50,8 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $buildNro = Join-Path $projectRoot 'native-switch\rr3-native-rehost.nro'
 $archiveRoot = Join-Path $projectRoot '.build\eden-runs'
 
-$edenRoot = 'E:\Eden'
-$edenExe = Join-Path $edenRoot 'eden.exe'
+$edenRoot = $EmulatorRoot
+$edenExe = Join-Path $edenRoot $EmulatorExe
 $sdmcSwitch = Join-Path $edenRoot 'user\sdmc\switch'
 $appDir = Join-Path $sdmcSwitch 'rr3-native-rehost'
 $deployedNro = Join-Path $appDir 'rr3-native-rehost.nro'
@@ -74,7 +81,11 @@ if (-not (Test-Path (Join-Path $appDir 'data\core.romfs') -PathType Leaf)) {
 }
 
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$label = if ($Tag) { "$stamp-$($Tag -replace '[^A-Za-z0-9._-]', '_')" } else { $stamp }
+# The emulator goes in the label: a CITRON run and an Eden run of the SAME
+# binary are the cross-check, and an archive folder that cannot say which
+# emulator produced it is worthless for that comparison.
+$label = "$stamp-$EmulatorName"
+if ($Tag) { $label += "-$($Tag -replace '[^A-Za-z0-9._-]', '_')" }
 $stash = Join-Path $sdmcSwitch "_stale_$stamp"
 New-Item -ItemType Directory -Force -Path $stash | Out-Null
 New-Item -ItemType Directory -Force -Path $archiveRoot | Out-Null
@@ -128,6 +139,15 @@ $process = Start-Process -FilePath $edenExe -ArgumentList "`"$deployedNro`"" -Pa
 # hundred KB, and archiving it un-cleared silently mixes in the PREVIOUS run's
 # faults. Truncate it before launch so every archived histogram is per-run.
 $edenLog = Join-Path $edenRoot 'user\log\eden_log.txt'
+# CITRON writes its own log under a different name, and the file is only
+# created once the emulator has actually started, so the name is discovered
+# rather than assumed. Without this the CITRON run would silently archive an
+# EMPTY emulator log and the comparison would be worthless.
+if ($EmulatorName -ne 'eden') {
+    $candidate = Get-ChildItem (Join-Path $edenRoot 'user\log') -File -Filter '*.txt' -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($candidate) { $edenLog = $candidate.FullName }
+}
 if (Test-Path $edenLog -PathType Leaf) {
     try {
         Clear-Content -LiteralPath $edenLog -ErrorAction Stop
@@ -186,6 +206,11 @@ foreach ($marker in $markers) {
     }
 }
 $edenLog = Join-Path $edenRoot 'user\log\eden_log.txt'
+if ($EmulatorName -ne 'eden') {
+    $candidate = Get-ChildItem (Join-Path $edenRoot 'user\log') -File -Filter '*.txt' -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($candidate) { $edenLog = $candidate.FullName }
+}
 if (Test-Path $edenLog -PathType Leaf) {
     Copy-Item -LiteralPath $edenLog -Destination (Join-Path $archive 'eden_log.txt.tail') -Force
 }

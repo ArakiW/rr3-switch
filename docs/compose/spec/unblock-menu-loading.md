@@ -1718,3 +1718,46 @@ The byte-freeze existed to keep the binding table from drifting. This change
 keeps the table identical and changes one policy boolean that the file's own
 comment asks to be flipped, so the new hash is recorded here rather than left
 stale in the session gate.
+### S19 -- the emulator is exonerated: CITRON reproduces the identical terminal state
+
+Date: 2026-10-19. Archive 20261019-225410-citron-citron1.
+
+The guest's behaviour lives in the emulator's HLE -- accept, poll, thread
+scheduling -- so "is this the emulator's fault?" had to be answered with a
+second implementation rather than an argument. CITRON
+(E:\AI\AC-SWITCH\tools\citron, copied to E:\Citron) is a different emulator
+build: "citron Development Build | main-0237a9b88", firmware 22.0.0-3.0 where
+Eden uses 23.0. Same NRO, same rr3-gfx.conf.
+
+| counter | Eden (nogo2) | CITRON |
+|---|---|---|
+| stat-layout lines | 115 | 230 |
+| mmap-file-ok | 126 | 252 |
+| fs-candidate | 2001 | 4001 |
+| Invalid DeviceId! | 0 | 0 |
+| Sub Sync Queued | 0 | 0 |
+| Social Media not initialised | 0 | 0 |
+| rr3gui: requests | 0 | 0 |
+| MainMenu mentions | 0 | 0 |
+| ord3 last import | accept | accept |
+| frames | 15480 | 1080 |
+
+Same terminal state under two unrelated emulators: thread ord3's last import is
+accept in both, the GUI volume is never read in both, MainMenu is never
+requested in both, and every Cloudcell complaint is zero in both -- so the
+fixes from S17/S18 transfer unchanged.
+
+Two things this DOES say:
+  * the emulator is not the blocker;
+  * CITRON gets TWICE as far through the asset walk (230 distinct files against
+    115) on the same binary, so the remaining gap is not a fixed point either
+    emulator reaches -- it is where the guest stops asking.
+
+One harness defect this exposed: the harness archived ZERO guest lines for the
+CITRON run because it looked in the emulator's own sdmc, while CITRON's config
+still pointed at E:\Eden\user\sdmc. An archive that says "0 lines" without
+saying which card was read is indistinguishable from a run where the guest
+never started. Test-OnEden.ps1 now takes -EmulatorRoot/-EmulatorExe/
+-EmulatorName, puts the emulator in the archive label, discovers the emulator
+log by name instead of assuming eden_log.txt, and CITRON's config now points at
+E:/Citron/user.
