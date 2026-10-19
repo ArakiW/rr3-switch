@@ -2748,21 +2748,32 @@ const char* cloudcellClass(uintptr_t methodId) {
     if (cls == nullptr) {
         return nullptr;
     }
-    // Any Cloudcell class, not just HttpRequest. The first cut of this helper
-    // matched the HttpRequest leaf only, which quietly put the dispatch block
-    // below out of reach of every other Cloudcell call -- AndroidAccountManager
-    // included -- so the whole switch looked dead. Widened to the package.
+    // Any Cloudcell class, not just HttpRequest. The first cut matched the
+    // HttpRequest leaf only, which put the dispatch block below out of reach of
+    // every other Cloudcell call; the second cut compared the package as a
+    // PREFIX, which also matched nothing, because the classpath the guest uses
+    // starts "com/firemonkeys/" and only then reaches "cloudcellapi/".
+    // A live run proved both: cc-dispatch=0 lines while jni-void showed
+    // class=com/firemonkeys/cloudcellapi/AndroidAccountManager right beside it.
+    //
+    // Substring, not prefix and not full equality: the package can be spelled
+    // with or without a leading path by different FindClass callers, and the
+    // leaf alone would collide across packages.
     static const char kPkg[] = "cloudcellapi/";
     const size_t pkgLen = sizeof(kPkg) - 1;
     for (size_t i = 0; cls[i] != '\0'; ++i) {
-        if (i >= pkgLen) {
-            break;
+        if (cls[i] != kPkg[0]) {
+            continue;
         }
-        if (cls[i] != kPkg[i]) {
-            return nullptr;
+        size_t k = 1;
+        while (k < pkgLen && cls[i + k] == kPkg[k]) {
+            ++k;
+        }
+        if (k == pkgLen) {
+            return cls;
         }
     }
-    return cls;
+    return nullptr;
 }
 
 // True when `cls` names the HttpRequest facade specifically, i.e. the leaf past
