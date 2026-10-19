@@ -1634,6 +1634,15 @@ bool platformBoolForMethod(const char* name) {
 uintptr_t jniObjectForMethod(uintptr_t methodId) {
     const char* name = jniMethodName(methodId);
     if (name == nullptr) {
+        // A methodId with no record behind it -- GetMethodID never ran for it, or
+        // the record table wrapped past kMaxJniMethods. This return sits ABOVE
+        // the catch-all further down, which is why two rounds of work on the
+        // catch-all could not move the handle the dispatch interlock refuses:
+        // this path returns before the catch-all is ever reached, and being
+        // uninstrumented it also left the registry holding only the install-time
+        // label, so the log could not say so.
+        registerHostHandle(reinterpret_cast<uintptr_t>(&g_fakeObjectObject),
+                           "jniObjectForMethod/no-such-method");
         return reinterpret_cast<uintptr_t>(&g_fakeObjectObject);
     }
     // Fallback for methods jniNamedObjectForMethod did not claim, and for any
@@ -1699,29 +1708,15 @@ uintptr_t jniObjectForMethod(uintptr_t methodId) {
     if (RR3_NULL_UNKNOWN_OBJECTS != 0) {
         return 0;
     }
-    // objid=1: give the guest an object that at least knows its class.
+    // REVERTED 2026-10-19. Returning a class-carrying pool object here was
+    // tried on the hypothesis that this catch-all produced the AndroidAccountManager
+    // handle the dispatch interlock refuses. Archive 20261019-161312-ccreal2
+    // refuted both halves: frames fell 16320 -> 120, and with the label
+    // refinement fixed the refusal still named sentinel/g_fakeObjectObject, so
+    // this was never the producer.
     //
-    // MEASURED 2026-10-19 (archive 20261019-124506-hreg3). The handle the
-    // dispatch interlock keeps refusing for AndroidAccountManager.login and
-    // setUserIdentifier is sentinel/g_fakeObjectObject -- not a slot of the
-    // pool. So the guest never constructs that object through NewObjectV; it
-    // comes back from one of the object-returning fallbacks, and this line is
-    // the one that produced it. jniNewObjectV's pool work was therefore never
-    // on this path, which is why its A/B showed no frame change.
-    //
-    // The methodId is right here, so the class is recoverable. Returning a pool
-    // object keyed to it is the difference between the guest holding an opaque
-    // byte and holding an object whose GetObjectClass answers, which is what
-    // made login unreachable in the first place.
-    //
-    // Under objid=0 nothing here changes; the sentinel stands.
-    if (::rr3::gfxObjectIdentity()) {
-        const JniMethodRecord* record = findJniMethod(methodId);
-        const char* cls = record != nullptr ? className(record->clazz) : nullptr;
-        if (cls != nullptr) {
-            return newFakeObject(record->clazz);
-        }
-    }
+    // The instrument could not see the change before that fix, so the earlier
+    // ccreal1 result was uninterpretable in both directions. Now it is.
     registerHostHandle(reinterpret_cast<uintptr_t>(&g_fakeObjectObject),
                        "jniObjectForMethod/catch-all-sentinel");
     return reinterpret_cast<uintptr_t>(&g_fakeObjectObject);
@@ -3579,6 +3574,8 @@ uintptr_t jniGetObjectField(uintptr_t /*env*/, uintptr_t object,
     if (font != nullptr && rawEquals(jniFieldName(fieldId), "bmpData")) {
         return fontBmpData(font);
     }
+    registerHostHandle(reinterpret_cast<uintptr_t>(&g_fakeObjectObject),
+                       "jniGetObjectField/default-sentinel");
     return reinterpret_cast<uintptr_t>(&g_fakeObjectObject);
 }
 
