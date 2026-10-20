@@ -3237,7 +3237,7 @@ void alertAnswerPositiveImpl(uintptr_t env, int64_t idPositive,
     // below still happens, and this rawLog line is what says nobody will take
     // it. (The view-side pumps would, if the frame loop is still alive.)
     startAlertPump();
-    cloudcell_defer([env, idPositive, guestX1]() {
+    cloudcell_defer("platform.show-message", [env, idPositive, guestX1]() {
         // Resolved inside the deferred body, not on the guest path: the
         // ManagedMethod tables cannot be used for these exports (libRealRacing3.so
         // has no DT_SONAME, so the DT_SONAME pass in so_util.cpp never runs for

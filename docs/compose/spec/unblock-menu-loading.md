@@ -2988,3 +2988,164 @@ trusted to find a caller's either.
    host-side listener the guest is supposed to reach) or whether it is
    an outbound accept the guest never needed, decides whether this is
    host-fixable at all. `nogo=1` currently makes it unsatisfiable.
+
+### S26 -- THE WEDGE IS A BRANCH TO ADDRESS 0 (2026-10-20)
+
+#### 1. The instrument: every deferred item now has a name
+
+`cloudcell_defer` takes a `tag` and the pump logs one line on entry and
+one on return, so a batch that does not finish says WHICH item did not
+finish:
+
+```
+phase=cloudcell_defer: n=1 total=1 depth=1 tag=aam.login
+phase=cloudcell_pump: site=frame phase=entering drained=1 entering=1 ...
+phase=cloudcell-item: enter id=1 tag=aam.login site=frame
+   (no "cloudcell-item: return" line, ever)
+```
+
+Archive `20261020-230804-eden-wedgectl`. The single item in the frame-1
+batch was **`aam.login`** -- the deferred
+`AndroidAccountManager.LoginCompleteCallback`. The guest's own hint
+(`ACTION_LOAD_FRIEND_VECTOR`) was a red herring: the GooglePlay
+friend-vector callback was never even enqueued.
+
+#### 2. Why it does not return: it is not a lock, it is a branch to 0
+
+The guest's export is a four-instruction trampoline (guest `0x1ce7318`):
+
+```
+0x1ce7318  tst w2, #0xff      ; the boolean
+0x1ce731c  mov x1, x4         ; the user handle
+0x1ce7320  cset w0, ne
+0x1ce7324  br x3               ; TAIL-BRANCH to the completion pointer
+```
+
+So the completion pointer arrives in `x3` and is **branched to**. Eden's
+own log says what happened:
+
+```
+[ 20.940466] Core.ARM <Critical> ...ExceptionRaised:
+             Cannot execute instruction at unmapped address 0x00000000000000
+[ 20.941319] Core.ARM <Error> ...LogBacktrace: Backtrace @ PC=0000000000000004
+R03=0000000000000000 ...
+V01=436574656C706D6F_006B6361626C6C61   ; "ompleteCallback"
+```
+
+`R03` is `x3` and it is **zero**. The guest branch-to-zero killed the
+frame thread outright, which is why the census then read `pc=0x4`
+(sentinel), `delta=0`, `idle_ms=276095`, and why `after-cloudcell-pump`
+was never emitted. The identical fault is in the previous archive at
+`t=20.908754`, so this is the wedge, not a new one.
+
+`x3` was zero because the guest calls `login()` on an
+`AndroidAccountManager` instance that never received
+`Constructor(JJ)V`:
+
+```
+phase=aam-ctor: obj=0x80f455c0 callback=0x10826fbda0 user=0x10826fbd30
+phase=aam-login: obj=0x80f436d0 callback=0x0            user=0x10826fc2b0
+```
+
+Two instances: the one that got `Constructor` and the one that got
+`setUserIdentifier` + `login` are different objects, and the second
+one's completion pointer is zero.
+
+#### 3. A second, independent bug found on the way: the non-virtual JNI dispatch
+
+`iface_NewObject` calls the constructor NON-virtually, but it called
+**every** dispatcher as `(env, obj, jclazz, va_list)`, while
+`ManagedMethod::Register` builds a dispatcher of shape
+`(env, obj, va_list)`. For a virtual-registered constructor the va_list
+landed in the `jclass` slot and the constructor read its arguments from
+the wrong place. `iface_CallMethod` and `iface_CallMethodV` already
+branched on `method->takes_class`; the non-virtual variants did not.
+They do now (`native-switch/source/jni_compat/jni.cpp`).
+
+#### 4. The fix, and what it measured
+
+Two changes, both minimal:
+
+1. `aam_login` refuses to deliver a login completion whose continuation
+   pointer is NULL, and says so in the log. There is no completion
+   target on that instance, so there is nothing to complete -- and
+   delivering one would branch the guest to 0.
+2. The `takes_class` fix above.
+
+Archive `20261020-234046-eden-loginfix`:
+
+| | before (`wedgectl`) | after (`loginfix`) |
+|---|---|---|
+| frames in 300 s | 2 | **15720** |
+| last gfx-stats | `frames=2 calls=8 draws=0/0` | `frames=15720 calls=47165 draws=0/0` |
+| "Cannot execute instruction" | 1 (t=20.94 s) | **0** |
+| cloudcell-item lines | 1 enter, 0 return | 0 (nothing deferred) |
+| `MainMenu` | 0 | 0 |
+| "Unable to send Sync" | 2 | 7 |
+
+**The frame loop is alive for the first time.** The menu is still not
+reached: `draws=0/0` throughout and `MainMenu` is still 0.
+
+#### 5. "Social Media not initialised": which Java method, really
+
+The open question from S25 is now answered by the guest's own code, and
+the answer is **not** `GetSessionValid`.
+
+The test the guest performs at `0x1d0307c` is `Cloudcell` vtable slot 43
+-> the `cc::social::ISocialMedia` sub-object at `Cloudcell+0x2f8` ->
+**slot 27** (`ldr x8,[x8,#0xd8]`). The vtable installed there is
+`0x1f66df8` (`0x1cbe530`: `str x8,[x19,#0x2f8]`, with the vtable address
+read from the relocation at `0x1f7dff0` = `0x1f66de8` + 0x10), and its
+slot 27 is **`0x1d066e4`**. That function is:
+
+```
+0x1d066e4  ldp x19, x20, [x0, #8]     ; the 14-entry provider vector
+0x1d0670c  ldr x0, [x19]              ; one provider
+0x1d06718  ldr x8, [x8, #0x20]        ; the provider's slot 4
+0x1d0671c  blr x8
+0x1d06720  tbnz w0, #0, #0x1d06700    ; bit0 set -> next provider
+0x1d06724  mov w0, wzr                ; any provider clear -> NOT initialised
+```
+
+So it is an **AND over all fourteen providers' slot 4**. The GooglePlay
+provider's slot 4 is `0x1ca7654` = `ldrb w0,[x0,#0xc0]`, i.e. the
+availability byte at `GooglePlayManager+0x148`. That byte is written in
+exactly one place, `0x1ca23e8`:
+
+```
+0x1ca23d0  ldr x0, [x19, #8]
+0x1ca23d8  ldr x8, [x8, #0xf8]     ; the WORKER's vtable slot 31
+0x1ca23dc  blr x8
+0x1ca23e0  tbz w0, #0, #0x1ca23ec  ; clear -> the byte is NOT written
+0x1ca23e8  strb w8, [x19, #0x148]  ; the byte
+```
+
+The guest resolves `IsInitialPhaseComplete` on `GooglePlayWorker` at
+boot (the resolution order is in Eden's JNI log) and the port answers it
+(`ccsocialok`). But the guest never **calls** it: the refresh path
+`0x1ca2188` that would call it is entered only from the
+login-completion flow, and that flow never completed.
+
+**⇒ There IS a path the port can satisfy, and `GetSessionValid` is not
+it. `ccsocialok` answers a question the guest never asks at this site.
+The gate opens only when the guest receives a login completion and walks
+the refresh path, asks `IsInitialPhaseComplete`, and gets the byte
+written.**
+
+#### What is still open (after S26)
+
+1. **The guest's real completion pointer.** `Constructor(JJ)V` delivered
+   `0x10826fbda0` / `0x10826fbd30` -- two addresses in the guest's
+   STACK region (`0x1082...`), not a code pointer, and not in any guest
+   image (the image biases are `0x2106b83000`, `0x2102b9f000`,
+   `0x2102e73000`, `0x2102ffd000`). The port's model of that method is
+   therefore still wrong: it assumes arg0 is a code pointer for `br x3`.
+   Until the real one is known, the login completion cannot be
+   delivered, so the refresh path is never entered, so
+   `GooglePlayManager+0x148` stays 0, so "Social Media not initialised"
+   keeps being logged and the sync queue never drains.
+2. **The accept() the async task is parked in** (unchanged from S25).
+3. The menu is still not reached: `draws=0/0` and `MainMenu=0` after
+   15720 frames. The download gate's queue is still empty
+   (`qCount=0` on 197 samples).
+

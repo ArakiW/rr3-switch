@@ -36,5 +36,19 @@
  * passes false: an always-empty queue would otherwise emit one line per frame
  * and bury everything else, so it logs only when there was something to drain.
  */
-void cloudcell_defer(std::function<void()> fn);
+/*
+ * `tag` names the deferred item at its enqueue site.
+ *
+ * MEASURED 2026-10-20, archive 20261020-223250-eden-ccmodebg. The frame-1
+ * batch held exactly ONE item (enqueued_total=1, entered_total=1,
+ * drained_total=0, and the post-run pump line absent), and the only enqueue
+ * in the whole process was the one immediately after the guest's
+ * `AndroidAccountManager.login` dispatch. A queue with one item and no
+ * counter that says WHICH item is not an answer, so every defer site now
+ * carries a stable name and the pump logs the name on entry and on return.
+ *
+ * The name is a plain string literal and is never freed: it lives as long
+ * as the process, which is what lets the pump print it without owning it.
+ */
+void cloudcell_defer(const char *tag, std::function<void()> fn);
 void cloudcell_pump(const char *site, bool always_log = true);

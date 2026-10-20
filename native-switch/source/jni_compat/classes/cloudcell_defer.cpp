@@ -62,7 +62,23 @@ static void debugLine(const char *text)
  * and the same blocking mutexLock still happens, so the number of acquisitions
  * and the outcome of every pump are unchanged. */
 static Mutex g_queue_lock{};
-static std::vector<std::function<void()>> g_queue;
+
+/* One deferred item. `tag` is the name of the site that produced it -- a
+ * string literal, so it outlives the process and the pump can print it
+ * without owning it -- and `id` is the enqueue sequence number, which makes
+ * an item identifiable even if two sites use the same tag.
+ *
+ * MEASURED 2026-10-20, archive 20261020-223250-eden-ccmodebg: the frame-1
+ * batch held exactly ONE item (enqueued_total=1, entered_total=1,
+ * drained_total=0, post-run pump line absent) and the process made exactly
+ * ONE enqueue in 300 s. The counters said "one item, and it never
+ * returned"; they could not say WHICH one. That is what the tag is for. */
+struct DeferredItem {
+    const char *tag;
+    unsigned id;
+    std::function<void()> fn;
+};
+static std::vector<DeferredItem> g_queue;
 
 /* Instrumentation (pump-instrumentation run). `g_enqueued_total` exists so the
  * pump line can distinguish "the queue was empty because nothing was ever
@@ -173,28 +189,53 @@ static void reportDrainLockProbe(const char *site, const char *outcome,
  * itself per request; the running total in the pump line carries the rest. */
 static const unsigned kMaxEnqueueLines = 32;
 
-void cloudcell_defer(std::function<void()> fn)
+/* The per-item enter/return lines are the instrument that NAMES the callback
+ * that wedges, so they are bounded but generously: 96 lines covers 32 items
+ * with both an enter and a return, which is more than the 300 s run ever
+ * enqueued.
+ *
+ * The budget is a plain counter and it is touched from whichever thread
+ * drains the queue, so two threads draining at once can overshoot the cap by
+ * one or two lines. That is deliberate: making it atomic would put a locked
+ * operation in front of the one place this file is allowed to touch shared
+ * state, and an overshoot of two lines costs nothing while a lock there costs
+ * the run its diagnostic. */
+static unsigned g_item_lines = 0;
+static const unsigned kMaxItemLines = 96;
+
+static bool itemLineBudget(void)
+{
+    if (g_item_lines >= kMaxItemLines) {
+        return false;
+    }
+    ++g_item_lines;
+    return true;
+}
+
+void cloudcell_defer(const char *tag, std::function<void()> fn)
 {
     unsigned depth = 0;
     unsigned long long total = 0;
+    unsigned id = 0;
     {
         mutexLock(&g_queue_lock);
-        g_queue.push_back(std::move(fn));
-        depth = (unsigned)g_queue.size();
         total = ++g_enqueued_total;
+        id = (unsigned)total;
+        g_queue.push_back(DeferredItem{tag, id, std::move(fn)});
+        depth = (unsigned)g_queue.size();
         mutexUnlock(&g_queue_lock);
     }
 
     if (g_enqueue_lines < kMaxEnqueueLines) {
         ++g_enqueue_lines;
-        trace("cloudcell_defer: n=%u total=%llu depth=%u", g_enqueue_lines,
-              total, depth);
+        trace("cloudcell_defer: n=%u total=%llu depth=%u tag=%s", g_enqueue_lines,
+              total, depth, tag != nullptr ? tag : "(null)");
     }
 }
 
 void cloudcell_pump(const char *site, bool always_log)
 {
-    std::vector<std::function<void()>> batch;
+    std::vector<DeferredItem> batch;
     unsigned depth_before = 0;
     unsigned depth_after_swap = 0;
     unsigned long long enqueued_before = 0;
@@ -309,9 +350,32 @@ void cloudcell_pump(const char *site, bool always_log)
      *
      * Re-entrancy: the batch is a local vector, never the shared one, so a
      * callback that calls cloudcell_pump() re-entrantly sees only what other
-     * threads have queued and cannot observe or re-run its own entry. */
-    for (auto &fn : batch)
-        fn();
+     * threads have queued and cannot observe or re-run its own entry.
+     *
+     * THE PER-ITEM LINES. One on entry and one on return, each naming the
+     * item. They are the difference between "a batch of one did not finish"
+     * and "a batch of one DID NOT FINISH, AND IT WAS <this>".
+     *
+     * The return line is the one that never appears for the wedging item,
+     * and that absence IS the measurement: an enter line with no matching
+     * return line, followed by the absence of the post-run pump line and
+     * drained_total not advancing, is a callback that entered guest code and
+     * never came back.
+     *
+     * The enter line is written BEFORE fn() runs, so a callback that wedges
+     * on its first instruction still leaves its name on disk. Both lines are
+     * outside g_queue_lock, for the same reason the pump's own lines are. */
+    for (auto &item : batch) {
+        const char *name = item.tag != nullptr ? item.tag : "(null)";
+        if (itemLineBudget()) {
+            trace("cloudcell-item: enter id=%u tag=%s site=%s", item.id, name,
+                  site);
+        }
+        item.fn();
+        if (itemLineBudget()) {
+            trace("cloudcell-item: return id=%u tag=%s", item.id, name);
+        }
+    }
 
     unsigned depth_after = 0;
     unsigned long long reentrant = 0;

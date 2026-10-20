@@ -80,7 +80,7 @@ static void http_post(JNIEnv *env, jobject self)
     CCHttpRequest *req = (CCHttpRequest *)self;
     req->pending = JNI_TRUE;
 
-    cloudcell_defer([env, req]() {
+    cloudcell_defer("http.post", [env, req]() {
         if (!req->pending || req->closed)
             return;
         req->pending = JNI_FALSE;

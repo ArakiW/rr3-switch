@@ -1060,14 +1060,46 @@ ABI_ATTR static T iface_CallNonVirtualMethodV(JNIEnv *env, jobject obj, jclass j
     printf("TRACE JNI: %s...\n", method->name);
 #endif
 
-    T (*dispatch)(JNIEnv *, jobject, jclass, va_list) = (decltype(dispatch))method->addr_variadic;
-    if constexpr (std::is_same_v<T, void>) {
-        dispatch(env, obj, jclazz, va);
+    // The dispatcher shape depends on how the method was REGISTERED, not on
+    // how it is being called.
+    //
+    // MEASURED 2026-10-20 (Eden archive 20261020-230804-eden-wedgectl, fault
+    // at t=20.94 s: "Cannot execute instruction at unmapped address 0x0",
+    // R03=0, V01 carrying "ompleteCallback"). The guest's
+    // Java_..._AndroidAccountManager_LoginCompleteCallback is a four-
+    // instruction trampoline (guest 0x1ce7318):
+    //     tst w2,#0xff ; mov x1,x4 ; cset w0,ne ; br x3
+    // so the completion pointer arrives in x3 and is tail-BRANCHED TO. It was
+    // zero, so the guest branched to address 0 and the frame thread died there
+    // ("Backtrace @ PC=0x4", census pc=0x4 sentinel, delta=0, idle_ms=276 s).
+    //
+    // The pointer was zero because the guest creates that object with
+    // NewObject(clazz, ctorId, callback, user): NewObject calls the
+    // constructor NON-virtually, and "Constructor" is registered with
+    // ManagedMethod::Register, whose dispatcher is (env, obj, va_list) - it
+    // does NOT take a jclass. This function used to call every dispatcher as
+    // (env, obj, jclazz, va_list) unconditionally, so for a virtual-
+    // registered constructor the va_list landed in the jclass slot and the
+    // constructor read its arguments from the wrong place.
+    //
+    // takes_class is exactly the bit that says which shape the dispatcher
+    // has: RegisterNonVirtual sets it, Register does not.
+    if (method->takes_class) {
+        T (*dispatch)(JNIEnv *, jobject, jclass, va_list) = (decltype(dispatch))method->addr_variadic;
+        if constexpr (std::is_same_v<T, void>) {
+            dispatch(env, obj, jclazz, va);
+        } else {
+            return dispatch(env, obj, jclazz, va);
+        }
     } else {
-        return dispatch(env, obj, jclazz, va);
+        T (*dispatch)(JNIEnv *, jobject, va_list) = (decltype(dispatch))method->addr_variadic;
+        if constexpr (std::is_same_v<T, void>) {
+            dispatch(env, obj, va);
+        } else {
+            return dispatch(env, obj, va);
+        }
     }
 }
-
 template <typename T> 
 ABI_ATTR static T iface_CallNonVirtualMethodA(JNIEnv *env, jobject obj, jclass jclazz, jmethodID meth, const jvalue *val)
 {
@@ -1083,11 +1115,22 @@ ABI_ATTR static T iface_CallNonVirtualMethodA(JNIEnv *env, jobject obj, jclass j
     printf("TRACE JNI: %s...\n", method->name);
 #endif
 
-    T (*dispatch)(JNIEnv *, jobject, jclass, const jvalue *) = (decltype(dispatch))method->addr_array;
-    if constexpr (std::is_same_v<T, void>) {
-        dispatch(env, obj, jclazz, val);
+    // Same rule as the V variant above: the dispatcher's shape comes from
+    // takes_class, not from the entry point that reached it.
+    if (method->takes_class) {
+        T (*dispatch)(JNIEnv *, jobject, jclass, const jvalue *) = (decltype(dispatch))method->addr_array;
+        if constexpr (std::is_same_v<T, void>) {
+            dispatch(env, obj, jclazz, val);
+        } else {
+            return dispatch(env, obj, jclazz, val);
+        }
     } else {
-        return dispatch(env, obj, jclazz, val);
+        T (*dispatch)(JNIEnv *, jobject, const jvalue *) = (decltype(dispatch))method->addr_array;
+        if constexpr (std::is_same_v<T, void>) {
+            dispatch(env, obj, val);
+        } else {
+            return dispatch(env, obj, val);
+        }
     }
 }
 

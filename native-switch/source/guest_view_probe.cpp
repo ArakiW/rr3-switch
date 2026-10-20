@@ -562,7 +562,7 @@ extern "C" uint64_t cloudcellEndpointStubRequest(void* self, const void* str,
         else if (std::strcmp(mode, "bg") == 0) {
             // Deferred. Nothing is passed in: the record lives in
             // g_ccPending, which the drain reads under g_ccPendingLock.
-            cloudcell_defer([]() { cloudcellPumpCompletion("bg"); });
+            cloudcell_defer("cc.continuation", []() { cloudcellPumpCompletion("bg"); });
         }
     } else {
         char diag[160];

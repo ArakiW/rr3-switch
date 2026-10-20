@@ -66,6 +66,12 @@ static void aam_constructor(JNIEnv *, jobject self, jlong login_cb, jlong user)
     CCAccountManager *am = (CCAccountManager *)self;
     am->login_cb = login_cb;
     am->user_ptr = user;
+    /* This callback pointer is the one number the class cannot do without: the
+     * guest's LoginCompleteCallback tail-branches to it (guest 0x1ce7318,
+     * `br x3`), so a zero here is a branch to address 0. Logged so that a run
+     * says whether the pointer arrived or was lost on the way in. */
+    trace("aam-ctor: obj=%p callback=0x%llx user=0x%llx", (void *)self,
+          (unsigned long long)login_cb, (unsigned long long)user);
 }
 
 static void aam_destructor(JNIEnv *, jobject self)
@@ -107,7 +113,35 @@ static void aam_login(JNIEnv *env, jobject self)
     CCAccountManager *am = (CCAccountManager *)self;
     jlong cb = am->login_cb, user = am->user_ptr;
 
-    cloudcell_defer([env, self, cb, user]() {
+    trace("aam-login: obj=%p callback=0x%llx user=0x%llx", (void *)self,
+          (unsigned long long)cb, (unsigned long long)user);
+
+    if (cb == 0) {
+        /* No completion target on this instance.
+         *
+         * The guest's LoginCompleteCallback is a four-instruction trampoline
+         * (guest 0x1ce7318): `tst w2,#0xff ; mov x1,x4 ; cset w0,ne ; br x3`.
+         * It TAIL-BRANCHES to the completion pointer, so delivering a
+         * completion with a zero pointer branches the guest's frame thread to
+         * address 0 and kills the frame loop for good.
+         *
+         * MEASURED 2026-10-20, Eden archive 20261020-230804-eden-wedgectl:
+         * "Core.ARM Critical: Cannot execute instruction at unmapped address
+         * 0x0" at t=20.94 s, R03=0, and from then on the root thread's census
+         * entry reads pc=0x4 (sentinel), delta=0, idle_ms=276 s - which is
+         * exactly the wedge this whole investigation was chasing.
+         *
+         * So: answer honestly. There is no completion to deliver, and saying
+         * so is the whole answer. The login never completes, which is the
+         * truth on a console with no Google account service, and the guest
+         * keeps running instead of dying.
+         */
+        trace("aam-login: no completion callback on this instance; not "
+              "delivering a login completion (the guest would branch to 0)");
+        return;
+    }
+
+    cloudcell_defer("aam.login", [env, self, cb, user]() {
         static AamLoginCompleteFn fn = cloudcell_native<AamLoginCompleteFn>(
             "Java_com_firemonkeys_cloudcellapi_AndroidAccountManager_LoginCompleteCallback");
         if (fn)
@@ -255,7 +289,7 @@ static void uim_web_browser_open_url(JNIEnv *env, jobject self, jobject /*webVie
     CCUserInterfaceManager *uim = (CCUserInterfaceManager *)self;
     jlong fail = uim->wb_fail, user = uim->wb_user;
 
-    cloudcell_defer([env, self, fail, user]() {
+    cloudcell_defer("uim.web-fail", [env, self, fail, user]() {
         static UimWebFailFn fn = cloudcell_native<UimWebFailFn>(
             "Java_com_firemonkeys_cloudcellapi_UserInterfaceManager_"
             "WebBrowserLoadFailCallback");
@@ -352,7 +386,7 @@ static jstring fb_access_token(JNIEnv *env, jobject) { return env->NewStringUTF(
 static void fb_login(JNIEnv *env, jobject self, jobjectArray, jboolean,
                      jlong cb, jlong user)
 {
-    cloudcell_defer([env, self, cb, user]() {
+    cloudcell_defer("fb.login", [env, self, cb, user]() {
         static FbLoginFn fn = cloudcell_native<FbLoginFn>(
             "Java_com_firemonkeys_cloudcellapi_FacebookWorker_LoginCallback");
         if (!fn)
@@ -365,7 +399,7 @@ static void fb_login(JNIEnv *env, jobject self, jobjectArray, jboolean,
 
 static void fb_logout(JNIEnv *env, jobject self, jlong cb, jlong user)
 {
-    cloudcell_defer([env, self, cb, user]() {
+    cloudcell_defer("fb.logout", [env, self, cb, user]() {
         static FbPairFn fn = cloudcell_native<FbPairFn>(
             "Java_com_firemonkeys_cloudcellapi_FacebookWorker_LogoutCallback");
         if (fn)
@@ -373,10 +407,13 @@ static void fb_logout(JNIEnv *env, jobject self, jlong cb, jlong user)
     });
 }
 
-static void fb_defer_bool(JNIEnv *env, jobject self, const char *symbol,
-                          jlong cb, jlong user)
+/* `tag` names the deferred item so the pump's per-item log line says WHICH
+ * Facebook callback is in flight. Five different guest-visible actions share
+ * this one body, and "fb.bool" would not tell them apart. */
+static void fb_defer_bool(JNIEnv *env, jobject self, const char *tag,
+                          const char *symbol, jlong cb, jlong user)
 {
-    cloudcell_defer([env, self, symbol, cb, user]() {
+    cloudcell_defer(tag, [env, self, symbol, cb, user]() {
         FbBoolFn fn = cloudcell_native<FbBoolFn>(symbol);
         if (fn)
             fn(env, self, JNI_FALSE, cb, user);
@@ -385,14 +422,14 @@ static void fb_defer_bool(JNIEnv *env, jobject self, const char *symbol,
 
 static void fb_permission_check(JNIEnv *env, jobject self, jobjectArray, jlong cb, jlong user)
 {
-    fb_defer_bool(env, self,
+    fb_defer_bool(env, self, "fb.permission-check",
                   "Java_com_firemonkeys_cloudcellapi_FacebookWorker_"
                   "PermissionCheckCallback", cb, user);
 }
 
 static void fb_permission_grant(JNIEnv *env, jobject self, jobjectArray, jlong cb, jlong user)
 {
-    fb_defer_bool(env, self,
+    fb_defer_bool(env, self, "fb.permission-grant",
                   "Java_com_firemonkeys_cloudcellapi_FacebookWorker_"
                   "PermissionGrantCallback", cb, user);
 }
@@ -402,7 +439,7 @@ static void fb_permission_grant(JNIEnv *env, jobject self, jobjectArray, jlong c
  * written against their own Java, so the two must not be made uniform. */
 static void fb_load_friend_vector(JNIEnv *env, jobject self, jlong cb, jlong user)
 {
-    cloudcell_defer([env, self, cb, user]() {
+    cloudcell_defer("fb.load-friend-vector", [env, self, cb, user]() {
         static FbFriendsFn fn = cloudcell_native<FbFriendsFn>(
             "Java_com_firemonkeys_cloudcellapi_FacebookWorker_"
             "LoadFriendVectorCallback");
@@ -414,21 +451,21 @@ static void fb_load_friend_vector(JNIEnv *env, jobject self, jlong cb, jlong use
 static void fb_feed_post(JNIEnv *env, jobject self, jstring, jstring, jstring, jstring,
                          jstring, jstring, jboolean, jlong cb, jlong user)
 {
-    fb_defer_bool(env, self,
+    fb_defer_bool(env, self, "fb.feed-post",
                   "Java_com_firemonkeys_cloudcellapi_FacebookWorker_"
                   "FeedPostCallback", cb, user);
 }
 
 static void fb_photo_post(JNIEnv *env, jobject self, jstring, jbyteArray, jlong cb, jlong user)
 {
-    fb_defer_bool(env, self,
+    fb_defer_bool(env, self, "fb.photo-post",
                   "Java_com_firemonkeys_cloudcellapi_FacebookWorker_"
                   "PhotoPostCallback", cb, user);
 }
 
 static void fb_friend_invite(JNIEnv *env, jobject self, jstring, jstring, jlong cb, jlong user)
 {
-    fb_defer_bool(env, self,
+    fb_defer_bool(env, self, "fb.friend-invite",
                   "Java_com_firemonkeys_cloudcellapi_FacebookWorker_"
                   "FriendInviteCallback", cb, user);
 }
@@ -562,7 +599,7 @@ static jstring gp_google_play_name(JNIEnv *env, jobject) { return env->NewString
  * logins do not share a helper. */
 static void gp_login(JNIEnv *env, jobject self, jlong cb, jlong user, jboolean)
 {
-    cloudcell_defer([env, self, cb, user]() {
+    cloudcell_defer("gp.login", [env, self, cb, user]() {
         static GpLoginFn fn = cloudcell_native<GpLoginFn>(
             "Java_com_firemonkeys_cloudcellapi_GooglePlayWorker_NativeLoginCallback");
         if (!fn)
@@ -574,7 +611,7 @@ static void gp_login(JNIEnv *env, jobject self, jlong cb, jlong user, jboolean)
 
 static void gp_logout(JNIEnv *env, jobject self, jlong cb, jlong user)
 {
-    cloudcell_defer([env, self, cb, user]() {
+    cloudcell_defer("gp.logout", [env, self, cb, user]() {
         static GpPairFn fn = cloudcell_native<GpPairFn>(
             "Java_com_firemonkeys_cloudcellapi_GooglePlayWorker_LogoutCallback");
         if (fn)
@@ -586,7 +623,7 @@ static void gp_logout(JNIEnv *env, jobject self, jlong cb, jlong user)
  * passes those on failure. */
 static void gp_load_friend_vector(JNIEnv *env, jobject self, jlong cb, jlong user)
 {
-    cloudcell_defer([env, self, cb, user]() {
+    cloudcell_defer("gp.load-friend-vector", [env, self, cb, user]() {
         static GpFriendsFn fn = cloudcell_native<GpFriendsFn>(
             "Java_com_firemonkeys_cloudcellapi_GooglePlayWorker_"
             "LoadFriendVectorCallback");
@@ -599,7 +636,7 @@ static void gp_load_friend_vector(JNIEnv *env, jobject self, jlong cb, jlong use
 /* LoadProfile's own failure branch passes a null array, not an empty one. */
 static void gp_load_profile(JNIEnv *env, jobject self, jstring, jlong cb, jlong user)
 {
-    cloudcell_defer([env, self, cb, user]() {
+    cloudcell_defer("gp.load-profile", [env, self, cb, user]() {
         static GpProfileFn fn = cloudcell_native<GpProfileFn>(
             "Java_com_firemonkeys_cloudcellapi_GooglePlayWorker_"
             "LoadProfileCallback");
@@ -612,7 +649,7 @@ static void gp_share(JNIEnv *env, jobject self, jstring, jstring, jstring, jstri
                      jstring, jstring, jbyteArray, jstring, jstring, jstring,
                      jlong cb, jlong user)
 {
-    cloudcell_defer([env, self, cb, user]() {
+    cloudcell_defer("gp.share", [env, self, cb, user]() {
         static GpBoolFn fn = cloudcell_native<GpBoolFn>(
             "Java_com_firemonkeys_cloudcellapi_GooglePlayWorker_ShareCallback");
         if (fn)
@@ -752,7 +789,7 @@ static void gs_initialize(JNIEnv *env, jobject self)
     CCGoogleStore *st = (CCGoogleStore *)self;
     jlong cb = st->cb_initialize, user = st->user_ptr;
 
-    cloudcell_defer([env, cb, user]() {
+    cloudcell_defer("store.initialize", [env, cb, user]() {
         static GsInitializeFn fn = cloudcell_native<GsInitializeFn>(
             "Java_com_firemonkeys_cloudcellapi_CC_1GoogleStoreServiceV3_1Class_"
             "InitializeCallback");
@@ -776,7 +813,7 @@ static void gs_get_product_details(JNIEnv *env, jobject self, jobjectArray)
     CCGoogleStore *st = (CCGoogleStore *)self;
     jlong cb = st->cb_product_details_error, user = st->user_ptr;
 
-    cloudcell_defer([env, cb, user]() {
+    cloudcell_defer("store.product-details", [env, cb, user]() {
         static GsDetailsErrorFn fn = cloudcell_native<GsDetailsErrorFn>(
             "Java_com_firemonkeys_cloudcellapi_CC_1GoogleStoreServiceV3_1Class_"
             "ProductDetailsErrorCallback");
@@ -794,7 +831,7 @@ static void gs_purchase(JNIEnv *env, jobject self, jstring sku, jlong, jlong)
     CCGoogleStore *st = (CCGoogleStore *)self;
     jlong cb = st->cb_purchase_error, user = st->user_ptr;
 
-    cloudcell_defer([env, sku, cb, user]() {
+    cloudcell_defer("store.purchase", [env, sku, cb, user]() {
         static GsPurchaseErrorFn fn = cloudcell_native<GsPurchaseErrorFn>(
             "Java_com_firemonkeys_cloudcellapi_CC_1GoogleStoreServiceV3_1Class_"
             "PurchaseErrorCallback");
@@ -813,7 +850,7 @@ static void gs_restore_purchase(JNIEnv *env, jobject self)
     CCGoogleStore *st = (CCGoogleStore *)self;
     jlong cb = st->cb_restore, user = st->user_ptr;
 
-    cloudcell_defer([env, cb, user]() {
+    cloudcell_defer("store.restore", [env, cb, user]() {
         static GsRestoreFn fn = cloudcell_native<GsRestoreFn>(
             "Java_com_firemonkeys_cloudcellapi_CC_1GoogleStoreServiceV3_1Class_"
             "RestoreCallback");
@@ -830,7 +867,7 @@ static void gs_refresh_store_purchases(JNIEnv *env, jobject self)
     CCGoogleStore *st = (CCGoogleStore *)self;
     jlong cb = st->cb_refresh_purchases, user = st->user_ptr;
 
-    cloudcell_defer([env, cb, user]() {
+    cloudcell_defer("store.refresh-purchases", [env, cb, user]() {
         static GsRefreshFn fn = cloudcell_native<GsRefreshFn>(
             "Java_com_firemonkeys_cloudcellapi_CC_1GoogleStoreServiceV3_1Class_"
             "RefreshStorePurchasesCallback");
@@ -895,7 +932,7 @@ static void ad_constructor(JNIEnv *, jobject) {}
  */
 static void ad_display_interstitial(JNIEnv *env, jobject self, jstring, jobject, jlong cb)
 {
-    cloudcell_defer([env, self, cb]() {
+    cloudcell_defer("ad.interstitial", [env, self, cb]() {
         static AdInterstitialFn fn = cloudcell_native<AdInterstitialFn>(
             "Java_com_firemonkeys_cloudcellapi_CC_1GoogleAdManager_1Class_"
             "OnInterstitialFailed");
@@ -910,7 +947,7 @@ static void ad_display_interstitial(JNIEnv *env, jobject self, jstring, jobject,
 static void ad_display_banner(JNIEnv *env, jobject self, jstring key, jstring,
                               jobject, jlong cb, jboolean)
 {
-    cloudcell_defer([env, self, key, cb]() {
+    cloudcell_defer("ad.banner", [env, self, key, cb]() {
         static AdBannerFn fn = cloudcell_native<AdBannerFn>(
             "Java_com_firemonkeys_cloudcellapi_CC_1GoogleAdManager_1Class_OnBannerFailed");
         if (fn)
@@ -1024,7 +1061,7 @@ static void prompt_ctor(JNIEnv *, jobject, jclass) {}
 static void prompt_display_rate_app(JNIEnv *env, jobject self, jstring, jstring,
                                     jstring, jstring)
 {
-    cloudcell_defer([env, self]() {
+    cloudcell_defer("prompt.rate-app", [env, self]() {
         static PromptFn fn = cloudcell_native<PromptFn>(
             "Java_com_firemonkeys_cloudcellapi_AppPromptManager_OnDontRate");
         if (fn)
