@@ -510,6 +510,52 @@ static jboolean gp_session_changed(JNIEnv *, jobject) { return JNI_FALSE; }
 static jstring gp_person_id(JNIEnv *env, jobject) { return env->NewStringUTF(""); }
 static jstring gp_person_name(JNIEnv *env, jobject) { return env->NewStringUTF(""); }
 
+/* The GooglePlayWorker methods the guest resolves that this port had no
+ * stub for. MEASURED 2026-10-20, archive 20261020-203430-eden-probe2loop: the
+ * guest's own GetMethodID trace lists exactly nine names on this class, and
+ * only the first two had a registered stub.
+ *
+ * IsInitialPhaseComplete()Z is the one that gates the whole subsystem, and
+ * the chain to it is:
+ *
+ *   0x1cbe0bc  Cloudcell ctor -> 0x1d060ac  (cc::social::SocialMedia ctor)
+ *   0x1d060ac  builds a 14-entry vector of provider interfaces, one per
+ *              social backend, and logs "CC: Initialized SocialMedia".
+ *              That log is UNCONDITIONAL -- it is not the gate.
+ *   0x1d066e4  cc::social::SocialMedia vtable slot 27 = the real "is
+ *              initialised" query: it walks that vector and asks EVERY
+ *              provider's ISocialMedia slot 4, ANDing the answers
+ *   0x1ca7654  GooglePlayManager's slot 4 -> ldrb w0, [x0, #0xc0],
+ *              i.e. the availability byte at GooglePlayManager+0x148
+ *   0x1ca23e8  that byte is written only by cc::social::GooglePlayManager's
+ *              refresh path (0x1ca2188), and only when the Java worker
+ *              answers IsInitialPhaseComplete() with TRUE
+ *   0x1d0307c  the Cloudcell sync thread asks the same question
+ *              (SocialMedia slot 27) and, when the bit is clear, logs
+ *              "CC: Unable to send Sync, Social Media not initialised."
+ *              and returns BEFORE draining its 10765/10712 sub-sync queue
+ *
+ * The other six names are the identity getters the guest asks for in the
+ * same breath. They have no Play Games SDK behind them here, so they answer
+ * the way every other un-backed social method in this file does: an empty
+ * id/name, and "not installed" for the native-app probe.
+ *
+ * IsInitialPhaseComplete answers the SAME switch the sibling
+ * GetSessionValid() already answers -- ccsocialok, "the social-media
+ * session reports itself valid". The operator asks for one fiction, not
+ * two, and the conf already sets it. The shape is a boolean the guest
+ * itself declared (()Z), so there is nothing to mis-parse.
+ */
+static jboolean gp_initial_phase_complete(JNIEnv *, jobject) {
+    return rr3::gfxCloudcellSocialOk() ? JNI_TRUE : JNI_FALSE;
+}
+static jboolean gp_login_in_progress(JNIEnv *, jobject) { return JNI_FALSE; }
+static jboolean gp_native_app_installed(JNIEnv *, jobject) { return JNI_FALSE; }
+static jstring gp_google_plus_id(JNIEnv *env, jobject) { return env->NewStringUTF(""); }
+static jstring gp_google_plus_name(JNIEnv *env, jobject) { return env->NewStringUTF(""); }
+static jstring gp_google_play_id(JNIEnv *env, jobject) { return env->NewStringUTF(""); }
+static jstring gp_google_play_name(JNIEnv *env, jobject) { return env->NewStringUTF(""); }
+
 /* onConnectionFailed (GooglePlayWorker.java:468) answers
  * LoginCallback(STR_EMPTY, STR_EMPTY). An empty person id is this class's
  * "not signed in" - Facebook uses "0" for the same state, which is why the two
@@ -588,6 +634,20 @@ static const ManagedMethod gp_methods[] = {
         CCGooglePlusWorker::clazz, "GetSessionValid", "()Z"),
     ManagedMethod::Register<&gp_session_changed>(
         CCGooglePlusWorker::clazz, "GetSessionChanged", "()Z"),
+    ManagedMethod::Register<&gp_initial_phase_complete>(
+        CCGooglePlusWorker::clazz, "IsInitialPhaseComplete", "()Z"),
+    ManagedMethod::Register<&gp_login_in_progress>(
+        CCGooglePlusWorker::clazz, "GetLoginInProgress", "()Z"),
+    ManagedMethod::Register<&gp_native_app_installed>(
+        CCGooglePlusWorker::clazz, "IsNativeAppInstalled", "()Z"),
+    ManagedMethod::Register<&gp_google_plus_id>(
+        CCGooglePlusWorker::clazz, "GetGooglePlusId", "()Ljava/lang/String;"),
+    ManagedMethod::Register<&gp_google_plus_name>(
+        CCGooglePlusWorker::clazz, "GetGooglePlusName", "()Ljava/lang/String;"),
+    ManagedMethod::Register<&gp_google_play_id>(
+        CCGooglePlusWorker::clazz, "GetGooglePlayId", "()Ljava/lang/String;"),
+    ManagedMethod::Register<&gp_google_play_name>(
+        CCGooglePlusWorker::clazz, "GetGooglePlayName", "()Ljava/lang/String;"),
     ManagedMethod::Register<&gp_person_id>(
         CCGooglePlusWorker::clazz, "GetPersonId", "()Ljava/lang/String;"),
     ManagedMethod::Register<&gp_person_name>(
