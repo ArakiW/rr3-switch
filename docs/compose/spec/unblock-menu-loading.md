@@ -3441,5 +3441,125 @@ Two other observations from the same run, for whoever takes the next step:
    method on a DIFFERENT object. Why the guest holds two handles for one
    manager is still unexplained.
 
+## S28 - the fake Cloudcell authenticate response, built and NOT reached
+
+### What was built
+
+`native-switch/source/jni_compat/classes/cc_cloudcell_auth.{h,cpp}` (new) and
+`cc_http_request.cpp` now hold a hand-built Cloudcell LOGIN response:
+
+* the BinaryBlob **checksum** (guest raw `0x1cb9734`) - not crc32, not
+  adler32. Read off the disassembly: multiply the four bytes of each group
+  together, then divide by the fourth one, 32-bit wrap, ARM64 `sdiv`
+  truncation toward zero.
+* the **box** format (writer `0x1cbd66c`, reader `0x1cbd8f0`):
+  `[u32 checksum][u32 mode][payload]`, the checksum over everything from
+  offset 8. Mode 1 is `u32 uncompressed_length` + a zlib stream, mode 2 is
+  `u8 key` and `C[i] = P[i] ^ ((key + 3*i) & 0xFF)`. The guest sends mode 1
+  then mode 2 (zlib inside XOR) and unboxes twice, so the response body is
+  the outer XOR box around the inner zlib box.
+* the **authenticate payload**, in the order
+  `CC_SyncManager_Class::AuthenticationCallback` (guest raw `0x1d0131c`)
+  reads it: f0 (non-zero, `0x1d013dc`), f1, f2 = **2**, f3 = member id, f4
+  and f7 (bools, `< 2`), f5, f6, f8 = token length + raw bytes (non-zero,
+  `0x1d0158c`), and f9 after the token (`0x1d01d9c`).
+* f2 = 2 is not a guess. The state names live in a table at `0x1f66a68`
+  (read out of `.data.rel.ro`): 0 LEGACY, 1 INITIATE, **2
+  AUTHENTICATE_SUCCESS**, 3 AUTHENTICATED, 4 REAUTHENTICATE, 5
+  MEMBER_CONFLICT, 6 DEVICE_CONFLICT, 7 SOCIAL_AUTH_CHANGED, 8
+  REAUTHENTICATE_STRICT. The guest branches on state == 2 at `0x1d01484`
+  and only that branch parses the member id and the token at all.
+* f3 = 1 satisfies the guest's hard comparison at `0x1d01dc4`, which is
+  against the read-only constant **1** at guest raw `0x600f30` (reached
+  through the GOT slot `0x1f6e270`).
+
+Delivery uses the guest's own natives, not a guess:
+`Java_com_firemonkeys_cloudcellapi_HttpRequest_dataCallback` (guest raw
+`0x1ce493c`) then `..._completeCallback` (guest raw `0x1ce4a3c`), which is
+the order `HttpThread.run()` uses (`reverse/java/sources/com/firemonkeys/
+cloudcellapi/HttpThread.java:92-104, :319-321`). `headerCallback` is
+deliberately NOT called, so the inputs of the guest's own assertion at
+`0x1ce3fd4` (AndroidHttpRequestWorker.cpp:147) stay exactly as they are on
+the error path.
+
+### What the run measured: the guest never calls that class
+
+Archive `20261021-044636-eden-cloudresp2`, 300 s, `nogo=0 ccmode=bg
+ccloginok=1 ccsocialok=1 ccdisp=2 objid=1`:
+
+| signal | baseline `20261021-010106-eden-devid` | after |
+|---|---|---|
+| `CC: Invalid DeviceId!` | 5 | **5** |
+| `CC: AUTH INFO` | 0 | **0** |
+| `CC: Sub Sync Queued` | 15 | **15** |
+| `MainMenu` | 0 | **0** |
+| `cc-http-init` (new probe) | n/a | **0** |
+| `cc-auth-req` (new probe) | n/a | **0** |
+
+**Nothing changed, and the new probe says why.** `http_init` now logs one
+line per call; it logged zero times in the whole run. The port's
+`com/firemonkeys/cloudcellapi/HttpRequest` facade is never reached.
+
+The guest does resolve it - Eden's JNI trace shows
+
+```
+[jni] FindClass com/firemonkeys/cloudcellapi/HttpRequest
+[jni] GetMethodID <init> / init / addHeader / post / close / isClosed / shutdown
+[jni] NewStringUTF RealRacing3/14.0.1 [H562]
+[jni] NewStringUTF POST
+[jni] NewStringUTF https://connect-dev-ss.cloudcell.com:443/time
+```
+
+and **every one of those lookups succeeds** (the guest-view log has zero
+`jni-lookup-miss` lines in the whole run, and `FindClass` warns loudly when
+a class is missing). The guest then never instantiates the object and never
+calls `init`: no `Constructor` line for the class, no `cc-http-init`, and
+the only `cloudcell_defer` in the entire run is still `tag=aam.login`.
+
+### The next blocker: the transport, not the class
+
+The one HTTP request the guest makes in this configuration is
+
+```
+CC: [1] POST request [https://connect-dev-ss.cloudcell.com:443/time]
+```
+
+logged by the Cloudcell **Android HTTP worker** (the format string
+`CC: [%lu] %s request [%s]` is at guest raw `0x49283b`, referenced from
+`0x1ce1eb4`, right next to the source path
+`.../Cloudcell/CloudcellApi/Android/AndroidHttpRequestWorker.cpp`). That
+request never completes, so the guest never reaches the authenticate call
+at all, and the loop S27 describes ("Invalid DeviceId" -> "Sub Sync Queued:
+13" -> "Unable to send Sync") is what it waits on.
+
+The same worker resolves the Java class and then does not use it, so the
+question for the next step is **which transport it picks instead** - the
+`/time` request is the first thing that has to succeed, and it is the
+thing that gates the login.
+
+Note for the record: the port's own spec elsewhere says that forging a
+success is the one thing this port must not do. The fake response above is
+such a forgery, and it was built because it was asked for; it is inert in
+this configuration, so nothing was forged in the run - but the decision to
+ship a success-answering Cloudcell is the Chief's, not the implementer's.
+
+### What is still open (after S28)
+
+1. **The transport for `POST https://connect-dev-ss.cloudcell.com:443/time`.**
+   Until that one request is answered, the authenticate request never
+   happens and no amount of correctness in the login response matters.
+2. **The fake response is correct but unexercised.** It is wired to the
+   guest's own `dataCallback`/`completeCallback` exports and to the
+   guest's own BinaryBlob format; it fires the moment the guest uses the
+   Java facade, and never before.
+3. The member id the guest compares the response against at `0x1d01e20` is
+   the one the account manager already holds (written there at
+   `0x1d01ebc`). It is 0 before the first login and the port cannot read
+   it from the host side, so f3 = 1 satisfies the constant comparison but
+   may not satisfy that one. The consequence of a mismatch is known (the
+   error flag at `0x1d01e68` and the conflict path at `0x1d01fd4`), and it
+   is measurable as soon as the transport question above is answered.
+
+
 
 

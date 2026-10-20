@@ -1,13 +1,17 @@
 #include <stdio.h>
 #include <new>
+#include <string.h>
+#include <vector>
 
 #include "../../eap_port/platform_adapter.h"
 #include "../../eap_port/so_util_adapter.h"
 #include "../../eap_port/trace_adapter.h"
 #include "../jni.h"
 #include "../jni_internals.h"
+#include "cc_cloudcell_auth.h"
 #include "cloudcell_defer.h"
 #include "cloudcell_natives.h"
+#include "rr3/guest_view_trace.hpp"
 
 /*
  * com.firemonkeys.cloudcellapi.HttpRequest - the load-bar blocker.
@@ -24,13 +28,56 @@
  * the lookups returned NULL, post() was a no-op, and the sync/licence requests
  * stayed pending forever while the asset manager sat on the load bar.
  *
- * The stub answers "the transfer failed" rather than "the transfer finished".
- * errorCallback(ptr, 0) is literally what HttpThread.run() emits when
- * openConnection()/getInputStream() throws - responseCode is still 0 at that
- * point (HttpThread.java:143) - i.e. the no-network path the engine already
- * knows how to unwind. completeCallback would instead hand a zero-length body
- * to CC_SyncManager_Class::HttpPostCallback and friends, which then parse it.
+ * THE FAKE SERVER, added 2026-10-21.
+ *
+ * The guest's account manager keeps a server-issued device id, it stays 0, and
+ * the guest logs "CC: Invalid DeviceId! Have we connected to cloudcell yet?"
+ * forever, which keeps the sync queue at 13 items and the main menu
+ * unreachable. The device id comes from the Cloudcell LOGIN response body, so
+ * this class now answers exactly one request shape - the authenticate request -
+ * with a hand-built AUTHENTICATE_STATE_AUTHENTICATE_SUCCESS payload, and
+ * leaves every other request failing honestly.
+ *
+ * The delivery is the Java-side contract, not a guess:
+ *
+ *   HttpThread.run() (reverse/java/sources/com/firemonkeys/cloudcellapi/
+ *   HttpThread.java:92-104, :319-321) is the reference order:
+ *       headerCallback(ptr, contentLength, headers)
+ *       dataCallback(ptr, bytes, len)      once per read
+ *       completeCallback(ptr, httpStatus)   at the end, on success
+ *       errorCallback(ptr, httpStatus)      at the end, on failure
+ *
+ * The guest exports all four natives, and the port already calls
+ * errorCallback, so the success pair exists:
+ *
+ *   Java_com_firemonkeys_cloudcellapi_HttpRequest_dataCallback
+ *       guest raw 0x1ce493c, signature (JNIEnv*, jobject, jlong, jbyteArray,
+ *       jint). Read from the disassembly: it mallocs a buffer of the given
+ *       length, copies the byte array into it through the JNIEnv vtable slot
+ *       0x640 (GetByteArrayElements), calls the worker's vtable[4] with
+ *       (worker, buffer, length) and frees the buffer.
+ *   Java_com_firemonkeys_cloudcellapi_HttpRequest_completeCallback
+ *       guest raw 0x1ce4a3c, signature (JNIEnv*, jobject, jlong, jint). Read
+ *       from the disassembly: it tail-calls the shared OnJNICompletion with
+ *       success = true and the status, which is the counterpart of the
+ *       errorCallback's success = false.
+ *
+ * headerCallback is deliberately NOT called: the guest's own success path
+ * would set the response content type, and the assertion at 0x1ce3fd4
+ * (AndroidHttpRequestWorker.cpp:147) compares a string the worker derives
+ * from that header against the one it expects. Leaving the header alone keeps
+ * the inputs of that comparison exactly as they are on the error path the
+ * port has been taking all along.
  */
+
+/* The body the guest hands to init(). The engine builds it with the guest's
+ * BinaryBlob writer (raw 0x1cbdd28), so it is a flat sequence of
+ * little-endian 32-bit words and length-prefixed byte strings. It is small
+ * (the authenticate request is a few hundred bytes), so it is kept in a
+ * fixed buffer: no heap, no destructor, and no lifetime question for an
+ * object the class registry allocated with calloc. */
+static const size_t kMaxBodyBytes = 4096;
+
 class CCHttpRequest : public Object {
 public:
     static Class clazz;
@@ -41,6 +88,9 @@ public:
     jlong    callback = 0;
     jboolean closed   = JNI_FALSE;
     jboolean pending  = JNI_FALSE;
+
+    uint8_t  body[kMaxBodyBytes];
+    size_t   bodyLen  = 0;
 };
 
 /* Java: public native void errorCallback(long j, int i) - an instance method,
@@ -55,6 +105,34 @@ public:
  * JVM would do and it costs nothing. */
 using CCHttpErrorFn = void (*)(JNIEnv *, jobject, jlong, jint);
 
+/* Java: public native void dataCallback(long j, byte[] bArr, int i) and
+ * public native void completeCallback(long j, int i). Both are instance
+ * methods, so the object is the second parameter. The argument order is the
+ * Java one, and the guest's own implementations read it that way (see the
+ * file comment). */
+using CCHttpDataFn     = void (*)(JNIEnv *, jobject, jlong, jbyteArray, jint);
+using CCHttpCompleteFn = void (*)(JNIEnv *, jobject, jlong, jint);
+
+/* The member id the guest compares the response against when the request
+ * carries none. The guest compares it at 0x1d01dc4 against a read-only
+ * constant of 1 at guest raw 0x600f30 (through the GOT slot 0x1f6e270), so 1
+ * is the value that satisfies that comparison. */
+static const uint32_t kDefaultMemberId = 1u;
+
+/* Bounded log budget, in the spirit of the other Cloudcell probes (a few
+ * dozen lines for a whole run). */
+static const unsigned kMaxAuthLogLines = 24;
+
+static bool authLogBudget(void)
+{
+    static unsigned s_lines = 0;
+    if (s_lines >= kMaxAuthLogLines) {
+        return false;
+    }
+    ++s_lines;
+    return true;
+}
+
 static void http_ctor(JNIEnv *, jobject self, jclass)
 {
     /* NewObject callocs and never runs a constructor (jni/jni.cpp:216), so the
@@ -62,8 +140,8 @@ static void http_ctor(JNIEnv *, jobject self, jclass)
     new (self) CCHttpRequest();
 }
 
-static void http_init(JNIEnv *, jobject self, jstring /*url*/, jstring /*method*/,
-                      jstring /*userAgent*/, jbyteArray /*body*/,
+static void http_init(JNIEnv *env, jobject self, jstring /*url*/, jstring /*method*/,
+                      jstring /*userAgent*/, jbyteArray body,
                       jint /*readCapacity*/, jlong callback,
                       jboolean /*failOnErrorStatus*/)
 {
@@ -71,9 +149,88 @@ static void http_init(JNIEnv *, jobject self, jstring /*url*/, jstring /*method*
     req->callback = callback;
     req->closed   = JNI_FALSE;
     req->pending  = JNI_FALSE;
+
+    /* Keep the body. Without it http_post() cannot tell the authenticate
+     * request from the sync request, and the two share the same URL path
+     * (CC_Sync.php, guest raw 0x3e3551) and the same first four words. */
+    req->bodyLen = 0;
+    if (body != nullptr) {
+        jsize len = env->GetArrayLength(body);
+        if (len > 0) {
+            size_t take = ((size_t)len < kMaxBodyBytes) ? (size_t)len : kMaxBodyBytes;
+            env->GetByteArrayRegion(body, 0, (jsize)take,
+                                    (jbyte *)req->body);
+            req->bodyLen = take;
+        }
+    }
+
+    /* One line per request, so "the guest never calls this class" is a
+     * MEASURED statement and not an inference from the absence of the
+     * http.post deferral line. */
+    if (authLogBudget()) {
+        trace("cc-http-init: body=%zu", (unsigned)req->bodyLen);
+    }
 }
 
 static void http_add_header(JNIEnv *, jobject, jstring, jstring) {}
+
+/*
+ * Build the authenticate response and hand it to the guest the way
+ * HttpThread.run() would: the body first, then the completion.
+ *
+ * Returns false when the response could not be built or delivered, in which
+ * case the caller falls back to the honest failure.
+ */
+static bool deliverAuthSuccess(JNIEnv *env, CCHttpRequest *req,
+                                const cccloud::AuthRequest &info)
+{
+    static CCHttpDataFn data_callback = cloudcell_native<CCHttpDataFn>(
+        kCCHttpDataCallback);
+    static CCHttpCompleteFn complete_callback = cloudcell_native<CCHttpCompleteFn>(
+        kCCHttpCompleteCallback);
+
+    if (data_callback == nullptr || complete_callback == nullptr) {
+        warning("HttpRequest: success natives missing (data=%p complete=%p); "
+                "request %p stays pending\n",
+                (void *)data_callback, (void *)complete_callback, (void *)req);
+        return false;
+    }
+
+    const uint32_t memberId = info.hasMemberId ? info.memberId : kDefaultMemberId;
+
+    std::vector<uint8_t> body;
+    if (!cccloud::buildAuthResponse(memberId, body)) {
+        warning("HttpRequest: could not build the authenticate response\n");
+        return false;
+    }
+
+    if (authLogBudget()) {
+        trace("cc-auth-resp: produced member=%u body=%zu headers=%zu consumed=%zu",
+              memberId, (unsigned)body.size(), (unsigned)info.headerCount,
+              (unsigned)info.consumed);
+    }
+    rr3::guestViewWideLog("cc-auth-resp", memberId, (unsigned long long)body.size(),
+                           "authenticate response built for the guest");
+
+    jbyteArray array = env->NewByteArray((jsize)body.size());
+    if (array == nullptr) {
+        warning("HttpRequest: could not allocate the response byte array\n");
+        return false;
+    }
+    env->SetByteArrayRegion(array, 0, (jsize)body.size(),
+                             (const jbyte *)body.data());
+
+    data_callback(env, (jobject)req, req->callback, array, (jint)body.size());
+    complete_callback(env, (jobject)req, req->callback, 200);
+
+    if (authLogBudget()) {
+        trace("cc-auth-sent: member=%u bytes=%zu status=200",
+              memberId, (unsigned)body.size());
+    }
+    rr3::guestViewWideLog("cc-auth-sent", memberId, (unsigned long long)body.size(),
+                           "authenticate response delivered to the guest");
+    return true;
+}
 
 static void http_post(JNIEnv *env, jobject self)
 {
@@ -84,6 +241,27 @@ static void http_post(JNIEnv *env, jobject self)
         if (!req->pending || req->closed)
             return;
         req->pending = JNI_FALSE;
+
+        cccloud::AuthRequest info;
+        const bool authShaped =
+            cccloud::parseAuthRequest(req->body, req->bodyLen, info);
+
+        if (authShaped) {
+            if (authLogBudget()) {
+                trace("cc-auth-req: matched env=%u,%u x=%u headers=%zu body=%zu "
+                      "consumed=%zu member=%u",
+                      info.env1, info.env2, info.clientId,
+                      (unsigned)info.headerCount, (unsigned)info.bodySize,
+                      (unsigned)info.consumed,
+                      info.hasMemberId ? info.memberId : kDefaultMemberId);
+            }
+            if (deliverAuthSuccess(env, req, info)) {
+                return;
+            }
+        } else if (authLogBudget()) {
+            trace("cc-auth-req: not the authenticate request body=%zu",
+                  (unsigned)req->bodyLen);
+        }
 
         static CCHttpErrorFn error_callback = cloudcell_native<CCHttpErrorFn>(
             "Java_com_firemonkeys_cloudcellapi_HttpRequest_errorCallback");

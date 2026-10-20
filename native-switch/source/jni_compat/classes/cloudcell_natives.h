@@ -53,18 +53,47 @@
  * written at two sites (jni_bridge.cpp and rr3_Platform.cpp) and so is listed
  * once.
  *
- * As of this writing 2 of the 25 are present in the main image's .dynsym and 23
- * are not - the guest spells those with the JNI-mangled inner-class form
+ * The "2 of the 25 are present" claim that used to stand here was WRONG and
+ * is replaced by the measurement: the boot census prints
+ *     cloudcell-natives: 20/27 resolved in the main image
+ * The names that do not resolve are the JNI-mangled inner-class spellings
  * (CC_1FacebookWorker_1Class_...) where the image exports the flat one
- * (FacebookWorker_...). The image is stripped, so those 23 are absent from
- * .symtab too and cannot be resolved by name at all. That is a separate defect
- * from this one, in files this header does not own; the census line is what
+ * (FacebookWorker_...), plus the facades this guest does not ship at all.
+ * The image is stripped, so the unresolved ones are absent from .symtab too
+ * and cannot be resolved by name at all. That is a separate defect from
+ * this one, in files this header does not own; the census line is what
  * makes it visible at boot instead of months later.
+ *
+ * 2026-10-21: two more, both PRESENT in the image, for the fake Cloudcell
+ * login response: HttpRequest_dataCallback (guest raw 0x1ce493c) and
+ * HttpRequest_completeCallback (guest raw 0x1ce4a3c). That makes 27 distinct
+ * names behind 24 call sites.
+ *
+ * The "how many of them are present" sentence above was STALE and is
+ * replaced by the measurement: the boot census in archive
+ * 20261021-043823-eden-cloudresp prints
+ *     cloudcell-natives: 20/27 resolved in the main image
+ * so 20 of the 27 resolve, not 2. The 7 that do not are the
+ * JNI-mangled inner-class spellings (CC_1FacebookWorker_1Class_..., and the
+ * GoogleStore/GoogleAd facades this guest does not ship at all).
+ *
+ * The two success natives are named ONCE, here, and used from the call sites
+ * through these constants. The lookup name is what tools/check-cc-symbols.py
+ * verifies against the image, and a second copy of the same literal in a
+ * second file would be a second thing to keep in step; one checked literal
+ * used everywhere is both less to maintain and one less place to get wrong.
  */
+inline constexpr const char *kCCHttpDataCallback =
+    "Java_com_firemonkeys_cloudcellapi_HttpRequest_dataCallback";
+inline constexpr const char *kCCHttpCompleteCallback =
+    "Java_com_firemonkeys_cloudcellapi_HttpRequest_completeCallback";
+
 inline const char *const *cloudcellNativeNames(unsigned &count) {
     static const char *const kNames[] = {
         "Java_com_firemint_realracing_MainActivity_alertMessageExecuteCallback",
         "Java_com_firemonkeys_cloudcellapi_HttpRequest_errorCallback",
+        kCCHttpDataCallback,
+        kCCHttpCompleteCallback,
         "Java_com_firemonkeys_cloudcellapi_AndroidAccountManager_LoginCompleteCallback",
         "Java_com_firemonkeys_cloudcellapi_UserInterfaceManager_WebBrowserLoadFailCallback",
         "Java_com_firemonkeys_cloudcellapi_FacebookWorker_LoginCallback",
