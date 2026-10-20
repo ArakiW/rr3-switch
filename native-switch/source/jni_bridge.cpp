@@ -143,9 +143,19 @@ char g_fakeObjectObject{};
 // just behind it.
 //
 // Sized against Class::instance_size with headroom -- the largest registered
-// facade is CCUserInterfaceManager, which holds a handful of jlong callback
-// slots. 512 B per instance is an order of magnitude over that and costs
-// nothing, the pool being static.
+// facade is CCHttpRequest (jni_compat/classes/cc_http_request.cpp), which
+// holds a 4 KB request body inline: 8 (vptr) + 8 (callback) + 4 + 4 (flags)
+// + 4096 (body) + 8 (bodyLen) = 4128 bytes.
+//
+// RAISED 512 -> 4608 on 2026-10-21. The old 512 B could not hold that
+// facade, and the slot is NOT sized from Class::instance_size: newFakeObject
+// hands out a fixed stride. A facade that does not fit writes over the
+// neighbouring pool slots and over their headers, which is a silent
+// corruption of every other live object. The HttpRequest facade is the first
+// one that needs more than the old figure.
+//
+// The pool is static, so the cost is BSS only: 512 slots x 4624 B = 2.26 MB,
+// next to the 4 MB byte-array pool this file already carries.
 struct FakeObjectHeader {
     uint32_t magic;     // 'FOBJ'
     uint32_t reserved;
@@ -153,7 +163,7 @@ struct FakeObjectHeader {
 };
 constexpr uint32_t kFakeObjectMagic = 0x4A424F46;  // FOBJ
 constexpr size_t kFakeObjectSlots = 512;
-constexpr size_t kFakeObjectInstance = 512;
+constexpr size_t kFakeObjectInstance = kFakeObjectInstanceBytes;
 constexpr size_t kFakeObjectStride = sizeof(FakeObjectHeader) + kFakeObjectInstance;
 static_assert(sizeof(FakeObjectHeader) == 16, "header must stay 16 bytes");
 static_assert(kFakeObjectStride % 8 == 0, "instances must stay 8-aligned");
@@ -593,9 +603,39 @@ struct JniMethodRecord {
 };
 
 constexpr uint32_t kJniMethodMagic = 0x5252334d; // RR3M
-constexpr size_t kMaxJniMethods = 256;
+
+// RAISED 256 -> 1024 on 2026-10-21, with a measurement behind it.
+//
+// The guest binds its JNI methods with GetMethodID/GetStaticMethodID and keeps
+// the handle it was given, handing it back on every call. Replaying the JNI
+// trace of Eden archive 20261021-044636-eden-cloudresp2 (.build/cc_jni_replay.py
+// against that archive's eden_log.txt.tail) gives 265 DISTINCT
+// (class, name, static) bindings in ONE run, and the Cloudcell HttpRequest
+// block lands exactly on the old cap:
+//
+//     <init>      255th distinct binding
+//     init        256th distinct binding
+//     addHeader   257th  -> refused
+//
+// rememberJniMethod() answered the overflow with the shared &g_fakeMethodId
+// sentinel. findJniMethod() cannot resolve that id, so jniMethodName() returned
+// null and jniCallVoidMethodV() returned BEFORE the ManagedMethod dispatch.
+// The guest's init() therefore never reached
+// jni_compat/classes/cc_http_request.cpp, the fake login response never fired,
+// the account manager's device id stayed 0, and the guest looped on
+// "CC: Invalid DeviceId!".
+//
+// Eviction is not an option: the guest caches the handle and hands it back, so
+// an id whose identity changes breaks the call it was issued for. The table
+// only grows.
+constexpr size_t kMaxJniMethods = 1024;
 JniMethodRecord g_jniMethods[kMaxJniMethods]{};
 size_t g_jniMethodCount = 0;
+
+// className() is defined further down, next to the class table. Forward
+// declared here because rememberJniMethod() needs it to name the class it is
+// refusing to record.
+const char* className(uintptr_t handle);
 
 // Short, allocation-free description of what a JNI call handed back, so a stub
 // returning a dummy where the engine wanted a real Surface/Context/window
@@ -891,6 +931,27 @@ uintptr_t rememberJniMethod(uintptr_t clazz, const char* name,
         }
     }
     if (g_jniMethodCount >= kMaxJniMethods) {
+        // Loud, because the sentinel below is indistinguishable from a real id
+        // at the call site: findJniMethod() cannot resolve it, the caller
+        // returns before it can dispatch, and the guest's call simply never
+        // arrives. A silent overflow is exactly the defect this file already
+        // paid for once, and it cost the whole Cloudcell login.
+        static unsigned s_overflowLines = 0;
+        if (s_overflowLines < 8) {
+            ++s_overflowLines;
+            const char* cls = className(clazz);
+            char details[256];
+            __builtin_snprintf(details, sizeof(details),
+                               "REFUSED class=%s name=%s sig=%s count=%u limit=%u",
+                               cls != nullptr ? cls : "(sentinel)",
+                               name != nullptr ? name : "(null)",
+                               signature != nullptr ? signature : "(null)",
+                               (unsigned)g_jniMethodCount,
+                               (unsigned)kMaxJniMethods);
+            guestViewWideLog("jni-method-overflow",
+                             static_cast<unsigned long long>(g_jniMethodCount),
+                             static_cast<unsigned long long>(clazz), details);
+        }
         return reinterpret_cast<uintptr_t>(&g_fakeMethodId);
     }
     JniMethodRecord& method = g_jniMethods[g_jniMethodCount++];
@@ -3790,6 +3851,30 @@ void jniCallVoidMethodV(uintptr_t env, uintptr_t object,
     const char* name = jniMethodName(methodId);
     jniPairMark("enter", name, methodId, 0);
     if (name == nullptr) {
+        // The SLOT was reached and the id was not resolvable. Those are two
+        // different failures and they look identical from the guest's side -
+        // the call returns and nothing happens - so a run has to be able to
+        // tell them apart.
+        //
+        // This is also the honest form of the "not wired" question. Slot 62 IS
+        // wired: g_jniTable[62] = jniCallVoidMethodV, and that handler carries
+        // the ManagedMethod dispatch. A call that arrives here and does not
+        // dispatch is an ID problem, not a slot problem.
+        static unsigned s_unresolvedLines = 0;
+        if (s_unresolvedLines < 16) {
+            ++s_unresolvedLines;
+            char line[192];
+            __builtin_snprintf(line, sizeof(line),
+                               "slot=62 mid=0x%llx sentinel=%d table=%u/%u",
+                               (unsigned long long)methodId,
+                               methodId == reinterpret_cast<uintptr_t>(&g_fakeMethodId)
+                                   ? 1 : 0,
+                               (unsigned)g_jniMethodCount,
+                               (unsigned)kMaxJniMethods);
+            guestViewWideLog("jni-void-unresolved",
+                             static_cast<unsigned long long>(methodId),
+                             static_cast<unsigned long long>(object), line);
+        }
         return;
     }
 
@@ -3822,17 +3907,40 @@ void jniCallVoidMethodV(uintptr_t env, uintptr_t object,
                          static_cast<unsigned long long>(object), detail);
 
         if (isHttpRequest && isInit) {
-            // Only slot 62 gives an indexable array. Slot 61's args are a
-            // va_list* and reading it as one would be undefined; the line above
-            // records which entry happened, so a slot-61 run is visible instead
-            // of silently mis-parsed.
+            // Only slot 62 is unpacked here. Slot 61's fourth argument is a
+            // va_list* the CALLER owns and the guest never uses for this
+            // class (it always goes through the variadic helper 0xba7af8,
+            // which is slot 62); the line above records which entry happened,
+            // so a slot-61 run is visible instead of silently mis-parsed.
             if (rawEquals(t_jniVoidEntry, "62") && args != nullptr) {
-                const jobject* argv = static_cast<const jobject*>(args);
-                // init(String url, String method, String userAgent,
-                //      byte[] body, int readCapacity, long callback,
-                //      boolean failOnErrorStatus)
+                // Slot 62's fourth argument is the GUEST's va_list, NOT a
+                // jvalue array - see decodeGuestVarArgs. Reading the block as
+                // a flat array handed this capture the block's own header
+                // words (the stack-area pointer and the save-area top) instead
+                // of the arguments, which is the same mistake the dispatch
+                // block below was already fixed for.
+                //
+                // The guest's init is
+                //   init(String userAgent, String method, String url,
+                //        byte[] body, int readCapacity, long callback,
+                //        boolean, double, boolean, boolean, int)
+                // (decompiled com/firemonkeys/cloudcellapi/HttpRequest.java),
+                // so the callback is parameter 5.
+                const JniMethodRecord* rec = findJniMethod(methodId);
+                const char* sig = rec != nullptr && rec->signature[0] != '\0'
+                                      ? rec->signature
+                                      : nullptr;
+                jvalue decoded[kMaxGuestVarArgs];
+                __builtin_memset(decoded, 0, sizeof(decoded));
+                const size_t argc =
+                    sig != nullptr
+                        ? decodeGuestVarArgs(args, sig, decoded, kMaxGuestVarArgs)
+                        : 0;
                 const uint64_t callback =
-                    reinterpret_cast<uintptr_t>(argv[7]);
+                    argc >= 6
+                        ? static_cast<uint64_t>(
+                              reinterpret_cast<uintptr_t>(decoded[5].l))
+                        : 0;
                 CloudcellHttpRequestSlot* slot = nullptr;
                 for (size_t i = 0; i < kCloudcellHttpRequestSlots; ++i) {
                     if (g_ccHttpSlots[i].object == object ||

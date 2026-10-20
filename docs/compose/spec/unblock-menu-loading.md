@@ -3560,6 +3560,146 @@ ship a success-answering Cloudcell is the Chief's, not the implementer's.
    error flag at `0x1d01e68` and the conflict path at `0x1d01fd4`), and it
    is measurable as soon as the transport question above is answered.
 
+## S29 - the handoff is slot 62, and what was missing was the port's method TABLE
+
+### The handoff (MEASURED, guest disassembly)
+
+S28 stopped at "the worker resolves the Java class and then does not use it".
+The class IS used. The full chain, read off the guest:
+
+| guest vaddr | what it is |
+|---|---|
+| `0x49283b` | the format string `CC: [%lu] %s request [%s]` (`.rodata`) |
+| `0x1ce1c00` | the Cloudcell **Android HTTP worker** function; it builds the request, calls `0x1ce350c` at `0x1ce1d4c`, and logs `POST request [...]` at `0x1ce1eb4` |
+| `0x1ce350c` | the function that creates the Java object and calls `init` / `addHeader` / `post` |
+| `0x1ce356c` | `bl 0x1c68e74` - `JavaNativeInterfaceObject::createObject`: FindClass (`0x1c687d4`), GetMethodID `"<init>"` `"()V"` (JNIEnv slot 33, offset `0x108`), NewObjectV (`0x12b622c`, slot 29), NewGlobalRef (slot 21, offset `0xa8`), DeleteLocalRef (slot 23, offset `0xb8`). The global ref is stored at `worker+0xc8` |
+| `0x1ce35a0`..`0x1ce3678` | GetMethodID for `init`, `addHeader`, `post`, `close`, `isClosed`, `shutdown` |
+| **`0x1ce3850`** | **`bl 0xba7af8` - the handoff: `CallVoidMethodV(env, worker+0xc8, initMethodID, va_list)`** |
+| `0x1ce3908`, `0x1ce3a34` | `bl 0xba7af8` - `addHeader` |
+| `0x1ce3adc` | `bl 0xba7af8` - `post` |
+| `0xba7af8` | the guest's ONE variadic helper: `ldr x8, [x8, #0x1f0]` - **JNIEnv slot 62 = `CallVoidMethodV`** (`0x1f0` = 496 = 62 x 8) |
+
+So the handoff slot is **62 (`CallVoidMethodV`)** on the object at
+`worker+0xc8`, and the arguments are the guest's `init`:
+`x3` user agent, `x4` method (`"POST"`), `x5` URL, `x6` body (`byte[]`),
+`x7` read capacity (`int`), stack[0] callback (`long`), stack[1] `z`,
+`v0` server time (`double`), stack[2] `z2`, stack[3] `z3`, stack[4] `i2`.
+That is exactly the guest's registered signature
+`(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[BIJZDZZI)V` and
+exactly the decompiled
+`com/firemonkeys/cloudcellapi/HttpRequest.java`
+`init(String userAgent, String method, String url, byte[] body,
+int readCapacity, long callback, boolean, double, boolean, boolean, int)`.
+
+### The port's side: the slot was wired; the ID was not
+
+`g_jniTable[62] = jniCallVoidMethodV` (`jni_bridge.cpp:4292`), and that
+handler DOES carry the ManagedMethod dispatch. **The conf note's "that slot
+is not wired to dispatch at all yet" is true of `CallObjectMethod` (slots
+34/35 - `jniCallObjectMethodV` has no ManagedMethod dispatch) and it is NOT
+true of the slot this handoff uses.** S29 does not re-open ccdisp=2 on the
+strength of that note.
+
+What actually happened is smaller and quieter. `rememberJniMethod()` handed
+out the shared `&g_fakeMethodId` sentinel once the port's method table was
+full; `findJniMethod()` cannot resolve that id; `jniMethodName()` returned
+null; and `jniCallVoidMethodV()` returned **before** it reached the
+dispatch. The slot was reached and the call still did not arrive.
+
+MEASURED, by replaying the JNI trace of archive `20261021-044636-eden-cloudresp2`
+(`.build/cc_jni_replay.py` against that archive's `eden_log.txt.tail`):
+
+```
+distinct (class, name, static) bindings replayed: 265
+table limit                                : 256
+first HttpRequest entry : log line 2229, ('.../HttpRequest', '<init>', 0), rank 255
+                          log line 2230, ('.../HttpRequest', 'init',   0), rank 256
+first overflow          : log line 2231, ('.../HttpRequest', 'addHeader', 0), rank 257
+```
+
+The guest registers 247 instance methods and 16 372 static-method lookups in
+one run; 265 of them are DISTINCT. The Cloudcell `HttpRequest` block lands
+exactly on the 256 cap.
+
+### The fix
+
+1. `kMaxJniMethods` 256 -> 1024 (`jni_bridge.cpp`). Eviction is not an
+   option - the guest caches the handle and hands it back - so the table
+   only grows. The overflow path is now **loud** (`jni-method-overflow`).
+2. `jniCallVoidMethodV` now logs `jni-void-unresolved` when the id does not
+   resolve, so "the slot was reached and the id was not" is distinguishable
+   from "the slot is not wired".
+3. The fast-fail block's capture of the callback read the va_list as a flat
+   `jvalue` array. It now uses `decodeGuestVarArgs` - the port's ONE va_list
+   convention - so the callback is the guest's value and not the block's own
+   header words.
+4. The fake-object pool granted **512 bytes** per instance, while
+   `CCHttpRequest` is **4128** bytes (it holds a 4 KB request body inline)
+   and the pool does not size the slot from `Class::instance_size`. The
+   first dispatch would have written over the neighbouring slots. The
+   instance size is now 4608 (`kFakeObjectInstanceBytes` in
+   `jni_compat/jni_internals.h`) and `cc_http_request.cpp` static_asserts
+   that the facade fits.
+
+### The run
+
+Archive `20261021-053123-eden-dispatch1`, 300 s, the same conf
+(`nogo=0 ccmode=bg ccloginok=1 ccsocialok=1 ccdisp=2 objid=1`). That is the
+archive of the shipped NRO (deployed sha256 `36902D21...`, identical to the
+built one). Two earlier post-fix runs, `20261021-051344-eden-dispatch1` and
+`20261021-052604-eden-dispatch1`, give the same numbers in every row, so the
+result is not a one-run artefact.
+
+| signal | baseline `20261021-044636-eden-cloudresp2` | after |
+|---|---|---|
+| `cc-http-init` | 0 | **1** |
+| `cc-auth-req` | 0 | **1** |
+| `CC: AUTH INFO` | 0 | **0** |
+| `CC: Invalid DeviceId!` | 5 | **5** |
+| `CC: Sub Sync Queued` | 15 | **15** |
+| `MainMenu` | 0 | **0** |
+| `CC: [1] POST complete` | 0 | **1** |
+| frames | 16320 | **16320** |
+
+`frames` is unchanged, so ccdisp=2 did not regress this time. The dispatch
+lines are in the archive:
+
+```
+cc-dispatch ... class=com/firemonkeys/cloudcellapi/HttpRequest method=init  -> MATCH
+cc-dispatch ... class=com/firemonkeys/cloudcellapi/HttpRequest method=post  -> MATCH
+cc-dispatch ... class=com/firemonkeys/cloudcellapi/HttpRequest method=close -> MATCH
+```
+
+and the guest's own log grew a line it never had before:
+`CC: [1] POST complete [Succeeded=False]`. The request now COMPLETES. It
+completes as a FAILURE, for the reason below.
+
+### The next blocker: the first Cloudcell request is `POST /time`, not the authenticate request
+
+The body the guest handed to `init()` is **one byte** (the port's
+`NewByteArray` line says `length=1`), and the URL is
+`https://connect-dev-ss.cloudcell.com:443/time`.
+
+`cc_http_request.cpp` answers exactly one request shape - the authenticate
+request, whose body is built by the guest at `0x1d00364` / `0x1d00f38`. A
+`/time` body is not that shape, so it falls through to `errorCallback` and
+the guest logs `POST complete [Succeeded=False]`.
+
+The chain that follows is now fully determined:
+
+1. `/time` fails -> the guest never learns the server time.
+2. The server time is what the guest passes as the `double` of the NEXT
+   request's `init` (the guest's own log line for the answer is
+   `CC: Server time returned; server time: %f server-local time diff: %f`,
+   `.rodata 0x3fc1e4`), so the guest never builds the authenticate request.
+3. No authenticate request -> no device id -> `Invalid DeviceId!` x5,
+   `Sub Sync Queued` x15, `MainMenu` 0.
+
+So the authenticate response built in S28 is still correct and still
+unexercised, and the thing to answer next is a `/time` response whose body
+yields a double.
+
+
 
 
 

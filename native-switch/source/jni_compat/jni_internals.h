@@ -189,6 +189,24 @@ struct Class {
     jsize instance_size;
 };
 
+/*
+ * Bytes of instance space every fake object gets.
+ *
+ * The port's fake-object pool (source/jni_bridge.cpp newFakeObject) hands out
+ * a FIXED stride; it does NOT size the slot from Class::instance_size. A
+ * facade whose instance_size exceeds this therefore writes over the
+ * neighbouring pool slots and over their headers, which is a silent corruption
+ * of every other live object.
+ *
+ * 4608 because CCHttpRequest (jni_compat/classes/cc_http_request.cpp) holds a
+ * 4 KB request body inline: 8 (vptr) + 8 (callback) + 4 + 4 (flags) + 4096
+ * (body) + 8 (bodyLen) = 4128 bytes. It is the first registered facade that
+ * does not fit in the 512 B this used to be, and it is the first one whose
+ * methods are actually dispatched, so the shortfall was never observable
+ * before the Cloudcell HttpRequest handoff was wired.
+ */
+constexpr uint32_t kFakeObjectInstanceBytes = 4608;
+
 struct Object {
     virtual Class *_getClass() = 0;
 };

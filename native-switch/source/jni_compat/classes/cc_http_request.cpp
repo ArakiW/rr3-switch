@@ -93,6 +93,16 @@ public:
     size_t   bodyLen  = 0;
 };
 
+/* This facade is dispatched onto an object that the port's fake-object pool
+ * handed out (jni_bridge.cpp newFakeObject), and that pool gives every
+ * instance a FIXED stride - it does not size the slot from
+ * Class::instance_size. The inline body above is 4 KB, so a pool that grants
+ * less than that would let init() write over the neighbouring slots and their
+ * headers. Checked here rather than discovered at runtime. */
+static_assert(sizeof(CCHttpRequest) <= kFakeObjectInstanceBytes,
+              "CCHttpRequest does not fit in the port's fake-object instance "
+              "space; raise kFakeObjectInstanceBytes");
+
 /* Java: public native void errorCallback(long j, int i) - an instance method,
  * so the second parameter is the object. Verified against the disassembly of
  * Java_com_firemonkeys_cloudcellapi_HttpRequest_errorCallback at
@@ -140,8 +150,33 @@ static void http_ctor(JNIEnv *, jobject self, jclass)
     new (self) CCHttpRequest();
 }
 
-static void http_init(JNIEnv *env, jobject self, jstring /*url*/, jstring /*method*/,
-                      jstring /*userAgent*/, jbyteArray body,
+/* Java: public void init(String userAgent, String method, String url,
+ *                        byte[] body, int readCapacity, long callback,
+ *                        boolean, double, boolean, boolean, int timeoutSeconds)
+ *
+ * The parameter ORDER is the guest's, read out of the decompiled
+ * com/firemonkeys/cloudcellapi/HttpRequest.java:
+ *
+ *     public void init(String str, String str2, String str3, byte[] bArr,
+ *                      int i, long j, boolean z, double d, boolean z2,
+ *                      boolean z3, int i2) {
+ *         this.m_serverTime = d;
+ *         this.m_bSSLCheck = z2;
+ *         if (i2 > 0) { this.m_TimeoutMilliseconds = i2 * 1000; }
+ *         initSSLContext();
+ *         initUserAgent(str);
+ *         this.m_thread = new HttpThread(this, str2, str3, bArr, i, j, z, z3);
+ *     }
+ *
+ * so str is the user agent, str2 the method and str3 the URL. The four
+ * trailing parameters are not modelled here: the port answers the request
+ * itself and has no use for the server time, the SSL check or the timeout.
+ * The two the port DOES need - the body and the callback - sit at index 3
+ * and index 5 of the guest's argument list, which is where the port's
+ * array-form dispatcher reads them.
+ */
+static void http_init(JNIEnv *env, jobject self, jstring /*userAgent*/,
+                      jstring /*method*/, jstring /*url*/, jbyteArray body,
                       jint /*readCapacity*/, jlong callback,
                       jboolean /*failOnErrorStatus*/)
 {
