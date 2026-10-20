@@ -937,7 +937,56 @@ void logWatchedOpen(const char* guestPath, const Resolution& resolution, int fd)
                         static_cast<unsigned long long>(size), details);
 }
 
+// ---------------------------------------------------------------------------
+// The asset-list request trace.
+//
+// WHY IT EXISTS. The guest's download phase ends on a gate that asks whether
+// the AssetDownloadService's queue is empty, and that queue holds ASSET-LIST
+// FILE NAMES -- the names of the files the guest wanted and could not find.
+// The existing path-req trace does not fire for these paths (they mention
+// none of .depot/gui/apk/Tracks/vehicles/Shaders/.vsh/.fsh) and it carries
+// neither the resolved candidates nor the errno, so "the guest asked for
+// asset_list_base.txt and the host looked in rr3core:/files/apk/res/..." is
+// not visible anywhere in the log.
+//
+// NARROW BY CONSTRUCTION. It fires only for a path that contains
+// "asset_list", it is capped, and it changes nothing about path-req, about
+// path-req's cap, or about any other trace.
+//
+// One line per request. The line carries the raw guest path, the two
+// candidates the host tried (primary and fallback), the errno of the LAST
+// attempt, and whether the request was a read or a write.
+constexpr const char* kAssetListMarker = "asset_list";
+constexpr unsigned kAssetListLines = 60;
+
+bool isAssetListPath(const char* path) {
+    return path != nullptr && std::strstr(path, kAssetListMarker) != nullptr;
+}
+
+// Defined below, next to withReadFallback: that is the only place that
+// knows the errno of the last attempt, and this is where the resolve
+// failure -- which never reaches an attempt at all -- is reported.
+//
+// `rc` is the result of the last attempt (0 = served) and `lastErrno` is
+// the errno that attempt left behind.
+void logAssetListRequest(const char* guestPath, const Resolution& resolution,
+                         bool writing, int rc, int lastErrno);
+
+// The resolver itself. resolvePath() below is the wrapper every caller uses.
+bool resolvePathImpl(const char* path, bool writing, Resolution& resolution);
+
 bool resolvePath(const char* path, bool writing, Resolution& resolution) {
+    const bool resolved = resolvePathImpl(path, writing, resolution);
+    if (!resolved && isAssetListPath(path)) {
+        // The request never got as far as an attempt: the resolver refused
+        // it. The errno here is the resolver's, and the candidates are
+        // whatever it managed to build before giving up.
+        logAssetListRequest(path, resolution, writing, -1, errno);
+    }
+    return resolved;
+}
+
+bool resolvePathImpl(const char* path, bool writing, Resolution& resolution) {
     // Item 4: one bounded line, emitted from the first resolvePath of the run,
     // so the next run can prove items 1-3 are compiled in without re-deriving
     // anything. Placed here rather than behind the watched-path gate on
@@ -1158,16 +1207,50 @@ bool resolvePath(const char* path, bool writing, Resolution& resolution) {
 // kProbeSubtree, so it cannot grow with the rest of the log.
 constexpr const char* kProbeSubtree = "vehicles/shaders";
 
+// The asset-list trace itself. One line per request, capped.
+//
+// The paths are truncated at 380 characters each: the buffer stays inside a
+// guest thread's stack (the bridge allows a 16 KiB one) and a guest path
+// that long does not occur -- the longest one seen is an apk/res path of
+// about 90 characters.
+void logAssetListRequest(const char* guestPath, const Resolution& resolution,
+                         bool writing, int rc, int lastErrno) {
+    static unsigned s_lines = 0;
+    if (s_lines >= kAssetListLines) {
+        return;
+    }
+    ++s_lines;
+    char details[0x600];
+    __builtin_snprintf(details, sizeof(details),
+                       "api=%s writing=%d rc=%d last_errno=%d"
+                       " guest_path=%.380s primary=%.380s fallback=%.380s",
+                       gResolveApi != nullptr ? gResolveApi : "?",
+                       writing ? 1 : 0, rc, lastErrno,
+                       guestPath != nullptr ? guestPath : "-",
+                       resolution.primary[0] != '\0' ? resolution.primary : "-",
+                       resolution.fallback[0] != '\0' ? resolution.fallback : "-");
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "assetlist-req", s_lines, 0, details);
+}
+
 template <typename Callback>
-int withReadFallback(const Resolution& resolution, Callback callback) {
+int withReadFallback(const Resolution& resolution, const char* guestPath,
+                     Callback callback) {
     const bool probe = resolution.primary != nullptr &&
                        std::strstr(resolution.primary, kProbeSubtree) != nullptr;
+    // The asset-list requests are traced here because this is the only place
+    // that knows WHICH candidates the host tried and what the last attempt
+    // left behind. The guest path is passed in because the resolver is the
+    // only place that knows what the guest asked for.
+    const bool assetList = isAssetListPath(guestPath);
     // Counts the attempts this one logical lookup makes, so the trace can say
     // "3 candidates, last errno=2" instead of leaving the reader to infer it.
     unsigned attempts = 0;
+    int lastErrno = 0;
     const auto attempt = [&](const char* candidate) {
         ++attempts;
         const int rc = callback(candidate);
+        lastErrno = errno;
         if (probe) {
             char diag[640];
             __builtin_snprintf(diag, sizeof(diag),
@@ -1188,6 +1271,9 @@ int withReadFallback(const Resolution& resolution, Callback callback) {
         }
         result = attempt(candidate);
         if (result == 0) {
+            if (assetList) {
+                logAssetListRequest(guestPath, resolution, false, 0, lastErrno);
+            }
             return 0;
         }
         const int error = errno;
@@ -1240,7 +1326,12 @@ int withReadFallback(const Resolution& resolution, Callback callback) {
                                        "sdmc:/switch/rr3-native-rehost/%s", rel);
             if (n > 0 && static_cast<size_t>(n) < sizeof(card)) {
                 result = callback(card);
+                lastErrno = errno;
                 if (result == 0) {
+                    if (assetList) {
+                        logAssetListRequest(guestPath, resolution, false, 0,
+                                            lastErrno);
+                    }
                     return 0;
                 }
                 // Same retraction as the volume candidate above, and for the
@@ -1251,6 +1342,9 @@ int withReadFallback(const Resolution& resolution, Callback callback) {
     }
     if (result != 0 && errno == 0) {
         errno = firstError;
+    }
+    if (assetList) {
+        logAssetListRequest(guestPath, resolution, false, result, errno);
     }
     return result;
 }
@@ -1468,6 +1562,37 @@ bool externalDataReady() { return gStatus.ready; }
 uint64_t guestFilesystemSelfTest() {
     uint64_t bits = 0;
     Resolution value{};
+    // POSITIVE CONTROL for the asset-list trace.
+    //
+    // The trace fires only for a path that contains "asset_list", so a run in
+    // which the guest never asks for an asset list produces ZERO
+    // assetlist-req lines -- and "the guest never asked" and "the trace is
+    // broken" would then be the same observation. This one call makes the
+    // trace fire at least once per run, so its absence in a later run is a
+    // fact about the guest instead of a fact about the instrument.
+    //
+    // It asserts nothing: the bit is NOT taken from the mask, because the
+    // existence of an asset list is not a contract. The path is the one the
+    // guest itself uses, so the line is also a sample of the real thing.
+    // gResolveApi is set so the line says where it came from.
+    {
+        const char* const kControlPath = "files/apk/res/asset_list_base.txt";
+        gResolveApi = "self-test";
+        value = {};
+        if (resolvePath(kControlPath, false, value)) {
+            struct stat probe{};
+            withReadFallback(value, kControlPath,
+                             [&probe](const char* candidate) {
+                                 return ::stat(candidate, &probe);
+                             });
+        }
+        // resolvePath() logs the failure itself when it refuses the path, so
+        // the control produces exactly one assetlist-req line either way.
+        // The resolution is dropped afterwards: the assertions below each
+        // start from an empty Resolution, and the control's candidates would
+        // otherwise survive into the first one.
+        value = {};
+    }
     if (resolvePath("/storage/emulated/0/Android/data/com.ea.games.r3_row/files/.depot/langs.utf8", false, value) &&
         std::strcmp(value.primary, "rr3core:/files/.depot/langs.utf8") == 0) bits |= 1;
     value = {};
@@ -1552,22 +1677,37 @@ std::FILE* guestFopen(const char* path, const char* mode) {
     }
     const bool writing = mode != nullptr && std::strpbrk(mode, "wa+") != nullptr;
     Resolution resolution{};
-    if (!resolvePath(path, writing, resolution) ||
-        rejectReadOnlyWrite(resolution, writing)) {
+    if (!resolvePath(path, writing, resolution)) {
         if (path != nullptr && path[0] != '\0') {
             appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                                 "fopen-fail-resolve", 0, 0, path);
         }
         return nullptr;
     }
+    if (rejectReadOnlyWrite(resolution, writing)) {
+        // Split out of the combined check so the read-only rejection can be
+        // told apart from a resolve failure: the resolve failure is already
+        // reported by resolvePath(), and reporting it twice would double the
+        // asset-list lines for one request.
+        if (isAssetListPath(path)) {
+            logAssetListRequest(path, resolution, true, -1, errno);
+        }
+        return nullptr;
+    }
     std::FILE* file = nullptr;
     if (writing) {
         file = std::fopen(resolution.primary, mode);
+        if (isAssetListPath(path)) {
+            // The write path does not go through withReadFallback, so the
+            // write is traced here instead.
+            logAssetListRequest(path, resolution, true,
+                                file == nullptr ? -1 : 0, errno);
+        }
     } else {
         // Same reason as guestOpen: the read path needs the trailing-".z"
         // retry, and that lives only in withReadFallback. See the long note
         // there -- this is the same 71-failure shape reached through fopen.
-        withReadFallback(resolution, [&file, mode](const char* candidate) {
+        withReadFallback(resolution, path, [&file, mode](const char* candidate) {
             file = std::fopen(candidate, mode);
             return file == nullptr ? -1 : 0;
         });
@@ -1640,8 +1780,18 @@ int guestOpen(const char* path, int flags, ...) {
         va_end(arguments);
     }
     Resolution resolution{};
-    if (!resolvePath(path, writing, resolution) ||
-        rejectReadOnlyWrite(resolution, writing)) {
+    if (!resolvePath(path, writing, resolution)) {
+        logWatchedResult("guestOpen", path, resolution.primary, -1, errno, -1, 0u);
+        return -1;
+    }
+    if (rejectReadOnlyWrite(resolution, writing)) {
+        // Split out of the combined check so the read-only rejection can be
+        // told apart from a resolve failure: the resolve failure is already
+        // reported by resolvePath(), and reporting it twice would double the
+        // asset-list lines for one request.
+        if (isAssetListPath(path)) {
+            logAssetListRequest(path, resolution, true, -1, errno);
+        }
         logWatchedResult("guestOpen", path, resolution.primary, -1, errno, -1, 0u);
         return -1;
     }
@@ -1650,6 +1800,11 @@ int guestOpen(const char* path, int flags, ...) {
         fd = (flags & O_CREAT) != 0
             ? ::open(resolution.primary, flags, mode)
             : ::open(resolution.primary, flags);
+        if (isAssetListPath(path)) {
+            // The write path does not go through withReadFallback, so the
+            // write is traced here instead.
+            logAssetListRequest(path, resolution, true, fd < 0 ? -1 : 0, errno);
+        }
     } else {
         // Route the READ path through withReadFallback, like guestStat,
         // guestAccess and friends. This used to hand-roll primary + fallback,
@@ -1679,7 +1834,7 @@ int guestOpen(const char* path, int flags, ...) {
         // now reporting "Failed opening file". Same run also proved the .z
         // retry itself works -- mtResourceCache failures went 71 -> 0 and the
         // pixel readback turned from 000000ff to 00ffffff.
-        const int rc = withReadFallback(resolution, [&fd, flags, mode](const char* candidate) {
+        const int rc = withReadFallback(resolution, path, [&fd, flags, mode](const char* candidate) {
             fd = (flags & O_CREAT) != 0
                 ? ::open(candidate, flags, mode)
                 : ::open(candidate, flags);
@@ -1767,7 +1922,7 @@ int guestAccess(const char* path, int mode) {
         logWatchedResult("guestAccess", path, resolution.primary, -1, errno, -1, 0u);
         return -1;
     }
-    const int rc = withReadFallback(resolution,
+    const int rc = withReadFallback(resolution, path,
         [mode](const char* candidate) { return ::access(candidate, mode); });
     logWatchedResult("guestAccess", path, resolution.primary, rc,
                      rc == 0 ? 0 : errno, -1, 0u);
@@ -2207,7 +2362,7 @@ int guestStat(const char* path, struct stat* output) {
     // rather than written there directly. Passing `output` straight to ::stat
     // is what put st_atim.tv_nsec where the guest reads its file size.
     struct stat host{};
-    const int rc = withReadFallback(resolution,
+    const int rc = withReadFallback(resolution, path,
         [&host](const char* candidate) { return ::stat(candidate, &host); });
     const bool ok = rc == 0 && output != nullptr;
     if (ok) {
@@ -2226,7 +2381,7 @@ int guestLstat(const char* path, struct stat* output) {
     Resolution resolution{};
     if (!resolvePath(path, false, resolution)) return -1;
     struct stat host{};
-    const int rc = withReadFallback(resolution,
+    const int rc = withReadFallback(resolution, path,
         [&host](const char* candidate) { return ::lstat(candidate, &host); });
     if (rc == 0 && output != nullptr) writeBionicStat(host, output);
     return rc;
@@ -2311,6 +2466,15 @@ DIR* guestOpendir(const char* path) {
     DIR* directory = ::opendir(resolution.primary);
     if (directory == nullptr && errno == ENOENT && resolution.fallback[0] != '\0') {
         directory = ::opendir(resolution.fallback);
+    }
+    if (isAssetListPath(path)) {
+        // A directory request is a request too: the guest can find its asset
+        // lists by listing a directory instead of naming a file, and this is
+        // the only path-taking entry point that does not go through
+        // withReadFallback.
+        logAssetListRequest(path, resolution, false,
+                            directory != nullptr ? 0 : -1,
+                            directory != nullptr ? 0 : errno);
     }
     if (path != nullptr && std::strstr(path, "gui") != nullptr) {
         appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",

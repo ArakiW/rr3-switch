@@ -2876,6 +2876,35 @@ uintptr_t resolveMainImageLoadBias() {
     return gLoaderImages[mainIndex].loadBias();
 }
 
+// True when [runtimeAddress, runtimeAddress + bytes) is inside the mapped
+// image of libRealRacing3.so.
+//
+// The guest image is mapped for the guest vaddr range
+// [minimumAddress, minimumAddress + image.size()); a runtime address is
+// converted back to a guest vaddr by subtracting the image's load bias and
+// then tested against the PT_LOAD program headers with the loader's own
+// CrossImage::containsMemory.
+//
+// WHY IT EXISTS. A diagnostic that reads guest memory has to be able to say
+// "that address is not mapped" instead of faulting the process, and the
+// loader already knows the answer for every address of the image. The
+// conversion uses the same loadBias() that resolveMainImageLoadBias()
+// returns, so a caller that derives its addresses from that bias and
+// checks them with this function cannot disagree with itself.
+bool guestImageContains(uintptr_t runtimeAddress, size_t bytes) {
+    const size_t mainIndex = embeddedSonameIndex("libRealRacing3.so");
+    if (mainIndex >= gLoaderImageCount || !gLoaderImages[mainIndex].loaded) {
+        return false;
+    }
+    const CrossImage& image = gLoaderImages[mainIndex];
+    const uintptr_t bias = image.loadBias();
+    if (runtimeAddress < bias) {
+        return false;
+    }
+    const uint64_t vaddr = static_cast<uint64_t>(runtimeAddress - bias);
+    return image.containsMemory(vaddr, static_cast<uint64_t>(bytes));
+}
+
 uintptr_t resolveMainImageSpanBytes() {
     const size_t mainIndex = embeddedSonameIndex("libRealRacing3.so");
     if (mainIndex >= gLoaderImageCount || !gLoaderImages[mainIndex].loaded) {

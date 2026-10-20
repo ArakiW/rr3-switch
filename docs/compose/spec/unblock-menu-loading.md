@@ -1931,3 +1931,373 @@ replaces a guest vtable slot (guest_view_probe.cpp:2414 does exactly that), so
 the mechanism to answer SkipAsset by file existence is available; what is
 missing is the address, and it has to be found by disassembly rather than by
 symbol.
+### S23 -- the download phase in the ARM64 guest: the gate tests a QUEUE, and S22 described a different subsystem
+
+Date: 2026-10-20. Archive 20261020-002448-eden-prof4.
+Binary: `reverse/native/arm64/libRealRacing3.so` (33,110,472 B).
+
+Two claims this project was carrying are retracted first, because both of them are
+load-bearing for whatever gets built next.
+
+**RETRACTED: the decompiled call tree is not a different build.**
+
+`reverse/native/decomp-calltree/` is **the same android arm64 library**, read by
+Ghidra with an image base of **0x100000**. `013ad2e0_FUN_013ad2e0.c` therefore
+describes raw vaddr **0x12ad2e0**, and its `DAT_020b2688` is raw **0x1fb2688**.
+
+The claim that the call tree was an arm64-vita build is WRONG and is withdrawn
+here. `reverse/native/arm64-vita/libRealRacing3.so` (7,323,216 B) is a separate,
+unrelated Vita port and has nothing to do with the call tree.
+
+The proof is not the naming convention, it is an independent measurement. The GOT
+slot the gate reads is **0x1f6d5d8**, and the R_AARCH64_RELATIVE relocation on it
+carries addend **0x1fb2688** -- exactly the address the decompiled file calls
+`DAT_020b2688`, since 0x1fb2688 = 0x100000 + 0x1fb2688. The decompiled file and
+the raw binary agree on one specific checkable number, so they are the same image.
+
+The decompiled gate, in the form the rest of this section uses:
+
+    if (DAT_020b2688 != 0 &&
+        (lVar1 = *(long *)(DAT_020b2688 + 0x10518), lVar1 != 0) &&
+        (*(long *)(lVar1 + 0xe0) == *(long *)(lVar1 + 0xd8))) {
+      ... "startMusic" ...
+    } else {
+      "startMusic disabled during download";
+    }
+
+**RETRACTED: the host probe's read=0x0 says nothing about the guest's state.**
+
+The host's own probe printed (guest-view.log, `phase=reaper-asset-singleton`):
+
+    asset-probe: REFUSING bias=0x4fa7c10000 slot=0x4fa9b7d5d0 read=0x0
+        expected=0x4fa9bd6e98 delta=0xffffffb056429168 -- coordinate system
+        unverified, no other value reported
+
+The format string is at `native-switch/source/pthread_bridge.cpp:5621`; the
+constant it checks itself against (`kAssetSlotAddend = 0x1FC6E98`) is at line
+5608.
+
+**read=0x0 is not evidence that the relocation was not applied, and this line
+must not be cited as one.** The probe read the slot at **0x4fa9b7d5d0**, and
+Eden's own log has the matching line:
+
+    [   8.061332] HW.Memory <Error> core/memory.cpp:624:operator():
+        Unmapped Read64 @ 0x0000004FA9B7D5D0
+
+Same address. The probe was reading through the **pre-rebase bias 0x4fa7c10000**
+at an address that was no longer mapped, so the read returned zero out of a
+fault, not out of the guest's data. The probe was right to refuse to report any
+other value ("coordinate system unverified, no other value reported") -- the
+`read=0x0` simply is not a statement about the guest.
+
+There is a second reason the line cannot answer the question anyway. The probe
+reads the **asset** singleton slot, whose addend is **0x1fc6e98**. The gate
+reads a different slot, the **engine global** at **0x1fb2688**, and it wants the
+*service pointer* at `CGlobal+0x10518`. Even a correct read of the asset slot
+would not answer the gate.
+
+**The gate, in this binary's own instructions.**
+
+Raw **0x12ad2e0**, which logs "startMusic disabled during download" (string at
+raw **0x3902ff**):
+
+    0x12ad2ec  adrp x8, #0x1f6d000
+    0x12ad2f0  ldr  x8, [x8, #0x5d8]     ; GOT slot 0x1f6d5d8
+    0x12ad2f4  ldr  x8, [x8]             ; the engine global (raw 0x1fb2688)
+    0x12ad2f8  cbz  x8, #0x12ad318       ; -> "disabled"
+    0x12ad2fc  mov  w9, #0x518
+    0x12ad300  movk w9, #1, lsl #16      ; w9 = 0x10518
+    0x12ad304  ldr  x8, [x8, x9]         ; the AssetDownloadService pointer
+    0x12ad308  cbz  x8, #0x12ad318       ; -> "disabled"
+    0x12ad30c  ldp  x8, x9, [x8, #0xd8]  ; queue begin, queue end
+    0x12ad310  cmp  x9, x8
+    0x12ad314  b.eq #0x12ad32c           ; equal (empty) -> music is allowed
+
+So the guest considers itself "downloading" **iff the download queue is
+non-empty**. (Static derivation -- the condition is proven from the bytes;
+whether the queue is in fact non-empty at runtime is the open question at the
+end of this section.)
+
+And the two words are NOT byte counters. `+0xd8`/`+0xe0` are the begin/end
+pointer pair of a libc++ `std::vector` whose elements are 0x18-byte
+`std::string`s: the push at 0xbe9f04 is `str x10,[x20,#0xe0]`, fed by
+`add x10, x8, #0x18`.
+
+**Where the queue comes from.**
+
+The queue is rebuilt by **0xbe64f4**, which has **exactly one caller: 0xbe5bc0**,
+inside the AssetDownloadService vtable slot **+0x18** -- `0xbe56a0`,
+"AssetDownloadService::OnAssetListsComplete" (string at raw 0x462190, referenced
+from 0xbe5908).
+
+CORRECTION to S22: the sibling 32-bit port's story -- "the queue holds the assets
+that are missing because `isPrimaryFilename()` early-returns 1" -- describes a
+**different subsystem**. In this arm64 guest the queue holds **asset-list FILE
+NAMES**, and the decision to queue one is "the local asset loader could not open
+that file". (Static.)
+
+0xbe64f4:
+
+- clears the vector -- **0xbe6680**, `str x20,[x19,#0xe0]`, i.e. end := begin;
+- calls the asset loader **0x12bf7b4**, whose failure message is
+  `Asset::LoadFileInPlace unable to load file: '%s'` (string at raw 0x418c2c) --
+  **a name only reaches the queue because the guest first failed to load it
+  locally**;
+- calls **0xbe86a4**, which enumerates the asset-list names;
+- pushes through **0xbe9fd8 -> 0xbe9e28**.
+
+The names enumerated by 0xbe86a4 are literals in .rodata. **37** distinct
+`asset_list_*.txt` strings exist in the binary, including `asset_list_base.txt`
+(0x446e78), `asset_list_gui_assets_core.txt` (0x4620fd), `asset_list_menu.txt`
+(0x42ed68), `asset_list_audio.txt` (0x40e047), `asset_list_vehicle_common.txt`
+(0x459d22) and the `asset_list_quest_*` family (prefix at 0x3963ec). S22 said
+"roughly thirty"; the measured number is 37.
+
+CORRECTION to S22's second path: 0xbe64f4 is **not** reached from 0xbedc14. A raw
+BL scan of the whole image finds exactly one caller, 0xbe5bc0. 0xbedc14 is a
+different function -- it makes a vtable call at +0x90 and then +0x1b8 on the
+Cloudcell-side object -- and does not touch the queue builder.
+
+The asset-list ENTRY format is `path \t md5 \t compressedSize \t uncompressedSize`,
+and the path is content-root relative with the exact on-card file name, e.g.
+
+    /0.dat
+    /gui_assets/2048x1536/agreement/sprites_0.rgb.pvr.z
+    /gui/processed/AchievementBar.gui
+    /audio/Vehicles/4cyl_01/4cyl_01_idle.wav
+
+**The service object.**
+
+Constructed by **0x14045e0** (inside CGlobal::system_InitialiseServices; its own
+log strings name source `system_share.cpp:663/664`), with `operator new(528)`
+(`mov w0,#0x210` -> `_Znwm`) and the constructor at **0xbe2294**. The pointer is
+stored at **CGlobal+0x10518** by the single instruction **0x140461c**.
+
+That last one needs the bias spelled out, because capstone prints the store as
+`str x20,[x21,#0x10]` and the immediate is not 0x10518:
+
+    0x14045f0  mov  w8, #0x508
+    0x14045f4  movk w8, #1, lsl #16        ; w8 = 0x10508
+    0x14045f8  mov  x19, x0               ; x19 = CGlobal
+    0x14045fc  add  x21, x0, x8           ; x21 = CGlobal + 0x10508
+    ...
+    0x140610   bl   #0xbe2294             ; the constructor
+    0x14061c   str  x20, [x21, #0x10]     ; => CGlobal + 0x10518
+
+A whole-image scan for a `+0x10518` immediate finds **zero** stores, because the
+offset is reached through the pre-biased register x21 and not through the
+instruction encoding.
+
+The function has **exactly one caller: 0x1404994**, inside **0x14048c8**.
+
+CORRECTION to the working note: 0x14048c8 does not "start a worker thread and
+join it before the service is created". The two are **alternative arms of the
+same gate**, and the thread is **detached, not joined**:
+
+    0x140494c  tbz  w8, #0, #0x14049a4   ; -> the thread arm
+    0x1404990  mov  x0, x19
+    0x1404994  bl   #0x14045e0            ; -> the service arm
+    ...
+    0x1404a38  bl   pthread_create
+    0x1404a44  bl   std::thread::detach() ; NOT a join
+    0x1404a4c  bl   std::thread::~thread()
+    0x1404a5c  mov  x1, x20               ; not a call
+
+(The PLT stubs were resolved through .rela.plt: 0x1e18070 = `pthread_create`,
+0x1e18080 = `std::__ndk1::thread::detach`, 0x1e18090 =
+`std::__ndk1::thread::~thread`, 0x1e17b40 = `_Znwm`.)
+
+**The AssetDownloadService vtable.**
+
+Itanium ABI, so the layout is [offset-to-top][typeinfo][vfn0...]. The primary
+vtable starts at raw **0x1e54540**: offset-to-top 0 at 0x1e54540, typeinfo
+0x1e54708 at 0x1e54548, first function pointer at 0x1e54550.
+
+**Every slot's FILE BYTES ARE ZERO.** The first 0xC0 bytes of the vtable region
+read back all zero; the truth is the addend in .rela.dyn (151,591 relocation
+entries). A vtable read from the file alone reports a null slot.
+
+Measured slot values, every one of them R_AARCH64_RELATIVE:
+
+| slot | vaddr | target | |
+|---|---|---|---|
+| +0x00 | 0x1e54540 | -- | offset-to-top, 0 |
+| +0x08 | 0x1e54548 | 0x1e54708 | typeinfo |
+| +0x10 | 0x1e54550 | 0xbee74c | complete destructor |
+| +0x18 | 0x1e54558 | 0xbee95c | deleting destructor |
+| +0x20 | 0x1e54560 | 0xbe25dc | logs "InitialisationBegin"/"InitialisationEnd" |
+| +0x28 | 0x1e54568 | 0xbe56a0 | "AssetDownloadService::OnAssetListsComplete" |
+| +0x30 | 0x1e54570 | 0xbe7ae8 | |
+| +0x38 | 0x1e54578 | 0xbe7d00 | |
+| +0x40 | 0x1e54580 | 0xbe7d50 | |
+| +0x48 | 0x1e54588 | 0xbec6d4 | 4-byte `b` thunk onto 0xbec6d8 |
+| +0x50 | 0x1e54590 | 0xbeb37c | |
+| +0xd0 | 0x1e54610 | 0xbec3b0 | last slot measured here |
+
+The typeinfo at 0x1e54708 is also all-zero in the file; through its relocations
+its name addend is 0x4c04c0, which is the Itanium-mangled type name
+**`20AssetDownloadService`**.
+
+The function at 0xbec6d8 is the texture-variant predicate: it copies the name
+into a `std::string` and calls **0x11d02cc** and **0x11d097c**, which
+strstr-compare the eight spellings `.ptc.pvr.z`, `.ptc.pvr`, `.atc.dds.z`,
+`.atc.dds`, `.dxt.dds.z`, `.dxt.dds`, `.rgb.pvr.z`, `.rgb.pvr` (all eight
+confirmed present in .rodata). It is the arm64 counterpart of the sibling port's
+`AssetDownloadService::SkipAssetImpl` -- but it is **not** the function the
+asset-list loader calls, so the sibling port's hook does not transfer directly.
+(Static.)
+
+**The asset-list loader asks an AGENT, and the agent is not the ADS.**
+
+**0x1cd3a54** is "CC: AssetManager::LoadAssetList()" -- string
+"CC: AssetManager::LoadAssetList() : Asset List not found - %s" at raw
+**0x49b03b**, source `Cloudcell/CloudcellApi/AssetManager.cpp`. It parses each
+line with the format string at raw **0x47af5f**, whose file bytes are
+
+    %511[^<TAB>]<TAB>%n%63[^<LF>]<LF>%n
+
+i.e. the C-source spelling `"%511[^\t]\t%n%63[^\n]\n%n"` -- name, md5, two
+sizes. The control characters are stored directly in .rodata, not as the
+two-character escapes.
+
+For EVERY entry it asks an agent whether to skip the entry:
+
+    0x1cd3fe4  ldr  x0, [x21, #0x18]     ; the agent pointer, out of the AssetListInfo
+    0x1cd4000  ldr  x8, [x0]            ; its vtable
+    0x1cd4004  add  x1, sp, #0x190       ; the asset name
+    0x1cd4008  ldr  x8, [x8, #0x10]      ; the agent's FIRST virtual
+    0x1cd400c  blr  x8
+    0x1cd4010  tbnz w0, #0, #0x1cd3ef0   ; true -> skip this entry entirely
+
+The agent at +0x18 is **not** the AssetDownloadService. The call loads the
+agent's vtable entry at **+0x10**; in the ADS's own table, +0x10 measured from
+the address point (0x1e54550) is **0xbe25dc**, the InitialisationBegin
+function, which takes no name and could not answer a skip question. So the agent
+is a different implementation of `cc::IAssetManagerAgent` (the RTTI name
+`IAssetManagerAgent` is in the binary at 0x4c04dd).
+
+Callers of 0x1cd3a54 include **0x1cd33b0** (CC_AssetManager::QueueAssetListDownload)
+and **0x1cd5770** (CC_AssetManager::StartListDownload) -- a raw BL scan finds
+**8** callers in total, so those two are the named ones, not the only ones.
+
+And the guest's own strings make the transfer problem explicit: `SkipAsset`,
+`isPrimaryFilename` and `AssetDownloadService::SkipAssetImpl` are **absent from
+the binary** (the image has no .symtab, and none of these names appears in any
+string table). The sibling port's recipe -- "hook the ADS's SkipAssetImpl and
+answer by file existence" -- has no direct counterpart to hook here.
+
+One nuance worth keeping: the sibling port's *vocabulary* is present even though
+its mechanism is not. The guest ships `AssetDownloadService::ShowNoWifiMessage`
+(raw 0x3b8d99), `AssetDownloadService::OnDownloadsError()` (0x3b8d3c) and
+`AssetDownloadService::ConsentToDownload` (0x3b03e1). The run's guest log
+contains **none** of them -- "AssetDownloadService" appears 0 times in the whole
+guest log. So the Wi-Fi-gate story is not what is happening here, but it is not
+excluded by naming either; it is excluded by the fact that the gate is a queue
+and not a byte counter.
+
+**What the runtime actually showed.**
+
+From the archived run `.build/eden-runs/20261020-002448-eden-prof4`:
+
+- The guest logged "startMusic disabled during download" **exactly twice**
+  (guest-log ordinals **20** and **770**). Ordinal 770 is the **last** guest-log
+  line of the whole run, so the game is still in the download state at the end.
+  The log tail reads `RESUME SYSTEM START` / `RESUME SYSTEM END` /
+  `onWindowFocusChanged: hasFocus true` / `startMusic disabled during download`.
+- The frame loop is alive (**frames=15720**, the last `gfx-stats` line) but the
+  renderer draws nothing: `draws=0/0 tex=0 prog=0`.
+- The guest never opened a file on the GUI volume. `rr3gui` appears **twice** in
+  the whole log and both hits are the same directory listing -- `map-app` +
+  `opendir-ok` on `rr3gui1:/files/.depot/gui_assets` -- and there is no `rr3gui:`
+  alias at all. The guest's own content-root probes are
+  `files/.depot/gui_assets/2048x1536/test` (path-req ordinal 2),
+  `files/.depot/gui_assets/960x640/test` (ordinal 3) and
+  `Tracks/Menu/processed/menu_transition.banim` (ordinal 4).
+- The **only** asset the guest failed to load by name is
+  `Tracks/common/detail/detailmap_road_surface_norm_b.pvr` -- one
+  `LoadReadOnlyMappedFile failed getting full path:` (ordinal 762) and one
+  `mtResourceCache: Failed to load resource file:` (ordinal 763), and no other
+  line of either kind in the run. It does not exist in any of the three shipped
+  data packages (DXT, ATC, ETC). **That is a data gap, not a defect, and it is
+  not the blocker.**
+- The texture format family is **not** a blocker. The guest walks a format list
+  per texture: the nine spellings it tried for that asset were `.dxt.dds.z`,
+  `.dxt.dds`, `.etc.dds.z`, `.etc.dds`, `.rgb.pvr.z`, `.rgb.pvr`, `.rgbm.pvr.z`,
+  `.rgbm.pvr`, `.pvr`, and the deployed DXT package satisfies the walk. The
+  guest's reported GPU identity is "Imagination Technologies / PowerVR Rogue
+  GE8320" (really a Mali-G31 MP2 under the PowerVR Rogue brand), and the
+  packages carry one family each, so the walk finds the file either way.
+
+**The vaddrs, so nobody has to re-derive them.**
+
+| what | raw vaddr | note |
+|---|---|---|
+| download-phase gate | 0x12ad2e0 | logs "startMusic disabled during download" |
+| that string | 0x3902ff | |
+| engine global (GOT 0x1f6d5d8) | 0x1fb2688 | = decomp `DAT_020b2688` (base 0x100000) |
+| AssetDownloadService pointer | CGlobal+0x10518 | stored at 0x140461c |
+| service construction | 0x14045e0 | ctor 0xbe2294, operator new(528) |
+| the gate's only caller | 0x1404994 | inside 0x14048c8 |
+| ADS primary vtable | 0x1e54540 | file bytes all zero |
+| ADS typeinfo | 0x1e54708 | -> `20AssetDownloadService` |
+| OnAssetListsComplete | 0xbe56a0 | vtable +0x18 |
+| queue rebuild | 0xbe64f4 | only caller 0xbe5bc0 |
+| vector clear | 0xbe6680 | end := begin |
+| asset-list name enumeration | 0xbe86a4 | 37 asset_list_*.txt literals |
+| queue push | 0xbe9fd8 -> 0xbe9e28 | store at 0xbe9f04, element 0x18 |
+| local asset loader | 0x12bf7b4 | "Asset::LoadFileInPlace unable to load file: '%s'" |
+| LoadAssetList | 0x1cd3a54 | agent query at 0x1cd3fe4 |
+| the agent query | 0x1cd3fe4..0x1cd4010 | agent's first virtual at +0x10 |
+| format string | 0x47af5f | `%511[^TAB]TAB%n%63[^LF]LF%n` |
+| "Asset List not found - %s" | 0x49b03b | |
+| texture-variant predicate | 0xbec6d8 | thunk at 0xbec6d4 |
+| strstr-compare helpers | 0x11d02cc, 0x11d097c | 8 texture spellings |
+
+**Still open.**
+
+Which of the three gate conditions fails at runtime -- the engine global being
+unreachable, the service never being created, or the queue being non-empty --
+and if the queue, exactly which asset-list file names it holds. The three
+conditions, in the order the gate tests them:
+
+1. `*GOT(0x1f6d5d8)` != 0 -- the engine global
+2. `engine_global + 0x10518` != 0 -- the service
+3. `service->0xd8 != service->0xe0` -- the queue is non-empty
+
+The next step is a runtime probe that reads the engine global, the service
+pointer, the queue's begin/end **and the queue entry strings**, plus a narrow
+log of the guest's `asset_list` path requests and the host's resolution outcome
+for each. The static chain above says which address to read; it cannot say what
+is there.
+
+**A method note.**
+
+The diagnosis that made the difference was to stop reading the previous port's
+32-bit analysis as authoritative and instead re-derive the mechanism from
+**this** binary's own strings -- the guest ships "AssetDownloadService::",
+"CC: AssetManager::LoadAssetList()", "Asset::LoadFileInPlace unable to load
+file" and full RTTI names -- and to read the **.rela.dyn addends** instead of
+the file bytes. Every vtable slot and the typeinfo are zero in the file; a
+reader who trusts the file bytes sees a null vtable and stops.
+
+Same general lesson as the earlier entries in this document: a plausible story
+inherited from another build is not a fact about this build. S22's mechanism was
+a good story, and it was about a different subsystem.
+
+**A tooling trap, recorded for the future.**
+
+This cost three sub-agents one round:
+
+- In capstone 5, for ARM64, `ins.op_count(0)` returns **0** -- always use
+  `len(ins.operands)`.
+- The `adrp` operand immediate is **already the absolute page**: the target is
+  `ins.operands[1].imm + lo12`, with no shift and no pc page. (`adrp x8,
+  #0x1f6d000` + `ldr x8,[x8,#0x5d8]` -> 0x1f6d5d8, and `ins.operands[1].imm` is
+  0x1f6d000.)
+- A BL's imm26 is the low 26 bits: `w & 0x03FFFFFF`, sign-extended.
+- In this ELF the vtable and GOT slot CONTENTS are zero in the file; the truth is
+  the .rela.dyn addend.
+- A whole-image linear capstone disassembly desynchronises on data and produces
+  **false negatives** -- a scan for `mov #0x518` returned 0 hits even though the
+  gate contains it. Use a raw BL/word scan over .text for caller sets, and
+  disassemble known regions for instruction details.

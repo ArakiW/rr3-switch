@@ -3202,6 +3202,387 @@ GuestViewProbe runGuestViewProbe(NWindow* window, const char* progressPath) {
 
 namespace {
 
+// ---------------------------------------------------------------------------
+// The download-phase gate, read directly.
+//
+// The guest decides "I am still downloading" at ELF 0x12ad2e0
+// (FDE [0x12ad2e0, 0x12ad3b0)). That function is the tail of the string
+// "startMusic disabled during download" (0x3902ff), which is the only
+// thing the guest says while it is stuck, so the gate it evaluates is the
+// thing that has to be open:
+//
+//   12ad2ec  adrp x8, #0x1f6d000
+//   12ad2f0  ldr  x8, [x8, #0x5d8]     x8 = *(0x1f6d5d8)  the GOT slot
+//   12ad2f4  ldr  x8, [x8]             x8 = *x8          ONE MORE LEVEL
+//   12ad2f8  cbz x8, #0x12ad318       null  -> "downloading"
+//   12ad2fc  mov  w9, #0x518
+//   12ad300  movk w9, #1, lsl #16      w9 = 0x10518
+//   12ad304  ldr  x8, [x8, x9]         x8 = x8[0x10518]   the service
+//   12ad308  cbz x8, #0x12ad318       null  -> "downloading"
+//   12ad30c  ldp  x8, x9, [x8, #0xd8]  begin/end of the queue
+//   12ad310  cmp  x9, x8
+//   12ad314  b.eq #0x12ad32c           equal -> the OK path
+//
+// TWO LEVELS, NOT ONE. The asset-singleton probe lower down in this file
+// used to read the field at dlEngine+0x10518 -- one level too high -- and
+// concluded "the field is null, so branch 2". The value the guest branches
+// on is *(*(0x1f6d5d8)), and that value had never been read by anything.
+//
+// The queue holds ASSET-LIST FILE NAMES ("asset_list_base.txt" and
+// friends), not asset files: it is the list of files the guest wanted and
+// could not find.
+//
+// The two vtable words are read as well, because they are the proof that
+// the relocations were applied. Both are R_AARCH64_RELATIVE in the file
+// (addends 0xbe25dc and 0xbec6d4), so at run time they must read
+// bias+0xbe25dc and bias+0xbec6d4. A bare addend means the image was
+// relocated wrong; a zero means the vtable was never built.
+constexpr uint64_t kDlGotSlotElfVa = 0x1F6D5D8ULL;
+constexpr uint64_t kDlEngineGlobalElfVa = 0x1FB2688ULL;
+constexpr uint64_t kDlServiceOffset = 0x10518ULL;
+constexpr uint64_t kDlQueueBeginOffset = 0xD8ULL;
+constexpr uint64_t kDlQueueEndOffset = 0xE0ULL;
+constexpr uint64_t kDlAdsSlot10ElfVa = 0x1E54560ULL;
+constexpr uint64_t kDlAdsSlot38ElfVa = 0x1E54588ULL;
+// A libc++ std::string is 24 bytes and the queue is a vector of them.
+constexpr uint64_t kDlStringBytes = 0x18ULL;
+constexpr size_t kDlQueueStringsShown = 8;
+constexpr size_t kDlNameLimit = 40;
+constexpr unsigned kDlMaxLines = 200;
+// A guest pointer worth dereferencing. Deliberately wide: the gate exists
+// to keep a wild value from turning a diagnostic into a segfault, not to
+// judge whether the value is "valid".
+constexpr uintptr_t kDlPlausibleLo = 0x10000ULL;
+constexpr uintptr_t kDlPlausibleHi = 0x0000800000000000ULL;
+
+// One 64-bit word out of guest memory, or "not readable".
+struct DlWord {
+    uint64_t value{};
+    bool readable{};
+};
+
+// A guest pointer that is safe to dereference.
+//
+// guestImageContains() is the loader's own answer for the image-relative
+// addresses (the GOT slot, the engine global, the two relocation words):
+// it is exact, and it is the only test here that can say "this is mapped".
+//
+// The pointer-chased addresses are NOT in the image, and the image test can
+// only ever answer "no" for them. The engine object is a heap allocation
+// (the last run measured eng=0x210d8c6040 while the guest image ended at
+// 0x21087417a99), the AssetDownloadService is a heap object too, and so is
+// the queue. For those, the test that actually keeps the process alive is
+// a plausibility gate on the pointer: non-zero, above the first page and
+// inside the 48-bit user address space. Every pointer that reaches here
+// was read out of memory the guest itself wrote, so it is a pointer the
+// guest believes in; the gate is here so that a wild value cannot turn a
+// diagnostic into a segfault.
+//
+// A refused read is reported as "unmapped" and NEVER as a value, so a
+// skipped read can never be mistaken for a reading.
+bool dlPointerPlausible(uintptr_t address) {
+    return address >= kDlPlausibleLo && address < kDlPlausibleHi;
+}
+
+DlWord readDlWord(uintptr_t address) {
+    DlWord out{};
+    if (address == 0) {
+        return out;
+    }
+    if (guestImageContains(address, sizeof(uint64_t))) {
+        out.value = *reinterpret_cast<const volatile uint64_t*>(address);
+        out.readable = true;
+        return out;
+    }
+    if (!dlPointerPlausible(address)) {
+        return out;
+    }
+    out.value = *reinterpret_cast<const volatile uint64_t*>(address);
+    out.readable = true;
+    return out;
+}
+
+bool readDlByte(uintptr_t address, uint8_t& out) {
+    if (address == 0) {
+        return false;
+    }
+    if (!guestImageContains(address, 1) && !dlPointerPlausible(address)) {
+        return false;
+    }
+    out = *reinterpret_cast<const volatile uint8_t*>(address);
+    return true;
+}
+
+// One libc++ std::string, decoded.
+//
+// The layout is the one this binary uses, confirmed by scanning the
+// initialised string objects in .data.rel.ro: three of them carry a tag
+// byte of 0x20, 0x20 and 0x2c for inline texts of 16, 16 and 22
+// characters, i.e. the tag holds `size << 1` for a SHORT (SSO) string. The
+// same three objects would read as 32, 32 and 44 characters under the
+// other convention, and none of them matches it, so the encoding here is
+// settled rather than assumed.
+//
+//   tag bit 0 set  -> heap: length at +0x08, character pointer at +0x10
+//   tag bit 0 clear-> short: characters at +1, length = tag >> 1
+//
+// The length is NOT trusted for the bounds: the copy stops at the NUL, which
+// the allocator guarantees is inside the buffer. That is what keeps a wrong
+// length from reading past the end of the string's own storage. The heap
+// branch additionally refuses a length outside (0, 4096] BEFORE it touches
+// the character pointer, so an object whose tag was misread as "heap" cannot
+// turn the inline text into a wild pointer.
+constexpr size_t kDlInlineMax = 23;
+constexpr unsigned long long kDlMaxStringLength = 4096;
+struct DlString {
+    bool ok{};
+    bool heap{};
+    unsigned size{};
+    char text[kDlNameLimit + 1]{};
+};
+
+DlString decodeDlString(uintptr_t object) {
+    DlString out{};
+    uint8_t tag = 0;
+    if (!readDlByte(object, tag)) {
+        return out;
+    }
+    out.ok = true;
+    out.heap = (tag & 1) != 0;
+    if (!out.heap) {
+        out.size = static_cast<unsigned>(tag >> 1);
+        const size_t limit = out.size < kDlInlineMax
+                                 ? out.size
+                                 : (kDlInlineMax < kDlNameLimit ? kDlInlineMax
+                                                              : kDlNameLimit);
+        for (size_t i = 0; i < limit; ++i) {
+            uint8_t c = 0;
+            if (!readDlByte(object + 1 + i, c)) {
+                out.ok = false;
+                break;
+            }
+            if (c == 0) {
+                break;
+            }
+            out.text[i] = static_cast<char>(c);
+        }
+        out.text[limit] = '\0';
+        return out;
+    }
+    const DlWord sizeWord = readDlWord(object + 0x08);
+    if (!sizeWord.readable || sizeWord.value == 0 ||
+        sizeWord.value > kDlMaxStringLength) {
+        // A length outside the range means the tag was misread, so the
+        // character pointer is NOT touched: reading it would be reading
+        // whatever the inline text happens to spell.
+        out.ok = false;
+        return out;
+    }
+    const DlWord dataWord = readDlWord(object + 0x10);
+    if (!dataWord.readable || dataWord.value == 0) {
+        out.ok = false;
+        return out;
+    }
+    out.size = static_cast<unsigned>(sizeWord.value);
+    const size_t limit = out.size < kDlNameLimit ? out.size : kDlNameLimit;
+    for (size_t i = 0; i < limit; ++i) {
+        uint8_t c = 0;
+        if (!readDlByte(static_cast<uintptr_t>(dataWord.value) + i, c)) {
+            out.ok = false;
+            break;
+        }
+        if (c == 0) {
+            break;
+        }
+        out.text[i] = static_cast<char>(c);
+    }
+    out.text[limit] = '\0';
+    return out;
+}
+
+// Formats a guest value. A pointer that lands inside the image is printed
+// relative to the bias ("rr3+0x...") so a relocated pointer and an
+// unrelocated one can never be confused; anything else is printed raw. A
+// value that could not be read is printed "unmapped" and never as a number.
+void formatDlValue(char* out, size_t capacity, uintptr_t bias, uintptr_t span,
+                   DlWord word) {
+    if (!word.readable) {
+        __builtin_snprintf(out, capacity, "unmapped");
+        return;
+    }
+    if (bias != 0 && span != 0 && word.value >= bias &&
+        (word.value - bias) < span) {
+        __builtin_snprintf(out, capacity, "rr3+0x%llx",
+                           static_cast<unsigned long long>(word.value - bias));
+        return;
+    }
+    __builtin_snprintf(out, capacity, "0x%llx",
+                       static_cast<unsigned long long>(word.value));
+}
+
+// The state the probe compares between samples.
+struct DlGateState {
+    uint64_t gotEng{};
+    uint64_t eng{};
+    uint64_t svc{};
+    uint64_t svcVptr{};
+    uint64_t qBeg{};
+    uint64_t qEnd{};
+    uint64_t qCount{};
+    uint64_t slot10{};
+    uint64_t slot38{};
+    uint32_t readable{};
+    char names[kDlQueueStringsShown][kDlNameLimit + 1]{};
+};
+
+bool dlGateStateEqual(const DlGateState& a, const DlGateState& b) {
+    if (a.gotEng != b.gotEng || a.eng != b.eng || a.svc != b.svc ||
+        a.svcVptr != b.svcVptr || a.qBeg != b.qBeg || a.qEnd != b.qEnd ||
+        a.qCount != b.qCount || a.slot10 != b.slot10 ||
+        a.slot38 != b.slot38 || a.readable != b.readable) {
+        return false;
+    }
+    for (size_t i = 0; i < kDlQueueStringsShown; ++i) {
+        if (std::strcmp(a.names[i], b.names[i]) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Polls the download-phase gate and logs it when it changes.
+//
+// CHANGE-TRIGGERED, with the FIRST sample always logged. A fixed schedule
+// would report "never" for a value that merely arrived after the last
+// sample, and "the probe never ran" has to be distinguishable from "every
+// value is zero" -- which is why the first line is emitted unconditionally
+// even when everything reads 0.
+//
+// Capped at kDlMaxLines lines for the whole run.
+void pollDownloadPhaseGate(uint64_t frames) {
+    static unsigned s_lines = 0;
+    static bool s_emitted = false;
+    static DlGateState s_last{};
+
+    if (s_lines >= kDlMaxLines) {
+        return;
+    }
+
+    const uintptr_t bias = static_cast<uintptr_t>(resolveMainImageLoadBias());
+    const uintptr_t span = static_cast<uintptr_t>(resolveMainImageSpanBytes());
+
+    DlGateState current{};
+    const DlWord got = readDlWord(bias + kDlGotSlotElfVa);
+    const DlWord engWord = readDlWord(bias + kDlEngineGlobalElfVa);
+    const uint64_t eng = engWord.readable ? engWord.value : 0;
+    const DlWord svcWord = readDlWord(
+        static_cast<uintptr_t>(eng + kDlServiceOffset));
+    const uint64_t svc = (eng != 0 && svcWord.readable) ? svcWord.value : 0;
+    const DlWord vptrWord = readDlWord(static_cast<uintptr_t>(svc));
+    const DlWord begWord = readDlWord(
+        static_cast<uintptr_t>(svc + kDlQueueBeginOffset));
+    const DlWord endWord = readDlWord(
+        static_cast<uintptr_t>(svc + kDlQueueEndOffset));
+    const DlWord slot10Word = readDlWord(bias + kDlAdsSlot10ElfVa);
+    const DlWord slot38Word = readDlWord(bias + kDlAdsSlot38ElfVa);
+
+    const uint64_t qBeg = (svc != 0 && begWord.readable) ? begWord.value : 0;
+    const uint64_t qEnd = (svc != 0 && endWord.readable) ? endWord.value : 0;
+    const uint64_t qCount =
+        (qBeg != 0 && qEnd != 0 && qEnd >= qBeg)
+            ? (qEnd - qBeg) / kDlStringBytes
+            : 0;
+
+    current.gotEng = got.readable ? got.value : 0;
+    current.eng = eng;
+    current.svc = svc;
+    current.svcVptr = vptrWord.readable ? vptrWord.value : 0;
+    current.qBeg = qBeg;
+    current.qEnd = qEnd;
+    current.qCount = qCount;
+    current.slot10 = slot10Word.readable ? slot10Word.value : 0;
+    current.slot38 = slot38Word.readable ? slot38Word.value : 0;
+    uint32_t flags = 0;
+    flags |= got.readable ? 1u : 0u;
+    flags |= engWord.readable ? 2u : 0u;
+    flags |= svcWord.readable ? 4u : 0u;
+    flags |= vptrWord.readable ? 8u : 0u;
+    flags |= begWord.readable ? 16u : 0u;
+    flags |= endWord.readable ? 32u : 0u;
+    flags |= slot10Word.readable ? 64u : 0u;
+    flags |= slot38Word.readable ? 128u : 0u;
+    current.readable = flags;
+
+    // The queue entries, up to eight of them.
+    for (uint64_t i = 0; i < qCount && i < kDlQueueStringsShown; ++i) {
+        const uintptr_t object =
+            static_cast<uintptr_t>(qBeg + i * kDlStringBytes);
+        const DlString decoded = decodeDlString(object);
+        if (!decoded.ok) {
+            std::snprintf(current.names[i], kDlNameLimit + 1, "<unreadable>");
+        } else {
+            std::snprintf(current.names[i], kDlNameLimit + 1, "%s", decoded.text);
+        }
+    }
+
+    if (s_emitted && dlGateStateEqual(current, s_last)) {
+        return;
+    }
+    s_emitted = true;
+    s_last = current;
+    ++s_lines;
+
+    char gotText[32];
+    char engText[32];
+    char svcText[32];
+    char vptrText[32];
+    char begText[32];
+    char endText[32];
+    char slot10Text[32];
+    char slot38Text[32];
+    formatDlValue(gotText, sizeof(gotText), bias, span, got);
+    formatDlValue(engText, sizeof(engText), bias, span, engWord);
+    formatDlValue(svcText, sizeof(svcText), bias, span, svcWord);
+    formatDlValue(vptrText, sizeof(vptrText), bias, span, vptrWord);
+    formatDlValue(begText, sizeof(begText), bias, span, begWord);
+    formatDlValue(endText, sizeof(endText), bias, span, endWord);
+    formatDlValue(slot10Text, sizeof(slot10Text), bias, span, slot10Word);
+    formatDlValue(slot38Text, sizeof(slot38Text), bias, span, slot38Word);
+
+    // The names, as q0="..." q1="..." ...
+    char namePart[kDlQueueStringsShown * (kDlNameLimit + 16)]{};
+    size_t nameUsed = 0;
+    const size_t shown =
+        (qCount > 0) ? static_cast<size_t>(qCount < kDlQueueStringsShown
+                                               ? qCount
+                                               : kDlQueueStringsShown)
+                      : 1;
+    for (size_t i = 0; i < shown; ++i) {
+        const char* text = (qCount > 0) ? current.names[i] : "-";
+        const int written = __builtin_snprintf(
+            namePart + nameUsed, sizeof(namePart) - nameUsed, " q%zu=\"%s\"", i,
+            text);
+        if (written < 0 ||
+            static_cast<size_t>(written) >= sizeof(namePart) - nameUsed) {
+            break;
+        }
+        nameUsed += static_cast<size_t>(written);
+    }
+
+    char line[1200];
+    __builtin_snprintf(
+        line, sizeof(line),
+        "dlgate: f=%llu bias=0x%llx gotEng=%s eng=%s svc=%s svcV=%s"
+        " qBeg=%s qEnd=%s qCount=%llu slot10=%s slot38=%s%s",
+        static_cast<unsigned long long>(frames),
+        static_cast<unsigned long long>(bias),
+        gotText, engText, svcText, vptrText, begText, endText,
+        static_cast<unsigned long long>(qCount), slot10Text, slot38Text,
+        namePart);
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        line, 77, 0);
+}
+
 // The frame loop, verbatim, on whichever thread the dispatch above chose.
 //
 // Two things are thread-dependent and are handled here rather than at the call
@@ -3528,6 +3909,14 @@ void* frameLoopDriver(void* opaque) {
             //
             appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                                 cc, 74, 0);
+        }
+        // The download-phase gate, read directly. Its own cadence, its own
+        // phase name, and it logs only when one of its values changed --
+        // otherwise a 65-sample run would write 65 identical lines and the
+        // line that matters (the queue going from empty to non-empty) would
+        // be indistinguishable from the noise around it.
+        if ((frames % 240) == 0) {
+            pollDownloadPhaseGate(frames);
         }
         padUpdate(&framePad);
         // --- wedge breadcrumbs -------------------------------------------

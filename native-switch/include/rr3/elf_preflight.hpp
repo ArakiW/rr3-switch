@@ -264,6 +264,18 @@ uintptr_t resolveMainImageExport(const char* name);
 // Runtime load bias of libRealRacing3.so (0 if the image is not loaded).
 // Guest VA = loadBias + ELF virtual address.
 uintptr_t resolveMainImageLoadBias();
+// True when [runtimeAddress, runtimeAddress + bytes) is inside the mapped
+// image of libRealRacing3.so.
+//
+// The guest image is mapped for the guest vaddr range
+// [minimumAddress, minimumAddress + image.size()); the address is converted
+// back to a guest vaddr by subtracting the image's load bias (the same one
+// resolveMainImageLoadBias() returns) and then tested against the PT_LOAD
+// program headers.
+//
+// Why it exists: a diagnostic that reads guest memory has to be able to say
+// "that address is not mapped" instead of faulting the process.
+bool guestImageContains(uintptr_t runtimeAddress, size_t bytes);
 
 // Real ELF span of the main guest image, in bytes:
 // maximumAddress - minimumAddress (NOT the 128 MiB kMaximumImageSize cap, and
