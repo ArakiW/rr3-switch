@@ -3134,18 +3134,312 @@ written.**
 
 #### What is still open (after S26)
 
-1. **The guest's real completion pointer.** `Constructor(JJ)V` delivered
-   `0x10826fbda0` / `0x10826fbd30` -- two addresses in the guest's
-   STACK region (`0x1082...`), not a code pointer, and not in any guest
-   image (the image biases are `0x2106b83000`, `0x2102b9f000`,
-   `0x2102e73000`, `0x2102ffd000`). The port's model of that method is
-   therefore still wrong: it assumes arg0 is a code pointer for `br x3`.
-   Until the real one is known, the login completion cannot be
-   delivered, so the refresh path is never entered, so
-   `GooglePlayManager+0x148` stays 0, so "Social Media not initialised"
-   keeps being logged and the sync queue never drains.
+1. ~~**The guest's real completion pointer.**~~ **CLOSED in S27** - see
+   below. The pointer is a guest CODE address, `0x1ce6e2c` plus the main
+   image's load bias, and the port was reading it out of the wrong place
+   entirely.
 2. **The accept() the async task is parked in** (unchanged from S25).
 3. The menu is still not reached: `draws=0/0` and `MainMenu=0` after
    15720 frames. The download gate's queue is still empty
    (`qCount=0` on 197 samples).
+
+## S27 - the login completion pointer, measured in the guest
+
+### The question S26 left open
+
+S26 ended with one open item that blocked everything downstream: the guest's
+`AndroidAccountManager` completion pointer. `Constructor(JJ)V` delivered
+`0x10826fbda0` / `0x10826fbd30` - two addresses in the guest's STACK region
+(`0x1082...`), and the guest's `LoginCompleteCallback` TAIL-BRANCHES to the
+first of them. A pointer that is not a guest code address is not merely
+useless: it is a branch into the stack.
+
+The port's model of the method was also wrong in a second, structural way,
+which S26 had not isolated: the two longs it logged were not the guest's two
+arguments at all.
+
+### 1. How the guest creates the account manager (MEASURED, guest disassembly)
+
+The guest resolves the method itself. The classpath string is at `.rodata`
+`0x3f42b6` and the two literals it pairs with it are `"Constructor"`
+(`0x49ae00`) and `"(JJ)V"` (`0x412599`):
+
+```
+$ python .build/rr3fast.py str "com/firemonkeys/cloudcellapi/AndroidAccountManager" "(JJ)V" "Constructor"
+  file=0x3f42b6 va=0x3f42b6 sec=.rodata :: 'com/firemonkeys/cloudcellapi/AndroidAccountManager'
+  file=0x412599 va=0x412599 sec=.rodata :: '(JJ)V'
+  file=0x415e80 va=0x415e80 sec=.rodata :: 'Constructor'
+  file=0x49ae00 va=0x49ae00 sec=.rodata :: 'Constructor'
+```
+
+Two guest functions reference all three (`xrefs`): `0x1ce6c88` and
+`0x1ce6e60`. `0x1ce6e60` is the class constructor - the guest's own factory
+(`0x1ce6c28`) news 0x98 bytes and calls it:
+
+```
+0x1ce6c68  mov  w0, #0x98
+0x1ce6c6c  bl   0x1e17b40        ; operator new
+0x1ce6c70  mov  x19, x0
+0x1ce6c74  bl   0x1ce6e60        ; the C++ constructor
+```
+
+and the constructor resolves and calls the Java method like this:
+
+```
+0x1ce6ed4  adrp x2, #0x3f4000
+0x1ce6edc  add  x2, x2, #0x2b6   ; -> 0x3f42b6 'com/firemonkeys/cloudcellapi/AndroidAccountManager'
+0x1ce6f20  adrp x2, #0x49a000
+0x1ce6f28  add  x2, x2, #0xe00   ; -> 0x49ae00 'Constructor'
+0x1ce6f24  adrp x3, #0x412000
+0x1ce6f2c  add  x3, x3, #0x599   ; -> 0x412599 '(JJ)V'
+0x1ce6f38  bl   0x1c68fcc        ; GetMethodID(cls, "Constructor", "(JJ)V")
+0x1ce6f3c  adrp x3, #0x1f7e000
+0x1ce6f40  ldr  x1, [x19, #0x80]      ; the receiver
+0x1ce6f44  ldr  x3, [x3, #0x278]      ; the FIRST long
+0x1ce6f48  mov  x2, x0               ; the method id
+0x1ce6f4c  mov  x0, x21              ; the JNIEnv
+0x1ce6f50  mov  x4, x19              ; the SECOND long
+0x1ce6f54  bl   0xba7af8             ; the call
+```
+
+**So the signature really is `(JJ)V`**, and the port's registration of it was
+right; the port was reading the two longs from the wrong place.
+
+### 2. Where the continuation pointer comes from (MEASURED)
+
+The first long is a relocated global, and the relocation is the answer:
+
+```
+$ python .build/rr3fast.py reloc 0x1f7e278
+### reloc for 0x1f7e278  sec=.got  file_word=0x0000000000000000
+  off=0x1f7e278 type=1027 sym=0 addend=0x1ce6e2c
+    -> R_AARCH64_RELATIVE target vaddr = 0x1ce6e2c sec=.text
+```
+
+`0x1ce6e2c` is a guest CODE address, and it is the guest's own
+`AndroidAccountManager::OnLoginComplete` - the function that asserts
+`'LoginCompleteCallback'` / `AndroidAccountManager.cpp:72` and then notifies
+the listener vector:
+
+```
+0x1ce6e2c  cbz x1, #0x1ce6e40
+0x1ce6e30  and w8, w0, #1        ; the boolean
+0x1ce6e34  mov x0, x1            ; the user handle
+0x1ce6e38  mov w1, w8
+0x1ce6e3c  b   #0x1ce71e4        ; -> the listener notify
+```
+
+The second long is `x19` - the guest's own C++ object pointer, i.e. the
+"user" handle the completion carries back.
+
+The guest's own trampoline, exported in `.dynsym` at exactly that address
+(`Java_com_firemonkeys_cloudcellapi_AndroidAccountManager_LoginCompleteCallback`,
+value `0x1ce7318`, size 16 - four instructions), closes the loop:
+
+```
+0x1ce7318  tst w2, #0xff     ; w2 = the boolean
+0x1ce731c  mov x1, x4        ; x1 = the user handle (the second long)
+0x1ce7320  cset w0, ne       ; w0 = (boolean != 0)
+0x1ce7324  br x3             ; TAIL-BRANCH to the first long
+```
+
+**⇒ The completion pointer is a guest code address, `0x1ce6e2c` + the main
+image's load bias, and the user handle is the guest's C++ object pointer.**
+
+### 3. What the port was doing wrong
+
+The port's slot-62 path (`JNIEnv::CallVoidMethodV`) treated the guest's
+fourth argument as a flat `jvalue[]` array. It is not: it is the guest's own
+`va_list`, built by the guest's single variadic helper `0xba7af8` (149 call
+sites use it):
+
+```
+0xba7b08  stp  x3, x4, [x29, #-0x78]   ; x3..x7 -> the GP register save area
+0xba7b0c  stp  x5, x6, [x29, #-0x68]
+0xba7b10  stur x7,   [x29, #-0x58]
+0xba7b14  stp  q0, q1, [sp]            ; q0..q7 -> the vector save area
+...
+0xba7b4c  stp  x9,  x8,  [x29, #-0x18]
+0xba7b50  stp  x12, x10, [x29, #-0x28]
+0xba7b5c  ldp  q0, q1, [x29, #-0x28]
+0xba7b68  stp  q0, q1, [x29, #-0x50]
+0xba7b60  sub  x3, x29, #0x50          ; the block IS the va_list
+0xba7b64  ldr  x8, [x8, #0x1f0]        ; JNI table slot 62 = CallVoidMethodV
+0xba7b6c  blr  x8
+```
+
+The block is 32 bytes: `[0]` the stack argument area, `[1]` the TOP of the
+general-purpose register save area, `[2]` the TOP of the vector save area,
+`[3]` packed offsets. The general-purpose arguments are one 8-byte slot each,
+at `[top-0x28]` (the first, `x3`), `[top-0x20]` (`x4`), `[top-0x18]`,
+`[top-0x10]`, `[top-0x08]`.
+
+**The port's own log proves it read the header, not the arguments.** In
+archive `20261020-234046-eden-loginfix` the port logged
+
+```
+phase=cc-http-void ... method=Constructor ... obj=0x80f455c0 args=0x10826fbd30
+phase=aam-ctor: obj=0x80f455c0 callback=0x10826fbda0 user=0x10826fbd30
+```
+
+`args` (the block's own address) is `0x10826fbd30`, and the value the port
+logged as `user` is **the same number**. The value it logged as `callback`
+is the block's word 0 - the stack-argument pointer. The two "longs" were the
+`va_list`'s own header words.
+
+There is a second, independent defect behind it: the port's
+`jniNewObjectV` **ignored the method id and the argument block entirely**, so
+a guest `NewObject(clazz, ctorId, ...)` could never store anything, and the
+port could not say which slot the guest had asked for.
+
+### 4. The fix
+
+Three bounded changes:
+
+1. `native-switch/source/jni_bridge.cpp` - `decodeGuestVarArgs()` unpacks
+   the guest's `va_list` into a `jvalue` array, using the guest's own JNI
+   signature for the layout (the signature comes from the guest's
+   `GetMethodID` record, not from the port's registration). The slot-62 path
+   now calls the array-form dispatcher with the unpacked array instead of
+   with the raw block. This also fixes every other Cloudcell method that
+   takes arguments through slot 62 - the `HttpRequest.init` callback was
+   read from `argv[7]`, which was the guest's stack.
+2. `native-switch/source/jni_bridge.cpp` - two capped instrumentation lines,
+   as asked for: `jni-newobject` (the class, the method id and the raw
+   argument block of every `NewObjectV` for this class) and `aam-varargs`
+   (the method, the signature, the argument count and the two decoded longs
+   of every slot-62 call for this class).
+3. `native-switch/source/jni_compat/classes/cc_services.cpp` - the pair is
+   ALSO kept at class level, and `aam_login` falls back to it. This is
+   needed because the two calls arrive on different port objects (measured:
+   `Constructor` on `0x80f455c0`, `login` on `0x80f436d0`), so the instance
+   that receives `login()` has no callback of its own. The delivery is
+   refused unless the callback is inside the guest image
+   (`rr3::guestImageContains`), so a bad value can never become a branch
+   into the stack.
+
+### 5. The gates
+
+| gate | result |
+|---|---|
+| `tools/Build-NativeSwitch.ps1` | exit 0 (stderr: only `find: 'romfs': No such file or directory`) |
+| `tools/Test-RR3Inputs.ps1` | exit 0 |
+| `native-switch/tests/test_*.py` (11) | 11 pass, 0 fail |
+| `tools/check-cc-symbols.py` | 35 resolved / 16 known-absent / 0 unexpected |
+
+### 6. The run: archive `20261021-004233-eden-cbfix`
+
+`tools/Test-OnEden.ps1 -Seconds 300 -Tag cbfix`, conf unchanged
+(`nogo=0 ccmode=bg ccloginok=1 ccsocialok=1 ccdisp=2 objid=1`).
+
+| | before (`20261020-234046-eden-loginfix`) | after (`20261021-004233-eden-cbfix`) |
+|---|---|---|
+| frames / calls | 15720 / 47165 | 15960 / 47885 |
+| last gfx-stats | `frames=15720 calls=47165 draws=0/0` | `frames=15960 calls=47885 draws=0/0` |
+| `MainMenu` | 0 | 0 |
+| "Unable to send Sync" | 7 | 7 |
+| guest log lines | 11412 | 11412 |
+| **"Cannot execute instruction"** | 0 | **0** |
+| **"ExceptionRaised"** | 0 | **0** |
+| **cloudcell-item lines** | **0** | **2 (enter + return)** |
+
+**The new instrumentation, from the archive:**
+
+```
+phase=jni-newobject ... class=com/firemonkeys/cloudcellapi/AndroidAccountManager
+                        method=<init> mid=0x81435ac8 block=0x1082efbd00
+                        w0=0x1082efbd70 w1=0x1082efbd00
+phase=aam-varargs ... method=Constructor sig=(JJ)V argc=2 block=0x1082efbd30
+                     cb=0x2109069e2c cb_rr3=yes user=0x21111c9e40
+phase=aam-ctor: obj=0x8185b5d0 callback=0x2109069e2c user=0x21111c9e40
+phase=aam-login: obj=0x818596e0 callback=0x2109069e2c user=0x21111c9e40 source=class
+phase=cloudcell_defer: n=1 total=1 depth=1 tag=aam.login
+phase=cloudcell-item: enter  id=1 tag=aam.login site=frame
+phase=cloudcell-item: return id=1 tag=aam.login
+```
+
+**The decode is confirmed by arithmetic, not by assumption.** The run's main
+image bias is `0x2107383000` (the `sampler-flush` line's `mainBias=`), and
+`cb - bias = 0x2109069e2c - 0x2107383000 = 0x1CE6E2C` -- exactly the
+`.rela.dyn` addend of `0x1f7e278` that the guest loads into `x3`. The
+`user` handle, `0x21111c9e40`, is a guest heap address, not a stack address:
+the old (wrong) values were `0x10826fbda0` / `0x10826fbd30`, and the new
+run's raw block words are `0x1082efbd70` / `0x1082efbd00` -- the same shape
+of stack pointers the port used to hand back as "the callback" and "the
+user".
+
+**⇒ The login completion now reaches the guest, for the first time.** The
+deferred item ENTERED and RETURNED (the previous archive has zero
+`cloudcell-item` lines), the guest's trampoline at `0x1ce7318` executed and
+tail-branched to the guest's own `0x1ce6e2c`, and the guest's frame thread
+is still alive: 15960 frames, no "Cannot execute instruction", no
+"ExceptionRaised".
+
+**But the guest's state did not change.** The guest's own log is the same
+991 `guest-log-any` lines with the same "Sub Sync Queued" counter progression
+(2, 11, 13 x6, 20, 80, 10712, 10738, 10765, 10790, 10795) as the previous
+archive, and the menu is still not reached (`MainMenu` 0, `draws=0/0`).
+
+### 7. The next blocker: the Cloudcell device id is empty
+
+The guest asks for its EA device id and the port answers with an **empty
+string**:
+
+```
+native-switch/source/jni_bridge.cpp:1813
+    if (rawEquals(name, "GetEADeviceId")) return "";
+```
+
+and the guest's own log says so, with the brackets empty:
+
+```
+phase=guest-log-any ordinal=779 ... NimbleManager::GetEADeviceId []
+phase=guest-log-any ordinal=974 ... CC: Invalid DeviceId! Have we connected to cloudcell yet?
+phase=guest-log-any ordinal=980 ... CC: Unable to send Sync, Social Media not initialised.
+```
+
+That is the loop that is still running: with no device id the Cloudcell
+state machine never initialises, so the guest keeps re-queueing the sync
+("Sub Sync Queued: 13") and keeps refusing to send it ("Social Media not
+initialised"), and the download gate's queue stays empty.
+
+The port already has a non-empty identifier to hand out -- `getDeviceUID`
+answers `"switch-rr3-native"` (`jni_bridge.cpp:1751`) -- so the next step
+is to answer `GetEADeviceId` with the same kind of stable, non-empty string
+instead of `""`, and then re-measure whether the social-media byte
+(`GooglePlayManager+0x148`) gets written.
+
+Two other observations from the same run, for whoever takes the next step:
+
+* The guest resolves `IsInitialPhaseComplete` (it is in Eden's JNI trace),
+  and the port registers it - on `GooglePlusWorker`
+  (`cc_services.cpp:733`) - but the guest never calls anything on
+  `GooglePlusWorker` in this run (0 log lines in both archives). So the
+  refresh path that writes the availability byte is not reached through the
+  GooglePlus worker; the byte must come from the GooglePlay provider's
+  own path.
+* `GooglePlayWorker.GetSessionValid` and
+  `FacebookWorker.GetSessionValid` ARE dispatched and answer 1
+  (`ccsocialok=1`). The guest's "not initialised" verdict is an AND over
+  fourteen providers, so one provider still saying "no" is enough to keep
+  the complaint.
+
+### What is still open (after S27)
+
+1. **The device id.** `GetEADeviceId` answers `""`, so the guest's Cloudcell
+   state machine never initialises. This is now the first blocker, and it is
+   a one-line answer to change.
+2. The menu is still not reached: `draws=0/0` and `MainMenu=0` after 15960
+   frames. The download gate's queue is still empty (`qCount=0` on 197
+   samples).
+3. **The accept() the async task is parked in** (unchanged from S25).
+4. The two port objects for the one guest account manager are still two
+   objects (`Constructor` on `0x8185b5d0`, `login` on `0x818596e0`), so the
+   class-level fallback in `aam_login` is load-bearing, not cosmetic. The
+   `jni-newobject` line shows the guest creating the account manager with
+   `NewObjectV(cls, "<init>")`; the guest then calls the Java `Constructor`
+   method on a DIFFERENT object. Why the guest holds two handles for one
+   manager is still unexplained.
+
+
 

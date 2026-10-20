@@ -54,7 +54,27 @@ public:
 
     jlong login_cb = 0;   /* Constructor(long j, long j2): j  */
     jlong user_ptr = 0;   /*                               j2 */
+
+    /* The guest creates exactly ONE account manager (guest 0x1ce6c28 news
+     * 0x98 bytes and constructs it), but the port's two handles for it are
+     * not the same object: the "Constructor" call arrives on one port object
+     * and the "login" call on another.
+     *
+     * MEASURED 2026-10-20, Eden archive 20261020-234046-eden-loginfix:
+     *     cc-dispatch ... method=Constructor -> MATCH obj=0x80f455c0
+     *     cc-dispatch ... method=login        -> MATCH obj=0x80f436d0
+     * so the instance that receives login() has no callback of its own and
+     * the completion could never be delivered.
+     *
+     * The pair is therefore ALSO kept at class level, and login() falls back
+     * to it. Both stores are logged with their source, so a run says which
+     * one answered instead of leaving it to be guessed. */
+    static jlong s_login_cb;
+    static jlong s_user_ptr;
 };
+
+jlong CCAccountManager::s_login_cb = 0;
+jlong CCAccountManager::s_user_ptr = 0;
 
 /* Java: public static native void LoginCompleteCallback(boolean, long, long) */
 using AamLoginCompleteFn = void (*)(JNIEnv *, jclass, unsigned char, jlong, jlong);
@@ -66,6 +86,11 @@ static void aam_constructor(JNIEnv *, jobject self, jlong login_cb, jlong user)
     CCAccountManager *am = (CCAccountManager *)self;
     am->login_cb = login_cb;
     am->user_ptr = user;
+    /* The class-level copy is what makes the completion reachable: the guest's
+     * "login" call arrives on a different port object than the one this
+     * constructor ran on (see CCAccountManager above). */
+    CCAccountManager::s_login_cb = login_cb;
+    CCAccountManager::s_user_ptr = user;
     /* This callback pointer is the one number the class cannot do without: the
      * guest's LoginCompleteCallback tail-branches to it (guest 0x1ce7318,
      * `br x3`), so a zero here is a branch to address 0. Logged so that a run
@@ -112,12 +137,24 @@ static void aam_login(JNIEnv *env, jobject self)
 {
     CCAccountManager *am = (CCAccountManager *)self;
     jlong cb = am->login_cb, user = am->user_ptr;
+    /* Where the pair came from. The instance's own copy is the normal answer;
+     * the class-level copy is the fallback for the case MEASURED on
+     * 2026-10-20 (archive 20261020-234046-eden-loginfix), where the
+     * "Constructor" call and the "login" call arrive on different port
+     * objects (0x80f455c0 vs 0x80f436d0) and the instance that receives
+     * login() has no callback of its own. */
+    const char* source = "instance";
+    if (cb == 0 && CCAccountManager::s_login_cb != 0) {
+        cb = CCAccountManager::s_login_cb;
+        user = CCAccountManager::s_user_ptr;
+        source = "class";
+    }
 
-    trace("aam-login: obj=%p callback=0x%llx user=0x%llx", (void *)self,
-          (unsigned long long)cb, (unsigned long long)user);
+    trace("aam-login: obj=%p callback=0x%llx user=0x%llx source=%s", (void *)self,
+          (unsigned long long)cb, (unsigned long long)user, source);
 
     if (cb == 0) {
-        /* No completion target on this instance.
+        /* No completion target anywhere.
          *
          * The guest's LoginCompleteCallback is a four-instruction trampoline
          * (guest 0x1ce7318): `tst w2,#0xff ; mov x1,x4 ; cset w0,ne ; br x3`.
@@ -141,12 +178,34 @@ static void aam_login(JNIEnv *env, jobject self)
         return;
     }
 
+    /* The callback is a guest CODE address: the guest's LoginCompleteCallback
+     * trampoline (guest 0x1ce7318) TAIL-BRANCHES to it, so the value has to
+     * be somewhere the guest can execute. guestImageContains() answers
+     * exactly that - "is this runtime address inside the mapped main image" -
+     * so a value that is not (a stack address, a null, a host pointer) is
+     * refused here instead of becoming a branch into nowhere.
+     *
+     * MEASURED 2026-10-20, archive 20261020-234046-eden-loginfix: before the
+     * argument block was unpacked correctly the port read the block's own
+     * header words and would have called the callback 0x10826fbda0, which is
+     * the guest's stack. */
+    if (!rr3::guestImageContains(static_cast<uintptr_t>(cb), 4)) {
+        trace("aam-login: callback 0x%llx is not inside the guest image; not "
+              "delivering a login completion (the guest would branch to a "
+              "non-executable address)",
+              (unsigned long long)cb);
+        return;
+    }
+
     cloudcell_defer("aam.login", [env, self, cb, user]() {
         static AamLoginCompleteFn fn = cloudcell_native<AamLoginCompleteFn>(
             "Java_com_firemonkeys_cloudcellapi_AndroidAccountManager_LoginCompleteCallback");
         if (fn)
             fn(env, (jclass)&CCAccountManager::clazz,
                rr3::gfxCloudcellLoginOk() ? JNI_TRUE : JNI_FALSE, cb, user);
+        else
+            trace("aam-login: the guest's LoginCompleteCallback export did not "
+                  "resolve; the completion was not delivered");
     });
 }
 

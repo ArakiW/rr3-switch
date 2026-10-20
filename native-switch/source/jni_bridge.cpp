@@ -1810,7 +1810,23 @@ const char* platformStringForMethod(const char* name) {
     // Offline: no EA Tracking/Synergy component. Returning a non-null fake
     // made Java call methods on a sentinel and stall cloudcell init.
     if (rawEquals(name, "getComponent")) return nullptr;
-    if (rawEquals(name, "GetEADeviceId")) return "";
+    // GetEADeviceId, 2026-10-21.
+    //
+    // It answered "" and the guest logged
+    //     NimbleManager::GetEADeviceId []
+    //     CC: Invalid DeviceId! Have we connected to cloudcell yet?
+    // An empty device id is the guest's definition of "never connected to
+    // Cloudcell": the account manager's device-id field stays unset, the
+    // environment never becomes available, and the social-media availability
+    // byte at GooglePlayManager+0x148 is never written - which is what keeps
+    // the sync queue at 10765/10712 and the main menu unreachable.
+    //
+    // The value is opaque to the guest, so a stable non-empty string is enough.
+    // It must be non-NULL and non-empty: a NULL return would make the guest
+    // call methods on a sentinel, which is the failure mode the getComponent
+    // line above documents. It must ALSO not look like a Java object - a plain
+    // string, like every other value this function returns.
+    if (rawEquals(name, "GetEADeviceId")) return "rr3-switch-device-000000000001";
     if (rawEquals(name, "GetSynergyId")) return "";
     return "";
 }
@@ -2092,8 +2108,55 @@ uintptr_t jniGetStringUTFChars(uintptr_t /*env*/, uintptr_t string,
     return reinterpret_cast<uintptr_t>(jniStringValue(string));
 }
 
+// True when the class handle is the guest's AndroidAccountManager. The guest
+// spells the classpath "com/firemonkeys/cloudcellapi/AndroidAccountManager"
+// (guest .rodata 0x3f42b6), so the leaf is enough.
+static bool isAndroidAccountManagerClass(uintptr_t clazz) {
+    const char* name = className(clazz);
+    if (name == nullptr) {
+        return false;
+    }
+    const char kLeaf[] = "AndroidAccountManager";
+    for (const char* p = name; *p != '\0'; ++p) {
+        const char* q = p;
+        const char* k = kLeaf;
+        while (*k != '\0' && *q != '\0' && *k == *q) {
+            ++k;
+            ++q;
+        }
+        if (*k == '\0') {
+            return true;
+        }
+    }
+    return false;
+}
+
 uintptr_t jniNewObjectV(uintptr_t /*env*/, uintptr_t clazz,
-                        uintptr_t /*methodId*/, void* /*args*/) {
+                        uintptr_t methodId, void* args) {
+    // MEASURED 2026-10-21: this path used to ignore the method id and the
+    // argument block entirely, so a guest NewObject(clazz, ctorId, ...) could
+    // never store anything, and a run could not say which slot the guest had
+    // asked for. One capped line for the class that matters.
+    if (isAndroidAccountManagerClass(clazz)) {
+        static unsigned s_aamNewObjectLines = 0;
+        if (s_aamNewObjectLines < 8) {
+            ++s_aamNewObjectLines;
+            const char* mname = jniMethodName(methodId);
+            const uint64_t* raw = static_cast<const uint64_t*>(args);
+            char details[256];
+            __builtin_snprintf(details, sizeof(details),
+                               "class=%s method=%s mid=0x%llx block=%p w0=0x%llx "
+                               "w1=0x%llx",
+                               className(clazz) != nullptr ? className(clazz) : "?",
+                               mname != nullptr ? mname : "(null)",
+                               (unsigned long long)methodId, args,
+                               raw != nullptr ? (unsigned long long)raw[0] : 0ull,
+                               raw != nullptr ? (unsigned long long)raw[1] : 0ull);
+            guestViewWideLog("jni-newobject", (unsigned long long)methodId,
+                             (unsigned long long)clazz, details);
+        }
+    }
+
     // The one class the guest constructs and then calls instance methods on.
     // Everything else keeps the shared sentinel unless objid=1.
     const uintptr_t fontClass = fontClassHandle();
@@ -3590,6 +3653,137 @@ const ManagedMethod* managedMethodByNameAlone(const char* name,
     return nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// The guest's JNI variadic argument block
+// ---------------------------------------------------------------------------
+//
+// MEASURED 2026-10-21 from the guest's own disassembly
+// (reverse/native/arm64/libRealRacing3.so).
+//
+// The guest never calls JNIEnv::CallVoidMethod with loose arguments. It has
+// exactly one variadic helper, guest 0xba7af8, and 149 call sites use it:
+//
+//     stp  x3, x4, [x29, #-0x78]   ; x3..x7 -> the GP register save area
+//     stp  x5, x6, [x29, #-0x68]
+//     stur x7,   [x29, #-0x58]
+//     stp  q0, q1, [sp]            ; q0..q7 -> the vector save area
+//     ...
+//     stp  x12, x10, [x29, #-0x28] ; the 32-byte block
+//     stp  x9,  x8,  [x29, #-0x18]
+//     ldp  q0, q1, [x29, #-0x28]
+//     stp  q0, q1, [x29, #-0x50]
+//     sub  x3, x29, #0x50          ; the block IS the va_list
+//     ldr  x8, [x8, #0x1f0]        ; JNI table slot 62 = CallVoidMethodV
+//     blr  x8
+//
+// So the fourth argument the port receives for slot 62 is NOT a jvalue array.
+// It is the guest's own va_list:
+//
+//     [0]  the caller's outgoing stack argument area
+//     [1]  the TOP of the general-purpose register save area
+//     [2]  the TOP of the vector register save area
+//     [3]  packed offsets
+//
+// The general-purpose arguments are one 8-byte slot each, at [top-0x28] (the
+// first, x3), [top-0x20] (x4), [top-0x18], [top-0x10] and [top-0x08]; the
+// vector arguments are 16-byte slots ending at the vector top.
+//
+// WHAT THIS COST (measured, Eden archive 20261020-234046-eden-loginfix): the
+// port read the block as a flat jvalue array, so for the guest's
+// "Constructor(long,long)" call it took the block's own words as the two
+// longs: callback=0x10826fbda0 (the stack-area pointer) and
+// user=0x10826fbd30 (the save-area top, which is the block's own address).
+// Both are stack addresses. The real values are the guest's continuation code
+// address and the C++ object pointer.
+//
+// The guest's own numbers for that call, for comparison (same archive): the
+// guest resolves GetMethodID(cls, "Constructor", "(JJ)V") on
+// com/firemonkeys/cloudcellapi/AndroidAccountManager at guest 0x1ce6c88 and
+// 0x1ce6e60, and passes the first long from the relocated global 0x1f7e278,
+// whose .rela.dyn addend is 0x1ce6e2c - a guest CODE address, the
+// continuation the guest's own LoginCompleteCallback trampoline at 0x1ce7318
+// tail-branches to.
+static constexpr size_t kMaxGuestVarArgs = 16;
+
+// Unpacks the guest's variadic block into a jvalue array, using the guest's
+// own JNI signature for the layout. Returns how many arguments were written.
+static size_t decodeGuestVarArgs(const void* block, const char* signature,
+                                 jvalue* out, size_t maxOut) {
+    if (block == nullptr || signature == nullptr || out == nullptr) {
+        return 0;
+    }
+    const uint64_t* words = static_cast<const uint64_t*>(block);
+    const uintptr_t stackArea = static_cast<uintptr_t>(words[0]);
+    const uintptr_t gpTop = static_cast<uintptr_t>(words[1]);
+    const uintptr_t fpTop = static_cast<uintptr_t>(words[2]);
+
+    const char* open = nullptr;
+    for (const char* p = signature; *p != '\0'; ++p) {
+        if (*p == '(') {
+            open = p + 1;
+            break;
+        }
+    }
+    if (open == nullptr) {
+        return 0;
+    }
+
+    size_t gpIndex = 0;    // which general-purpose slot this argument uses
+    size_t fpIndex = 0;    // which vector slot
+    size_t stackIndex = 0; // overflow arguments already taken from the stack
+    size_t written = 0;
+
+    for (const char* p = open; *p != '\0' && *p != ')';) {
+        char type = *p++;
+        if (type == '[') {
+            while (*p == '[') {
+                ++p;
+            }
+            if (*p == 'L') {
+                while (*p != '\0' && *p != ';') {
+                    ++p;
+                }
+                if (*p == ';') {
+                    ++p;
+                }
+            }
+            type = 'L';
+        } else if (type == 'L') {
+            while (*p != '\0' && *p != ';') {
+                ++p;
+            }
+            if (*p == ';') {
+                ++p;
+            }
+        }
+        if (written >= maxOut) {
+            break;
+        }
+
+        uint64_t raw = 0;
+        if (type == 'F' || type == 'D') {
+            if (fpIndex < 8 && fpTop != 0) {
+                raw = *reinterpret_cast<const uint64_t*>(fpTop - 0x80 + 16 * fpIndex);
+            } else if (stackArea != 0) {
+                raw = *reinterpret_cast<const uint64_t*>(stackArea + 8 * stackIndex);
+                ++stackIndex;
+            }
+            ++fpIndex;
+        } else {
+            if (gpIndex < 5 && gpTop != 0) {
+                raw = *reinterpret_cast<const uint64_t*>(gpTop - 0x28 + 8 * gpIndex);
+            } else if (stackArea != 0) {
+                raw = *reinterpret_cast<const uint64_t*>(stackArea + 8 * stackIndex);
+                ++stackIndex;
+            }
+            ++gpIndex;
+        }
+        out[written].l = reinterpret_cast<jobject>(static_cast<uintptr_t>(raw));
+        ++written;
+    }
+    return written;
+}
+
 void jniCallVoidMethodV(uintptr_t env, uintptr_t object,
                        uintptr_t methodId, void* args) {
     // `env` is the JNIEnv the guest passed.
@@ -3789,15 +3983,65 @@ void jniCallVoidMethodV(uintptr_t env, uintptr_t object,
                                      static_cast<unsigned long long>(methodId),
                                      static_cast<unsigned long long>(object), why);
                 } else if (rawEquals(t_jniVoidEntry, "62") && args != nullptr) {
-                    // Slot 62 hands over an array of 8-byte slots, which is
-                    // exactly the jvalue array the array-form dispatcher reads.
-                    // This is the form that matches; passing the array to the
-                    // va_list-form dispatcher would read one word too few.
+                    // Slot 62 is JNIEnv::CallVoidMethodV, whose fourth argument
+                    // is a va_list - NOT a jvalue array. The guest builds that
+                    // va_list in its own variadic helper (guest 0xba7af8), and
+                    // the layout is fixed by that helper's disassembly; see
+                    // decodeGuestVarArgs above for the whole story.
+                    //
+                    // The array-form dispatcher reads its arguments from a
+                    // jvalue array, so the block has to be unpacked first.
+                    // Reading the block raw (the old behaviour) handed the
+                    // dispatcher the block's own header words, which is why
+                    // the guest's "Constructor(long,long)" arrived with two
+                    // stack addresses instead of the callback and the user
+                    // handle.
+                    const JniMethodRecord* rec = findJniMethod(methodId);
+                    const char* sig = rec != nullptr && rec->signature[0] != '\0'
+                                          ? rec->signature
+                                          : method->signature;
+                    jvalue argv[kMaxGuestVarArgs];
+                    __builtin_memset(argv, 0, sizeof(argv));
+                    const size_t argc =
+                        decodeGuestVarArgs(args, sig, argv, kMaxGuestVarArgs);
+
+                    // One capped line for the class that matters, so a run can
+                    // say what the guest actually passed instead of leaving it
+                    // to be re-derived.
+                    if (isAndroidAccountManagerClass(rec != nullptr ? rec->clazz : 0)) {
+                        static unsigned s_aamArgLines = 0;
+                        if (s_aamArgLines < 8) {
+                            ++s_aamArgLines;
+                            const uintptr_t bias = resolveMainImageLoadBias();
+                            const uint64_t cb =
+                                argc >= 1
+                                    ? static_cast<uint64_t>(
+                                          reinterpret_cast<uintptr_t>(argv[0].l))
+                                    : 0;
+                            const uint64_t user =
+                                argc >= 2
+                                    ? static_cast<uint64_t>(
+                                          reinterpret_cast<uintptr_t>(argv[1].l))
+                                    : 0;
+                            char details[256];
+                            __builtin_snprintf(
+                                details, sizeof(details),
+                                "method=%s sig=%s argc=%u block=%p cb=0x%llx cb_rr3=%s "
+                                "user=0x%llx",
+                                name, sig != nullptr ? sig : "(null)",
+                                (unsigned)argc, args, (unsigned long long)cb,
+                                cb > bias ? "yes" : "no", (unsigned long long)user);
+                            guestViewWideLog("aam-varargs",
+                                             (unsigned long long)methodId,
+                                             (unsigned long long)object, details);
+                        }
+                    }
+
                     using Fn = void (*)(JNIEnv*, jobject, jvalue*);
                     reinterpret_cast<Fn>(method->addr_array)(
                         reinterpret_cast<JNIEnv*>(env),
                         reinterpret_cast<jobject>(object),
-                        static_cast<jvalue*>(args));
+                        argv);
                 } else {
                     // Slot 61's args really are a va_list*, so the variadic
                     // form is correct there. Deliberately NOT indexed.
