@@ -2548,3 +2548,443 @@ nogo=1-era fact that nogo=0 has already overtaken. Both were visible only by
 reading the probe's own call site and the S18-era archive side by side with
 today's.
 
+
+
+### S25 -- the probe becomes a time series, and the condvar's owner is named
+
+Date: 2026-10-20. Archive 20261020-195848-eden-probe2 (tag `probe2`, 300 s).
+Baseline: 20261020-171259-eden-loopboth (S24).
+
+S24 left two things open. This entry closes the first, names the second,
+and corrects one premise from the brief it was given.
+
+#### 1. The dlgate probe moved off the frame loop
+
+**The defect, exactly.** `pollDownloadPhaseGate()` was called from exactly
+one place -- the render frame loop, under `if ((frames % 240) == 0)`. The
+frame loop dies at frame 2 in the collapsed run, so the probe sampled
+EXACTLY ONCE per run, at `f=0`. One reading cannot distinguish "the
+AssetDownloadService was never created" from "the probe stopped sampling
+before the service was created". That is why S24's `svc=0x0` was a
+frame-0 reading and not a verdict.
+
+**Where it went.** The probe now runs on the HOST sampler thread,
+`samplerWorker()` in `native-switch/source/guest_view_probe.cpp` -- a raw
+libnx `threadCreate` thread at priority `kDiagnosticThreadPriority`
+(0x3B), which ticks every 75 ms (`kSamplerIntervalNs`).
+
+That thread is the right carrier for a measured reason, not a stylistic
+one: it is a raw host thread, NOT a thread created through the guest
+pthread bridge, and a guest-bridge thread never gets scheduled out of
+`svcSleepThread` on Eden (the same fact the file already records at
+guest_view_probe.cpp:842-848). It is PROVEN to survive the collapse --
+the probe2 archive has 92 `phase=sampler-flush` lines and the last one is
+at the very END of the 300 s run whose frame loop stopped at frame 2.
+
+The root-pc-sampler thread in `pthread_bridge.cpp` would be the other
+candidate, but its body is in a file this change does not own and there
+is no seam into it from here.
+
+**The cadence.** Two triggers, and both are needed:
+
+1. a STATE CHANGE -- reported on the very next tick (<=75 ms), so a
+   change is never hidden behind the heartbeat;
+2. a **1 s HEARTBEAT** (`kDlHeartbeatMs = 1000`), so the log is a time
+   series even when nothing changes.
+
+Trigger 2 is what makes the probe answer the question it exists to
+answer. A series of `svc=0x0` readings across the whole run is a
+statement about the whole run; one reading is a statement about one
+instant. Without the heartbeat the probe would print one line and be
+indistinguishable from the frame-0 sample it replaced. The heartbeat is
+measured on the wall clock (`armGetSystemTick`), not on a tick count, so
+a starved carrier produces a LONGER gap rather than a burst of
+catch-up samples.
+
+**The line format is unchanged** (`phase=dlgate: f=... bias=... gotEng=...
+eng=... svc=... svcV=... qBeg=... qEnd=... qCount=... slot10=... slot38=...
+q0="..."`), and so is the per-line cap (`kDlMaxLines = 200`). One field's
+MEANING changed: `f=` is now the emitted-line index (0-based) rather
+than the render frame counter, because a frame counter does not exist
+off the frame loop. Consecutive lines are consecutive samples.
+
+**What the run measured.** 20261020-195848-eden-probe2, and
+reproduced in 20261020-201647-eden-probe2c (a third run, 300 s, same
+result):
+
+    phase=dlgate lines: 200   (the cap; the series is longer)
+    f=0   bias=0x210714f000 gotEng=rr3+0x1fb2688 eng=0x210e2d4260 svc=0x0
+          svcV=unmapped qBeg=unmapped qEnd=unmapped qCount=0
+          slot10=rr3+0xbe25dc slot38=rr3+0xbec6d4 q0="-"
+    f=199 (same values)
+    distinct svc values across all 200 lines: 1   -> 0x0
+    distinct qCount values across all 200 lines: 1 -> 0
+    first dlgate at log line 7701, last at 12944 (the file is 13494 lines)
+    bracketed by census-sweep ordinal=3 (elapsed_ms=12066) and
+                     census-sweep ordinal=56 (elapsed_ms=224528)
+
+So the series spans roughly **212 s of the 300 s run at ~0.94 Hz**, and
+the cap (200 lines) is what stopped it, not the run. Every one of the
+200 readings says `svc=0x0`, `qCount=0`, `svcV=unmapped`, with the two
+relocation words intact (`slot10=rr3+0xbe25dc`, `slot38=rr3+0xbec6d4`).
+**The AssetDownloadService was never created, and now that is a
+statement about 212 seconds of the run rather than about one instant
+at frame 0.** The frame loop was dead for essentially all of it.
+
+**Two runs, and a third that also reproduced it, put the SAME ELF
+offsets on three different load biases** -- `libc++_shared.so +0x77a30`
+for the wait, `libRealRacing3.so +0x1626fd8` for the blocked worker,
+`+0x1406f94` for the async task, in all three. That is the strongest
+cross-run confirmation available: the addresses are the guest's, not
+the run's.
+
+**A THIRD run, 20261020-201647-eden-probe2c, reproduced the 200-line
+series and the whole blocker shape exactly** (73 census sweeps,
+`ordinal=4 last=pthread_cond_wait`, `ordinal=5 last=accept`,
+`total_signals=0`). A second run in the same session,
+20261020-201304-eden-probe2b, produced only SIX dlgate lines and its
+guest stopped making progress at ~20 s -- with the frame loop at frame
+240 instead of frame 2, i.e. the GUEST took a different path that run
+and wedged somewhere else and earlier. That is run-to-run variance in
+the guest's own startup, not a property of the probe: the probe's
+output is the same in every run that lived long enough, and the run
+that produced 6 lines produced 6 because the thing it was measuring had
+already stopped.
+
+**A safety change the move forced.** The probe used to run on the
+guest's own thread, between frames, where the guest was not mutating
+memory. On a host thread it reads guest memory CONCURRENTLY with a
+running guest, and a heap object the guest is in the middle of freeing is
+a pointer-shaped value pointing at a page that is no longer there. The
+heap reads now ask the kernel with the SAME query the census uses for
+guest stack words (`svcQueryMemory` + a `Perm_R` check, as in
+`censusReadStackWord` in `pthread_bridge.cpp`); a page that is not
+mapped, or is mapped without read permission, is reported as "unmapped"
+and never as a value. The image-relative reads are unaffected --
+`guestImageContains()` is already exact for those. A diagnostic that can
+crash the run it is measuring is worse than no diagnostic.
+
+**And the cost of that guard had to be bounded.** The first version
+queried the kernel PER BYTE, and the queue is up to eight std::strings
+of up to 24 bytes each: ~200 `svcQueryMemory` calls per sample, i.e.
+thousands of syscalls a second, from the thread that also does a
+pause/context/resume round trip on the guest. The guard now caches the
+last queried page and the string decoder asks about a WHOLE RANGE once
+instead of a byte at a time, so a sample costs a handful of queries
+rather than hundreds.
+
+#### 2. Who owns the condvar, and who must signal it
+
+**A premise in the brief was wrong, and it matters.** S24's next step
+said to "subtract the run's load bias" to get the ELF vaddr. The run's
+bias (`0x210714f000` for `libRealRacing3.so` in probe2) does not apply:
+`wait_caller=0x210363fa30` is BELOW it, so it is not in the main image.
+The `phase=sampler-image` lines in the same run give the bases:
+
+| runtime | image | offset |
+|---|---|---|
+| `0x210363fa30` (wait_caller) | `libc++_shared.so` (base `0x21035c8000`) | `+0x77a30` |
+| `0x210368abd4` (acquire_site) | `libc++_shared.so` | `+0xc2bd4` |
+| `0x210368ac28` (the unlock site) | `libc++_shared.so` | `+0xc2c28` |
+| `0x2108775fd8` (ordinal 4's start) | `libRealRacing3.so` | `+0x1626fd8` |
+| `0x210877601c` (ordinal 4's lr) | `libRealRacing3.so` | `+0x162701c` |
+| `0x2108555f94` (ordinal 5's start) | `libRealRacing3.so` | `+0x1406f94` |
+| `0x210e2c37b8` (the mutex) | GUEST HEAP | -- |
+| `0x210e2c37e0` (the condvar) | GUEST HEAP | -- |
+
+The probe2c run has different bases (`libc++_shared.so` at
+`0x21033c8000`, `libRealRacing3.so` at `0x2106f4f000`) and therefore
+different runtime addresses -- and IDENTICAL offsets: `wait_caller`
+`+0x77a30`, `acquire_site` `+0xc2bd4`, ordinal 4's start `+0x1626fd8`,
+ordinal 5's start `+0x1406f94`. Three runs, three biases, one set of
+offsets.
+
+The probe2 run reproduces the loopboth addresses EXACTLY in ELF-offset
+terms (`+0x77a30`, `+0xc2bd4`, `+0x1626fd8`, `+0x1406f94`), which is
+the strongest cross-run confirmation available: two runs, different
+biases, same offsets.
+
+**The waiting function is libc++'s `std::condition_variable::wait`.**
+`libc++_shared.so + 0x77a14` is the function; the recorded
+`wait_caller` `+0x77a30` is the instruction after its
+`bl 0xecbc0` (`__libcpp_condvar_wait`). The same function's
+neighbouring strings are the proof -- `libc++_shared.so + 0x4be7f` reads
+`"condition_variable::wait: mutex not locked"` and `+0x4cb06` reads
+`"condition_variable wait failed"`.
+
+**The chain, in raw vaddrs:**
+
+```
+libRealRacing3.so 0x1626fd8   the worker body (ordinal 4's start routine)
+  -> 0x16270c8  bl std::condition_variable::wait   (PLT 0x1e19390)
+     -> libc++_shared.so 0x77a14  std::condition_variable::wait
+        -> libc++_shared.so 0xecbc0  __libcpp_condvar_wait
+           -> host pthread_cond_wait  (the import the census saw)
+```
+
+`0x1626fd8` is the std::thread-style trampoline: it is the function
+whose `pthread_setspecific` (PLT `0x1e18150`) and `__thread_local_data`
+(PLT `0x1e18140`) calls are the signature, and it is reached from
+`0x1624d94` via the `adrp`/`add` pair at `0x1624e34`/`0x1624e44` -- i.e.
+it is the entry point of a thread that `0x1624d94` creates. The census
+confirms it independently: ordinal 4's `start=` is
+`libRealRacing3.so + 0x1626fd8` and `creator=3`.
+
+**Who is SUPPOSED to signal it.** The notifier is
+`libRealRacing3.so 0x1624cc8`, which calls `std::condition_variable::
+notify_one` (PLT `0x1e19370`) at `0x1624d08`. It is reached from
+`0x1624c68`, which is reached from `0x161f4d0` and `0x164cf80`. A
+sibling notifier is at `0x1624ecc` (nine callers).
+
+**The mutex explains the shape.** The census reports
+`census-mutex-held ordinal=4 guest=210e2c37b8 owner_ord=4
+acquire_site=210368abd4 held_ms=282582 acquires=4`. The acquire_site is
+`libc++_shared.so + 0xc2bd4` = `std::mutex::lock` (the PLT `0x1e18040`
+is `_ZNSt6__ndk15mutex4lockEv`). The guest's `0x1626fd8` takes that
+mutex at `0x162706c` and then, at `0x16270c8`, calls
+`condition_variable::wait` on the object at `+0x40` -- the condvar.
+The mutex is `0x210e2c37b8` and the condvar `0x210e2c37e0`, and
+`0x210e2c37e0 - 0x210e2c37b8 = 0x28` -- the two are ADJACENT FIELDS of
+one guest object, a `std::mutex` at `+0x00` and a
+`std::condition_variable` at `+0x28`. That is the `std::async`
+shared-state layout, and the object at `0x1fb5328` is the one S24
+already identified.
+
+**Whether the mutex is genuinely still held is a HOST-side question
+the census cannot answer by itself**, because the ledger records
+`held_ms` from the guest's own lock/unlock calls, and a
+`pthread_cond_timedwait` that times out does not call the guest's
+`pthread_mutex_unlock` -- the guest never asked to unlock. The host
+bridge's `guestPthreadCondWait` (pthread_bridge.cpp:5975) implements
+the wait as a LOOP of one-second `pthread_cond_timedwait`s, and each
+timeout re-acquires the mutex. So the census's `held_ms=282582` for
+this mutex is EXPECTED for any thread sitting in a timed wait -- it is
+not by itself evidence that the guest holds the mutex.
+
+**So the missing guest-side action is a specific one.** The signal was
+never SENT: the census says `total_signals=0`, `unsignalled_objects=1`,
+`worst_deficit=1`. The notifier `0x1624cc8` is a guest code path, and
+the census shows ordinal 4 has not advanced since the run began
+(`delta=0`). The one thing that must happen and does not is:
+
+**the guest's own `__async_assoc_state` completion path must publish
+the result and notify the condition variable -- and the thread that
+would run it has already EXITED.**
+
+**Is ordinal 4 the async task that must set the ready bit? NO, and
+this is the correction to the brief.** The async task is a DIFFERENT
+thread: ordinal 5, whose `start=` is `libRealRacing3.so + 0x1406f94` --
+the trampoline S24 named, whose body is `0x1406f80 bl 0x140445c` (the
+async callable) followed by `b 0x1e18130` (`__assoc_sub_state::
+set_value`, PLT `0x1e18130` ->
+`_ZNSt6__ndk117__assoc_sub_state9set_valueEv`).
+
+**And what ordinal 5 is doing differs between the runs, and the
+difference is the whole story:**
+
+| | loopboth (S24) | probe2 / probe2c |
+|---|---|---|
+| ordinal 5 `last=` | `pthread_exit` | `accept` |
+| ordinal 5 `exited=` | **1** | **0** |
+| ordinal 5 `idle_ms=` | 276004 | 276261 |
+| ordinal 5 `enters=` | 274 | 269 |
+| ordinal 4 `last=` | `pthread_cond_wait` | `pthread_cond_wait` |
+| ordinal 4 `exited=` | 0 | 0 |
+
+So in loopback the async task thread had ALREADY EXITED (via
+`pthread_exit`, not by returning normally) -- which means the
+`b 0x1e18130` (set_value) at the end of the trampoline may never have
+executed, and the brief's claim that "bit 2 is set when the guest's own
+task body 0x140445c returns normally" does not apply to a thread that
+was cancelled.
+
+In probe2/probe2c the async task thread has NOT exited: it is parked in
+`accept` (`inbridge=0/guest`, `delta=0`). The guest's accept call sites
+are `0x12e1a34`, `0x12e556c` and `0x1a826b4` (PLT `0x1e18f70`), and
+ordinal 5's `lr_ring` is `libRealRacing3.so + 0x12e5e74 ...` -- i.e.
+inside the `0x12e5b74` function, whose `0x12e5ec8` branches back into
+it. That is the guest's OWN loopback listener, and with `nogo=1` the
+socket stack is down: the run's own `phase=sock-socket` line reads
+`fd=-1 ... errno=0 policy=passthrough`, `phase=sock-listen` reads
+`ret=-1 errno=9`, and `phase=sock-connect` reads
+`policy=offline-refuse ret=-1 errno=111`. So the guest's accept is
+waiting for a connection that can never arrive, because the guest's own
+listener socket could not be created.
+
+**Which thread runs `0x140445c`, and what is IT waiting on?**
+Ordinal 5, and in probe2 it is waiting on the guest's own `accept()` --
+on a socket that `nogo=1` guarantees will never be connected.
+
+**The gate's own waiter is NOT stuck.** `0x14048c8` (the gate) calls
+`0x1404ac0` (the future waiter) at `0x1404960`, and `0x1404ac0` POLLS
+the status byte at `[state+0x70]` (`ldr w8, [x22, #0x70]`) and returns 0
+(success) when BIT 2 is set -- it does NOT block. So the gate is
+waiting on a POLL, not on a condvar, and it is not what is stuck.
+
+**The chain, end to end, with the one missing link marked:**
+
+```
+libRealRacing3.so 0x14048c8  the download-phase gate
+  -> 0x1404ac0  poll [state+0x70] bit 2   (never blocks)
+     ... needs the async task to have run to completion ...
+
+libRealRacing3.so 0x1406f94  ordinal 5: the async task thread
+  -> 0x1406f80 bl 0x140445c   (the async callable)
+     -> 0x12e5b74 ... 0x12e5ec8   the guest's own socket listener
+        -> accept()  <-- BLOCKED: nogo=1 means the listener never exists
+  -> 0x1406f90 b 0x1e18130    set_value   <-- NEVER REACHED
+
+libRealRacing3.so 0x1626fd8  ordinal 4: a different worker
+  -> 0x16270c8 bl condition_variable::wait  (libc++ 0x77a14)
+     -> blocked forever: total_signals=0, the notifier 0x1624cc8 never runs
+```
+
+**The single missing guest-side action.** The async task at
+`libRealRacing3.so 0x1406f94` must be allowed to RUN TO COMPLETION so
+that `0x1406f90 b 0x1e18130` (`set_value`) executes and the ready bit
+lands. In probe2 it cannot, because it is parked in the guest's own
+`accept()`, which `nogo=1` makes unsatisfiable. In loopboth it had
+already exited via `pthread_exit` without reaching `set_value`.
+
+**And ordinal 4's wait is the same root cause, not a second one.** The
+condvar ordinal 4 waits on is the one the async state's completion path
+is supposed to notify (`0x1624cc8`). The async task never completes,
+so the notify never happens, so ordinal 4 waits for the whole run. The
+guest's own `std::async` machinery has one dependency -- the callable
+must return -- and the callable is stuck.
+
+#### 3. The sync queue
+
+**The two log sites**, both in the guest's own Cloudcell code:
+
+- `"CC: Unable to send Sync, Social Media not initialised."` -- string at
+  `.rodata` `0x3aee47`, referenced from `libRealRacing3.so 0x1d0307c`
+  (the `adrp`/`add` pair at `0x1d031a4`/`0x1d031ac`, the log call at
+  `0x1d031b4`).
+- `"CC: Sub Sync Queued: %d\n"` -- string at `.rodata` `0x3ebbef`,
+  referenced from `libRealRacing3.so 0x1d02e00` (the `adrp`/`add` pair
+  at `0x1d02fd4`/`0x1d02fdc`, the log call at `0x1d02fe4`). The `%d`
+  comes from `[sp,#0x14]`, loaded at `0x1d02fcc`.
+
+**What "Social Media not initialised" actually tests.** At `0x1d0307c`:
+
+```
+0x1d030ac  ldr  x20, [x20, #0x5d0]   ; the Cloudcell global
+0x1d030b0  ldr  x8, [x20]             ; its vtable
+0x1d030b4  ldr  x9, [x9, #0x158]      ; vtable slot 43
+0x1d030bc  blr  x9                    ; -> returns an object
+0x1d030c4  ldr  x8, [x0]
+0x1d030c8  ldr  x8, [x8, #0xd8]       ; THAT object's vtable slot 27
+0x1d030cc  blr  x8                    ; -> bool
+0x1d030d0  tbz  w0, #0, #0x1d031a0    ; bit0 clear -> the "not initialised" log
+```
+
+Slot 43 of the Cloudcell vtable (`0x1f63b58`) is `0x1cbfb6c` =
+`add x0, x0, #0x2f8 ; ret` -- it returns the sub-object at
+`Cloudcell+0x2f8`. That sub-object's vtable is installed at `0x1cbe530`
+and its typeinfo names **`cc::social::ISocialMedia`** (RTTI
+`N2cc6social12ISocialMediaE` at `.rodata 0x604966`, typeinfo object at
+`0x1f66f00`, vtable at `0x1f66f18`), whose slot 27 (`+0xd8`) is
+`0x1d081b8`. The concrete class is **`cc::social::SocialMedia`**
+(RTTI `N2cc6social11SocialMediaE` at `0x60494c`, vtable `0x1f66de8`).
+
+**And this is NOT the `GetSessionValid` path our `ccsocialok=1` switch
+controls.** The port's switch makes
+`FacebookWorker.GetSessionValid()` / `GooglePlayWorker.GetSessionValid()`
+answer true (`native-switch/source/jni_compat/classes/cc_services.cpp:446`
+and `:588`, reached through the BOOLEAN JNI slot in
+`native-switch/source/jni_bridge.cpp`). But the guest's test here is two
+levels of C++ virtual dispatch inside `libRealRacing3.so` -- the
+`cc::social::ISocialMedia` sub-object, then ITS vtable slot 27.
+Nothing in that chain is a JNI call to `GetSessionValid`, so the switch
+does not reach it.
+
+That is the answer to "does our switch actually satisfy it": **no**. The
+switch answers a question the guest never asks at this site, which is why
+the guest keeps logging the message with `ccsocialok=1` set (the Eden
+conf has `ccsocialok=1` AND the archive still shows the message at
+ordinals 965 and 970 in loopboth, and at the equivalent ordinals here).
+
+**What the guest's own notion is.** The `cc::social::ISocialMedia`
+component's slot 27 is the guest's "is the social-media session usable"
+bit. The port already has a pin for a DIFFERENT Cloudcell decision point
+-- `cloudcellPinZero27` (guest_view_probe.cpp:154) forces Cloudcell
+vtable slot 27 to return 0 so the engine takes its give-up path instead
+of spinning. But that pin is on the FIRST-level Cloudcell vtable, not on
+the `cc::social::ISocialMedia` vtable that this test uses, so it does
+not affect this log line.
+
+**What our host must provide.** For this site to stop logging, the
+`cc::social::ISocialMedia` sub-object's slot 27 must return a bool with
+bit 0 set. The guest builds its own Cloudcell object (`0x1cbe03c`,
+allocating `0x4d0` bytes and installing the `cc::ICloudcell` vtable
+`0x1f63b58` at `0x1cbe290`), so the host can only influence this
+through the JAVA side of that component -- which is what `ccsocialok=1`
+was MEANT to do, but the guest's `cc::social::ISocialMedia` evidently
+asks the Java layer something ELSE (a different class, method, or value)
+than `GetSessionValid`. **Finding which Java method
+`cc::social::ISocialMedia` slot 27 consults is the next piece of work
+on this side, and it is a Java-layer question, not a guest one.**
+
+**What the 10765 sync items are.** `0x1d02e00` is the queueing
+function. It takes a lock at `+0x10` (`ldaxrb`/`stxrb` on `[x0+0x10]`),
+then at `0x1d02ea4` reads `[x19+0x50]` (a count) and `[x19+0x48]` (a
+table of per-slot entries), and at `0x1d02ee0` selects the entry with a
+modular index. It then appends at `0x1d02fa4` (`bl 0x1d05a54`) or, when
+the table is full, at `0x1d02fc8` (`bl 0x1d05320`), and logs the NEW
+COUNT. So `10765` and `10712` are COUNTS of queued sub-sync items, not
+identifiers: the queue is being re-populated and never drained, which
+is exactly what the "Unable to send Sync" log above it predicts.
+
+**What drains them.** The same file: `0x1d0307c` is the DRAIN attempt
+("Unable to send Sync, ..."), and the send path is the
+"CC: Sending Sync with SubSyncs:" string at `.rodata 0x458563`,
+referenced from `0x1d03234`/`0x1d0323c` in the SAME function
+`0x1d0307c` -- and the order inside that function is decisive:
+
+```
+0x1d030d0  tbz  w0, #0, #0x1d031a0   ; social-media bit clear -> "Unable to send Sync" and RETURN
+0x1d030d4  ... (the send path)
+0x1d03188  ldp  x8, x9, [x19, #0x30]  ; queue begin/end
+0x1d03190  b.eq #0x1d031ec            ; queue EMPTY -> skip the send
+0x1d03234  "CC: Sending Sync with SubSyncs:"
+```
+
+So the order in one function is: test the social-media bit -> if clear,
+log "Unable to send Sync" and RETURN WITHOUT SENDING -> the queue is
+never drained -> the next tick queues more -> the count grows. The
+queue-empty check at `0x1d03188` is AFTER the bit test, so the queue
+would not be drained even if it were empty; the bit test is the gate.
+
+**So the two halves of C are the same story, and the same root cause as
+B.** The sync queue grows because the send is gated on a social-media
+bit the host is not satisfying; the download-phase gate is gated on a
+future whose producing thread is parked in the guest's own `accept()`.
+Both are the guest waiting on something that only the outside world
+can supply -- a live social-media session, and a connected socket.
+
+#### 4. A note on the analyser's positive control
+
+The control in `.build/rr3fast.py` FAILED when this work started, and
+the failure was real, not cosmetic: the `.eh_frame_hdr` search table
+uses `DW_EH_PE_datarel|sdata4` (encoding byte `0x3b`), so every entry is
+relative to the ADDRESS OF THE SECTION, not to section+4. With the
+section+4 base, every function start was off by four and the control
+resolved `0x12ad2e0` to `0x12ad228` -- the PREVIOUS function. The
+control now passes (`func_of(0x12ad2e0) == 0x12ad2e0`). Recorded
+because a scanner that cannot find its own function boundaries cannot be
+trusted to find a caller's either.
+
+#### What is still open
+
+1. **Which Java method does `cc::social::ISocialMedia` slot 27
+   consult?** This is a Java-layer question and it is the only
+   remaining host-side lever for the "Social Media not initialised"
+   log. `ccsocialok=1` does not reach it, and the guest's own
+   `Cloudcell+0x2f8` sub-object is built by the guest, so the host
+   cannot simply pin it.
+2. **The accept() the async task is parked in.** Whether the guest's
+   own loopback listener is the thing that must be connected (a
+   host-side listener the guest is supposed to reach) or whether it is
+   an outbound accept the guest never needed, decides whether this is
+   host-fixable at all. `nogo=1` currently makes it unsatisfiable.

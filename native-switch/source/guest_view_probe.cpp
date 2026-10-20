@@ -1283,6 +1283,11 @@ CondVar g_samplerWait{};
 // dead one on a 150 s run: this line is the fast, bounded answer.
 std::atomic<bool> g_samplerWakeReported{false};
 
+// The download-phase gate probe. Defined far below, next to the rest of the
+// download-phase code; declared here because the sampler thread below is
+// its only caller and it runs BEFORE the definition.
+void pollDownloadPhaseGate();
+
 void samplerWorker(void* opaque) {
     const Handle target = static_cast<Handle>(reinterpret_cast<uintptr_t>(opaque));
     uint64_t sinceFlush = 0;
@@ -1352,6 +1357,31 @@ void samplerWorker(void* opaque) {
         if (!g_samplerRunning.load(std::memory_order_relaxed)) {
             break;
         }
+        // The download-phase gate probe, on this thread.
+        //
+        // MOVED HERE 2026-10-20, off the render frame loop. The frame loop
+        // dies at frame 2 in the collapsed run, so a probe living there
+        // samples ONCE and its single reading cannot tell "the
+        // AssetDownloadService was never created" from "the probe stopped
+        // sampling before the service was created". This thread is a raw
+        // libnx threadCreate thread -- not a guest pthread thread, which
+        // never gets scheduled out of svcSleepThread on Eden -- and it
+        // demonstrably keeps running after the frame loop is gone (the
+        // 20261020-171259-eden-loopboth archive has 88 `phase=sampler-flush`
+        // lines, the last at the very end of a 300 s run whose frame loop
+        // stopped at frame 2).
+        //
+        // The probe's own 1 s heartbeat decides what it writes, so calling
+        // it on every 75 ms tick is safe and costs one comparison.
+        //
+        // Placement: BEFORE the pause round trip, so the gate is read while
+        // the guest thread is still running rather than while it is paused.
+        // The probe only READS guest memory, and every read is guarded
+        // (guestImageContains for image-relative addresses, and for the
+        // pointer-chased heap ones a plausibility gate PLUS an
+        // svcQueryMemory readability check), so a concurrent guest cannot
+        // turn it into a fault.
+        pollDownloadPhaseGate();
         const Result pauseResult =
             svcSetThreadActivity(target, ThreadActivity_Paused);
         if (R_FAILED(pauseResult)) {
@@ -3249,6 +3279,13 @@ constexpr uint64_t kDlStringBytes = 0x18ULL;
 constexpr size_t kDlQueueStringsShown = 8;
 constexpr size_t kDlNameLimit = 40;
 constexpr unsigned kDlMaxLines = 200;
+// The heartbeat, in milliseconds.
+//
+// 1 Hz. The carrier thread ticks at 75 ms (kSamplerIntervalNs), so this is
+// roughly every 13th tick; the check is on the wall clock rather than on a
+// tick count, so a starved carrier produces a LONGER gap rather than a
+// burst of catch-up samples.
+constexpr uint64_t kDlHeartbeatMs = 1000;
 // A guest pointer worth dereferencing. Deliberately wide: the gate exists
 // to keep a wild value from turning a diagnostic into a segfault, not to
 // judge whether the value is "valid".
@@ -3284,6 +3321,79 @@ bool dlPointerPlausible(uintptr_t address) {
     return address >= kDlPlausibleLo && address < kDlPlausibleHi;
 }
 
+// Is this address actually mapped and readable RIGHT NOW?
+//
+// The plausibility gate above says "this is a pointer-shaped value"; it
+// does NOT say the page exists. That was tolerable while the probe ran
+// inside the render frame loop, on the guest's own thread, at a point
+// where the guest was between frames.
+//
+// It stopped being tolerable when the probe moved to a host thread
+// (2026-10-20): the probe now reads guest memory CONCURRENTLY with a
+// guest that is running, and a heap object the guest is in the middle of
+// freeing is a pointer-shaped value pointing at a page that is no longer
+// there. Dereferencing it faults the whole process, and a diagnostic that
+// can crash the run it is measuring is worse than no diagnostic.
+//
+// So the heap reads ask the kernel, with the SAME query the census uses
+// for guest stack words (pthread_bridge.cpp, censusReadStackWord):
+// svcQueryMemory, then a Perm_R check. A page that is not mapped, or is
+// mapped without read permission, is reported as "unmapped" -- refused,
+// never a value.
+//
+// The image-relative reads do not need this: guestImageContains() is
+// already exact, and those pages are mapped for the whole run.
+//
+// ONE PAGE CACHED, and the reason is the syscall cost. This runs on a
+// 75 ms tick and reads a queue of up to eight std::strings, each up to
+// 24 bytes long; a per-byte query would be ~200 svcQueryMemory calls
+// per sample, i.e. thousands of syscalls a second from a thread that
+// also does a pause/context/resume round trip on the guest. The last
+// queried page is remembered, so a string's bytes cost ONE query
+// instead of twenty-four, and the whole sample costs a handful.
+//
+// Thread-confined by construction: only the sampler thread calls the
+// probe, and it is the only caller of these helpers.
+bool dlMemoryReadable(uintptr_t address) {
+    constexpr uintptr_t kPageMask = ~static_cast<uintptr_t>(0xFFF);
+    const uintptr_t page = address & kPageMask;
+    static uintptr_t s_cachedPage = 0;
+    static bool s_cachedReadable = false;
+    static bool s_cachedValid = false;
+    if (s_cachedValid && page == s_cachedPage) {
+        return s_cachedReadable;
+    }
+    MemoryInfo info{};
+    u32 pageInfo = 0;
+    bool readable = false;
+    if (R_FAILED(svcQueryMemory(&info, &pageInfo, static_cast<u64>(address)))) {
+        readable = false;
+    } else {
+        readable = (info.perm & Perm_R) != 0;
+    }
+    s_cachedPage = page;
+    s_cachedReadable = readable;
+    s_cachedValid = true;
+    return readable;
+}
+
+// Is the whole range [address, address+length) readable?
+//
+// A range can straddle two pages, and both have to be readable, so this
+// asks about each end. The middle of a range that is mapped at both ends
+// and is at most a page or two long is mapped too; the caller only ever
+// passes a std::string's own storage, which is a single allocation.
+bool dlRangeReadable(uintptr_t address, size_t length) {
+    if (length == 0) {
+        return true;
+    }
+    if (!dlMemoryReadable(address)) {
+        return false;
+    }
+    const uintptr_t last = address + length - 1;
+    return dlMemoryReadable(last);
+}
+
 DlWord readDlWord(uintptr_t address) {
     DlWord out{};
     if (address == 0) {
@@ -3294,7 +3404,8 @@ DlWord readDlWord(uintptr_t address) {
         out.readable = true;
         return out;
     }
-    if (!dlPointerPlausible(address)) {
+    if (!dlPointerPlausible(address) ||
+        !dlRangeReadable(address, sizeof(uint64_t))) {
         return out;
     }
     out.value = *reinterpret_cast<const volatile uint64_t*>(address);
@@ -3306,8 +3417,10 @@ bool readDlByte(uintptr_t address, uint8_t& out) {
     if (address == 0) {
         return false;
     }
-    if (!guestImageContains(address, 1) && !dlPointerPlausible(address)) {
-        return false;
+    if (!guestImageContains(address, 1)) {
+        if (!dlPointerPlausible(address) || !dlMemoryReadable(address)) {
+            return false;
+        }
     }
     out = *reinterpret_cast<const volatile uint8_t*>(address);
     return true;
@@ -3355,12 +3468,17 @@ DlString decodeDlString(uintptr_t object) {
                                  ? out.size
                                  : (kDlInlineMax < kDlNameLimit ? kDlInlineMax
                                                               : kDlNameLimit);
+        // The whole inline storage is checked ONCE, not byte by byte: the
+        // readability guard is a kernel query, and a queue of eight strings
+        // would otherwise cost ~200 queries a sample.
+        if (!dlRangeReadable(object + 1, limit)) {
+            out.ok = false;
+            out.text[0] = '\0';
+            return out;
+        }
         for (size_t i = 0; i < limit; ++i) {
-            uint8_t c = 0;
-            if (!readDlByte(object + 1 + i, c)) {
-                out.ok = false;
-                break;
-            }
+            const uint8_t c = *reinterpret_cast<const volatile uint8_t*>(
+                object + 1 + i);
             if (c == 0) {
                 break;
             }
@@ -3385,12 +3503,13 @@ DlString decodeDlString(uintptr_t object) {
     }
     out.size = static_cast<unsigned>(sizeWord.value);
     const size_t limit = out.size < kDlNameLimit ? out.size : kDlNameLimit;
+    if (!dlRangeReadable(static_cast<uintptr_t>(dataWord.value), limit)) {
+        out.ok = false;
+        return out;
+    }
     for (size_t i = 0; i < limit; ++i) {
-        uint8_t c = 0;
-        if (!readDlByte(static_cast<uintptr_t>(dataWord.value) + i, c)) {
-            out.ok = false;
-            break;
-        }
+        const uint8_t c = *reinterpret_cast<const volatile uint8_t*>(
+            static_cast<uintptr_t>(dataWord.value) + i);
         if (c == 0) {
             break;
         }
@@ -3450,7 +3569,7 @@ bool dlGateStateEqual(const DlGateState& a, const DlGateState& b) {
     return true;
 }
 
-// Polls the download-phase gate and logs it when it changes.
+// Polls the download-phase gate and logs it.
 //
 // CHANGE-TRIGGERED, with the FIRST sample always logged. A fixed schedule
 // would report "never" for a value that merely arrived after the last
@@ -3458,11 +3577,50 @@ bool dlGateStateEqual(const DlGateState& a, const DlGateState& b) {
 // value is zero" -- which is why the first line is emitted unconditionally
 // even when everything reads 0.
 //
+// BUT the change-trigger alone is not enough for the question this probe
+// exists to answer, and the difference is the whole point of the move.
+//
+// WHY IT MOVED (2026-10-20). The probe used to run under
+// `if ((frames % 240) == 0)` in the render frame loop, and the frame loop
+// DIED at frame 2. So the probe sampled EXACTLY ONCE per run, at f=0, and
+// that one reading could not distinguish "the AssetDownloadService was
+// never created" from "the probe stopped sampling before the service was
+// created". One reading is not a time series.
+//
+// It now runs on a HOST THREAD that keeps ticking after the frame loop
+// dies, so `svc` is observed over TIME. The carrier is samplerWorker() in
+// this file -- a raw libnx threadCreate thread, NOT a guest pthread thread
+// (a thread created through the guest pthread bridge never gets scheduled
+// out of svcSleepThread on Eden, so it cannot be used for this). That
+// thread is PROVEN to survive the collapse: the 20261020-171259-eden-loopboth
+// archive has 88 `phase=sampler-flush` lines with the last one at the very
+// end of a 300 s run whose frame loop stopped at frame 2.
+//
+// The root-pc-sampler thread in pthread_bridge.cpp would be the other
+// candidate, but its body is in a file this change does not own and there
+// is no seam into it from here.
+//
+// EMISSION. Two triggers:
+//   1. the sampled STATE changed -- reported on the very next tick
+//      (<=75 ms), so a change is never hidden behind the heartbeat;
+//   2. a 1 s HEARTBEAT, so the log is a time series even when nothing
+//      changes. Without it the probe would print one line and be
+//      indistinguishable from the frame-0 sample it replaced.
+//
+// The heartbeat is what makes "was the service ever created" answerable:
+// a series of svc=0x0 readings across the whole run is a statement about
+// the whole run, and one reading is a statement about one instant.
+//
+// `f=` is the emitted-line index, 0-based, so consecutive lines are
+// consecutive samples. It used to be the render frame counter, which is
+// meaningless off the frame loop.
+//
 // Capped at kDlMaxLines lines for the whole run.
-void pollDownloadPhaseGate(uint64_t frames) {
+void pollDownloadPhaseGate() {
     static unsigned s_lines = 0;
     static bool s_emitted = false;
     static DlGateState s_last{};
+    static uint64_t s_lastEmitTick = 0;
 
     if (s_lines >= kDlMaxLines) {
         return;
@@ -3525,11 +3683,24 @@ void pollDownloadPhaseGate(uint64_t frames) {
         }
     }
 
-    if (s_emitted && dlGateStateEqual(current, s_last)) {
+    // Two triggers: a state change, and the 1 s heartbeat. The heartbeat is
+    // what makes this a time series rather than the single frame-0 reading
+    // it replaced.
+    //
+    // armGetSystemTick() is the same monotonic clock the rest of this file
+    // uses (armGetSystemTickFreq()), so the cadence is wall-clock and does
+    // not depend on how often the carrier thread is actually scheduled.
+    const uint64_t nowTick = armGetSystemTick();
+    const uint64_t tickFreq = armGetSystemTickFreq();
+    const uint64_t elapsedMs = (nowTick - s_lastEmitTick) * 1000ULL /
+                               (tickFreq != 0 ? tickFreq : 1);
+    const bool heartbeatDue = s_emitted && elapsedMs >= kDlHeartbeatMs;
+    if (s_emitted && !heartbeatDue && dlGateStateEqual(current, s_last)) {
         return;
     }
     s_emitted = true;
     s_last = current;
+    s_lastEmitTick = nowTick;
     ++s_lines;
 
     char gotText[32];
@@ -3570,11 +3741,14 @@ void pollDownloadPhaseGate(uint64_t frames) {
     }
 
     char line[1200];
+    // f= is the emitted-line index (0-based), so consecutive lines are
+    // consecutive samples. It used to be the render frame counter, which
+    // does not exist off the frame loop.
     __builtin_snprintf(
         line, sizeof(line),
         "dlgate: f=%llu bias=0x%llx gotEng=%s eng=%s svc=%s svcV=%s"
         " qBeg=%s qEnd=%s qCount=%llu slot10=%s slot38=%s%s",
-        static_cast<unsigned long long>(frames),
+        static_cast<unsigned long long>(s_lines - 1),
         static_cast<unsigned long long>(bias),
         gotText, engText, svcText, vptrText, begText, endText,
         static_cast<unsigned long long>(qCount), slot10Text, slot38Text,
@@ -4087,14 +4261,14 @@ void* frameLoopDriver(void* opaque) {
             appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                                 cc, 74, 0);
         }
-        // The download-phase gate, read directly. Its own cadence, its own
-        // phase name, and it logs only when one of its values changed --
-        // otherwise a 65-sample run would write 65 identical lines and the
-        // line that matters (the queue going from empty to non-empty) would
-        // be indistinguishable from the noise around it.
-        if ((frames % 240) == 0) {
-            pollDownloadPhaseGate(frames);
-        }
+        // The download-phase gate probe is NOT called here any more. It used
+        // to be, under `if ((frames % 240) == 0)`, and the frame loop dies
+        // at frame 2 in the collapsed run, so the probe sampled EXACTLY ONCE
+        // per run -- a single reading, which is not a time series and cannot
+        // answer "was the service ever created". It now runs on the host
+        // sampler thread (samplerWorker), which keeps ticking after the
+        // frame loop is gone. See pollDownloadPhaseGate() for the details.
+        //
         // DIAGNOSTIC (STEP 1): force the server-variable feature bits. Every
         // frame, and BEFORE the guest's render call below, so the guest sees
         // the forced bits on the very first frame it can ask for them. The
