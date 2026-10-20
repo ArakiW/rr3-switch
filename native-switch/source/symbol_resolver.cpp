@@ -687,7 +687,7 @@ int censusBind(int sockfd, const struct sockaddr* address, socklen_t length) {
 // This is the only change to this file, and it is a constant, not the binding
 // table. The file's byte hash changes with it; the new value is recorded in
 // docs/compose/spec/unblock-menu-loading.md (S18) and in the session gate.
-constexpr bool allowLoopbackConnect = false;
+constexpr bool allowLoopbackConnect = true;
 
 int censusConnect(int sockfd, const struct sockaddr* address, socklen_t length) {
     CENSUS_IMPORT("connect");

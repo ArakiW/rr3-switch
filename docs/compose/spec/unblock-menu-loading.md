@@ -1712,12 +1712,19 @@ it is a constant, not the binding table.
 
     symbol_resolver.cpp SHA-256
       was 32a3e014b037a848650cab98049d42165460009e3948b0e42e755dc587d3a228
-      now 83cf9edb9ee2569a34a5b24568d79ae7d9a8dccb0b9b2a46abc47a422e370c9d
+      then 83cf9edb9ee2569a34a5b24568d79ae7d9a8dccb0b9b2a46abc47a422e370c9d
+      now c41bb7a2c4bd8e1c06e142dfb6d4fb62d2dd46d45adf6d1234aedf804054ef1e
 
 The byte-freeze existed to keep the binding table from drifting. This change
 keeps the table identical and changes one policy boolean that the file's own
 comment asks to be flipped, so the new hash is recorded here rather than left
 stale in the session gate.
+
+UPDATE 2026-10-20 (S24): the constant was flipped BACK to true, so the "now"
+line above is no longer this entry's value. The 83cf9edb value is this entry's
+own (the S18 state) and is kept as the "then" line; the current value of the
+file is c41bb7a2c4bd8e1c06e142dfb6d4fb62d2dd46d45adf6d1234aedf804054ef1e, and
+S24 records the measurement that made the flip.
 ### S19 -- the emulator is exonerated: CITRON reproduces the identical terminal state
 
 Date: 2026-10-19. Archive 20261019-225410-citron-citron1.
@@ -2301,3 +2308,243 @@ This cost three sub-agents one round:
   **false negatives** -- a scan for `mov #0x518` returned 0 hits even though the
   gate contains it. Use a raw BL/word scan over .text for caller sets, and
   disassemble known regions for instruction details.
+
+### S24 -- both knobs on at once: the loopback handshake completes, and the gate still does not move
+
+Date: 2026-10-20. Archive 20261020-171259-eden-loopboth (tag `loopboth`, 300 s).
+Baseline: 20261020-165534-eden-nogo0 (300 s). One line changed, and it is a
+constant, not the binding table:
+
+    native-switch/source/symbol_resolver.cpp:690
+    -constexpr bool allowLoopbackConnect = false;
+    +constexpr bool allowLoopbackConnect = true;
+
+    symbol_resolver.cpp SHA-256
+      was 83cf9edb9ee2569a34a5b24568d79ae7d9a8dccb0b9b2a46abc47a422e370c9d
+      now c41bb7a2c4bd8e1c06e142dfb6d4fb62d2dd46d45adf6d1234aedf804054ef1e
+
+The Eden conf was flipped to `nogo=0` by hand before this run
+(`E:\Eden\user\sdmc\switch\rr3-gfx.conf`, 4001 B of the 4096 B buffer, no other
+key touched), so **20261020-171259 is the first and only run in this project
+with the socket stack UP and the loopback exception ON at the same time.**
+Neither combination had ever been tested in the other direction.
+
+**Neither knob alone works, and now both together do not work either.**
+
+- `nogo=1` alone (20261020-153215-eden-featbits1): the socket stack is down, so
+  the guest's `socket()` returns -1 and the guest cannot build its own listener,
+  so the worker that has to come up never comes up. The guest's own text:
+  `phase=sock-socket ... fd=-1 ... errno=9 policy=passthrough` and
+  `phase=sock-bind ... ret=-1 errno=9`. The guest could not create one socket.
+- `allowLoopbackConnect=false` alone (20261020-165534-eden-nogo0): the socket
+  stack is up, the guest's listener is created successfully, and then the guest
+  dials ITSELF and is refused. The guest's own text:
+  `phase=sock-connect ... policy=loopback-refuse ret=-1 errno=111`. The
+  handshake that the guest's worker depends on never completes.
+- Both on (20261020-171259-eden-loopboth): **the handshake completes and the
+  guest's own listener hands back a real descriptor -- and the gate does not
+  move.**
+
+**The nogo=0 measurement (baseline 20261020-165534-eden-nogo0, 300 s), verbatim:**
+
+    phase=sock-socket ordinal=0 target=0000000000000000 fd=4 domain=2 type=1 proto=6 fd=4 errno=0 policy=passthrough
+    phase=sock-bind ordinal=0 target=0000000000000000 fd=4 family=0 raw= ret=0 errno=0
+    phase=sock-listen ordinal=0 target=0000000000000000 fd=4 backlog=1 ret=0 errno=0
+    phase=sock-socket ordinal=0 target=0000000000000000 fd=5 domain=2 type=1 proto=6 fd=5 errno=0 policy=passthrough
+    phase=sock-getsockname ordinal=0 target=0000000000000000 fd=4 family=AF_INET addr=127.0.0.1 port=4103 ret=0 errno=0 result=0x00000000 fd=listener inet:4103 len=16->256 pre=0000000000000000 post=100210077f000001
+    phase=sock-connect ordinal=0 target=0000000000000000 fd=5 family=AF_INET addr=127.0.0.1 port=4103 policy=loopback-refuse ret=-1 errno=111
+    phase=sock-accept ordinal=0 target=0000000000000000 fd=4 timeout wait_ms=50 ret=-1 errno=EAGAIN
+    phase=sock-socket ordinal=0 target=0000000000000000 fd=-1 domain=518 type=2 proto=17 fd=-1 errno=97 policy=refuse-family
+    phase=sock-bind ordinal=0 target=0000000000000000 fd=-1 family=AF_INET addr=0.0.0.0 port=60002 ret=-1 errno=9
+    phase=sock-bind ordinal=0 target=0000000000000000 fd=-1 family=AF_INET addr=0.0.0.0 port=0 ret=-1 errno=9
+
+    phase=gfx-stats ordinal=301 target=0000000000000002  backend=mesa src=file reason=frame frames=2 calls=8 draws=0/0 src=0/0 glslDump=0 bin=0/0 fmt=0x0000 compile=0 link=0 prog=0 sh=0 tex=0 vbo=0 texImg=0/0[none] compTex=0/0/0[none] readPx=0 last=- unknown=0[none] magic=- callers=[none]
+
+The conf file's own warning predicted this shape exactly: "a send() that never
+returns is also what a WRONG nogo looked like". The run collapsed to
+**frames=2**, `draws=0/0`.
+
+**The both-on measurement (20261020-171259-eden-loopboth, 300 s), verbatim:**
+
+    phase=sock-socket ordinal=0 target=0000000000000000 fd=5 domain=2 type=1 proto=6 fd=5 errno=0 policy=passthrough
+    phase=sock-bind ordinal=0 target=0000000000000000 fd=5 family=0 raw= ret=0 errno=0
+    phase=sock-listen ordinal=0 target=0000000000000000 fd=5 backlog=1 ret=0 errno=0
+    phase=sock-socket ordinal=0 target=0000000000000000 fd=6 domain=2 type=1 proto=6 fd=6 errno=0 policy=passthrough
+    phase=sock-getsockname ordinal=0 target=0000000000000000 fd=5 family=AF_INET addr=127.0.0.1 port=4152 ret=0 errno=0 result=0x00000000 fd=listener inet:4152 len=16->256 pre=0000000000000000 post=100210387f000001
+    phase=sock-connect ordinal=0 target=0000000000000000 fd=6 family=AF_INET addr=127.0.0.1 port=4152 policy=loopback-connect ret=0 errno=0
+    phase=sock-accept ordinal=0 target=0000000000000000 fd=5 picked ret=4 errno=0
+    phase=sock-socket ordinal=0 target=0000000000000000 fd=-1 domain=518 type=2 proto=17 fd=-1 errno=97 policy=refuse-family
+    phase=sock-bind ordinal=0 target=0000000000000000 fd=-1 family=AF_INET addr=0.0.0.0 port=60002 ret=-1 errno=9
+    phase=sock-bind ordinal=0 target=0000000000000000 fd=-1 family=AF_INET addr=0.0.0.0 port=0 ret=-1 errno=9
+
+    phase=gfx-stats ordinal=301 target=0000000000000002  backend=mesa src=file reason=frame frames=2 calls=8 draws=0/0 src=0/0 glslDump=0 bin=0/0 fmt=0x0000 compile=0 link=0 prog=0 sh=0 tex=0 vbo=0 texImg=0/0[none] compTex=0/0/0[none] readPx=0 last=- unknown=0[none] magic=- callers=[none]
+
+**The A/B on the two lines that matter.** `policy=loopback-refuse ret=-1
+errno=111` became `policy=loopback-connect ret=0 errno=0`, and `sock-accept`
+went from `timeout wait_ms=50 ret=-1 errno=EAGAIN` to `picked ret=4`. **The
+knob does exactly what it was designed to do**: the guest's own loopback
+handshake now completes and its own listener returns a real, connected
+descriptor. That was the first time this has ever been observed.
+
+And the gate did not move. `frames=2` and `draws=0/0` are byte-for-byte
+identical to the baseline.
+
+**The dlgate line, both archives, verbatim:**
+
+    20261020-171259-eden-loopboth
+    phase=dlgate: f=0 bias=0x2106d83000 gotEng=rr3+0x1fb2688 eng=0x210df07ee0 svc=0x0 svcV=unmapped qBeg=unmapped qEnd=unmapped qCount=0 slot10=rr3+0xbe25dc slot38=rr3+0xbec6d4 q0="-" ordinal=77 target=0000000000000000
+
+    20261020-165534-eden-nogo0
+    phase=dlgate: f=0 bias=0x2106983000 gotEng=rr3+0x1fb2688 eng=0x210db080e0 svc=0x0 svcV=unmapped qBeg=unmapped qEnd=unmapped qCount=0 slot10=rr3+0xbe25dc slot38=rr3+0xbec6d4 q0="-" ordinal=77 target=0000000000000000
+
+Identical apart from the load bias and the two heap addresses. `svc=0x0`,
+`qCount=0`, in both.
+
+**The counts, both archives:**
+
+| what | loopboth | nogo0 |
+|---|---|---|
+| `phase=dlgate` lines | 1 | 1 |
+| `phase=guest-log-any` lines | 972 | 972 |
+| "startMusic disabled during download" | 2 | 2 |
+| "Bad config. Corrupted JSON config" | 1 | 1 |
+| "AssetDownloadService" | 0 | 0 |
+| `phase=sock-socket` / `-bind` / `-listen` / `-accept` / `-connect` | 3/3/1/1/1 | 3/3/1/1/1 |
+| `phase=gfx-stats` lines | 2 | 2 |
+| total guest-view log lines | 18714 | 10616 |
+
+**The guest's own 972 log lines are byte-for-byte IDENTICAL between the two
+archives.** A `Compare-Object` over the two `phase=guest-log-any` sequences
+returns **zero** differences -- same 972 lines, same ordinals, same text,
+including `startMusic disabled during download` at ordinals **20** and **772**
+and `Bad config. Corrupted JSON config: unexpected end of input` at ordinal
+**17**. The guest did not do one single thing differently with the loopback
+handshake working.
+
+**The guest's own last log lines (identical in both archives, ordinals 965-972):**
+
+    phase=guest-log-any ordinal=965 target=00000000f4246041 CC: Unable to send Sync, Social Media not initialised.
+    phase=guest-log-any ordinal=966 target=0000000003e982cf CC: Updating Cloudcell friends...
+    phase=guest-log-any ordinal=967 target=00000000cf8766ff CC: ENQUEUED ACTION: [GooglePlayManager::ACTION_LOAD_FRIEND_VECTOR]
+    phase=guest-log-any ordinal=968 target=00000000680791e5 CC: INITIATING ACTION [GooglePlayManager::ACTION_LOAD_FRIEND_VECTOR]
+    phase=guest-log-any ordinal=969 target=00000000dd1bb24c CC: Sub Sync Queued: 10765
+    phase=guest-log-any ordinal=970 target=00000000f4246041 CC: Unable to send Sync, Social Media not initialised.
+    phase=guest-log-any ordinal=971 target=00000000d61fc0d2 CC: Sub Sync Queued: 10712
+    phase=guest-log-any ordinal=972 target=0000000005631eb0 [RevSDK] userId set to d_0
+
+**A MEASUREMENT LIMITATION THAT MUST BE FIXED BEFORE THE NEXT RUN: the dlgate
+probe samples ONCE, and only because the frame loop is dead.**
+
+`pollDownloadPhaseGate()` is called from exactly one place, the render frame
+loop, under `if ((frames % 240) == 0)` (`guest_view_probe.cpp:4095`). The
+frame counter never passed **2** in either archive, so the probe ran **exactly
+once** in each, at `f=0`, at guest-log ordinal 77 -- i.e. **before** the
+second `startMusic disabled during download` at ordinal 772. The one dlgate
+line per archive is a frame-0 sample, not a time series, so **on its own it
+cannot distinguish "the service was never created" from "the probe stopped
+sampling before the service was created."** The `svc=0x0` is a true reading of
+frame 0 and says nothing about frame 772.
+
+The evidence that carries the conclusion is the guest's own log instead: it is
+byte-identical to the baseline, and the frame counter never moved. The probe's
+logic is right; its PLACEMENT is wrong for a collapsed run. It belongs on a
+host thread that keeps ticking -- the `root-pc-sampler` thread produced
+**7998** `phase=root-pc-sampler-step` lines over the full 300 s in this run
+against **18** in the baseline, so a 1 Hz sampler thread survives the collapse
+that killed the frame loop.
+
+**CORRECTION to the standing claim that "ordinal=3 is the thread parked in
+accept".** In BOTH of today's archives ordinal=3 is NOT in accept:
+
+    20261020-171259-eden-loopboth
+    phase=census-ord ordinal=3 target=0000000000000010 start=0x0 creator=0 delta=0 idle_ms=284253 last=pthread_mutex_unlock inbridge=0/guest enters=16 exited=0 host=0 root=1 lr_ring=21032bfc28 21032bfbd4 21032bfc28 21032bfbd4 21032749e4 21032bfc28 21032bfbd4 21032bfc28
+
+    20261020-165534-eden-nogo0
+    phase=census-ord ordinal=3 target=0000000000000010 start=0x0 creator=0 delta=0 idle_ms=287668 last=pthread_mutex_unlock inbridge=0/guest enters=16 exited=0 host=0 root=1 lr_ring=2102ebfc28 2102ebfbd4 2102ebfc28 2102ebfbd4 2102e749e4 2102ebfc28 2102ebfbd4 2102ebfc28
+
+`last=pthread_mutex_unlock`, `enters=16`, `exited=0` -- identical in both. The
+"parked in accept" state was real, but it belongs to the **nogo=1** era:
+archive 20261019-220406-nogo2, the S18 evidence, does show
+
+    phase=census-ord ordinal=3 target=0000000000000119 start=0x2107f55f94 creator=0 delta=0 idle_ms=276572 last=accept inbridge=0/guest enters=273 exited=0 host=0 root=0 lr_ring=2107e34e74 2107e309a4 2107e309c8 2107e309d4 2107e309f4 2107e30a10 2107e30a24 2107e30a38
+
+`last=accept`, `enters=273`. So S18's premise was correct for its own archive
+and **has been overtaken by nogo=0**: with the socket stack up, the guest's
+`accept` is bounded by `acceptWaitMs=50` and returns `EAGAIN` instead of
+parking forever, and the guest's stuck thread is no longer ordinal=3.
+
+**The thread that IS stuck, in both archives, is ordinal=4 -- and it is stuck
+on a condvar that is never signalled.** That is the shape of the real
+blocker: the gate at 0x14048c8 waits (bounded) on a worker whose readiness
+flag is bit 2 of `[target+0x70]`, and the worker's readiness is supposed to be
+announced by exactly this condvar.
+
+    20261020-171259-eden-loopboth
+    phase=census-ord ordinal=4 target=0000000000000009 start=0x21083a9fd8 creator=3 delta=0 idle_ms=284250 last=pthread_cond_wait inbridge=1/pthread_cond_wait enters=9 exited=0 host=0 root=0 lr_ring=21032e09c4 21032e0a80 21032e0a98 21083aa01c 21032bfbd4 21032bfc28 21032bfbd4 2103274a30
+    phase=census-wait ordinal=73 target=0000000000000001 kind=cond obj=210defa1c0 waited=1 signalled=0 deficit=1 wait_caller=2103274a30
+    phase=census-wait-sum ordinal=73 target=0000000000000001 condvars_waited_on=1 total_waits=1 total_signals=0 unsignalled_objects=1 worst_deficit=1
+    phase=census-mutex-held ordinal=4 target=000000210defa198 orphan=0 guest=210defa198 owner_ord=4 owner_key=82809200 acquire_site=21032bfbd4 held_ms=284250 acquires=4
+
+    20261020-165534-eden-nogo0
+    phase=census-ord ordinal=4 target=0000000000000009 start=0x2107fa9fd8 creator=3 delta=0 idle_ms=287163 last=pthread_cond_wait inbridge=1/pthread_cond_wait enters=9 exited=0 host=0 root=0 lr_ring=2102ee09c4 2102ee0a80 2102ee0a98 2107faa01c 2102ebfbd4 2102ebfc28 2102ebfbd4 2102e74a30
+    phase=census-wait ordinal=73 target=0000000000000001 kind=cond obj=210daf77c0 waited=1 signalled=0 deficit=1 wait_caller=2102e74a30
+    phase=census-wait-sum ordinal=73 target=0000000000000001 condvars_waited_on=1 total_waits=1 total_signals=0 unsignalled_objects=1 worst_deficit=1
+    phase=census-mutex-held ordinal=4 target=000000210daf7798 orphan=0 guest=210daf7798 owner_ord=4 owner_key=82409200 acquire_site=2102ebfbd4 held_ms=287163 acquires=4
+
+`total_waits=1`, `total_signals=0`, `unsignalled_objects=1`, `worst_deficit=1`
+-- **one condvar wait, never signalled**, in both runs, while ordinal=4 holds
+a guest mutex for ~284 s out of the 300 s run. This is the wait that the
+AssetDownloadService worker's readiness is supposed to release, and nothing
+signals it. That is why the service is never created: **the guest's own
+worker never signals the gate that waits for it.** The loopback exception was
+never on that path.
+
+**The addresses, so nobody has to re-derive them.**
+
+| what | where | note |
+|---|---|---|
+| the constant that was flipped | `native-switch/source/symbol_resolver.cpp:690` | `allowLoopbackConnect` false -> true |
+| the branch that consumes it | `native-switch/source/symbol_resolver.cpp:702` | `loopback && allowLoopbackConnect` -> real `::connect` |
+| the accept bound | `native-switch/source/symbol_resolver.cpp:578` | `acceptWaitMs = 50` |
+| the accept policy knob | `native-switch/source/symbol_resolver.cpp:601` | `acceptBlocksForever = false` |
+| the dlgate probe | `native-switch/source/guest_view_probe.cpp:3462` | `pollDownloadPhaseGate()` |
+| the probe's ONLY call site | `native-switch/source/guest_view_probe.cpp:4095` | `if ((frames % 240) == 0)` -- frame loop |
+| GOT slot read | `0x1f6d5d8` | `kDlGotSlotElfVa` |
+| engine global | `0x1fb2688` | `kDlEngineGlobalElfVa` |
+| service pointer offset | `+0x10518` | `kDlServiceOffset` |
+| queue begin / end | `+0xd8` / `+0xe0` | `kDlQueueBeginOffset` / `kDlQueueEndOffset` |
+| ADS vtable slots 10 / 38 | `0x1e54560` / `0x1e54588` | `kDlAdsSlot10ElfVa` / `kDlAdsSlot38ElfVa` |
+| download-phase gate | `0x12ad2e0` | logs "startMusic disabled during download" |
+| service construction | `0x14045e0` | ctor `0xbe2294`, store at `0x140461c` |
+| the gate that waits for the worker | `0x14048c8` | caller `0x1404994` |
+
+**Still open, and now narrower.**
+
+The loopback exception is **exonerated as the blocker**: the guest's own
+handshake works, its own listener accepts, and nothing downstream changed.
+What is left is the pair of facts above -- the service is still not created
+(S23's open question, still open, and now with a stronger independent witness
+than the single frame-0 dlgate sample), and ordinal=4 is parked in
+`pthread_cond_wait` on a condvar with `total_signals=0`.
+
+Two concrete next steps, in order:
+
+1. **Move the dlgate probe off the frame loop** onto the sampler thread that
+   survives the collapse (7998 `root-pc-sampler-step` lines over 300 s), on a
+   1 Hz heartbeat, so `svc` becomes a time series instead of one frame-0
+   reading. Without this, every future run has the same ambiguity.
+2. **Find who is supposed to signal the condvar** `obj=210defa1c0` that
+   ordinal=4 waits on (`wait_caller=2103274a30`, `acquire_site=21032bfbd4`),
+   and find out why the worker that would signal it never starts. That is the
+   actual blocker; the socket layer was never it.
+
+**A method note.** The temptation with this result is to report "the loopback
+knob made the handshake work and the gate still did not move" and stop. The
+honest report has to carry two more facts that are easy to leave out and that
+change what the next agent should do: the dlgate probe sampled ONCE because
+the frame loop died at frame 2 (so `svc=0x0` is a frame-0 reading, not a
+300 s verdict), and the "ordinal=3 is parked in accept" premise is an
+nogo=1-era fact that nogo=0 has already overtaken. Both were visible only by
+reading the probe's own call site and the S18-era archive side by side with
+today's.
+
