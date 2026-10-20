@@ -3699,6 +3699,86 @@ So the authenticate response built in S28 is still correct and still
 unexercised, and the thing to answer next is a `/time` response whose body
 yields a double.
 
+### S29: the /time answer is a RESPONSE HEADER, not a body
+
+The last sentence above is WRONG, and the way it is wrong is the whole
+blocker. The `/time` answer is not in the response body at all.
+
+**The parser.** The guest's ServerTimeManager reads the server time in the
+function at **guest raw `0x1cef8a4`** (`ServerTimeManager.cpp`, asserted
+against the file name at `.rodata 0x48a180`). It is a VIRTUAL method - it has
+no direct caller - and it is reached through the std::function the
+ServerTimeManager registers with the request manager (its invoker is
+`.got 0x1f7e3f0`, whose R_AARCH64_RELATIVE addend is `0x1cef8a4`).
+
+Its disassembly, read instruction by instruction:
+
+```
+0x1cef8c8  ldr x8, [x0, #0x70]      ; the request token
+0x1cef8cc  cmp x8, x2               ; must equal the token of THIS answer
+0x1cef8d0  b.ne <return>            ; otherwise the answer is dropped
+0x1cef8f8  adrp x8, #0x460000       ; "X-Request-Start"
+0x1cef904  add  x8, x8, #0xbf2      ; .rodata 0x460bf2 - the ONLY reference
+0x1cef92c  bl  0xa0b240             ; the guest's hash-map find
+0x1cef97c  bl  0xbcb038             ; typed extraction of the value
+0x1cef9d0  bl  0x1e18b80             ; strtod()  (PLT strtod)
+0x1cef9d4  str d0, [x19, #0x88]     ; this->serverTime, a double
+```
+
+So the value the guest reads is a STRING that `strtod` parses: the wire
+form is **ASCII decimal seconds**, not a raw little-endian double and not a
+BinaryBlob. The double the guest ends up with is `1793000000.125000` for
+the answer the port sends.
+
+**Where the map comes from.** The map the parser looks the key up in is the
+RESPONSE HEADER map, and the guest's own native
+`Java_com_firemonkeys_cloudcellapi_HttpRequest_headerCallback` (guest raw
+**`0x1ce4348`**, 1524 bytes) builds it. That function binds the JNI methods
+`keySet` (`()Ljava/util/Set;`), `iterator`, `hasNext`, `next`, `get`
+(`(Ljava/lang/Object;)Ljava/lang/Object;` and `(I)Ljava/lang/Object;`) and
+`size` (`()I`), walks the `java.util.Map` the Java layer handed it, and
+stores every (name, value) pair in the guest's own map at **worker+0x180**:
+
+```
+0x1ce4668  mov x3, x26              ; the key from iterator.next()
+0x1cef466c ldr x2, [x8]             ; Map.get
+0x1cef4670 bl  0x10f3e94            ; CallObjectMethodV(env, map, get, key)
+0x1ce46d4  cmp w28, #1              ; the value list's size
+0x1ce4720 bl  0x10f3e94            ; CallObjectMethodV(env, list, get, i)
+0x1ce4750 bl  0x1ce4250             ; GetStringUTFChars -> the value's bytes
+0x1ce47a4 add x0, x19, #0x178       ; x19 = worker+8, so worker+0x180: the map
+0x1ce47c0 bl  0xbcb038              ; look the key up in it
+```
+
+`worker+0x180` is the same map the ServerTimeManager's parser reads, so the
+port has to answer the `/time` request with a HEADER named
+`X-Request-Start` whose value is ASCII decimal seconds.
+
+**What the port does now.** `cc_http_request.cpp` captures the request URL
+in `init()` (the URL is the only reliable discriminator - the guest's byte[]
+is not a port array object, so `GetArrayLength` answers 0 for every request
+and the body cannot tell the two requests apart), and for a URL containing
+`/time` it now:
+
+1. builds a `java.util.Map` with the single entry
+   `X-Request-Start` -> `1793000000.125000`,
+2. hands it to the guest's own native `headerCallback`, then
+3. calls `completeCallback(200)`.
+
+No body is delivered: the guest reads no body for this request, and
+`HttpThread.run()` never calls `dataCallback` for an empty body either. No
+`Content-Type` is sent either - the guest's completion handler compares the
+response's content type against the one the worker expects (guest raw
+`0x1ce3f68` -> `0x1ce3fd4`) and asserts when they differ, and the port
+sends none today without the guest asserting.
+
+The three `java.util` collections the guest walks are answered by NAME plus
+the RECEIVER (`ccheaders::handleObject` / `handleBoolean` / `handleInt` in
+`jni_compat/classes/cc_http_headers.h`), because the port's own name-keyed
+fallbacks answer `keySet`, `iterator` and `get` with a shared dummy - which
+is exactly why the map the guest built was empty.
+
+
 
 
 

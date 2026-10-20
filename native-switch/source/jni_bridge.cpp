@@ -62,6 +62,7 @@
 // through the JNIEnv vtable implemented here, so both paths have to enqueue
 // into the same queue.
 #include "eap_port/trace_adapter.h"
+#include "jni_compat/classes/cc_http_headers.h"
 #include "jni_compat/classes/cloudcell_defer.h"
 #include "jni_compat/classes/cloudcell_natives.h"
 
@@ -2044,6 +2045,25 @@ uintptr_t jniNoop() {
     return 0;
 }
 
+// A bounded trace of the RESPONSE-HEADER walk, so a run can say what the
+// guest's native headerCallback (guest raw 0x1ce4348) actually asked the port
+// for. The guest binds "keySet", "iterator", "hasNext", "next", "get" and
+// "size" and walks the java.util.Map the port handed it; if any of those
+// steps does not appear here, the guest never got that far, and the server
+// time cannot have been read.
+bool ccHeaderTrace(const char* what, const char* a, const char* b) {
+    static unsigned s_lines = 0;
+    if (s_lines >= 24) {
+        return false;
+    }
+    ++s_lines;
+    char line[224];
+    __builtin_snprintf(line, sizeof(line), "%s %s %s", what,
+                       a != nullptr ? a : "-", b != nullptr ? b : "-");
+    guestViewWideLog("cc-hdr", 0, 0, line);
+    return true;
+}
+
 uintptr_t jniFindClass(uintptr_t /*env*/, const char* name) {
     rawLog("[jni] FindClass ");
     rawLog(name);
@@ -2052,6 +2072,9 @@ uintptr_t jniFindClass(uintptr_t /*env*/, const char* name) {
     // after the guest registers its natives. Driven from a JNI call because
     // that is where the guest's own thread and the guest TLS are available.
     jniNativeJavaSideTick();
+    if (name != nullptr && name[0] == 'j' && name[5] == '/') {
+        ccHeaderTrace("FindClass", name, nullptr);
+    }
     return classHandleFor(name);
 }
 
@@ -2083,6 +2106,12 @@ uintptr_t jniGetMethodID(uintptr_t /*env*/, uintptr_t clazz,
     rawLog(name);
     rawLog("\n");
     ++g_jniMethodBindings;
+    if (name != nullptr &&
+        (rawEquals(name, "keySet") || rawEquals(name, "iterator") ||
+         rawEquals(name, "hasNext") || rawEquals(name, "next") ||
+         rawEquals(name, "get") || rawEquals(name, "size"))) {
+        ccHeaderTrace("GetMethodID", name, signature);
+    }
     return rememberJniMethod(clazz, name, signature, false);
 }
 
@@ -2285,11 +2314,37 @@ void jniPairMark(const char* phase, const char* name, uintptr_t methodId,
 #endif
 }
 
-uintptr_t jniCallObjectMethodV(uintptr_t /*env*/, uintptr_t /*object*/,
+uintptr_t jniCallObjectMethodV(uintptr_t /*env*/, uintptr_t object,
                                uintptr_t methodId, void* args) {
     const char* name = jniMethodName(methodId);
     const bool returnsString = jniMethodReturnsString(methodId);
     jniPairMark("enter", name, methodId, 0);
+    // The response-header map, answered before every name-keyed fallback.
+    //
+    // The guest's native headerCallback walks the java.util.Map the port
+    // hands it ("keySet", "iterator", "hasNext", "next", "get", "size"). The
+    // name-keyed path below answers "keySet", "iterator" and "get" with the
+    // shared dummy, which is why the map the guest built was empty and the
+    // server time was never read. The facade recognises its own objects, so
+    // nothing else on this path changes.
+    {
+        uintptr_t headerResult = 0;
+        if (name != nullptr &&
+            ccheaders::handleObject(object, name, &headerResult)) {
+            ccHeaderTrace("hook-obj", name, "answered");
+            jniPairMark("exit", name, methodId, headerResult);
+            return headerResult;
+        }
+        if (name != nullptr && (rawEquals(name, "keySet") ||
+                                rawEquals(name, "iterator") ||
+                                rawEquals(name, "next") ||
+                                rawEquals(name, "get"))) {
+            char detail[96];
+            __builtin_snprintf(detail, sizeof(detail), "obj=0x%llx",
+                               (unsigned long long)object);
+            ccHeaderTrace("hook-obj", name, detail);
+        }
+    }
     uintptr_t rawArg = 0;
     uintptr_t result = jniNamedObjectForMethod(methodId, args, &rawArg);
     const bool named = result != 0;
@@ -2535,6 +2590,23 @@ thread_local const char* t_jniVoidEntry = "62";
 int32_t jniCallBooleanMethodV(uintptr_t env, uintptr_t object,
                               uintptr_t methodId, void* args) {
     const char* name = jniMethodName(methodId);
+    // The response-header map: "hasNext" on the iterator the port handed
+    // out. The name table below answers hasNext with false, which would end
+    // the guest's header walk before the first entry.
+    {
+        bool headerResult = false;
+        if (name != nullptr &&
+            ccheaders::handleBoolean(object, name, &headerResult)) {
+            ccHeaderTrace("hook-bool", name, "answered");
+            return headerResult ? 1 : 0;
+        }
+        if (name != nullptr && rawEquals(name, "hasNext")) {
+            char detail[96];
+            __builtin_snprintf(detail, sizeof(detail), "obj=0x%llx",
+                               (unsigned long long)object);
+            ccHeaderTrace("hook-bool", name, detail);
+        }
+    }
     // Scoped by the receiver, not by the name. init / loadGlyph / loadBitmap /
     // loadBitmapDynamic are ordinary method names that other classes may also
     // declare, and platformBoolForMethod has no receiver to scope on (it is
@@ -2668,9 +2740,26 @@ int32_t jniCallBooleanMethod(uintptr_t env, uintptr_t object,
     return result;
 }
 
-int32_t jniCallIntMethodV(uintptr_t /*env*/, uintptr_t /*object*/,
+int32_t jniCallIntMethodV(uintptr_t /*env*/, uintptr_t object,
                           uintptr_t methodId, void* /*args*/) {
     const char* name = jniMethodName(methodId);
+    // The response-header map: "size" on the value list. The name table
+    // below has no "size", so the list would look empty and the guest would
+    // never ask for the header value.
+    {
+        int32_t headerResult = 0;
+        if (name != nullptr &&
+            ccheaders::handleInt(object, name, &headerResult)) {
+            ccHeaderTrace("hook-int", name, "answered");
+            return headerResult;
+        }
+        if (name != nullptr && rawEquals(name, "size")) {
+            char detail[96];
+            __builtin_snprintf(detail, sizeof(detail), "obj=0x%llx",
+                               (unsigned long long)object);
+            ccHeaderTrace("hook-int", name, detail);
+        }
+    }
     const int32_t result = platformIntForMethod(name);
     if (name != nullptr && gateScalarNameInteresting(name)) {
         gateTraceScalar("gate-obj-int", name, result, methodId);
@@ -4732,3 +4821,29 @@ JniSlotHistogram diffJniHistograms(const JniSlotHistogram& after,
 }
 
 } // namespace rr3
+
+// ---- the response-header facade's side of the port ----------------------
+//
+// The guest's native headerCallback (Java_com_firemonkeys_cloudcellapi_
+// HttpRequest_headerCallback, guest raw 0x1ce4348) walks the java.util.Map
+// the port hands it, using "keySet", "iterator", "hasNext", "next", "get"
+// and "size", and fills the guest's own header map at worker+0x180. The
+// guest's ServerTimeManager then reads the server time out of THAT map
+// (guest raw 0x1cef8a4 looks the key "X-Request-Start" up in it and
+// strtod's the value).
+//
+// The port answers those calls by name plus the receiver, so the three
+// helpers the facade needs - the object pool, the class table and the string
+// table - have to be reachable from outside this file's namespaces. These
+// three wrappers are that surface, and nothing else.
+//
+// They are outside namespace rr3 on purpose: the facade lives in
+// jni_compat/classes/cc_http_request.cpp and names them as
+// ccheaders::allocObject and friends, so they have to be at global scope.
+namespace ccheaders {
+
+uintptr_t allocObject(uintptr_t classHandle) { return rr3::newFakeObject(classHandle); }
+uintptr_t classHandle(const char* name) { return rr3::classHandleFor(name); }
+uintptr_t makeString(const char* value) { return rr3::makeJniString(value); }
+
+} // namespace ccheaders

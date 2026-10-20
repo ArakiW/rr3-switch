@@ -53,6 +53,11 @@
  * written at two sites (jni_bridge.cpp and rr3_Platform.cpp) and so is listed
  * once.
  *
+ * 2026-10-21, later: one more, HttpRequest_headerCallback (guest raw
+ * 0x1ce4348), for the response headers the guest's ServerTimeManager reads
+ * the server time out of. That makes 28 distinct names behind 25 call sites,
+ * and 21 of the 28 resolve.
+ *
  * The "2 of the 25 are present" claim that used to stand here was WRONG and
  * is replaced by the measurement: the boot census prints
  *     cloudcell-natives: 20/27 resolved in the main image
@@ -87,6 +92,18 @@ inline constexpr const char *kCCHttpDataCallback =
     "Java_com_firemonkeys_cloudcellapi_HttpRequest_dataCallback";
 inline constexpr const char *kCCHttpCompleteCallback =
     "Java_com_firemonkeys_cloudcellapi_HttpRequest_completeCallback";
+/*
+ * The response HEADERS. The guest's own implementation (guest raw 0x1ce4348)
+ * walks the java.util.Map it is handed and fills the guest's header map at
+ * worker+0x180, and the guest's ServerTimeManager reads the server time out
+ * of THAT map (guest raw 0x1cef8a4 looks the key "X-Request-Start" up in it
+ * and strtod's the value).
+ *
+ * Present in the image: .dynsym gives
+ * Java_com_firemonkeys_cloudcellapi_HttpRequest_headerCallback at 0x1ce4348.
+ */
+inline constexpr const char *kCCHttpHeaderCallback =
+    "Java_com_firemonkeys_cloudcellapi_HttpRequest_headerCallback";
 
 inline const char *const *cloudcellNativeNames(unsigned &count) {
     static const char *const kNames[] = {
@@ -94,6 +111,7 @@ inline const char *const *cloudcellNativeNames(unsigned &count) {
         "Java_com_firemonkeys_cloudcellapi_HttpRequest_errorCallback",
         kCCHttpDataCallback,
         kCCHttpCompleteCallback,
+        kCCHttpHeaderCallback,
         "Java_com_firemonkeys_cloudcellapi_AndroidAccountManager_LoginCompleteCallback",
         "Java_com_firemonkeys_cloudcellapi_UserInterfaceManager_WebBrowserLoadFailCallback",
         "Java_com_firemonkeys_cloudcellapi_FacebookWorker_LoginCallback",

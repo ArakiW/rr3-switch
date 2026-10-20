@@ -9,6 +9,7 @@
 #include "../jni.h"
 #include "../jni_internals.h"
 #include "cc_cloudcell_auth.h"
+#include "cc_http_headers.h"
 #include "cloudcell_defer.h"
 #include "cloudcell_natives.h"
 #include "rr3/guest_view_trace.hpp"
@@ -78,6 +79,199 @@
  * object the class registry allocated with calloc. */
 static const size_t kMaxBodyBytes = 4096;
 
+/* ------------------------------------------------------------------ *
+ * The response-header facade (cc_http_headers.h)
+ * ------------------------------------------------------------------ */
+
+namespace ccheaders {
+
+/*
+ * The server time the port answers the /time request with.
+ *
+ * ASCII decimal seconds, because the guest's parser converts the header value
+ * with strtod() (guest raw 0x1cef9d0 -> PLT strtod at 0x1e18b80) and stores
+ * the result as a double at this+0x88. 1793000000.125000 is
+ * 2026-10-24T00:53:20Z: a plausible epoch, comfortably positive (the guest
+ * treats a non-positive server time as "no answer" and never logs it).
+ */
+const Entry kServerTime = { "X-Request-Start", "1793000000.125000" };
+
+namespace {
+
+/* "RCHTTP1" - lets the JNI hooks recognise the port's own header objects
+ * among the pool's other residents without a class lookup. */
+constexpr uint64_t kHeaderMagic = 0x5243485454503031ull;
+
+enum Kind : uint32_t {
+    kKindMap = 1,
+    kKindSet = 2,
+    kKindIterator = 3,
+    kKindList = 4,
+};
+
+/*
+ * One object of the java.util.Map / Set / Iterator / List the guest's native
+ * headerCallback walks.
+ *
+ * All four share one layout on purpose: the guest only ever reaches them
+ * through the JNIEnv, and the port answers those calls by name plus the
+ * receiver, so one type with a kind tag is enough and the port needs no
+ * entry in the class registry for java.util.
+ */
+struct HeaderObj {
+    uint64_t    magic;
+    uint32_t    kind;
+    uint32_t    index;    /* the iterator's cursor */
+    const Entry* entries;
+    uint32_t    count;
+};
+
+bool nameIs(const char* name, const char* wanted)
+{
+    if (name == nullptr) {
+        return false;
+    }
+    return strcmp(name, wanted) == 0;
+}
+
+const char* classNameFor(Kind kind)
+{
+    switch (kind) {
+    case kKindMap:      return "java/util/Map";
+    case kKindSet:      return "java/util/Set";
+    case kKindIterator: return "java/util/Iterator";
+    case kKindList:     return "java/util/List";
+    default:            return nullptr;
+    }
+}
+
+HeaderObj* asHeader(uintptr_t object)
+{
+    if (object == 0) {
+        return nullptr;
+    }
+    HeaderObj* obj = reinterpret_cast<HeaderObj*>(object);
+    return obj->magic == kHeaderMagic ? obj : nullptr;
+}
+
+uintptr_t makeHeader(Kind kind, const Entry* entries, uint32_t count)
+{
+    const char* className = classNameFor(kind);
+    if (className == nullptr) {
+        return 0;
+    }
+    const uintptr_t handle = classHandle(className);
+    if (handle == 0) {
+        return 0;
+    }
+    const uintptr_t object = allocObject(handle);
+    if (object == 0) {
+        return 0;
+    }
+    new (reinterpret_cast<void*>(object))
+        HeaderObj{ kHeaderMagic, static_cast<uint32_t>(kind), 0u, entries, count };
+    return object;
+}
+
+} // namespace
+
+uintptr_t createMap(const Entry* entries, size_t count)
+{
+    return makeHeader(kKindMap, entries, static_cast<uint32_t>(count));
+}
+
+/*
+ * The guest's native headerCallback walks the map it is given:
+ *
+ *   keySet()          -> a Set
+ *   iterator()        -> an Iterator
+ *   hasNext()         -> true while the cursor is inside the entries
+ *   next()            -> the next header NAME, as a Java string
+ *   map.get(name)     -> a List of that header's values
+ *   list.size()       -> how many values the list holds
+ *   list.get(index)   -> the value, as a Java string
+ *
+ * Every one of those is answered here, by name and by receiver. The port's
+ * own name-keyed fallbacks would answer "keySet", "iterator" and "get" with
+ * a shared dummy object (jni_bridge.cpp's fakeObjectHandle), which is what
+ * made the header map empty and the server time unreadable.
+ */
+bool handleObject(uintptr_t object, const char* name, uintptr_t* out)
+{
+    HeaderObj* obj = asHeader(object);
+    if (obj == nullptr || name == nullptr || out == nullptr) {
+        return false;
+    }
+    switch (obj->kind) {
+    case kKindMap:
+        if (nameIs(name, "keySet")) {
+            *out = makeHeader(kKindSet, obj->entries, obj->count);
+            return *out != 0;
+        }
+        if (nameIs(name, "get")) {
+            /* The port answers with one header, so every key maps to the
+             * same single-value list. The guest only asks for the keys the
+             * port itself handed out. */
+            *out = makeHeader(kKindList, obj->entries, obj->count);
+            return *out != 0;
+        }
+        return false;
+    case kKindSet:
+        if (nameIs(name, "iterator")) {
+            *out = makeHeader(kKindIterator, obj->entries, obj->count);
+            return *out != 0;
+        }
+        return false;
+    case kKindIterator:
+        if (nameIs(name, "next")) {
+            if (obj->index >= obj->count) {
+                *out = 0;
+                return true;
+            }
+            *out = makeString(obj->entries[obj->index].name);
+            obj->index += 1u;
+            return true;
+        }
+        return false;
+    case kKindList:
+        if (nameIs(name, "get")) {
+            *out = (obj->count > 0u) ? makeString(obj->entries[0].value) : 0u;
+            return true;
+        }
+        return false;
+    default:
+        return false;
+    }
+}
+
+bool handleBoolean(uintptr_t object, const char* name, bool* out)
+{
+    HeaderObj* obj = asHeader(object);
+    if (obj == nullptr || name == nullptr || out == nullptr) {
+        return false;
+    }
+    if (obj->kind == kKindIterator && nameIs(name, "hasNext")) {
+        *out = obj->index < obj->count;
+        return true;
+    }
+    return false;
+}
+
+bool handleInt(uintptr_t object, const char* name, int32_t* out)
+{
+    HeaderObj* obj = asHeader(object);
+    if (obj == nullptr || name == nullptr || out == nullptr) {
+        return false;
+    }
+    if (obj->kind == kKindList && nameIs(name, "size")) {
+        *out = static_cast<int32_t>(obj->count);
+        return true;
+    }
+    return false;
+}
+
+} // namespace ccheaders
+
 class CCHttpRequest : public Object {
 public:
     static Class clazz;
@@ -91,6 +285,24 @@ public:
 
     uint8_t  body[kMaxBodyBytes];
     size_t   bodyLen  = 0;
+
+    /*
+     * The request URL, which is what tells the /time request apart from the
+     * authenticate request.
+     *
+     * The guest builds the URL at runtime (snprintf("%04u-%s%s.cloudcell.com",
+     * envId, role, stage) at guest raw 0x1cf0e60) and the path is appended by
+     * the caller, so the two requests do NOT share a path: the guest's own log
+     * in the measured run prints
+     *     CC: [1] POST request [https://connect-dev-ss.cloudcell.com:443/time]
+     * while the authenticate request goes to CC_Sync.php. The URL is the only
+     * reliable discriminator, because the port cannot read the request body
+     * at all: the guest's byte[] is not a port array object, so
+     * GetArrayLength answers 0 for every request (the measured
+     * "cc-http-init: body=0").
+     */
+    char     url[256];
+    size_t   urlLen = 0;
 };
 
 /* This facade is dispatched onto an object that the port's fake-object pool
@@ -122,6 +334,17 @@ using CCHttpErrorFn = void (*)(JNIEnv *, jobject, jlong, jint);
  * file comment). */
 using CCHttpDataFn     = void (*)(JNIEnv *, jobject, jlong, jbyteArray, jint);
 using CCHttpCompleteFn = void (*)(JNIEnv *, jobject, jlong, jint);
+
+/* Java: public native void headerCallback(long j, int i, Map map) - the
+ * response HEADERS. The guest's own implementation (guest raw 0x1ce4348)
+ * walks the java.util.Map it is given with "keySet", "iterator",
+ * "hasNext", "next", "get" and "size", and stores every (name, value) pair
+ * in the guest's own map at worker+0x180 - which is the map the
+ * ServerTimeManager then reads the server time out of.
+ *
+ * The signature is the guest's own: (JNIEnv*, jobject, jlong, jint, jobject).
+ * The int is the content length and the jobject is the Map. */
+using CCHttpHeaderFn   = void (*)(JNIEnv *, jobject, jlong, jint, jobject);
 
 /* The member id the guest compares the response against when the request
  * carries none. The guest compares it at 0x1d01dc4 against a read-only
@@ -176,7 +399,7 @@ static void http_ctor(JNIEnv *, jobject self, jclass)
  * array-form dispatcher reads them.
  */
 static void http_init(JNIEnv *env, jobject self, jstring /*userAgent*/,
-                      jstring /*method*/, jstring /*url*/, jbyteArray body,
+                      jstring /*method*/, jstring url, jbyteArray body,
                       jint /*readCapacity*/, jlong callback,
                       jboolean /*failOnErrorStatus*/)
 {
@@ -184,6 +407,24 @@ static void http_init(JNIEnv *env, jobject self, jstring /*userAgent*/,
     req->callback = callback;
     req->closed   = JNI_FALSE;
     req->pending  = JNI_FALSE;
+
+    /* Keep the URL. It is the only thing that tells the /time request from
+     * the authenticate request (see the class comment). */
+    req->urlLen = 0;
+    req->url[0] = '\0';
+    if (url != nullptr) {
+        const char *text = env->GetStringUTFChars(url, nullptr);
+        if (text != nullptr) {
+            size_t take = 0;
+            while (take + 1u < sizeof(req->url) && text[take] != '\0') {
+                take += 1u;
+            }
+            memcpy(req->url, text, take);
+            req->url[take] = '\0';
+            req->urlLen = take;
+            env->ReleaseStringUTFChars(url, text);
+        }
+    }
 
     /* Keep the body. Without it http_post() cannot tell the authenticate
      * request from the sync request, and the two share the same URL path
@@ -201,9 +442,11 @@ static void http_init(JNIEnv *env, jobject self, jstring /*userAgent*/,
 
     /* One line per request, so "the guest never calls this class" is a
      * MEASURED statement and not an inference from the absence of the
-     * http.post deferral line. */
+     * http.post deferral line. The URL is on the same line because it is
+     * what identifies the request. */
     if (authLogBudget()) {
-        trace("cc-http-init: body=%zu", (unsigned)req->bodyLen);
+        trace("cc-http-init: body=%zu url=%s", (unsigned)req->bodyLen,
+              req->urlLen > 0u ? req->url : "(none)");
     }
 }
 
@@ -267,6 +510,77 @@ static bool deliverAuthSuccess(JNIEnv *env, CCHttpRequest *req,
     return true;
 }
 
+/*
+ * Answer the /time request.
+ *
+ * MEASURED: the guest's ServerTimeManager does not read the server time out
+ * of the response BODY. Its parser (guest raw 0x1cef8a4) looks the key
+ * "X-Request-Start" up in the guest's response-HEADER map (worker+0x180,
+ * filled by the guest's own native headerCallback at guest raw 0x1ce4348)
+ * and converts the value with strtod (guest raw 0x1cef9d0). The value is
+ * therefore ASCII decimal seconds.
+ *
+ * The delivery order is the Java one (HttpThread.run): headerCallback, then
+ * the body, then completeCallback. The /time response has no body the guest
+ * reads, so only the header and the completion are delivered - matching the
+ * Java contract, where ReadHttpData never calls dataCallback for a body that
+ * is empty.
+ *
+ * No Content-Type is sent: the guest's completion handler compares the
+ * response's content type against the one the worker expects
+ * (guest raw 0x1ce3f68 -> 0x1ce3fd4) and asserts when they differ. The port
+ * sends no content type today and the guest does not assert, so sending none
+ * keeps that comparison exactly as it is.
+ */
+static bool deliverServerTime(JNIEnv *env, CCHttpRequest *req)
+{
+    static CCHttpHeaderFn header_callback = cloudcell_native<CCHttpHeaderFn>(
+        kCCHttpHeaderCallback);
+    static CCHttpCompleteFn complete_callback = cloudcell_native<CCHttpCompleteFn>(
+        kCCHttpCompleteCallback);
+
+    if (header_callback == nullptr || complete_callback == nullptr) {
+        warning("HttpRequest: /time natives missing (header=%p complete=%p); "
+                "the server time cannot be delivered\n",
+                (void *)header_callback, (void *)complete_callback);
+        return false;
+    }
+
+    const uintptr_t map = ccheaders::createMap(&ccheaders::kServerTime, 1u);
+    if (map == 0) {
+        warning("HttpRequest: could not build the response header map\n");
+        return false;
+    }
+
+    if (authLogBudget()) {
+        trace("cc-srvtime: answering /time with header %s=%s (map=%p)",
+              ccheaders::kServerTime.name, ccheaders::kServerTime.value,
+              (void *)map);
+    }
+    {
+        char details[192];
+        __builtin_snprintf(details, sizeof(details),
+                           "url=%s header=%s value=%s map=%p", req->url,
+                           ccheaders::kServerTime.name,
+                           ccheaders::kServerTime.value, (void *)map);
+        rr3::guestViewWideLog("cc-srvtime",
+                              static_cast<unsigned long long>(req->callback),
+                              static_cast<unsigned long long>(req->bodyLen),
+                              details);
+    }
+
+    header_callback(env, (jobject)req, req->callback, 0, (jobject)map);
+    if (authLogBudget()) {
+        trace("cc-srvtime: headerCallback returned");
+    }
+    complete_callback(env, (jobject)req, req->callback, 200);
+
+    if (authLogBudget()) {
+        trace("cc-srvtime: header delivered, completed with status 200");
+    }
+    return true;
+}
+
 static void http_post(JNIEnv *env, jobject self)
 {
     CCHttpRequest *req = (CCHttpRequest *)self;
@@ -276,6 +590,20 @@ static void http_post(JNIEnv *env, jobject self)
         if (!req->pending || req->closed)
             return;
         req->pending = JNI_FALSE;
+
+        /* The /time request. The URL is the discriminator: the guest's own
+         * log prints "CC: [1] POST request
+         * [https://connect-dev-ss.cloudcell.com:443/time]" while the
+         * authenticate request goes to CC_Sync.php. The body cannot be used:
+         * the guest's byte[] is not a port array object, so the port reads a
+         * length of 0 for every request. */
+        if (strstr(req->url, "/time") != nullptr) {
+            if (deliverServerTime(env, req)) {
+                return;
+            }
+        } else if (authLogBudget()) {
+            trace("cc-http-req: not the /time request url=%s", req->url);
+        }
 
         cccloud::AuthRequest info;
         const bool authShaped =
