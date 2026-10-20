@@ -3583,6 +3583,183 @@ void pollDownloadPhaseGate(uint64_t frames) {
                         line, 77, 0);
 }
 
+// ---------------------------------------------------------------------------
+// DIAGNOSTIC (STEP 1): force the guest's server-variable feature bits.
+// ---------------------------------------------------------------------------
+//
+// THIS IS AN EXPERIMENT, NOT A FIX. It answers exactly one question:
+//
+//   Does the AssetDownloadService creation wait (guest 0x14048c8) depend on
+//   the SERVER-VARIABLE FEATURE BITS, or on the Cloudcell SYNC itself?
+//
+// The guest keeps those bits in a bitmap of 64-bit words behind a pointer in
+// .bss of the main image, at raw 0x1f9c290. The reader is guest 0xcfea60,
+// disassembled here (not paraphrased):
+//
+//   0xcfea84  adrp x8, #0x1f9c000
+//   0xcfea88  add  x8, x8, #0x290     ; &bitmapTablePtr
+//   0xcfea8c  ldr  x8, [x8]           ; x8 = table (array of 64-bit words)
+//   0xcfea90  mov  w9, w19            ; w19 = the bit index
+//   0xcfea94  lsr  x10, x9, #3        ; x10 = bit >> 3
+//   0xcfea98  and  x10, x10, #0x1ffffff8 ; clear the low three bits
+//   0xcfea9c  ldr  x8, [x8, x10]      ; the word
+//   0xcfeaa4  lsr  x8, x8, x9
+//   0xcfeaa8  and  w0, x8, #1         ; return (word >> bit) & 1
+//
+// For bits 38 (0x26), 49 (0x31) and 50 (0x32) the word index is 0 under
+// every reading of that sequence -- (38>>3)&~7 == (49>>3)&~7 == (50>>3)&~7
+// == 0 -- so all three live in table word 0, at their own bit positions, and
+// one OR-store sets all of them.
+//
+// The consumers are confirmed by disassembly, in the asset-download path:
+//   0xbe6534  mov w1, #0x26 ; 0xbe653c bl 0xcfea60 ; 0xbe6540 tbz w0,#0
+//   0xbe6690  mov w1, #0x32 ; 0xbe6694 bl 0xcfea60 ; 0xbe6698 tbz w0,#0
+//   (bit 49 is read the same way at 0xbe6718)
+//
+// THE SWITCH. A compile-time constant, because the emulator opt-in file
+// (sdmc:/switch/rr3-gfx.conf) is off limits for this experiment and an
+// environment variable is not guaranteed to survive Eden's own process
+// launch. Set to 1 to re-run the experiment.
+//
+// RESULT 2026-10-20 (archive 20261020-153215-eden-featbits1, 300 s, versus
+// baseline 20261020-144906-eden-regnat1): THE FORCING MOVED NOTHING, and
+// the reason is stronger than "the force did not work" -- THERE WAS NOTHING
+// TO FORCE.
+//
+//   featbits: f=0 tbl=0x210e4f3560 w0=0xfffe1d7ffffffff5 forced=0xfffe1d7ffffffff5
+//             b38=1 b49=1 b50=1 changed=0 writes=0 mask=0x6004000000000 on=1
+//
+// writes=0 on every one of the 67 samples: the host never wrote a byte,
+// because bits 38, 49 and 50 were ALREADY SET in the guest's own bitmap.
+// The dlgate line was byte-for-byte the baseline's (svc=0x0, qCount=0) and
+// the "startMusic disabled during download" / "Bad config. Corrupted JSON
+// config" / "AssetDownloadService" counts were 2 / 1 / 0, exactly as the
+// baseline.
+//
+// WHY THE BITS WERE ALREADY SET: the bitmap is a COMPILE-TIME CONSTANT, not
+// a parsed document. It is built by 0xcfe500 -- `0xcff164(&slot, 90, 1)`
+// (90 words of all-ones) followed by eight constant AND masks on word 0 and
+// one on word 1 -- and the value measured at run time (0xfffe1d7ffffffff5)
+// is exactly what that static computation produces, bit for bit. Nothing
+// in the run ever writes it. So the feature-bit lever is not merely
+// ineffective, it is INEXISTENT: there is no document to supply and no bit
+// to flip.
+//
+// The switch therefore defaults to 0: the shipped port must behave exactly
+// as it did before this experiment, and the diagnostic costs one load per
+// frame plus 67 log lines for no effect. Set it to 1 to reproduce the
+// archive above.
+#ifndef RR3_FORCE_FEATURE_BITS
+#define RR3_FORCE_FEATURE_BITS 0
+#endif
+
+constexpr uint64_t kFeatBitsTableElfVa = 0x1F9C290ULL;
+constexpr uint64_t kFeatBitsForceMask =
+    (1ULL << 38) | (1ULL << 49) | (1ULL << 50);
+constexpr unsigned kFeatBitsMaxLines = 200;
+
+// One 64-bit word written into guest memory, or "not written".
+//
+// The mirror of readDlWord(): an address inside the guest image is written
+// directly (guestImageContains is exact), and a pointer the guest itself
+// published is written when it is plausible. Anything else is refused, and a
+// refused write is reported as a refusal, never as a value.
+bool writeDlWord(uintptr_t address, uint64_t value) {
+    if (address == 0) {
+        return false;
+    }
+    if (!guestImageContains(address, sizeof(uint64_t)) &&
+        !dlPointerPlausible(address)) {
+        return false;
+    }
+    *reinterpret_cast<volatile uint64_t*>(address) = value;
+    return true;
+}
+
+// Forces the feature bits and says what it did.
+//
+// The write is RE-ASSERTED EVERY FRAME rather than done once, so that the
+// experiment cannot be invalidated by the guest overwriting the word
+// between the force and the guest's read. With the bitmap being the static
+// constant it turned out to be, the repeat costs one load and one compare
+// and changes nothing; the point of doing it per frame is that the RUN
+// would have been meaningless if the guest did overwrite it.
+//
+// The log is change-triggered plus a heartbeat every 240 frames, so the
+// archive shows (a) when the table first exists, (b) whether the guest ever
+// cleared the bits we set, and (c) the bit values the guest's own reader
+// would return for 38, 49 and 50.
+void forceServerVariableFeatureBits(uint64_t frames) {
+    static unsigned s_lines = 0;
+    static uint64_t s_lastTable = 0;
+    static bool s_tableSeen = false;
+    static uint64_t s_writes = 0;
+
+    if (s_lines >= kFeatBitsMaxLines) {
+        return;
+    }
+
+    const uintptr_t bias = static_cast<uintptr_t>(resolveMainImageLoadBias());
+    if (bias == 0) {
+        return;
+    }
+    const DlWord slot = readDlWord(bias + kFeatBitsTableElfVa);
+    if (!slot.readable) {
+        return;
+    }
+    const uint64_t table = slot.value;
+    if (table == 0 || !dlPointerPlausible(static_cast<uintptr_t>(table))) {
+        // The bitmap does not exist yet. The reader creates it lazily (the
+        // slow path at 0xcfea80 calls 0xcfe4fc, which allocates the table
+        // and publishes the pointer), so "no table" is a normal state, not
+        // an error -- and it is the state that says the guest never even
+        // reached the code that would have filled it from a sync.
+        return;
+    }
+    const DlWord word = readDlWord(static_cast<uintptr_t>(table));
+    if (!word.readable) {
+        return;
+    }
+    const uint64_t forced = word.value | kFeatBitsForceMask;
+    const bool changed = forced != word.value;
+    if (changed) {
+        if (!writeDlWord(static_cast<uintptr_t>(table), forced)) {
+            return;
+        }
+        ++s_writes;
+    }
+
+    const bool first = !s_tableSeen || table != s_lastTable;
+    const bool beat = (frames % 240) == 0;
+    if (!first && !changed && !beat) {
+        return;
+    }
+    s_tableSeen = true;
+    s_lastTable = table;
+    ++s_lines;
+
+    char tableText[40];
+    formatDlValue(tableText, sizeof(tableText), bias,
+                  static_cast<uintptr_t>(resolveMainImageSpanBytes()),
+                  slot);
+    char line[320];
+    __builtin_snprintf(
+        line, sizeof(line),
+        "featbits: f=%llu tbl=%s w0=0x%llx forced=0x%llx b38=%u b49=%u b50=%u"
+        " changed=%d writes=%llu mask=0x%llx on=%d",
+        static_cast<unsigned long long>(frames), tableText,
+        static_cast<unsigned long long>(word.value),
+        static_cast<unsigned long long>(forced),
+        static_cast<unsigned>((forced >> 38) & 1ULL),
+        static_cast<unsigned>((forced >> 49) & 1ULL),
+        static_cast<unsigned>((forced >> 50) & 1ULL),
+        changed ? 1 : 0, static_cast<unsigned long long>(s_writes),
+        static_cast<unsigned long long>(kFeatBitsForceMask),
+        RR3_FORCE_FEATURE_BITS ? 1 : 0);
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        line, 300, 0);
+}
+
 // The frame loop, verbatim, on whichever thread the dispatch above chose.
 //
 // Two things are thread-dependent and are handled here rather than at the call
@@ -3917,6 +4094,13 @@ void* frameLoopDriver(void* opaque) {
         // be indistinguishable from the noise around it.
         if ((frames % 240) == 0) {
             pollDownloadPhaseGate(frames);
+        }
+        // DIAGNOSTIC (STEP 1): force the server-variable feature bits. Every
+        // frame, and BEFORE the guest's render call below, so the guest sees
+        // the forced bits on the very first frame it can ask for them. The
+        // switch is a compile-time constant; see the block above.
+        if (RR3_FORCE_FEATURE_BITS) {
+            forceServerVariableFeatureBits(frames);
         }
         padUpdate(&framePad);
         // --- wedge breadcrumbs -------------------------------------------
