@@ -65,6 +65,12 @@
 #include "jni_compat/classes/cloudcell_defer.h"
 #include "jni_compat/classes/cloudcell_natives.h"
 
+// The Java side of the one class the guest binds natives for
+// (csdk/glucentralservices/eventbus/ServerEventBus). The header carries the
+// measurement that says why the port is that side, and the decompiled-Java
+// citations for what that class's Java-visible behaviour is.
+#include "jni_compat/classes/csdk_eventbus.h"
+
 // For ClassRegistry / ManagedMethod, so the call slots can be pointed at the
 // stubs in jni_compat/classes/. Nothing from that directory is currently
 // reachable from here: jniGetMethodID hands back a JniMethodRecord and every
@@ -1073,6 +1079,205 @@ uintptr_t fontClassHandle() {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// RegisterNatives: the guest's own native-method table.
+//
+// MEASURED 2026-10-20, archive 20261020-134823-eden-dlprobe2:
+//
+//  * Every "[jni] ..." line in Eden's log is THIS file's output. jniFindClass
+//    (below) writes exactly "[jni] FindClass <name>" through rawLog ->
+//    svcOutputDebugString, and the run's 27 distinct class names have that
+//    spelling -- so those lookups were answered by the port's own class
+//    table, not by a VM behind the emulator.
+//  * There is no second JNI path. Eden is a Switch emulator and has no JVM;
+//    the port never calls JNI_CreateJavaVM; and jni_compat/jni.cpp's
+//    jnienv_funcs is reachable only through that file's own fake JavaVM,
+//    while the guest's JNIEnv is the g_jniTable below.
+//
+// The Java side of a native-bound class IS this port, then, and a registration
+// that is thrown away is a registration that can never be called. Before this
+// change g_jniTable[215] was jniReturnZero, so the guest's seven exported
+// Java_csdk_glucentralservices_eventbus_ServerEventBus_* symbols -- the ones
+// the guest's own .data table at raw 0x1f8ae88 points at -- were dropped on
+// the floor and the guest's csdk could not be reached at all.
+//
+// The table is recorded so the host can call into the guest exactly the way
+// the Java side would: a static native is jlong (*)(JNIEnv*, jclass).
+// ---------------------------------------------------------------------------
+
+// The JNINativeMethod the guest passes: {name, signature, fnPtr}.
+struct GuestNativeMethod {
+    const char* name;
+    const char* signature;
+    void* fn;
+};
+
+constexpr size_t kMaxJniNativeBindings = 64;
+JniNativeBinding g_jniNativeBindings[kMaxJniNativeBindings]{};
+size_t g_jniNativeBindingCount = 0;
+bool g_jniNativeBindingOverflow = false;
+
+// The registration's own clock, in milliseconds since boot. 0 = never.
+uint64_t g_jniNativeRegisteredAtMs = 0;
+bool g_jniJavaSideStarted = false;
+
+// How long after the registration the Java side runs.
+//
+// The guest's JNI traffic is over by t=33.6 s in the baseline run: the last
+// "[jni]" line in Eden's log is at 33.588 s of a 223 s run. The delay
+// therefore has to fit inside that window or the Java side never runs at
+// all. Two seconds is long enough for the csdk's own initialisation -- whose
+// last act is the registration -- to be over, and short enough to still fire.
+constexpr uint64_t kJavaSideDelayMs = 2000;
+
+// The Java side runs on its own thread, with its own guest TLS.
+//
+// WHY A SEPARATE THREAD
+// ---------------------
+// The Java side calls back INTO the guest (shared(), globalToken(),
+// getMIDHandleEvent()). Running that on the thread that is inside the
+// guest's own csdk initialisation -- the thread that has just registered the
+// natives -- risks a SELF-deadlock: the csdk's shared-bus lock is a plain,
+// non-recursive mutex, and re-entering the csdk on the thread that holds it
+// would hang the guest outright.
+//
+// A separate thread turns that into an ordinary wait: the init thread keeps
+// running and releases the lock, and the Java side proceeds. If it still
+// cannot proceed, the run keeps going and the log says so -- the absence of
+// the "java-side end" line is then the evidence, and the guest's frames keep
+// coming either way.
+constexpr uint32_t kJavaSideThreadStackSize = 0x8000;
+constexpr int kJavaSideThreadPriority = 0x3B;
+
+void jniJavaSideWorker(void* opaque) {
+    (void)opaque;
+    GuestTlsScope tlsScope;
+    if (!tlsScope.active()) {
+        rawLog("[jni] eventbus: java-side thread could not install the guest TLS\n");
+        return;
+    }
+    csdkEventBusJavaSideRun();
+}
+
+// Starts the Java side, once, when the delay has elapsed.
+//
+// Called from a JNI call, so it runs on the guest's own thread with the
+// guest TLS installed -- but it only STARTS a thread; the guest is called
+// from that thread, not from here.
+void jniNativeJavaSideTick() {
+    if (g_jniJavaSideStarted || g_jniNativeRegisteredAtMs == 0) {
+        return;
+    }
+    const uint64_t freq = armGetSystemTickFreq();
+    if (freq == 0) {
+        return;
+    }
+    const uint64_t now = armGetSystemTick() * 1000ULL / freq;
+    if (now < g_jniNativeRegisteredAtMs + kJavaSideDelayMs) {
+        return;
+    }
+    g_jniJavaSideStarted = true;
+    static Thread g_jniJavaSideThread;
+    if (R_FAILED(threadCreate(&g_jniJavaSideThread, jniJavaSideWorker, nullptr,
+                              nullptr, kJavaSideThreadStackSize,
+                              kJavaSideThreadPriority,
+                              -2 /* default core */))) {
+        rawLog("[jni] eventbus: java-side threadCreate failed\n");
+        return;
+    }
+    threadStart(&g_jniJavaSideThread);
+    rawLog("[jni] eventbus: java-side thread started\n");
+}
+
+// RegisterNatives: the guest binds its own native methods to a Java class.
+//
+// The class handle is one of ours (classHandleFor gave it out), so the class
+// name is known; the methods are the guest's own function pointers. Both are
+// recorded, and one line is written so a run can say what was bound.
+uintptr_t jniRegisterNatives(uintptr_t env, uintptr_t clazz, const void* methods,
+                             int32_t count) {
+    if (methods == nullptr || count <= 0) {
+        return static_cast<uintptr_t>(-1);  // JNI_ERR
+    }
+    const GuestNativeMethod* table =
+        static_cast<const GuestNativeMethod*>(methods);
+    const char* classText = className(clazz);
+    const char* classLabel = classText != nullptr ? classText : "(unknown)";
+
+    size_t recorded = 0;
+    const GuestNativeMethod* first = nullptr;
+    for (int32_t index = 0; index < count; ++index) {
+        const GuestNativeMethod& method = table[index];
+        if (method.name == nullptr) {
+            continue;
+        }
+        if (first == nullptr) {
+            first = &method;
+        }
+        if (g_jniNativeBindingCount >= kMaxJniNativeBindings) {
+            g_jniNativeBindingOverflow = true;
+            continue;
+        }
+        JniNativeBinding& binding = g_jniNativeBindings[g_jniNativeBindingCount++];
+        binding.className = classLabel;
+        binding.name = method.name;
+        binding.signature = method.signature;
+        binding.fn = reinterpret_cast<uintptr_t>(method.fn);
+        binding.clazz = clazz;
+        binding.env = env;
+        ++recorded;
+    }
+
+    char details[288];
+    __builtin_snprintf(
+        details, sizeof(details),
+        "class=%s methods=%d recorded=%u first=%s%s%s fn=%p overflow=%d",
+        classLabel, static_cast<int>(count), static_cast<unsigned>(recorded),
+        first != nullptr ? first->name : "?",
+        first != nullptr && first->signature != nullptr ? ":" : "",
+        first != nullptr && first->signature != nullptr ? first->signature : "",
+        first != nullptr ? first->fn : nullptr,
+        g_jniNativeBindingOverflow ? 1 : 0);
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "jni-regnatives",
+                        static_cast<unsigned long long>(count), clazz, details);
+    rawLog("[jni] RegisterNatives ");
+    rawLog(classLabel);
+    rawLog("\n");
+
+    if (g_jniNativeRegisteredAtMs == 0) {
+        const uint64_t freq = armGetSystemTickFreq();
+        g_jniNativeRegisteredAtMs =
+            freq != 0 ? armGetSystemTick() * 1000ULL / freq : 0;
+    }
+    return 0;  // JNI_OK
+}
+
+// UnregisterNatives: the guest drops the bindings for a class.
+uintptr_t jniUnregisterNatives(uintptr_t /*env*/, uintptr_t clazz) {
+    const char* classText = className(clazz);
+    const char* classLabel = classText != nullptr ? classText : "(unknown)";
+    size_t removed = 0;
+    for (size_t index = 0; index < g_jniNativeBindingCount;) {
+        if (g_jniNativeBindings[index].clazz == clazz) {
+            g_jniNativeBindings[index] =
+                g_jniNativeBindings[g_jniNativeBindingCount - 1];
+            --g_jniNativeBindingCount;
+            ++removed;
+            continue;
+        }
+        ++index;
+    }
+    char details[128];
+    __builtin_snprintf(details, sizeof(details),
+                       "class=%s removed=%u", classLabel,
+                       static_cast<unsigned>(removed));
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "jni-unregnatives", static_cast<unsigned long long>(removed),
+                        clazz, details);
+    return 0;  // JNI_OK
+}
+
 // ---- Font state -----------------------------------------------------------
 //
 // Synthetic but self-consistent metrics for com.firemint.realracing.Font at
@@ -1766,6 +1971,10 @@ uintptr_t jniFindClass(uintptr_t /*env*/, const char* name) {
     rawLog("[jni] FindClass ");
     rawLog(name);
     rawLog("\n");
+    // The Java side of a native-bound class runs once, a couple of seconds
+    // after the guest registers its natives. Driven from a JNI call because
+    // that is where the guest's own thread and the guest TLS are available.
+    jniNativeJavaSideTick();
     return classHandleFor(name);
 }
 
@@ -3871,7 +4080,8 @@ void ensureInitialized() {
     g_jniTable[192] = reinterpret_cast<void*>(&jniReleaseByteArrayElements); // ReleaseByteArrayElements
     g_jniTable[200] = reinterpret_cast<void*>(&jniGetByteArrayRegion); // GetByteArrayRegion
     g_jniTable[208] = reinterpret_cast<void*>(&jniSetByteArrayRegion); // SetByteArrayRegion
-    g_jniTable[215] = reinterpret_cast<void*>(&jniReturnZero);        // RegisterNatives
+    g_jniTable[215] = reinterpret_cast<void*>(&jniRegisterNatives);  // RegisterNatives
+    g_jniTable[216] = reinterpret_cast<void*>(&jniUnregisterNatives);// UnregisterNatives
     g_jniTable[228] = reinterpret_cast<void*>(&jniReturnZero);        // ExceptionCheck
 
     // The one-byte sentinels are handles too, and the one the dispatch
@@ -4132,6 +4342,31 @@ JniSlotHistogram captureJniHistogram() {
 void* guestJniEnvironment() {
     ensureInitialized();
     return &g_jniVtable;
+}
+
+// The bindings the guest registered with RegisterNatives.
+//
+// Exposed outside the anonymous namespace because the Java side of a bound
+// class lives in its own file (jni_compat/classes/csdk_eventbus.cpp) and has
+// to reach the guest's own function pointers through it.
+//
+// The table is not locked. It is written by the guest's own thread inside
+// RegisterNatives and read by the Java-side thread afterwards, and the
+// Java-side thread is only started once the registration has landed, so the
+// write happens-before the read.
+const JniNativeBinding* findJniNativeBinding(const char* className,
+                                              const char* name) {
+    if (className == nullptr || name == nullptr) {
+        return nullptr;
+    }
+    for (size_t index = 0; index < g_jniNativeBindingCount; ++index) {
+        const JniNativeBinding& binding = g_jniNativeBindings[index];
+        if (rawEquals(binding.className, className) &&
+            rawEquals(binding.name, name)) {
+            return &binding;
+        }
+    }
+    return nullptr;
 }
 
 void* guestActivityObject() {

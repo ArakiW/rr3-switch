@@ -643,17 +643,94 @@ ABI_ATTR static void iface_SetObjectArrayElement(JNIEnv *env, jobjectArray jarr,
     memcpy((void*)offs, (void*)jobj, arr->element_size);
 }
 
+// RegisterNatives: the guest binds its own native methods to a Java class.
+//
+// MEASURED 2026-10-20, archive 20261020-134823-eden-dlprobe2: this file's
+// JNIEnv is NOT the JNIEnv the guest uses. The guest's JNIEnv is the
+// g_jniTable in jni_bridge.cpp, and its RegisterNatives slot was
+// jniReturnZero -- the registration was thrown away there. This table's
+// jnienv_funcs is reachable only through this file's own fake JavaVM
+// (jvm_funcs), and nothing calls JNI_CreateJavaVM, so nothing reaches it
+// today.
+//
+// The live implementation is jni_bridge.cpp's jniRegisterNatives, which
+// records the same thing and, because the port IS the Java side, can call
+// the guest's own function pointers back (see
+// jni_compat/classes/csdk_eventbus.cpp).
+//
+// This copy is kept honest rather than stubbed: the binding is recorded and
+// logged instead of being dropped on the floor, so a run that ever DOES
+// reach this JNIEnv can say what was bound. It is not made callable here,
+// because the call sites in this file dispatch through a compile-time
+// ManagedMethod dispatcher whose return type is fixed by the slot, and a
+// dynamically bound native has no such dispatcher to borrow.
+namespace {
+
+struct RegisteredNative {
+    const char* classPath;
+    const char* name;
+    const char* signature;
+    void* fn;
+};
+
+constexpr size_t kMaxRegisteredNatives = 64;
+RegisteredNative g_registeredNatives[kMaxRegisteredNatives]{};
+size_t g_registeredNativeCount = 0;
+
+}  // namespace
+
 ABI_ATTR static jint iface_RegisterNatives(JNIEnv *env, jclass jclazz,
     const JNINativeMethod* methods, jint nMethods)
 {
-    WARN_STUB;
-    return 0;
+    (void)env;
+    if (methods == NULL || nMethods <= 0) {
+        return JNI_ERR;
+    }
+    const Class* clz = (const Class*)jclazz;
+    const char* classPath = clz != NULL ? clz->classpath : "(null)";
+    const char* className = clz != NULL ? clz->classname : "(null)";
+    size_t recorded = 0;
+    for (jint index = 0; index < nMethods; ++index) {
+        const JNINativeMethod& method = methods[index];
+        if (method.name == NULL) {
+            continue;
+        }
+        if (g_registeredNativeCount >= kMaxRegisteredNatives) {
+            break;
+        }
+        RegisteredNative& native = g_registeredNatives[g_registeredNativeCount++];
+        native.classPath = classPath;
+        native.name = method.name;
+        native.signature = method.signature;
+        native.fn = method.fnPtr;
+        ++recorded;
+    }
+    eap_trace("jni-regnatives: class=%s name=%s methods=%d recorded=%u",
+              className, classPath, (int)nMethods, (unsigned)recorded);
+    return JNI_OK;
 }
 
 ABI_ATTR static jint iface_UnregisterNatives(JNIEnv *env, jclass jclazz)
 {
-    WARN_STUB;
-    return 0;
+    (void)env;
+    const Class* clz = (const Class*)jclazz;
+    if (clz == NULL) {
+        return JNI_ERR;
+    }
+    size_t removed = 0;
+    for (size_t index = 0; index < g_registeredNativeCount;) {
+        if (g_registeredNatives[index].classPath == clz->classpath) {
+            g_registeredNatives[index] =
+                g_registeredNatives[g_registeredNativeCount - 1];
+            --g_registeredNativeCount;
+            ++removed;
+            continue;
+        }
+        ++index;
+    }
+    eap_trace("jni-unregnatives: class=%s removed=%u", clz->classname,
+              (unsigned)removed);
+    return JNI_OK;
 }
 
 ABI_ATTR static jint iface_MonitorEnter(JNIEnv *env, jobject jobj)
