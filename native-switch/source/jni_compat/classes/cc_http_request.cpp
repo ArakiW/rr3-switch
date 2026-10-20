@@ -3,6 +3,8 @@
 #include <string.h>
 #include <vector>
 
+#include <switch.h>
+
 #include "../../eap_port/platform_adapter.h"
 #include "../../eap_port/so_util_adapter.h"
 #include "../../eap_port/trace_adapter.h"
@@ -510,6 +512,494 @@ static bool deliverAuthSuccess(JNIEnv *env, CCHttpRequest *req,
     return true;
 }
 
+/* ------------------------------------------------------------------ *
+ * The response-header probe
+ * ------------------------------------------------------------------ */
+
+/*
+ * WHAT THIS PROBES, AND WHY
+ * ==========================
+ *
+ * MEASURED (archive 20261021-063741-eden-srvtime2): the port hands the guest
+ * the header "X-Request-Start: 1793000000.125000" through the guest's own
+ * native headerCallback (guest raw 0x1ce4348), the guest's header walk runs
+ * (the port's cc-hdr trace shows keySet / iterator / hasNext / next / get /
+ * size all answered) and the request completes with Succeeded=True - but the
+ * guest never logs
+ *     "CC: Server time returned; server time: %f server-local time diff: %f"
+ * (format string at guest raw 0x3fc1d0).
+ *
+ * The guest's own code says that line is printed from exactly one place, the
+ * ServerTimeManager's response handler at guest raw 0x1cef2f8, and it is
+ * reached only when ALL of these hold:
+ *
+ *   0x1cef360  |now - (this+0x80)| <= 5.0   the parse happened recently
+ *   0x1cef37c  (this+0x88) > 0.0            THE SERVER TIME WAS PARSED
+ *   0x1cef384  (this+0x70) == the token     the token still matches
+ *   0x1cef390  |now - (this+0x78)| <  5.0   the response came back fast
+ *
+ * and that (this+0x88) is written by the parser at guest raw 0x1cef8a4, which
+ * ZEROES it first (0x1cef900) and only fills it when the key "X-Request-Start"
+ * is FOUND in the map it is handed:
+ *
+ *   0x1cef8c8  ldr x8, [x0, #0x70]   ; the token
+ *   0x1cef8cc  cmp x8, x2            ; must match, else the answer is dropped
+ *   0x1cef92c  bl 0xa0b240           ; the guest's hash-map find
+ *   0x1cef9d4  str d0, [x19, #0x88]  ; this->serverTime
+ *
+ * So the probe has to answer ONE question: did the header land in the guest's
+ * OWN response-header map, and does the parser read THAT map?
+ *
+ * It can answer the first half, because the guest's map is a hash map whose
+ * layout the port can read (taken from the guest's own find at guest raw
+ * 0xa0b240 and from the guest's own insert at guest raw 0x1ce48b8):
+ *
+ *   container+0x00  void**  the bucket array
+ *   container+0x08  size_t  the bucket count
+ *   node+0x00       node*   the next node in the bucket
+ *   node+0x08       u64     the key's hash
+ *   node+0x10       string  the key
+ *   node+0x28       string  the value
+ *
+ * and a std::string in this guest is
+ *
+ *   +0x00  byte   flags: bit0 set -> the data is on the heap, otherwise the
+ *                       length is (flags >> 1) and the data is inline
+ *   +0x01  byte[] the inline data
+ *   +0x08  u64    the length (long strings only)
+ *   +0x10  void*  the data pointer (long strings only)
+ *
+ * The container the guest's headerCallback writes to is at
+ * (*(worker+0x08)) + 0x178 (guest raw 0x1ce4794 and 0x1ce47a4), and the
+ * port knows the worker: it is the jlong the guest handed init(), and the port
+ * hands the very same value back to every callback.
+ *
+ * The port therefore reads the guest's map after the headerCallback and prints
+ * the (key, value) pairs it finds. No guest code is called, nothing is
+ * written, and every read is bounded.
+ */
+namespace ccprobe {
+
+/* Bounded, read-only. The guest's addresses are host addresses: the rehosted
+ * image is mapped into this process, so a guest pointer is directly readable. */
+
+static void appendText(char *out, size_t cap, size_t *used, const char *text)
+{
+    if (out == nullptr || text == nullptr || *used + 1u >= cap) {
+        return;
+    }
+    size_t take = strlen(text);
+    if (*used + take + 1u > cap) {
+        take = cap - *used - 1u;
+    }
+    memcpy(out + *used, text, take);
+    *used += take;
+    out[*used] = '\0';
+}
+
+/*
+ * Every guest read is gated on TWO checks, and both are load-bearing.
+ *
+ * svcQueryMemory answers for an unmapped address instead of letting the load
+ * trap (the rule the census uses: pthread_bridge.cpp's censusReadStackWord).
+ * On its own it is NOT enough under Eden: the kernel is asked about the HOST's
+ * mapping of the address, and Eden's emulated guest MMU has its own idea of
+ * what is mapped. A host address that happens to be readable can still be
+ * unmapped as far as the guest is concerned, and reading it takes the whole
+ * run down (archive 20261021-072048-eden-srvtime4 died on
+ * "HW.Memory <Error> core/memory.cpp:624: Unmapped Read64 @ 0x3A00000000",
+ * frames 16200 -> 3960, because the probe followed a pointer into the host's
+ * own address space).
+ *
+ * So a guest pointer is only followed when it is inside the guest's own 64-bit
+ * window - the guest's mappings sit either side of the image, and the host's
+ * code and heap do not - AND the kernel says the page is readable.
+ *
+ * The page query is CACHED, one page deep, and that is not an optimisation:
+ * the probe runs on the thread the guest called the JNI method from, so every
+ * syscall it spends is a syscall the guest's frame loop does not get. The
+ * first version of the hunt spent about 1500 of them and cost the run
+ * thousands of frames (16200 -> 8280).
+ */
+static uintptr_t g_checkedPage = 0;
+static bool     g_checkedPageOk = false;
+
+static bool guestReadable(uintptr_t addr)
+{
+    if (addr == 0 || (addr & 7u) != 0u) {
+        return false;
+    }
+    const uintptr_t bias = rr3::resolveMainImageLoadBias();
+    if (bias == 0) {
+        return false;
+    }
+    const uintptr_t lo = bias - 0x1000000000ull;
+    const uintptr_t hi = bias + 0x1000000000ull;
+    if (addr < lo || addr >= hi) {
+        return false;
+    }
+    const uintptr_t page = addr & ~0xfffull;
+    if (page != g_checkedPage) {
+        MemoryInfo info{};
+        u32 pageInfo = 0;
+        if (R_FAILED(svcQueryMemory(&info, &pageInfo, static_cast<u64>(page)))) {
+            g_checkedPage = page;
+            g_checkedPageOk = false;
+            return false;
+        }
+        g_checkedPage = page;
+        g_checkedPageOk = (info.perm & Perm_R) != 0;
+    }
+    return g_checkedPageOk;
+}
+
+static bool readU64(uintptr_t addr, uint64_t *out)
+{
+    if (out == nullptr || !guestReadable(addr)) {
+        return false;
+    }
+    memcpy(out, reinterpret_cast<const void *>(addr), sizeof(uint64_t));
+    return true;
+}
+
+/*
+ * Copy `len` bytes out of guest memory a guarded word at a time. A plain
+ * memcpy would cross a page boundary into an unmapped page: the string the
+ * guest's own code reads may start on the LAST byte of a page, and the read
+ * that follows it then lands on the next one.
+ */
+static bool copyGuestBytes(char *dst, uintptr_t src, size_t len)
+{
+    size_t done = 0;
+    while (done < len) {
+        uint64_t word = 0;
+        if (!readU64(src + done, &word)) {
+            return false;
+        }
+        size_t take = len - done;
+        if (take > sizeof(word)) {
+            take = sizeof(word);
+        }
+        memcpy(dst + done, &word, take);
+        done += take;
+    }
+    return true;
+}
+
+/* Read a guest std::string into a host buffer. Returns false when the string
+ * is not readable in the shape the guest's own code reads it. */
+static bool readGuestString(uintptr_t addr, char *out, size_t cap)
+{
+    if (addr == 0 || out == nullptr || cap < 2u) {
+        return false;
+    }
+    uint64_t head = 0;
+    if (!readU64(addr, &head)) {
+        out[0] = '\0';
+        return false;
+    }
+    const uint8_t flags = static_cast<uint8_t>(head & 0xffu);
+    if ((flags & 1u) != 0u) {
+        uint64_t len = 0;
+        uint64_t data = 0;
+        if (!readU64(addr + 8u, &len) || !readU64(addr + 0x10u, &data)) {
+            out[0] = '\0';
+            return false;
+        }
+        if (data == 0 || len == 0 || len > 4096u ||
+            !guestReadable(static_cast<uintptr_t>(data))) {
+            out[0] = '\0';
+            return false;
+        }
+        size_t take = (static_cast<size_t>(len) < cap - 1u)
+                          ? static_cast<size_t>(len) : cap - 1u;
+        if (!copyGuestBytes(out, static_cast<uintptr_t>(data), take)) {
+            out[0] = '\0';
+            return false;
+        }
+        out[take] = '\0';
+        return true;
+    }
+    size_t len = static_cast<size_t>(flags >> 1);
+    if (len > cap - 1u) {
+        len = cap - 1u;
+    }
+    /* The inline data starts one byte into the object, so it is copied a
+     * guarded byte at a time from the word that was already read. */
+    const uint8_t *src = reinterpret_cast<const uint8_t *>(&head);
+    size_t done = 0;
+    while (done < len) {
+        const size_t inWord = (done < 7u) ? (7u - done) : 0u;
+        if (inWord != 0u) {
+            memcpy(out + done, src + 1u + done, inWord);
+            done += inWord;
+            continue;
+        }
+        uint64_t word = 0;
+        if (!readU64(addr + 8u + (done - 7u), &word)) {
+            out[0] = '\0';
+            return false;
+        }
+        size_t take = len - done;
+        if (take > sizeof(word)) {
+            take = sizeof(word);
+        }
+        memcpy(out + done, &word, take);
+        done += take;
+    }
+    out[len] = '\0';
+    return true;
+}
+
+/*
+ * Print the (key, value) pairs of the guest's hash map at `container`.
+ * Returns how many pairs were printed.
+ */
+static unsigned describeMap(uintptr_t container, char *out, size_t cap)
+{
+    size_t used = 0;
+    if (out == nullptr || cap == 0u) {
+        return 0u;
+    }
+    out[0] = '\0';
+
+    uint64_t buckets = 0;
+    uint64_t count   = 0;
+    if (!readU64(container, &buckets) || !readU64(container + 8u, &count)) {
+        appendText(out, cap, &used, "unreadable");
+        return 0u;
+    }
+
+    char tmp[192];
+    __builtin_snprintf(tmp, sizeof(tmp), "buckets=0x%llx count=%llu",
+                       (unsigned long long)buckets, (unsigned long long)count);
+    appendText(out, cap, &used, tmp);
+
+    if (buckets == 0 || count == 0 || count > 8192u) {
+        appendText(out, cap, &used, " -> not a hash map");
+        return 0u;
+    }
+
+    unsigned pairs = 0u;
+    const uint64_t bucketsRead = (count < 16u) ? count : 16u;
+    for (uint64_t i = 0; i < bucketsRead && pairs < 8u; ++i) {
+        uint64_t node = 0;
+        if (!readU64(static_cast<uintptr_t>(buckets) + i * 8u, &node)) {
+            continue;
+        }
+        unsigned guard = 0u;
+        while (node != 0 && guard < 8u && pairs < 8u) {
+            ++guard;
+            char key[64];
+            char value[96];
+            if (!readGuestString(static_cast<uintptr_t>(node) + 0x10u, key, sizeof(key)) ||
+                !readGuestString(static_cast<uintptr_t>(node) + 0x28u, value, sizeof(value))) {
+                break;
+            }
+            __builtin_snprintf(tmp, sizeof(tmp), " [%s=%s]", key, value);
+            appendText(out, cap, &used, tmp);
+            ++pairs;
+            uint64_t next = 0;
+            if (!readU64(static_cast<uintptr_t>(node), &next)) {
+                break;
+            }
+            node = next;
+        }
+    }
+    return pairs;
+}
+
+/*
+ * The ServerTimeManager's vtable, measured in archive
+ * 20261021-072801-eden-srvtime5 (the probe read the manager's own vptr).
+ * It is a fast selector: the manager is the object whose FIRST WORD is this
+ * address, so the hunt needs one read per candidate instead of four.
+ */
+static const uintptr_t kManagerVtableElf = 0x1f65bb98ull;
+
+/*
+ * The ServerTimeManager's address, remembered once the hunt finds it. The
+ * hunt is expensive and the manager does not move between the three phases of
+ * one exchange, so the later phases read it directly (without this the probe
+ * cost the run thousands of frames: 16200 -> 8280).
+ */
+static uintptr_t g_managerAddr = 0;
+
+/*
+ * The ServerTimeManager's shape, read out of the guest's own code:
+ *
+ *   +0x70  the request token - the return value of the HTTP manager's
+ *          request-start call, stored by the manager itself at 0x1cef258
+ *   +0x78  the local time when the request went out   (0x1cef1d0)
+ *   +0x80  the local time when the answer was parsed   (0x1cef8fc)
+ *   +0x88  THE SERVER TIME (0x1cef9d4) - a double, epoch seconds
+ *
+ * So an object whose +0x78 reads back as an epoch second IS the manager, and
+ * its +0x88 says whether the answer reached it and its +0x70 is the token the
+ * parser compares against.
+ */
+static void reportManagerCandidate(uintptr_t p, const char *phase)
+{
+    /* The vtable selector first: one read per candidate, and the page it
+     * lands on is usually the page the candidate itself was read from. */
+    uint64_t vptr = 0;
+    if (!readU64(p, &vptr)) {
+        return;
+    }
+    const uintptr_t bias = rr3::resolveMainImageLoadBias();
+    const uintptr_t want = (bias != 0) ? (bias + kManagerVtableElf) : 0;
+    if (want == 0 || vptr != want) {
+        /* Fall back to the shape test: the manager's +0x78 is an epoch
+         * second, which no other object in the request has. */
+        uint64_t raw78 = 0;
+        if (!readU64(p + 0x78u, &raw78)) {
+            return;
+        }
+        double m78 = 0.0;
+        memcpy(&m78, &raw78, sizeof(m78));
+        if (!(m78 > 1.0e9 && m78 < 2.0e9)) {
+            return;
+        }
+    }
+    uint64_t raw78 = 0;
+    uint64_t raw80 = 0;
+    uint64_t raw88 = 0;
+    uint64_t raw60 = 0;
+    uint64_t raw70 = 0;
+    readU64(p + 0x70u, &raw70);
+    readU64(p + 0x78u, &raw78);
+    readU64(p + 0x80u, &raw80);
+    readU64(p + 0x88u, &raw88);
+    readU64(p + 0x60u, &raw60);
+    double m78 = 0.0;
+    double m80 = 0.0;
+    double m88 = 0.0;
+    memcpy(&m78, &raw78, sizeof(m78));
+    memcpy(&m80, &raw80, sizeof(m80));
+    memcpy(&m88, &raw88, sizeof(m88));
+    char line[256];
+    __builtin_snprintf(line, sizeof(line),
+                       "%s mgr=0x%llx token=0x%llx m78=%.6f m80=%.6f m88=%.6f "
+                       "m60=0x%llx",
+                       phase != nullptr ? phase : "-", (unsigned long long)p,
+                       (unsigned long long)raw70, m78, m80, m88,
+                       (unsigned long long)raw60);
+    rr3::guestViewWideLog("cc-probe-mgr", (unsigned long long)p, raw88, line);
+    g_managerAddr = p;
+}
+
+/*
+ * Hunt for the manager among the objects the record and the worker point at,
+ * one level down. Bounded: at most 96 direct candidates and 256 second-level
+ * ones, every read gated on svcQueryMemory.
+ */
+static void huntServerTime(uintptr_t record, uintptr_t worker, const char *phase)
+{
+    if (g_managerAddr != 0) {
+        reportManagerCandidate(g_managerAddr, phase);
+        return;
+    }
+
+    const uintptr_t bias = rr3::resolveMainImageLoadBias();
+    if (bias == 0) {
+        return;
+    }
+
+    uintptr_t roots[96];
+    unsigned rootCount = 0u;
+    for (unsigned i = 0; i < 32u && rootCount < 96u; ++i) {
+        uint64_t word = 0;
+        if (readU64(record + i * 8u, &word) && word != 0) {
+            roots[rootCount++] = static_cast<uintptr_t>(word);
+        }
+    }
+    for (unsigned i = 0; i < 52u && rootCount < 96u; ++i) {
+        uint64_t word = 0;
+        if (readU64(worker + i * 8u, &word) && word != 0) {
+            roots[rootCount++] = static_cast<uintptr_t>(word);
+        }
+    }
+
+    /* The manager sits among those words (measured: the hunt finds it there),
+     * so one pass is enough. The second one is a fallback for a layout that
+     * puts it one step further out. */
+    for (unsigned i = 0; i < rootCount; ++i) {
+        reportManagerCandidate(roots[i], phase);
+        if (g_managerAddr != 0u) {
+            break;
+        }
+    }
+}
+
+/*
+ * Report the worker's own state: its vtable (so the OnHeaders slot can be
+ * named), the object that owns the header map, and the header map's contents.
+ * `phase` says when this was taken.
+ */
+static void probeWorker(uintptr_t worker, const char *phase)
+{
+    char details[768];
+    size_t used = 0;
+    details[0] = '\0';
+
+    if (worker == 0) {
+        rr3::guestViewWideLog("cc-probe", 0, 0, "worker=0");
+        return;
+    }
+
+    uint64_t vptr = 0;
+    uint64_t vt3  = 0;
+    uint64_t base = 0;
+    if (!readU64(worker, &vptr) || !readU64(worker + 8u, &base)) {
+        rr3::guestViewWideLog("cc-probe", (unsigned long long)worker, 0,
+                              "worker unreadable");
+        return;
+    }
+    if (vptr != 0) {
+        readU64(static_cast<uintptr_t>(vptr) + 0x18u, &vt3);
+    }
+
+    const uintptr_t bias = rr3::resolveMainImageLoadBias();
+    char tmp[256];
+    __builtin_snprintf(tmp, sizeof(tmp),
+                       "%s worker=0x%llx vptr=0x%llx vtbl3=0x%llx elf3=0x%llx base=0x%llx",
+                       phase != nullptr ? phase : "-",
+                       (unsigned long long)worker, (unsigned long long)vptr,
+                       (unsigned long long)vt3,
+                       (unsigned long long)(vt3 >= bias ? vt3 - bias : 0u),
+                       (unsigned long long)base);
+    appendText(details, sizeof(details), &used, tmp);
+
+    /* The container the guest's headerCallback writes to, and the two
+     * neighbours, so a run says which of them is the real map. */
+    const uintptr_t candidates[3] = {
+        (base != 0) ? static_cast<uintptr_t>(base) + 0x178u : 0u,
+        worker + 0x178u,
+        worker + 0x180u,
+    };
+    static const char *kNames[3] = { "map@base+0x178", "map@worker+0x178",
+                                      "map@worker+0x180" };
+    for (int i = 0; i < 3; ++i) {
+        if (candidates[i] == 0) {
+            continue;
+        }
+        char mapText[384];
+        const unsigned pairs = describeMap(candidates[i], mapText, sizeof(mapText));
+        __builtin_snprintf(tmp, sizeof(tmp), " %s@0x%llx pairs=%u %s", kNames[i],
+                           (unsigned long long)candidates[i], pairs, mapText);
+        appendText(details, sizeof(details), &used, tmp);
+    }
+
+    rr3::guestViewWideLog("cc-probe", (unsigned long long)worker,
+                          (unsigned long long)vt3, details);
+
+    /* The objects the record and the worker point at, so a run says which
+     * pointer leads to the ServerTimeManager and what its fields say. */
+    huntServerTime(worker, (base != 0) ? static_cast<uintptr_t>(base) : worker, phase);
+}
+
+} // namespace ccprobe
+
 /*
  * Answer the /time request.
  *
@@ -569,11 +1059,17 @@ static bool deliverServerTime(JNIEnv *env, CCHttpRequest *req)
                               details);
     }
 
+    ccprobe::probeWorker((uintptr_t)req->callback, "before-header");
     header_callback(env, (jobject)req, req->callback, 0, (jobject)map);
     if (authLogBudget()) {
         trace("cc-srvtime: headerCallback returned");
     }
+    /* Did the header land in the guest's own map? The guest's ServerTimeManager
+     * reads it out of that map and nothing else, so this is the measurement
+     * that says whether the answer can reach this+0x88 at all. */
+    ccprobe::probeWorker((uintptr_t)req->callback, "after-header");
     complete_callback(env, (jobject)req, req->callback, 200);
+    ccprobe::probeWorker((uintptr_t)req->callback, "after-complete");
 
     if (authLogBudget()) {
         trace("cc-srvtime: header delivered, completed with status 200");

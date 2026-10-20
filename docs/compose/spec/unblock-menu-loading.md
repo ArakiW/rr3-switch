@@ -3778,6 +3778,120 @@ the RECEIVER (`ccheaders::handleObject` / `handleBoolean` / `handleInt` in
 fallbacks answer `keySet`, `iterator` and `get` with a shared dummy - which
 is exactly why the map the guest built was empty.
 
+## [S17] The server time ARRIVES: all three candidate causes are wrong (2026-10-21)
+
+### The probe
+
+`jni_compat/classes/cc_http_request.cpp` now carries `ccprobe`, a bounded
+read-only probe around the `/time` exchange. It reports three things, and it
+reads the guest's memory rather than calling into it:
+
+1. the guest's own response-header map (a hash map at `worker+0x178`),
+2. the ServerTimeManager's fields, found by a bounded two-level hunt,
+3. the vtables of the request's three callback objects.
+
+Every read is gated on `svcQueryMemory` **and** on the address being inside
+the guest's own 64-bit window. Both are load-bearing: on its own
+`svcQueryMemory` is not enough under Eden, because the kernel is asked about
+the HOST's mapping of an address while Eden's emulated guest MMU has its own
+idea of what is mapped. The first version of the probe followed a pointer
+into the host's address space and took the run down with it (archive
+`20261021-072048-eden-srvtime4`: `HW.Memory <Error> core/memory.cpp:624:
+Unmapped Read64 @ 0x0000003A00000000`, frames 16200 -> 3960).
+
+### The measurement (archive `20261021-074157-eden-srvtime7`)
+
+```
+before-header   map@worker+0x178  pairs=0  buckets=0x0 count=0
+after-header    map@worker+0x178  pairs=2  [=] [X-Request-Start=1793000000.125000]
+after-header    mgr  token=0x1  m78=1792539735.161719  m80=1792539735.322581
+                       m88=1793000000.125000
+after-complete  mgr  token=0x1  m80=1792539735.322581  m88=1793000000.125000
+```
+
+Archives `20261021-072801-eden-srvtime5` and `20261021-073540-eden-srvtime6`
+reproduce it: the server time lands at `this+0x88` in every run, and
+`this+0x70`, `this+0x88` and `this+0x60` are all still at their old values
+after the completion in every run.
+
+The probe as shipped costs the run nothing: `20261021-074157-eden-srvtime7`
+has **frames=16200**, the same as the no-probe baseline
+`20261021-063741-eden-srvtime2` (frames=16320). The first version of the hunt
+was not free - it spent about 1500 `svcQueryMemory` calls on the thread the
+guest called the JNI method from, and the run dropped to 3120 frames. The
+shipped version caches the page query, uses the manager's vtable as a
+one-read-per-candidate selector and stops the hunt at the level where the
+manager actually is.
+
+### What that rules out
+
+| Candidate | Verdict | Evidence |
+|---|---|---|
+| (a) the header never landed in the guest's map | **RULED OUT** | the map goes from `pairs=0 count=0` to `pairs=2` with `[X-Request-Start=1793000000.125000]` inside the native `headerCallback` call |
+| (b) the token check rejected the answer | **RULED OUT** | `m+0x80` is written by the parser at `0x1cef8fc`, i.e. only AFTER `cmp x8, x2` at `0x1cef8cc` passes, and it IS written (`m80=1792538901.930677`) |
+| (c) the parser reads a different map | **RULED OUT** | the parser is handed `worker+0x178` (`0x1ce2c78: add x1, x19, #0x178`) and the native `headerCallback` writes the very same container (`0x1ce47a4: add x0, x19, #0x178`); the probe reads one address in both cases |
+
+So the port's delivery is correct and complete: the header arrives, the
+guest's own parser finds it, `strtod` turns it into a double and the guest
+stores it at `this+0x88` as **1793000000.125000**.
+
+### Where the answer is actually lost
+
+The guest's ServerTimeManager response handler is guest raw `0x1cef2f8`, and
+it is the only place that prints
+
+```
+CC: Server time returned; server time: %f server-local time diff: %f
+```
+
+(format string at guest raw `0x3fc1d0`). It reaches the logger only when all
+of these hold:
+
+```
+0x1cef360  |now - (this+0x80)| <= 5.0    the parse happened recently
+0x1cef37c  (this+0x88) > 0.0             THE SERVER TIME WAS PARSED
+0x1cef384  (this+0x70) == the token      the token still matches
+0x1cef390  |now - (this+0x78)| <  5.0    the response came back fast
+```
+
+Measured against the state the probe read back: `m+0x88` is positive,
+`m+0x80` is set, and `m+0x80 - m+0x78` is 0.21 s, so the two timing windows
+are satisfied. The handler's SUCCESS path clears `this+0x70`, `this+0x88`
+and `this+0x60` (`0x1cef398`, `0x1cef3a4`, `0x1cef3b4`). After the
+completion all three still hold their old values (`token=0x1`,
+`m88=1793000000.125000`, `m60=0x1`), so **the handler never took its
+success path**.
+
+The only condition the probe cannot see is the handler's own token argument
+(`x3` at `0x1cef328`, compared at `0x1cef384`): the token in the manager is
+`this+0x70` and it is the return value of the HTTP manager's request-start
+call (`0x1cef258: str x0, [x19, #0x70]`), i.e. a guest-internal value the
+port never sees. The port cannot make that comparison fail on purpose, and
+it cannot make it pass either.
+
+### The chain, as measured
+
+```
+port -> guest native headerCallback (0x1ce4348)
+         fills the map at worker+0x178
+         calls record->vtable[3] = OnHeader (0x1ce3df0)
+           -> 0x1ce4b88 -> record+0x30's callback
+port -> guest native completeCallback (0x1ce4a3c)
+         -> OnJNICompletion (0x1ce3f68)
+           -> CompletionCallback (0x1ce4c60)
+             -> record+0x90's callback = the ServerTimeManager's bind
+               -> the parser (0x1cef8a4)      <- runs, m+0x88 is set
+               -> the handler (0x1cef2f8)     <- never reaches the logger
+```
+
+### Correction to the map's address
+
+The earlier note in this file says the map is at `worker+0x180`. The measured
+address is `(*(jlong+0x08)) + 0x178`: the jlong the guest hands `init()` is
+the request record, `record+0x08` is the `CC_AndroidHttpRequestWorker_Class*`,
+and the map is that worker's own field at `+0x178`.
+
+
 
 
 
