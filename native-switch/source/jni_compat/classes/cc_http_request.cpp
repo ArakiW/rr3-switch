@@ -327,6 +327,18 @@ bool handleInt(uintptr_t object, const char* name, int32_t* out)
 
 } // namespace ccheaders
 
+/* The cc::HttpRequestManager census lives in namespace ccprobe, further
+ * down this file.  It is declared here because the JNI hooks below are
+ * the port's only reliable "the guest made a request" signal, and the
+ * census needs the worker's address to tie a record to a request. */
+namespace ccprobe {
+void startMgr2Probe(void);
+void noteMgr2Request(uintptr_t worker, const char *url, size_t bodyLen,
+                     const uint8_t *body);
+void noteMgr2TimeRequest(uintptr_t worker, const char *url, size_t bodyLen,
+                         const uint8_t *body);
+} // namespace ccprobe
+
 class CCHttpRequest : public Object {
 public:
     static Class clazz;
@@ -503,12 +515,61 @@ static void http_init(JNIEnv *env, jobject self, jstring /*userAgent*/,
         trace("cc-http-init: body=%zu url=%s", (unsigned)req->bodyLen,
               req->urlLen > 0u ? req->url : "(none)");
     }
+
+    /* Start the cc::HttpRequestManager census, and tell it which
+     * request this is.  The census runs on its own host thread at 1 Hz;
+     * all it needs from here is the worker's address (the jlong the
+     * guest handed init()) and the identity of the request the port is
+     * serving, so the record it measures can be tied to a URL. */
+    ccprobe::startMgr2Probe();
+    ccprobe::noteMgr2Request((uintptr_t)req->callback, req->url, req->bodyLen,
+                              (const uint8_t *)req->body);
 }
 
 static void http_add_header(JNIEnv *, jobject, jstring, jstring) {}
 
 /*
- * Build the authenticate response and hand it to the guest the way
+ * THE AUTHENTICATE RESPONSE, AND THE URL FALLBACK FOR IT.
+ *
+ * The body-based match is the PRIMARY discriminator and stays first:
+ * cccloud::parseAuthRequest() reads the tail of the posted blob, and it
+ * is the only thing that can tell the authenticate request from the
+ * ordinary sync request, because the two share the same path
+ * (CC_Sync.php) and the same first four words.
+ *
+ * BUT THE BODY IS CURRENTLY UNREADABLE.  http_init() reads the body
+ * with GetArrayLength / GetByteArrayRegion, and those only accept the
+ * port's OWN fake byte arrays ("ARRB" magic, membership in
+ * g_byteArrays).  The guest's byte[] is a raw guest-memory pointer, so
+ * it is always rejected and the body length is ALWAYS 0.  MEASURED: every
+ * archive shows "cc-http-init: body=0".
+ *
+ * With bodyLen == 0 the body-based match can NEVER be auth-shaped, so
+ * the fake authenticate response (deliverAuthSuccess) has NEVER been
+ * delivered - not once.  It has never been exercised end to end, and
+ * when the authenticate request finally arrives the port would classify
+ * it as "not the authenticate request" and fall through to
+ * error_callback, and the guest would still log "CC: Invalid DeviceId!"
+ * for a completely different reason than the one being fixed.
+ *
+ * So the URL is the fallback discriminator, and the log says WHICH
+ * discriminator was used, because "matched" and "matched-by-url" are
+ * different claims and this project keeps confusing them:
+ *
+ *   cc-auth-req: matched          the body had the authenticate shape
+ *   cc-auth-req: matched-by-url   the URL named CC_Sync.php and the body
+ *                                 was unreadable
+ *
+ * The fallback is ONE-SHOT: the authenticate response is delivered at
+ * most once per process, so a later CC_Sync.php request (the ordinary
+ * sync) is not answered with a second authenticate response.
+ */
+static bool g_authDelivered = false;
+
+/* The guest's own path string for the sync/authenticate endpoint. */
+static const char kAuthUrlMarker[] = "CC_Sync.php";
+
+/* Build the authenticate response and hand it to the guest the way
  * HttpThread.run() would: the body first, then the completion.
  *
  * Returns false when the response could not be built or delivered, in which
@@ -526,6 +587,8 @@ static bool deliverAuthSuccess(JNIEnv *env, CCHttpRequest *req,
         warning("HttpRequest: success natives missing (data=%p complete=%p); "
                 "request %p stays pending\n",
                 (void *)data_callback, (void *)complete_callback, (void *)req);
+        rr3::guestViewWideLog("cc-auth-fail", 0, 0,
+                               "natives missing (data/complete export)");
         return false;
     }
 
@@ -534,6 +597,8 @@ static bool deliverAuthSuccess(JNIEnv *env, CCHttpRequest *req,
     std::vector<uint8_t> body;
     if (!cccloud::buildAuthResponse(memberId, body)) {
         warning("HttpRequest: could not build the authenticate response\n");
+        rr3::guestViewWideLog("cc-auth-fail", memberId, 0,
+                               "could not build the authenticate response");
         return false;
     }
 
@@ -548,6 +613,9 @@ static bool deliverAuthSuccess(JNIEnv *env, CCHttpRequest *req,
     jbyteArray array = env->NewByteArray((jsize)body.size());
     if (array == nullptr) {
         warning("HttpRequest: could not allocate the response byte array\n");
+        rr3::guestViewWideLog("cc-auth-fail", memberId,
+                               (unsigned long long)body.size(),
+                               "could not allocate the response byte array");
         return false;
     }
     env->SetByteArrayRegion(array, 0, (jsize)body.size(),
@@ -562,6 +630,7 @@ static bool deliverAuthSuccess(JNIEnv *env, CCHttpRequest *req,
     }
     rr3::guestViewWideLog("cc-auth-sent", memberId, (unsigned long long)body.size(),
                            "authenticate response delivered to the guest");
+    g_authDelivered = true;
     return true;
 }
 
@@ -894,6 +963,17 @@ static uintptr_t g_managerAddr = 0;
 static uintptr_t g_workerAddr = 0;
 
 /*
+ * The cc::HttpRequestManager resolver.  Defined with the stage-2 census
+ * further down this file; declared here because the first probe
+ * (describeActiveRequests) needs the SAME manager and must not keep
+ * asking the .bss word that is not one.
+ */
+static bool mgr2Resolve(uintptr_t bias, uintptr_t *ownerOut, uintptr_t *mgrOut,
+                        uint64_t *vptrOut);
+static bool mgr2ResolveViaRecord(uintptr_t rec, uintptr_t bias,
+                                  uintptr_t *mgrOut, uint64_t *vptrOut);
+
+/*
  * The ServerTimeManager's shape, read out of the guest's own code:
  *
  *   +0x70  the request token - the return value of the HTTP manager's
@@ -1047,14 +1127,18 @@ static void reportManagerCandidate(uintptr_t p, const char *phase)
  * comes out of cloudcell->vtable[4](), which a probe must not call. The
  * worker is the right handle and it costs one fewer hop.)
  */
-static void describeActiveRequests(uintptr_t worker)
+static void describeActiveRequests(uintptr_t worker, unsigned long long frames)
 {
-    /* Bounded: the record's fields live in one or two pages, but each read
-     * that crosses a page boundary costs the guest a syscall, and the probe
-     * runs on the thread the guest called JNI from. Four samples is a time
-     * series; sixty-seven is a cost. */
+    /* The 4-SAMPLE CAP IS REMOVED (2026-10-21).  It made the probe
+     * DEAD from about frame 960 onward: in a 16200-frame run that left
+     * 94% of the run unobserved, and "the record never changed" was
+     * indistinguishable from "the probe stopped looking".  The cost is
+     * one sample per 240-frame tick - about 67 samples over a whole
+     * run - and every field read lives on the record's own page, whose
+     * svcQueryMemory query is already cached, so the frame budget is
+     * untouched.  The bound that remains is a safety net, not a policy. */
     static unsigned s_samples = 0u;
-    if (s_samples >= 4u) {
+    if (s_samples >= 400u) {
         return;
     }
     ++s_samples;
@@ -1079,30 +1163,50 @@ static void describeActiveRequests(uintptr_t worker)
      * Is the record still in the HTTP request manager's active-request
      * vector?
      *
-     * The manager is a global: the guest's cc::HttpRequestManager pointer
-     * lives in .bss at 0x1f97818 (GOT 0x1f6dac8 -> that address), and
-     * cc::HttpRequestManager::Poll (0x1ce29b4) walks its vector at
-     * this+0x38 (begin) / this+0x40 (end) - a vector of POINTERS, 8 bytes
-     * per element ("ldr x21,[x8,x9,lsl #3]"), not of 0x30-byte records.
+     * THE MANAGER IS NOT THE .bss WORD AT 0x1f97818.  That word holds
+     * a pointer whose vptr is 0x1e4b948 (a different class), so
+     * everything the earlier version of this probe said about
+     * "mgr=" / "vecn=" / "invec=" was about the wrong object.
      *
-     * A record that is not in the vector is one the poll can never see, and
-     * a record that IS in it with +0xc8 set and +0xc9 clear is one the
-     * poll has not delivered yet. Those are different blockers and the
-     * probe has to tell them apart.
+     * The real manager is reached the way the guest's own code reaches
+     * it:  cc::HttpRequestManager's factory (guest raw 0x1cbe23c) does
+     * new(0x60), constructs it (0x1ce2644) and stores it at owner+0x218;
+     * the owner is published in .bss at 0x1fc6e98 (GOT slot 0x1f6d5d0) by
+     * 0x1cbe028.  So:
+     *
+     *   owner = *(bias + 0x1fc6e98)
+     *   mgr   = *(owner + 0x218)
+     *
+     * and the manager's vptr MUST be bias + 0x1f64858.  The vptr is
+     * checked before its +0x38/+0x40 are read, so a failed chain can
+     * never be reported as an empty vector.
+     *
+     * The vector at this+0x38 (begin) / this+0x40 (end) holds 8-byte
+     * POINTERS to records, not the records themselves: the guest's
+     * QueueRequest (0x1ce1a84) does "str x20, [x9], #8" to append.
      */
     const uintptr_t bias = rr3::resolveMainImageLoadBias();
     uint64_t mgr = 0, begin = 0, end = 0;
     uint64_t mgrvptr = 0;
     uint64_t vecn = 0;
     bool found = false;
-    if (bias != 0 &&
-        readU64(bias + 0x1f97818ull, &mgr) && mgr != 0) {
-        /* The object's own vptr, so the log says WHICH class the global
-         * holds. cc::HttpRequestManager's vtable base is 0x1f64848, so its
-         * vfunc0 slot - the address an instance's vptr points at - is
-         * 0x1f64858. If the vptr does not match, the global is some other
-         * object and its +0x38/+0x40 are not an active-request vector. */
-        readU64(static_cast<uintptr_t>(mgr), &mgrvptr);
+    uintptr_t owner = 0;
+    uintptr_t mgrAddr = 0;
+    uint64_t mgrVptr = 0;
+    /* PRIMARY: the record's own back-pointer (record+0xc0). */
+    uintptr_t mgrRec = 0;
+    uint64_t mgrRecVptr = 0;
+    if (mgr2ResolveViaRecord(static_cast<uintptr_t>(rec), bias, &mgrRec,
+                             &mgrRecVptr) && mgrRec != 0) {
+        mgrAddr = mgrRec;
+        mgrVptr = mgrRecVptr;
+    } else if (mgr2Resolve(bias, &owner, &mgrAddr, &mgrVptr) &&
+               mgrAddr != 0) {
+        /* the independent owner route, as a fallback */
+    }
+    if (mgrAddr != 0) {
+        mgr = mgrAddr;
+        mgrvptr = mgrVptr;
         if (readU64(static_cast<uintptr_t>(mgr) + 0x38u, &begin) &&
             readU64(static_cast<uintptr_t>(mgr) + 0x40u, &end) &&
             end > begin) {
@@ -1119,11 +1223,15 @@ static void describeActiveRequests(uintptr_t worker)
 
     char line[512];
     __builtin_snprintf(line, sizeof(line),
-                       "worker=0x%llx rec=0x%llx token=0x%llx c8=%llu c9=%llu "
-                       "d4=%llu handler100=0x%llx body130=0x%llx "
-                       "parser160=0x%llx status=0x%llx | mgr=0x%llx "
-                       "mgrvptr=0x%llx vecn=%llu invec=%d",
-                       (unsigned long long)worker, (unsigned long long)rec,
+                       /* "gf=", not "frames=": the Eden harness's instrument
+                        * census reads the LAST /frames=(\d+)/ in the guest log
+                        * as the guest's frame total, and a probe line that
+                        * says "frames=" would overwrite it. */
+                       "gf=%llu worker=0x%llx rec=0x%llx token=0x%llx "
+                       "c8=%llu c9=%llu d4=%llu handler100=0x%llx "
+                       "body130=0x%llx parser160=0x%llx status=0x%llx | "
+                       "mgr=0x%llx mgrvptr=0x%llx vecn=%llu invec=%d",
+                       frames, (unsigned long long)worker, (unsigned long long)rec,
                        (unsigned long long)tok,
                        (unsigned long long)(c8 & 0xffu),
                        (unsigned long long)((c8 >> 8) & 0xffu),
@@ -1251,6 +1359,870 @@ static void probeWorker(uintptr_t worker, const char *phase)
     huntServerTime(worker, (base != 0) ? static_cast<uintptr_t>(base) : worker, phase);
 }
 
+/* ------------------------------------------------------------------ *
+ * STAGE 2: THE cc::HttpRequestManager CENSUS   (tag: cc-probe-mgr2)
+ * ------------------------------------------------------------------ *
+ *
+ * WHY A SECOND STAGE EXISTS.  The first probe (cc-probe-req) asked the
+ * .bss word at 0x1f97818 for "the HTTP manager".  That word does not
+ * hold one.  Archive 20261021-105547-eden-srvbody2 shows it holding
+ * 0x2103b514a0 with vptr 0x21093ce948; with that run's bias
+ * (0x2107583000) the vptr's ELF vaddr is 0x1e4b948 - a different
+ * class.  Every "mgr=" / "vecn=" / "invec=" that probe printed was
+ * therefore about the WRONG object, and none of it is evidence.
+ *
+ * WHERE THE MANAGER REALLY IS, read out of the guest image (raw
+ * addresses are guest ELF vaddrs; add the image load bias for the
+ * run-time address):
+ *
+ *   cc::HttpRequestManager::HttpRequestManager   0x1ce2644
+ *       adrp x8, #0x1f7e000 ; ldr x8, [x8, #0x150]   ; the vtable base
+ *       add  x10, x8, #0x10                        ; = the vptr, 0x1f64858
+ *       str  q1, [x0]                              ; this+0 = the vptr
+ *       stur q0, [x0, #0x38] ; stur q0, [x0, #0x48]  ; the vector: begin
+ *                                                  ; at +0x38, end at +0x40
+ *   the factory that owns it                      0x1cbe23c
+ *       mov w0, #0x60 ; bl operator new            ; 0x60 bytes
+ *       bl  0x1ce2644                             ; construct it
+ *       str x24, [x19, #0x218]                    ; owner+0x218 = manager
+ *   the factory that owns the owner               0x1cbe028
+ *       adrp x22, #0x1f6d000 ; ldr x22, [x22, #0x5d0]  ; the .bss slot
+ *       str x21, [x22]                            ; .bss 0x1fc6e98 = owner
+ *
+ * SO AT RUN TIME:
+ *
+ *   owner = *(bias + 0x1fc6e98)
+ *   mgr   = *(owner + 0x218)
+ *
+ * and *(mgr) MUST be bias + 0x1f64858.  That vptr comparison is this
+ * stage's POSITIVE CONTROL: when it fails, nothing below is about the
+ * HTTP manager, and the log says so instead of pretending.
+ *
+ * THE VTABLE, from the image's own relocation table:
+ *
+ *   0x1f64848  offset-to-top 0                 (the vtable base)
+ *   0x1f64850  typeinfo
+ *   0x1f64858  vfunc0    = 0x1ce2680   <- what an instance holds
+ *   ...
+ *   0x1f648d0  vfunc15   = 0x1ce29b4   = cc::HttpRequestManager::Poll
+ *   0x1f648d8  vfunc16   = 0x1ce2c1c
+ *
+ * TWO CORRECTIONS to the earlier notes, both from that table: an
+ * instance's vptr is the vtable base PLUS 0x10 (0x1f64858), not the
+ * vtable base; and Poll is vfunc15 at slot 0x1f648d0, NOT 0x1f648c0 -
+ * that slot holds 0x1ce2e4c (vfunc14).
+ *
+ * THE POLL GATE, from cc::HttpRequestManager::Poll (0x1ce29b4):
+ *
+ *   0x1ce2a88  ldrb w8, [x21, #0xc8]   ; the response-complete flag
+ *   0x1ce2a8c  cbz  w8, skip           ; c8 == 0  -> not delivered
+ *   0x1ce2a90  ldrb w8, [x21, #0xc9]   ; the "already handled" flag
+ *   0x1ce2a94  cbnz w8, skip           ; c9 != 0  -> already handled
+ *   0x1ce2a98  ldr  x8, [x21, #0x100]  ; the handler delegate
+ *   0x1ce2a9c  strb w24, [x21, #0xc9]  ; c9 = 1  (BEFORE the call)
+ *
+ * c9 is set BEFORE the handler is called, and it is set even when the
+ * handler delegate is NULL.  So c9 == 1 means "Poll CLAIMED this
+ * record", not "the handler ran" - and Poll never claims it twice.
+ * After the handler runs, Poll REMOVES the record from the vector.
+ * So the four states the vector membership distinguishes are:
+ *
+ *   not in the vector      -> never queued, or already handled and removed
+ *   in, c8 == 0           -> the guest never marked the response complete
+ *   in, c8 == 1, c9 == 0  -> complete, handler installed, Poll has not run
+ *   in, c8 == 1, c9 == 1  -> Poll claimed it (and may or may not have run
+ *                            the handler: +0x100 tells us)
+ */
+
+/* The vptr a cc::HttpRequestManager instance carries. */
+static const uintptr_t kMgr2VptrElf     = 0x1f64858ull;
+/* .bss: the owner object.  owner+0x218 is the manager. */
+static const uintptr_t kMgr2OwnerSlot   = 0x1fc6e98ull;
+static const uintptr_t kMgr2OwnerMgrOff = 0x218ull;
+/* The owner's size, and the ServerTimeManager at owner+0x10. */
+static const uintptr_t kMgr2OwnerSize   = 0x4d0ull;
+static const uintptr_t kMgr2OwnerStmOff = 0x10ull;
+/* The OLD global the first probe used.  Kept, and reported, so the two
+ * readings can be told apart in the same log. */
+static const uintptr_t kMgr2WrongSlot   = 0x1f97818ull;
+/* .bss, from the image's program headers: the third PT_LOAD is
+ * vaddr 0x1f80880 filesz 0x146a0 memsz 0x47219, so .bss is
+ * 0x1f80880+0x146a0 .. 0x1f80880+0x47219 = 0x1f94f20 .. 0x1fc7a99. */
+static const uintptr_t kMgr2BssBegin    = 0x1f94f20ull;
+static const uintptr_t kMgr2BssEnd      = 0x1fc7a99ull;
+
+static const unsigned kMgr2MaxVecRecords = 32u;  /* records logged per sample  */
+static const unsigned kMgr2MaxLines      = 1200u;/* log lines for the whole run */
+static const unsigned kMgr2ScanEvery     = 10u;  /* one .bss scan per N samples  */
+static const unsigned kMgr2MaxTicks      = 420u; /* ~7 min at 1 Hz               */
+
+/* The record the port is serving, and the identity the PORT has for the
+ * request it is serving.  Written on the guest's own thread, read by the
+ * probe thread; both sides use relaxed atomics so the words are not torn.
+ *
+ * TWO SLOTS, because "the last init()" and "the /time request" are not
+ * the same request: the guest creates an HttpRequest for the
+ * authenticate exchange and another for /time, and the census has to be
+ * able to say WHICH record it is measuring.  The /time one is the slot
+ * that matters for the menu blocker; the other is kept so the log can
+ * show both. */
+static uintptr_t g_mgr2Record = 0;
+static uintptr_t g_mgr2Worker = 0;
+static char     g_mgr2Url[192] = {0};
+static uint32_t g_mgr2Body0 = 0xffffffffu;
+static uintptr_t g_mgr2TimeRecord = 0;
+static char     g_mgr2TimeUrl[192] = {0};
+static uint32_t g_mgr2TimeBody0 = 0xffffffffu;
+
+/*
+ * THE MANAGER, THE WAY THE RECORD ITSELF NAMES IT - THE PRIMARY HANDLE.
+ *
+ * The record carries a DIRECT back-pointer to its own manager:
+ *
+ *   0x1ce13d8  str x23, [x19, #0xc0]
+ *
+ * written in exactly one place in the HTTP module, inside QueueRequest,
+ * where x23 is the manager's `this`.  So:
+ *
+ *   mgr = *(record + 0xc0)
+ *
+ * and *(mgr) MUST be bias + 0x1f64858.  One hop instead of two, immune
+ * to the owner object being replaced, and it names the same object Poll
+ * walks.  The owner route stays as an INDEPENDENT cross-check and the
+ * log reports both, so a disagreement between them is visible.
+ */
+static bool mgr2ResolveViaRecord(uintptr_t rec, uintptr_t bias,
+                                  uintptr_t *mgrOut, uint64_t *vptrOut)
+{
+    if (rec == 0 || bias == 0) {
+        return false;
+    }
+    uint64_t mgr = 0;
+    if (!readU64(rec + 0xc0u, &mgr) || mgr == 0) {
+        return false;
+    }
+    uint64_t vptr = 0;
+    if (!readU64(static_cast<uintptr_t>(mgr), &vptr)) {
+        return false;
+    }
+    if (mgrOut != nullptr) { *mgrOut = static_cast<uintptr_t>(mgr); }
+    if (vptrOut != nullptr) { *vptrOut  = vptr; }
+    return vptr == static_cast<uint64_t>(bias + kMgr2VptrElf);
+}
+
+/*
+ * THE RECORD'S PATH, with the reader this layout wants.
+ *
+ * The port's existing readGuestString() assumes a libc++ std::string
+ * (flags / length / data) and mis-reads this field: the record's path
+ * is a (length, pointer) pair with the inline bytes beside it.
+ *
+ *   +0x08  16 bytes of INLINE data (used when the path is short)
+ *   +0x18  u64  the length
+ *   +0x20  ptr  the live data (used when the path is longer than 16)
+ *
+ * The path in this guest is 45 bytes, so the POINTER is the live data
+ * and the length is the length.  readGuestString() read that pointer as
+ * a std::string and therefore printed the URL with its FIRST CHARACTER
+ * CLIPPED: the same bytes, read through the wrong shape.  This reader
+ * prints the path as it is.
+ */
+static bool mgr2ReadPath(uintptr_t rec, char *out, size_t cap)
+{
+    if (out == nullptr || cap < 2u) {
+        return false;
+    }
+    out[0] = '\0';
+    uint64_t size = 0;
+    uint64_t ptr = 0;
+    if (!readU64(rec + 0x18u, &size) || !readU64(rec + 0x20u, &ptr)) {
+        return false;
+    }
+    if (size == 0 || size > 1024u) {
+        return false;
+    }
+    if (size <= 16u) {
+        const size_t take = static_cast<size_t>(size);
+        for (size_t i = 0; i < take; ++i) {
+            uint64_t word = 0;
+            if (!readU64(rec + 0x08u + (i & ~7ull), &word)) {
+                return false;
+            }
+            out[i] = static_cast<char>((word >> ((i & 7u) * 8u)) & 0xffu);
+        }
+        out[take] = '\0';
+        return true;
+    }
+    if (ptr == 0 || !guestReadable(static_cast<uintptr_t>(ptr))) {
+        return false;
+    }
+    size_t take = static_cast<size_t>(size);
+    if (take > cap - 1u) {
+        take = cap - 1u;
+    }
+    if (!copyGuestBytes(out, static_cast<uintptr_t>(ptr), take)) {
+        return false;
+    }
+    out[take] = '\0';
+    return true;
+}
+
+/* Read the record's fields, as the guest's own code reads them. */
+struct Mgr2Record {
+    uint64_t ptr;
+    uint64_t token;
+    uint64_t c8;
+    uint64_t c9;
+    uint64_t d0;        /* +0xd0: the HEADER-EVENT witness (not Poll) */
+    uint64_t d4;
+    uint64_t handler100;
+    uint64_t body130;
+    uint64_t parser160;
+    uint64_t status170;
+    uint64_t mgrPtr;    /* +0xc0: the manager, by the record's own back-pointer */
+    uint64_t pathLen;   /* +0x18 */
+    uint64_t pathPtr;   /* +0x20 */
+};
+
+static void mgr2ReadRecord(uintptr_t rec, Mgr2Record *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->ptr = rec;
+    if (rec == 0) {
+        return;
+    }
+    uint64_t word = 0;
+    if (readU64(rec + 0x00u, &word)) { out->token     = word; }
+    if (readU64(rec + 0xc8u, &word)) { out->c8        = word & 0xffu; out->c9 = (word >> 8) & 0xffu; }
+    if (readU64(rec + 0xd0u, &word)) { out->d0        = word & 0xffffffffu; }
+    if (readU64(rec + 0xd4u, &word)) { out->d4        = word & 0xffffffffu; }
+    if (readU64(rec + 0x100u, &word)) { out->handler100 = word; }
+    if (readU64(rec + 0x130u, &word)) { out->body130   = word; }
+    if (readU64(rec + 0x160u, &word)) { out->parser160 = word; }
+    if (readU64(rec + 0x170u, &word)) { out->status170 = word & 0xffffffffu; }
+    if (readU64(rec + 0xc0u, &word)) { out->mgrPtr    = word; }
+    if (readU64(rec + 0x18u, &word)) { out->pathLen   = word; }
+    if (readU64(rec + 0x20u, &word)) { out->pathPtr   = word; }
+}
+
+/*
+ * THE MANAGER, the way the guest's own code reaches it.
+ *
+ * owner = *(bias + 0x1fc6e98);  mgr = *(owner + 0x218)
+ *
+ * Returns true only when the whole chain resolved AND the object's vptr
+ * is the HttpRequestManager's.  The vptr check is the positive control:
+ * without it a wrong chain would produce a confident, wrong answer.
+ */
+static bool mgr2Resolve(uintptr_t bias, uintptr_t *ownerOut, uintptr_t *mgrOut,
+                        uint64_t *vptrOut)
+{
+    if (bias == 0) {
+        return false;
+    }
+    uint64_t owner = 0;
+    if (!readU64(bias + kMgr2OwnerSlot, &owner) || owner == 0) {
+        return false;
+    }
+    uint64_t mgr = 0;
+    if (!readU64(static_cast<uintptr_t>(owner) + kMgr2OwnerMgrOff, &mgr) || mgr == 0) {
+        return false;
+    }
+    uint64_t vptr = 0;
+    if (!readU64(static_cast<uintptr_t>(mgr), &vptr)) {
+        return false;
+    }
+    if (ownerOut != nullptr) { *ownerOut = static_cast<uintptr_t>(owner); }
+    if (mgrOut   != nullptr) { *mgrOut   = static_cast<uintptr_t>(mgr); }
+    if (vptrOut  != nullptr) { *vptrOut  = vptr; }
+    return vptr == static_cast<uint64_t>(bias + kMgr2VptrElf);
+}
+
+/*
+ * THE .bss SCAN - "how many HttpRequestManager instances are there?".
+ *
+ * It looks for FOUR things in one pass, because a single pass that
+ * finds nothing is worthless without a control that must be found:
+ *
+ *   T0  bias + 0x1f64858   the manager's vptr: a STATIC instance
+ *                           (an object whose first word IS the vptr)
+ *   T1  the owner address  THE POSITIVE CONTROL.  The owner is stored
+ *                           in the .bss at 0x1fc6e98, so this scan MUST
+ *                           find it there.  If T1 is not found, the scan
+ *                           is broken and T0's zero is meaningless.
+ *   T2  the manager address who points at the manager (the owner chain)
+ *   T3  0x1f64858          the raw, unrelocated vaddr, in case a word
+ *                           was written without the image's relocation
+ *
+ * It does NOT look for the manager's vptr in the heap, because the
+ * manager is NOT in the heap-by-scan: it is heap-ALLOCATED by
+ * operator new (0x1cbe23c) and reachable only through owner+0x218.
+ * A .bss scan therefore answers "are there static instances?", and the
+ * owner chain answers "where is the live one?".
+ */
+struct Mgr2Scan {
+    unsigned t0;        /* vptr hits            */
+    unsigned t1;        /* owner hits (control) */
+    unsigned t2;        /* manager-address hits */
+    unsigned t3;        /* raw vaddr hits       */
+    unsigned k0;        /* addresses stored for t0 */
+    unsigned k1;
+    unsigned k2;
+    unsigned k3;
+    uintptr_t t0At[4];
+    uintptr_t t1At[4];
+    uintptr_t t2At[4];
+    uintptr_t t3At[4];
+    uint64_t words;     /* words actually read  */
+};
+
+static void mgr2ScanBss(uintptr_t bias, uint64_t wantVptr, uint64_t wantOwner,
+                        uint64_t wantMgr, Mgr2Scan *out)
+{
+    memset(out, 0, sizeof(*out));
+    const uintptr_t begin = bias + kMgr2BssBegin;
+    const uintptr_t end   = bias + kMgr2BssEnd;
+    /* Every read goes through readU64, which enforces BOTH the
+     * svcQueryMemory readability check and the "is this inside the
+     * guest's 64-bit window" check.  A bare memcpy here would be the
+     * fault the project already paid for once. */
+    for (uintptr_t a = begin; a + 8u <= end; a += 8u) {
+        uint64_t word = 0;
+        if (!readU64(a, &word)) {
+            continue;
+        }
+        ++out->words;
+        /* The COUNT and the stored addresses are separate: the count is
+         * the number of hits (the answer to "how many instances?"), the
+         * stored list is only the first few of them. */
+        if (word == wantVptr) {
+            ++out->t0;
+            if (out->k0 < 4u) { out->t0At[out->k0++] = a; }
+        }
+        if (word == wantOwner) {
+            ++out->t1;
+            if (out->k1 < 4u) { out->t1At[out->k1++] = a; }
+        }
+        if (word == wantMgr) {
+            ++out->t2;
+            if (out->k2 < 4u) { out->t2At[out->k2++] = a; }
+        }
+        if (word == kMgr2VptrElf) {
+            ++out->t3;
+            if (out->k3 < 4u) { out->t3At[out->k3++] = a; }
+        }
+    }
+}
+
+/*
+ * THE IDENTITY DUMP - is the record we are measuring really the /time
+ * request?
+ *
+ * The record DOES carry its path, at +0x18 (the length) and +0x20 (the
+ * live data pointer), with 16 bytes of inline data at +0x08 for the
+ * short case.  This dump prints the first 0x40 bytes as hex, prints the
+ * path through the reader that layout wants (mgr2ReadPath), and ALSO
+ * tries to read every word in the dump that looks like a pointer as a
+ * guest std::string - the port's old reader, which reads the same
+ * bytes through the wrong shape and therefore clips the path's first
+ * character.  Both are printed so the two readings can be compared.
+ *
+ * The second, independent instrument is the TOKEN: the guest's
+ * cc::HttpRequestManager::QueueRequest (0x1ce1a84) stores the request
+ * token in record+0x00, and the ServerTimeManager stores the SAME token
+ * in its own +0x70 (0x1cef258).  The third is the port's own view: the
+ * URL and body[0] it is serving, logged on the sample line.
+ */
+static void mgr2DumpRecord(uintptr_t rec, uintptr_t owner, uint64_t stmToken)
+{
+    char hex[0x41 * 2 + 1];
+    size_t used = 0;
+    for (unsigned i = 0; i < 0x40u; i += 8u) {
+        uint64_t word = 0;
+        readU64(rec + i, &word);
+        for (unsigned b = 0; b < 8u; ++b) {
+            used += (size_t)__builtin_snprintf(hex + used, sizeof(hex) - used,
+                                               "%02x",
+                                               (unsigned)((word >> (b * 8u)) & 0xffu));
+        }
+    }
+    hex[used] = '\0';
+
+    uint64_t pathLen = 0;
+    readU64(rec + 0x18u, &pathLen);
+    uint64_t pathPtr = 0;
+    readU64(rec + 0x20u, &pathPtr);
+
+    /* Every word in the dump that looks like a pointer, read as a string. */
+    char strings[256];
+    size_t sUsed = 0;
+    strings[0] = '\0';
+    for (unsigned i = 0; i < 0x40u; i += 8u) {
+        uint64_t word = 0;
+        if (!readU64(rec + i, &word) || word == 0) {
+            continue;
+        }
+        const uintptr_t candidate = static_cast<uintptr_t>(word);
+        if (!guestReadable(candidate)) {
+            continue;
+        }
+        char text[96];
+        if (!readGuestString(candidate, text, sizeof(text))) {
+            continue;
+        }
+        /* Only printable, non-empty text is worth a log line. */
+        bool printable = (text[0] != '\0');
+        for (const char *p = text; *p != '\0' && printable; ++p) {
+            const unsigned char c = static_cast<unsigned char>(*p);
+            if (c < 0x20u || c > 0x7eu) {
+                printable = false;
+            }
+        }
+        if (!printable) {
+            continue;
+        }
+        sUsed += (size_t)__builtin_snprintf(strings + sUsed, sizeof(strings) - sUsed,
+                                            "%s+0x%02x=\"%s\"",
+                                            sUsed == 0 ? "" : " ", i, text);
+        if (sUsed >= sizeof(strings) - 1u) {
+            break;
+        }
+    }
+
+    uint64_t recToken = 0;
+    readU64(rec + 0x00u, &recToken);
+
+    /* The path, read with the reader this layout wants. */
+    char path[160];
+    const bool havePath = mgr2ReadPath(rec, path, sizeof(path));
+    if (!havePath) {
+        path[0] = '\0';
+    }
+
+    char line[1400];
+    __builtin_snprintf(line, sizeof(line),
+                       "rec-dump rec=0x%llx owner=0x%llx recToken=0x%llx "
+                       "stmToken=0x%llx pathLen=%llu pathPtr=0x%llx "
+                       "path=%s hex=%s strs=%s",
+                       (unsigned long long)rec, (unsigned long long)owner,
+                       (unsigned long long)recToken,
+                       (unsigned long long)stmToken,
+                       (unsigned long long)pathLen,
+                       (unsigned long long)pathPtr,
+                       havePath ? path : "(unreadable)", hex,
+                       sUsed != 0 ? strings : "(none)");
+    rr3::guestViewWideLog("cc-probe-mgr2", (unsigned long long)rec, 0, line);
+}
+
+/* The one sample.  Returns true when a line was written.
+ *
+ * `src` says which carrier took the sample ("frame" = the guest's own
+ * 240-frame tick, "host" = the 1 Hz host thread) and `frames` is the
+ * guest's frame counter, so the time series is anchored to the guest's
+ * own progress and not only to wall-clock time. */
+static bool mgr2Sample(const char *src, unsigned long long sample,
+                        unsigned long long frames, uint64_t dtMs, bool fullScan)
+{
+    static unsigned s_lines = 0;
+    if (s_lines >= kMgr2MaxLines) {
+        return false;
+    }
+    const uintptr_t bias = rr3::resolveMainImageLoadBias();
+    if (bias == 0) {
+        return false;
+    }
+
+    const uintptr_t recordAny  = __atomic_load_n(&g_mgr2Record, __ATOMIC_RELAXED);
+    const uintptr_t recordTime = __atomic_load_n(&g_mgr2TimeRecord, __ATOMIC_RELAXED);
+    const uintptr_t worker = __atomic_load_n(&g_mgr2Worker, __ATOMIC_RELAXED);
+
+    /* THE RECORD UNDER MEASUREMENT: the /time one when the port has
+     * served it, otherwise the last request the guest created. */
+    const uintptr_t record = (recordTime != 0) ? recordTime : recordAny;
+    const char *url = (recordTime != 0) ? g_mgr2TimeUrl : g_mgr2Url;
+    const uint32_t body0 = (recordTime != 0) ? g_mgr2TimeBody0 : g_mgr2Body0;
+
+    /* THE MANAGER, TWICE, AND THE TWO MUST AGREE.
+     *
+     *  - via the record's own back-pointer (record+0xc0): the primary
+     *    handle, one hop, and the object Poll walks.
+     *  - via the owner (owner = *(bias+0x1fc6e98); mgr = *(owner+0x218)):
+     *    the independent route, two hops.
+     */
+    uintptr_t mgrRec = 0;
+    uint64_t mgrRecVptr = 0;
+    const bool recOk = mgr2ResolveViaRecord(record, bias, &mgrRec, &mgrRecVptr);
+    uintptr_t owner = 0;
+    uintptr_t mgrOwner = 0;
+    uint64_t mgrOwnerVptr = 0;
+    const bool ownerOk = mgr2Resolve(bias, &owner, &mgrOwner, &mgrOwnerVptr);
+    const bool agree = (recOk && ownerOk && mgrRec == mgrOwner);
+
+    const uintptr_t mgr = recOk ? mgrRec : mgrOwner;
+    const uint64_t vptr = recOk ? mgrRecVptr : mgrOwnerVptr;
+    const bool resolved = recOk || ownerOk;
+
+    /* The OLD global, for the side-by-side.  It is NOT the manager. */
+    uint64_t oldPtr = 0;
+    uint64_t oldVptr = 0;
+    if (readU64(bias + kMgr2WrongSlot, &oldPtr) && oldPtr != 0) {
+        readU64(static_cast<uintptr_t>(oldPtr), &oldVptr);
+    }
+
+    /* THE ServerTimeManager, at the address the hunt found (it is the
+     * object whose +0x78 reads back as an epoch second, and whose +0x88
+     * holds the server time the port sent).  Its +0x70 is the request
+     * token, and the guest's QueueRequest (0x1ce1a84) stores the SAME
+     * token in record+0x00 - so "record.token == ServerTimeManager.token"
+     * is an identity instrument that does not use the port's own pointer
+     * at all.
+     *
+     * NOT owner+0x10: the owner's +0x10 holds a POINTER to the guest's
+     * time provider (the Cloudcell constructor writes a self-pointer
+     * there and the engine replaces it later), not the ServerTimeManager.
+     * The vptr is logged so the reader can confirm the class. */
+    uint64_t stmToken = 0;
+    uint64_t stmTime = 0;
+    uint64_t stmVptr = 0;
+    const uintptr_t stmAddr = g_managerAddr;
+    if (stmAddr != 0) {
+        readU64(stmAddr, &stmVptr);
+        readU64(stmAddr + 0x70u, &stmToken);
+        readU64(stmAddr + 0x88u, &stmTime);
+    }
+    double stmTimeD = 0.0;
+    memcpy(&stmTimeD, &stmTime, sizeof(stmTimeD));
+
+    /* The manager's active-request vector. */
+    uint64_t begin = 0;
+    uint64_t end = 0;
+    uint64_t count = 0;
+    uint64_t mgr58 = 0;
+    if (resolved) {
+        readU64(mgr + 0x38u, &begin);
+        readU64(mgr + 0x40u, &end);
+        if (end > begin && (end - begin) % 8u == 0u) {
+            count = (end - begin) / 8u;
+        }
+        /* The flag that gates the onHeaders / onBody / onComplete paths. */
+        readU64(mgr + 0x58u, &mgr58);
+    }
+    /* The worker's own slots: the body-append callback at +0x60 and the
+     * +0x58 flag.  The body-append path (guest raw 0x1ce2cc4) reads the
+     * record from its FOURTH ARGUMENT, not from worker+0x08, so these
+     * are the only view the port has of that path. */
+    uint64_t wk58 = 0;
+    uint64_t wk60 = 0;
+    if (worker != 0) {
+        readU64(worker + 0x58u, &wk58);
+        readU64(worker + 0x60u, &wk60);
+    }
+
+    /* IS THE RECORD IN THE VECTOR?  THE HEADLINE NUMBER. */
+    int inVector = -1;   /* -1 = unknown (the manager did not resolve) */
+    uint64_t hitIndex = 0;
+    if (resolved) {
+        /* A resolved manager with an EMPTY vector is a DEFINITIVE "not
+         * in it": there is no record to be in.  Only an unresolved
+         * manager leaves the answer unknown. */
+        inVector = 0;
+        const uint64_t cap = (count < kMgr2MaxVecRecords) ? count : kMgr2MaxVecRecords;
+        for (uint64_t i = 0; i < cap; ++i) {
+            uint64_t element = 0;
+            if (readU64(static_cast<uintptr_t>(begin) + i * 8u, &element) &&
+                element == static_cast<uint64_t>(record)) {
+                inVector = 1;
+                hitIndex = i;
+                break;
+            }
+        }
+    }
+
+    /* The record's own fields, and the vector's records. */
+    Mgr2Record own;
+    mgr2ReadRecord(record, &own);
+
+    char vecText[640];
+    size_t vUsed = 0;
+    vecText[0] = '\0';
+    /* The INDEPENDENT membership check: the /time request's record is
+     * the one in the vector whose token (record+0x00) equals the
+     * ServerTimeManager's token (its +0x70).  The guest writes both,
+     * from different code, so this does not depend on the port's own
+     * pointer at all. */
+    int timeTokIndex = -1;
+    for (uint64_t i = 0; i < count && i < kMgr2MaxVecRecords; ++i) {
+        uint64_t element = 0;
+        if (!readU64(static_cast<uintptr_t>(begin) + i * 8u, &element)) {
+            continue;
+        }
+        Mgr2Record r;
+        mgr2ReadRecord(static_cast<uintptr_t>(element), &r);
+        if (timeTokIndex < 0 && stmToken != 0 && r.token == stmToken) {
+            timeTokIndex = static_cast<int>(i);
+        }
+        vUsed += (size_t)__builtin_snprintf(
+            vecText + vUsed, sizeof(vecText) - vUsed,
+            "%s[%llu]rec=0x%llx tok=0x%llx c8=%llu c9=%llu d0=%llu d4=%llu "
+            "h100=0x%llx b130=0x%llx p160=0x%llx st170=0x%llx",
+            vUsed == 0 ? "" : " ", (unsigned long long)i,
+            (unsigned long long)r.ptr, (unsigned long long)r.token,
+            (unsigned long long)r.c8, (unsigned long long)r.c9,
+            (unsigned long long)r.d0,
+            (unsigned long long)r.d4, (unsigned long long)r.handler100,
+            (unsigned long long)r.body130, (unsigned long long)r.parser160,
+            (unsigned long long)r.status170);
+        if (vUsed >= sizeof(vecText) - 1u) {
+            break;
+        }
+    }
+
+    /* The .bss scan, on some samples only.  A target that could not be
+     * resolved is replaced by a value that cannot occur, because the
+     * .bss is mostly ZERO and a zero target would "match" every zero
+     * word in it. */
+    Mgr2Scan scan;
+    memset(&scan, 0, sizeof(scan));
+    if (fullScan) {
+        const uint64_t noMatch = ~0ull;
+        mgr2ScanBss(bias, static_cast<uint64_t>(bias + kMgr2VptrElf),
+                    (owner != 0) ? static_cast<uint64_t>(owner) : noMatch,
+                    (mgr != 0) ? static_cast<uint64_t>(mgr) : noMatch, &scan);
+    }
+
+    /* The record's own PATH, read with the reader this layout wants. */
+    char path[160];
+    const bool havePath = mgr2ReadPath(record, path, sizeof(path));
+    if (!havePath) {
+        path[0] = '\0';
+    }
+
+    char line[1600];
+    __builtin_snprintf(
+        line, sizeof(line),
+        /* THE FIELD IS NOT CALLED "frames".  The Eden harness's instrument
+         * census takes the LAST match of /frames=(\d+)/ in the guest log as
+         * the guest's frame total (tools/Test-OnEden.ps1:269), and a probe
+         * that emits "frames=" after the frame loop has stopped REPLACES
+         * that total with its own zero - which reads exactly like "the
+         * guest wedged on frame one", a misreading this project has made
+         * before.  "gf=" cannot match that regex. */
+        "src=%s sample=%llu gf=%llu dt_ms=%llu worker=0x%llx "
+        "owner=0x%llx mgr=0x%llx mgrvptr=0x%llx mgrvptrElf=0x%llx "
+        "recOk=%d ownerOk=%d agree=%d "
+        "vec=0x%llx/0x%llx/%llu rec=0x%llx invec=%d hit=%llu "
+        "timeTokIdx=%d "
+        "tok=0x%llx c8=%llu c9=%llu d0=%llu d4=%llu h100=0x%llx b130=0x%llx "
+        "p160=0x%llx st170=0x%llx mgr58=0x%llx wk58=0x%llx wk60=0x%llx "
+        "recMgr=0x%llx pathLen=%llu pathPtr=0x%llx path=%s "
+        "stm=0x%llx stmVptrElf=0x%llx stmTok=0x%llx stmTime=%.6f "
+        "recAny=0x%llx recTime=0x%llx "
+        "old=0x%llx oldVptr=0x%llx oldVptrElf=0x%llx "
+        "bssT0=%u bssT1=%u bssT2=%u bssT3=%u bssWords=%llu url=%s body0=0x%x",
+        src != nullptr ? src : "-", sample, frames, (unsigned long long)dtMs,
+        (unsigned long long)worker,
+        (unsigned long long)owner, (unsigned long long)mgr,
+        (unsigned long long)vptr,
+        (unsigned long long)(vptr >= bias ? vptr - bias : 0ull),
+        recOk ? 1 : 0, ownerOk ? 1 : 0, agree ? 1 : 0,
+        (unsigned long long)begin, (unsigned long long)end,
+        (unsigned long long)count, (unsigned long long)record, inVector,
+        (unsigned long long)hitIndex, timeTokIndex,
+        (unsigned long long)own.token,
+        (unsigned long long)own.c8, (unsigned long long)own.c9,
+        (unsigned long long)own.d0,
+        (unsigned long long)own.d4, (unsigned long long)own.handler100,
+        (unsigned long long)own.body130, (unsigned long long)own.parser160,
+        (unsigned long long)own.status170, (unsigned long long)mgr58,
+        (unsigned long long)wk58, (unsigned long long)wk60,
+        (unsigned long long)own.mgrPtr, (unsigned long long)own.pathLen,
+        (unsigned long long)own.pathPtr, path,
+        (unsigned long long)stmAddr,
+        (unsigned long long)(stmVptr >= bias ? stmVptr - bias : 0ull),
+        (unsigned long long)stmToken,
+        stmTimeD, (unsigned long long)recordAny, (unsigned long long)recordTime,
+        (unsigned long long)oldPtr, (unsigned long long)oldVptr,
+        (unsigned long long)(oldVptr >= bias ? oldVptr - bias : 0ull),
+        scan.t0, scan.t1, scan.t2, scan.t3,
+        (unsigned long long)scan.words, url, body0);
+    rr3::guestViewWideLog("cc-probe-mgr2", (unsigned long long)record,
+                          (unsigned long long)mgr, line);
+    ++s_lines;
+
+    /* The vector's records, one line each. */
+    if (vUsed != 0) {
+        char vline[1024];
+        __builtin_snprintf(vline, sizeof(vline), "vec mgr=0x%llx n=%llu %s",
+                           (unsigned long long)mgr, (unsigned long long)count,
+                           vecText);
+        rr3::guestViewWideLog("cc-probe-mgr2", (unsigned long long)mgr,
+                              (unsigned long long)count, vline);
+        ++s_lines;
+    }
+
+    /* The owner chain: who points at the manager. */
+    if (fullScan) {
+        char chain[512];
+        size_t cUsed = 0;
+        chain[0] = '\0';
+        cUsed += (size_t)__builtin_snprintf(
+            chain + cUsed, sizeof(chain) - cUsed,
+            "owner-chain mgr=0x%llx owner=0x%llx atOwner+0x%llx",
+            (unsigned long long)mgr, (unsigned long long)owner,
+            (unsigned long long)kMgr2OwnerMgrOff);
+        /* k1/k2/k3 are the numbers of STORED addresses; t1/t2/t3 are
+         * the total hit counts, which can be much larger. */
+        for (unsigned i = 0; i < scan.k2; ++i) {
+            cUsed += (size_t)__builtin_snprintf(
+                chain + cUsed, sizeof(chain) - cUsed,
+                " mgrAtBss+0x%llx", (unsigned long long)(scan.t2At[i] - bias));
+            if (cUsed >= sizeof(chain) - 1u) { break; }
+        }
+        for (unsigned i = 0; i < scan.k1; ++i) {
+            cUsed += (size_t)__builtin_snprintf(
+                chain + cUsed, sizeof(chain) - cUsed,
+                " ownerAtBss+0x%llx", (unsigned long long)(scan.t1At[i] - bias));
+            if (cUsed >= sizeof(chain) - 1u) { break; }
+        }
+        for (unsigned i = 0; i < scan.k0; ++i) {
+            cUsed += (size_t)__builtin_snprintf(
+                chain + cUsed, sizeof(chain) - cUsed,
+                " vptrAtBss+0x%llx", (unsigned long long)(scan.t0At[i] - bias));
+            if (cUsed >= sizeof(chain) - 1u) { break; }
+        }
+        rr3::guestViewWideLog("cc-probe-mgr2", (unsigned long long)mgr,
+                              (unsigned long long)scan.t1, chain);
+        ++s_lines;
+    }
+
+    /* The identity dump, once per distinct record. */
+    static uintptr_t s_dumped = 0;
+    if (record != 0 && record != s_dumped) {
+        s_dumped = record;
+        mgr2DumpRecord(record, owner, stmToken);
+        ++s_lines;
+    }
+    return true;
+}
+
+/* ------------------------------------------------------------------ *
+ * THE CARRIER: a raw libnx thread that samples once a second.
+ *
+ * It is a threadCreate thread and NOT a guest pthread, because guest
+ * pthreads never leave svcSleepThread on Eden (guest_view_probe.cpp's
+ * note).  It is never joined, on the census reporter's reasoning
+ * (jni_bridge.cpp:3429): the process exit reclaims it, and there is no
+ * teardown path this file owns to stop it on.
+ *
+ * The SLEEP is load-bearing: an instrument in this project that spun
+ * without one produced no output at all, having starved everything
+ * else.  The sleep is 250 ms and one line is emitted every fourth tick,
+ * so the nominal cadence is 1 Hz; the REAL elapsed time is on every
+ * line as dt_ms, because a starved carrier must show a LONGER gap
+ * rather than a burst of catch-up samples.
+ * ------------------------------------------------------------------ */
+static volatile int g_mgr2Started = 0;
+static volatile int g_mgr2Running = 0;
+static Thread        g_mgr2Thread;
+
+static void mgr2Worker(void *opaque)
+{
+    (void)opaque;
+    const int64_t kSleepNs = 250000000;   /* 250 ms */
+    const uint64_t tickFreq = armGetSystemTickFreq();
+    uint64_t lastTick = armGetSystemTick();
+    unsigned long long tick = 0;
+    unsigned long long sample = 0;
+    while (__atomic_load_n(&g_mgr2Running, __ATOMIC_RELAXED)) {
+        svcSleepThread(kSleepNs);
+        if (!__atomic_load_n(&g_mgr2Running, __ATOMIC_RELAXED)) {
+            break;
+        }
+        ++tick;
+        if ((tick % 4ull) != 0ull) {
+            continue;
+        }
+        const uint64_t now = armGetSystemTick();
+        const uint64_t dtMs = (tickFreq != 0)
+            ? ((now - lastTick) * 1000ull / tickFreq) : 0ull;
+        lastTick = now;
+        ++sample;
+        mgr2Sample("host", sample, 0ull, dtMs,
+                   sample == 1ull || (sample % kMgr2ScanEvery) == 0ull);
+        if (sample >= kMgr2MaxTicks) {
+            break;
+        }
+    }
+    __atomic_store_n(&g_mgr2Running, 0, __ATOMIC_RELAXED);
+}
+
+/* Start the carrier, exactly once.  Safe to call from the guest's own
+ * thread: it is only a comparison and, once, a threadCreate. */
+void startMgr2Probe(void)
+{
+    if (__atomic_exchange_n(&g_mgr2Started, 1, __ATOMIC_RELAXED) != 0) {
+        return;
+    }
+    __atomic_store_n(&g_mgr2Running, 1, __ATOMIC_RELAXED);
+    /* 0x3B, the preemptive priority libnx documents for cores 0..2 and
+     * the one the other diagnostic threads use (grep
+     * kDiagnosticThreadPriority).  0x2C is the main thread's priority
+     * and is NOT time-sliced. */
+    if (R_FAILED(threadCreate(&g_mgr2Thread, mgr2Worker, nullptr, nullptr,
+                              0x4000, 0x3B, -2 /* default core */))) {
+        __atomic_store_n(&g_mgr2Running, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_mgr2Started, 0, __ATOMIC_RELAXED);
+        rr3::guestViewWideLog("cc-probe-mgr2", 0, 0, "threadCreate failed");
+        return;
+    }
+    threadStart(&g_mgr2Thread);
+    rr3::guestViewWideLog("cc-probe-mgr2", 0, 0, "carrier started (250 ms tick, 1 line/s)");
+}
+
+/* Note the request the port is serving, so the record can be tied to
+ * it.  Called on the guest's own thread. */
+void noteMgr2Request(uintptr_t worker, const char *url, size_t bodyLen,
+                     const uint8_t *body)
+{
+    if (url != nullptr) {
+        size_t take = strlen(url);
+        if (take >= sizeof(g_mgr2Url)) {
+            take = sizeof(g_mgr2Url) - 1u;
+        }
+        memcpy(g_mgr2Url, url, take);
+        g_mgr2Url[take] = '\0';
+    }
+    g_mgr2Body0 = (bodyLen > 0 && body != nullptr)
+        ? static_cast<uint32_t>(body[0]) : 0xffffffffu;
+    __atomic_store_n(&g_mgr2Worker, worker, __ATOMIC_RELAXED);
+    uint64_t rec = 0;
+    if (worker != 0 && readU64(worker + 0x08u, &rec)) {
+        __atomic_store_n(&g_mgr2Record, static_cast<uintptr_t>(rec), __ATOMIC_RELAXED);
+    }
+}
+
+/* The same, for the /time request specifically.  This is the record the
+ * menu blocker is about. */
+void noteMgr2TimeRequest(uintptr_t worker, const char *url, size_t bodyLen,
+                         const uint8_t *body)
+{
+    if (url != nullptr) {
+        size_t take = strlen(url);
+        if (take >= sizeof(g_mgr2TimeUrl)) {
+            take = sizeof(g_mgr2TimeUrl) - 1u;
+        }
+        memcpy(g_mgr2TimeUrl, url, take);
+        g_mgr2TimeUrl[take] = '\0';
+    }
+    g_mgr2TimeBody0 = (bodyLen > 0 && body != nullptr)
+        ? static_cast<uint32_t>(body[0]) : 0xffffffffu;
+    uint64_t rec = 0;
+    if (worker != 0 && readU64(worker + 0x08u, &rec)) {
+        __atomic_store_n(&g_mgr2TimeRecord, static_cast<uintptr_t>(rec),
+                         __ATOMIC_RELAXED);
+    }
+}
+
 } // namespace ccprobe
 
 /*
@@ -1267,9 +2239,17 @@ static void probeWorker(uintptr_t worker, const char *phase)
  * field it reads lives in the manager's own page, so the page query is
  * already cached and no new syscall is spent.
  *
+ * `frames` is the guest's own frame counter, so every line is anchored
+ * to the guest's progress and not only to wall-clock time.  The 4-sample
+ * cap that used to sit on this call site is GONE: it made the probe dead
+ * from about frame 960 onward, so 94% of a 16200-frame run went
+ * unobserved and "the record never changed" was indistinguishable from
+ * "the probe stopped looking".
+ *
  * Returns true when a sample was taken.
  */
-extern "C" bool rr3ServerTimeManagerProbe(const char *phase)
+extern "C" bool rr3ServerTimeManagerProbe(const char *phase,
+                                           unsigned long long frames)
 {
     bool took = false;
     if (ccprobe::g_managerAddr != 0) {
@@ -1282,8 +2262,23 @@ extern "C" bool rr3ServerTimeManagerProbe(const char *phase)
      * installed?  This is the read that says which of those three is
      * missing.  It does not need the manager, so it runs even when the
      * manager hunt has not landed yet. */
-    ccprobe::describeActiveRequests(ccprobe::g_workerAddr);
+    ccprobe::describeActiveRequests(ccprobe::g_workerAddr, frames);
     return took;
+}
+
+/*
+ * THE FRAME-ANCHORED MANAGER SAMPLE.
+ *
+ * Called from the guest's own 240-frame tick, so the time series is
+ * anchored to the guest's frame counter: a line exists for every tick of
+ * the run, and the frame number on it says exactly which part of the run
+ * it describes.  It never runs the .bss scan - that is the host thread's
+ * job - so the cost on the guest's hot path is a handful of reads on
+ * pages the probe already touches.
+ */
+extern "C" void rr3HttpManagerFrameTick(unsigned long long frames)
+{
+    ccprobe::mgr2Sample("frame", frames, frames, 0ull, false);
 }
 
 /* ------------------------------------------------------------------ *
@@ -1514,6 +2509,12 @@ static bool deliverServerTime(JNIEnv *env, CCHttpRequest *req)
     }
 
     ccprobe::probeWorker((uintptr_t)req->callback, "before-header");
+    /* This IS the /time request, so its worker (and therefore its
+     * ActiveRequest_Struct) is the record the manager census must
+     * measure.  Named separately from the generic "last init()" slot,
+     * because the guest creates an HttpRequest for other exchanges too. */
+    ccprobe::noteMgr2TimeRequest((uintptr_t)req->callback, req->url,
+                                  req->bodyLen, (const uint8_t *)req->body);
     header_callback(env, (jobject)req, req->callback, 0, (jobject)map);
     if (authLogBudget()) {
         trace("cc-srvtime: headerCallback returned");
@@ -1599,6 +2600,7 @@ static void http_post(JNIEnv *env, jobject self)
             cccloud::parseAuthRequest(req->body, req->bodyLen, info);
 
         if (authShaped) {
+            /* THE BODY MATCH - the primary discriminator. */
             if (authLogBudget()) {
                 trace("cc-auth-req: matched env=%u,%u x=%u headers=%zu body=%zu "
                       "consumed=%zu member=%u",
@@ -1607,12 +2609,56 @@ static void http_post(JNIEnv *env, jobject self)
                       (unsigned)info.consumed,
                       info.hasMemberId ? info.memberId : kDefaultMemberId);
             }
-            if (deliverAuthSuccess(env, req, info)) {
+            rr3::guestViewWideLog("cc-auth-req", 1, (unsigned long long)req->bodyLen,
+                                   "matched (body shape)");
+            const bool ok = deliverAuthSuccess(env, req, info);
+            rr3::guestViewWideLog("cc-auth-deliver", ok ? 1 : 0,
+                                  (unsigned long long)req->bodyLen,
+                                  ok ? "delivered (by=body)"
+                                     : "FAILED (by=body)");
+            if (ok) {
                 return;
             }
-        } else if (authLogBudget()) {
-            trace("cc-auth-req: not the authenticate request body=%zu",
-                  (unsigned)req->bodyLen);
+        } else {
+            /* THE URL FALLBACK.
+             *
+             * The body cannot be read at all (the guest's byte[] is not a
+             * port array object, so the length is always 0), so the body
+             * match can never fire.  The guest's own path string for this
+             * endpoint is CC_Sync.php (guest raw 0x3e3551) and the /time
+             * request goes to .../time, so the URL tells the two apart.
+             *
+             * ONE-SHOT: only the first CC_Sync.php request is answered with
+             * the authenticate response, so the ordinary sync request that
+             * follows is not answered with a second one.
+             *
+             * The log says WHICH discriminator was used.  "matched-by-url"
+             * is NOT "matched": the body was never read. */
+            const bool urlSaysAuth =
+                (strstr(req->url, kAuthUrlMarker) != nullptr);
+            if (urlSaysAuth && !g_authDelivered) {
+                if (authLogBudget()) {
+                    trace("cc-auth-req: matched-by-url body=%zu url=%s "
+                          "(the body is unreadable: the guest's byte[] is not a "
+                          "port array object, so the length is always 0)",
+                          (unsigned)req->bodyLen, req->url);
+                }
+                rr3::guestViewWideLog("cc-auth-req", 2,
+                                       (unsigned long long)req->bodyLen,
+                                       "matched-by-url (body unreadable)");
+                cccloud::AuthRequest byUrl;   /* default: no member id */
+                const bool ok = deliverAuthSuccess(env, req, byUrl);
+                rr3::guestViewWideLog("cc-auth-deliver", ok ? 1 : 0,
+                                      (unsigned long long)req->bodyLen,
+                                      ok ? "delivered (by=url)"
+                                         : "FAILED (by=url)");
+                if (ok) {
+                    return;
+                }
+            } else if (authLogBudget()) {
+                trace("cc-auth-req: not the authenticate request body=%zu url=%s",
+                      (unsigned)req->bodyLen, req->url);
+            }
         }
 
         static CCHttpErrorFn error_callback = cloudcell_native<CCHttpErrorFn>(

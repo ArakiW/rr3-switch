@@ -900,8 +900,15 @@ extern "C" void* guestCodeWritableAddress(uintptr_t guestAddress);
 // Defined in jni_compat/classes/cc_http_request.cpp. Takes a LATE sample of
 // the guest's Cloudcell ServerTimeManager, so a run can tell "the guest's
 // server-time handler never ran" from "it ran after the response
-// exchange". Returns true when a sample was taken.
-extern "C" bool rr3ServerTimeManagerProbe(const char* phase);
+// exchange". The frame counter is passed so every line is anchored to
+// the guest's own progress. Returns true when a sample was taken.
+extern "C" bool rr3ServerTimeManagerProbe(const char* phase,
+                                          unsigned long long frames);
+// Defined in jni_compat/classes/cc_http_request.cpp. ONE compact
+// cc::HttpRequestManager census line per 240-frame tick, anchored to the
+// guest's frame counter, so the whole run is observed instead of the
+// first four samples.
+extern "C" void rr3HttpManagerFrameTick(unsigned long long frames);
 
 constexpr const char* kRenderExport =
     "Java_com_firemint_realracing_MainActivity_onViewRenderJNI";
@@ -4275,15 +4282,18 @@ void* frameLoopDriver(void* opaque) {
             // "the handler never ran" from "the handler ran after the
             // exchange".
             //
-            // Bounded to a handful of polls, so the run's frame budget is
-            // untouched: the manager's address is already known and every
-            // field read lives in the manager's own page, whose page query
-            // is already cached.
-            static unsigned s_lateSamples = 0u;
-            if (s_lateSamples < 4u &&
-                rr3ServerTimeManagerProbe("late-poll")) {
-                ++s_lateSamples;
-            }
+            // THE 4-SAMPLE CAP IS REMOVED (2026-10-21). It made the probe
+            // DEAD from about frame 960 onward: in a 16200-frame run that
+            // left 94% of the run unobserved, so "the record never changed"
+            // and "the probe stopped looking" were the same observation.
+            // The cost is one sample per 240-frame tick - about 67 over a
+            // whole run - and every field read lives on the record's or the
+            // manager's own page, whose page query is already cached, so
+            // the frame budget is untouched.
+            rr3ServerTimeManagerProbe("late-poll", frames);
+            // The cc::HttpRequestManager census, one compact line per
+            // 240-frame tick, anchored to the guest's frame counter.
+            rr3HttpManagerFrameTick(frames);
         }
         // The download-phase gate probe is NOT called here any more. It used
         // to be, under `if ((frames % 240) == 0)`, and the frame loop dies
