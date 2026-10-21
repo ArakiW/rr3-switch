@@ -50,14 +50,23 @@ DIR* guestOpendir(const char* path);
 // The guest's readdir returns a POINTER to a dirent in BIONIC's layout --
 // d_type at 0x12, d_name at 0x13 -- because the guest reads those offsets
 // (measured at 0x12a5c60, 0x12a5c84, 0x12b553c, 0x1892b48, 0x1b5e12c) and the
-// host's devkitPro newlib layout has d_type at 0x08 and d_name at 0x09.
-// Returning the host's entry unchanged made every directory entry invisible
-// to the guest. The return type is void* because the value is a
-// bionic-layout record, not a host `struct dirent`.
+// host's devkitPro newlib layout is different: MEASURED with this repo's
+// toolchain, newlib's `struct dirent` is
+//   { ino_t d_ino; unsigned char d_type; char d_name[NAME_MAX+1]; }
+// with a TWO-BYTE ino_t, so d_type is at 0x02 and d_name at 0x03 (not
+// 0x08/0x09: that was the old comment's claim and it was wrong).
+// Returning the host's entry unchanged made the guest read d_type out of
+// the middle of the name and d_name 16 bytes (0x13 - 3) into it -- so every
+// directory entry was invisible to the guest and every name it did show was
+// chopped by exactly 16 bytes. The return type is void* because the value
+// is a bionic-layout record, not a host `struct dirent`.
 void* guestReaddir(DIR* directory);
-// Verifies that the converted dirent carries d_type at 0x12 and d_name at
-// 0x13, the offsets the guest reads. Depends on nothing but the converter,
-// so it needs no volume and no guest run.
+// Verifies the dirent layout on BOTH sides: that the host's entry really
+// carries d_type at 2 and d_name at 3 (measured, and asserted at compile
+// time next to the BionicDirent type), and that the converted record
+// carries d_type at 0x12 and d_name at 0x13, the offsets the guest reads.
+// Depends on nothing but the converter and the header, so it needs no
+// volume and no guest run.
 bool bionicDirentLayoutSelfTest();
 long guestPathconf(const char* path, int name);
 ssize_t guestReadlink(const char* path, char* output, size_t size);

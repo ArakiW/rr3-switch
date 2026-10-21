@@ -55,12 +55,33 @@ dirent g_fakeGuiEntry{};
 // so the guest's dirent is {d_ino@0x00, d_off@0x08, d_reclen@0x10,
 // d_type@0x12, d_name@0x13}: bionic's layout.
 //
-// The HOST's is devkitPro newlib's: {d_ino@0x00, d_type@0x08,
-// d_name@0x09} (devkitA64 .../include/sys/dirent.h). The port used to
-// return the host's entry unchanged, so the guest read d_type out of the
-// host's d_name[9] -- always 0, i.e. DT_UNKNOWN -- and d_name out of the
-// host's d_name[10] -- always "". EVERY directory entry was therefore
-// INVISIBLE to the guest.
+// The HOST's is devkitPro newlib's, and it was MEASURED with this repo's own
+// build toolchain (aarch64-none-elf-gcc, devkitA64
+// .../aarch64-none-elf/include/sys/dirent.h):
+//
+//     struct dirent { ino_t d_ino; unsigned char d_type; char d_name[NAME_MAX+1]; };
+//
+//     sizeof(ino_t)                  == 2
+//     offsetof(struct dirent, d_type) == 2
+//     offsetof(struct dirent, d_name) == 3
+//     sizeof(struct dirent)          == 260
+//
+// NOTE THE TWO-BYTE ino_t: it is what puts d_type at 0x02 and d_name at 0x03
+// rather than at 0x08/0x09. An earlier version of this comment claimed
+// 0x08/0x09, and that claim was WRONG -- it was carried into
+// bionicDirentLayoutSelfTest(), which then asserted the wrong offsets and
+// therefore passed for the wrong reason. The static_asserts below are the
+// guard that makes that impossible to repeat: they are checked by the
+// compiler against the real header, on every build.
+//
+// THE CONSEQUENCE OF THE GAP. The guest reads d_type at 0x12 and d_name at
+// 0x13. Against the host's real layout that is d_type = host d_name[0x12-3]
+// = d_name[15] and d_name = host d_name[0x13-3] = d_name[16] -- the name
+// the guest sees starts SIXTEEN BYTES into the host's name, and the type
+// byte comes out of the middle of the name. So the port's old behaviour
+// (returning the host's entry unchanged) made every directory entry
+// INVISIBLE to the guest, and chopped exactly 16 bytes off every name it
+// did manage to show (0x13 - 3 = 16).
 //
 // THE MEASURED CONSEQUENCE. The guest's directory walks filter on d_type:
 // 0x12a5bb0 keeps d_type == DT_DIR into one vector and everything else into
@@ -81,6 +102,22 @@ struct BionicDirent {
     uint8_t d_type;
     char d_name[256];
 };
+
+// THE HOST LAYOUT, asserted against the real header.
+//
+// These three are the measurement the port's behaviour depends on, and they
+// are the ones a toolchain change would move silently: a newlib whose ino_t
+// grew from 2 bytes to 8 would push d_type from 0x02 to 0x08 and d_name from
+// 0x03 to 0x09, and the guest -- which reads 0x12/0x13 -- would go back to
+// seeing nothing at all. The compiler says so at build time instead of the
+// guest saying so at run time, 16 bytes off, with no error anywhere.
+static_assert(sizeof(ino_t) == 2,
+              "host dirent layout drifted: ino_t is no longer 2 bytes, so "
+              "d_type/d_name moved and the guest's 0x12/0x13 reads break");
+static_assert(offsetof(struct dirent, d_type) == 2,
+              "host dirent layout drifted: d_type is no longer at offset 2");
+static_assert(offsetof(struct dirent, d_name) == 3,
+              "host dirent layout drifted: d_name is no longer at offset 3");
 
 static_assert(offsetof(BionicDirent, d_type) == 0x12,
               "bionic dirent layout drifted: the guest reads d_type at 0x12");
@@ -754,6 +791,106 @@ bool isCacheRelative(const char* relative) {
 
 constexpr const char* kAppRoot = "sdmc:/switch/rr3-native-rehost";
 
+// THE APP-LOCAL PATH for a resolved path. ONE function, used by BOTH the
+// write redirect and the read fallback, so the two CANNOT disagree.
+//
+// A volume path is "<device>:/files/<rest>" and the app's own copy of the
+// same tree on the card is "<app root>/<rest>" -- the volume's "files/"
+// prefix is dropped, because the card layout has no "files/" level. A path
+// that is already on the card is returned unchanged.
+//
+// WHY IT HAS TO BE ONE FUNCTION. The guest writes an asset cache to
+// "<app root>/.depot/<asset>.ast" and reads it back later. The write has to
+// land on the card (the volumes are read-only) and the read has to find it
+// again. If the two derived the card path separately they would agree only
+// by accident, and the day one of them changed the guest would silently
+// stop finding its own downloads -- which is exactly the failure the
+// ".ast" writes are hitting now (248 x "Cannot open asset file to write
+// to." in archive 20261021-224416-eden-assetdl5, every one of them a write
+// the port aimed at the read-only core volume).
+bool appLocalPath(const char* resolved, char* output, size_t outputSize) {
+    if (resolved == nullptr || output == nullptr || outputSize == 0) {
+        return false;
+    }
+    if (std::strncmp(resolved, "sdmc:", 5) == 0) {
+        const int written = std::snprintf(output, outputSize, "%s", resolved);
+        return written > 0 && static_cast<size_t>(written) < outputSize;
+    }
+    const char* relative = std::strstr(resolved, ":/files/");
+    if (relative == nullptr) {
+        return false;
+    }
+    relative += 8;   // past ":/files/"
+    const int written = std::snprintf(output, outputSize, "%s/%s",
+                                      kAppRoot, relative);
+    return written > 0 && static_cast<size_t>(written) < outputSize;
+}
+
+// Create the parent directory chain of a card path, so a write into a
+// directory the card does not have yet still lands. The guest's asset cache
+// paths are nested -- ".depot/assets_480x320/common/sprites...ast" -- and
+// those directories exist only in the volume, never on the card.
+bool ensureParentDirectories(const char* path) {
+    if (path == nullptr) {
+        return false;
+    }
+    char work[0x600]{};
+    const int written = std::snprintf(work, sizeof(work), "%s", path);
+    if (written <= 0 || static_cast<size_t>(written) >= sizeof(work)) {
+        return false;
+    }
+    // Start after the device prefix, so "sdmc:" is never used as a directory.
+    char* cursor = work;
+    const char* prefix = std::strstr(work, ":/");
+    if (prefix != nullptr) {
+        cursor = work + (prefix - work) + 2;
+    }
+    else {
+        cursor = work + 1;
+    }
+    for (; *cursor != '\0'; ++cursor) {
+        if (*cursor != '/') {
+            continue;
+        }
+        *cursor = '\0';
+        ensureDirectory(work);
+        *cursor = '/';
+    }
+    return true;
+}
+
+// A WRITE of a path that resolved into a volume must land on the CARD.
+//
+// The seven romfs volumes are mounted read-only, so a write aimed at one
+// can only fail -- and the guest's own message for that failure is
+// "Cannot open asset file to write to." (248 times in one run), which is
+// the guest giving up on the download it had just completed.
+//
+// The card is the app's own writable area, and the path used here is the
+// SAME appLocalPath() the read fallback uses, so the guest's later read of
+// the file it just wrote finds it again.
+void redirectWriteToAppLocal(Resolution& resolution) {
+    char local[0x600]{};
+    if (!appLocalPath(resolution.primary, local, sizeof(local))) {
+        return;
+    }
+    if (std::strcmp(local, resolution.primary) == 0) {
+        // Already app-local: nothing to move, and nothing to unlock.
+        resolution.readOnly = false;
+        return;
+    }
+    ensureParentDirectories(local);
+    std::snprintf(resolution.primary, sizeof(resolution.primary), "%s", local);
+    // The card copy is writable; the volume copy never was.
+    resolution.readOnly = false;
+    // The fallback slot held a volume alias for the same file. A write has
+    // no fallback, and leaving a volume path there would let a later read
+    // answer from the volume instead of from the file just written.
+    resolution.fallback[0] = '\0';
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "map-write", 0, 0, local);
+}
+
 // getAppPath/getExternalStorageDir both return kAppRoot. Guest then opens
 // absolute sdmc: paths under it. isDevicePath used to pass those straight to
 // FAT, so files/.depot/gui_assets/** never reached the seven romfs volumes.
@@ -1290,6 +1427,13 @@ bool resolvePathImpl(const char* path, bool writing, Resolution& resolution);
 
 bool resolvePath(const char* path, bool writing, Resolution& resolution) {
     const bool resolved = resolvePathImpl(path, writing, resolution);
+    if (resolved && writing) {
+        // EVERY write goes through here, so this is the one place that has to
+        // know that a write aimed at a read-only volume cannot work. The
+        // path it lands on is the app-local one the read fallback also uses,
+        // so the guest finds the file again when it reads it back.
+        redirectWriteToAppLocal(resolution);
+    }
     if (!resolved && isAssetListPath(path)) {
         // The request never got as far as an attempt: the resolver refused
         // it. The errno here is the resolver's, and the candidates are
@@ -2116,31 +2260,30 @@ int withReadFallback(const Resolution& resolution, const char* guestPath,
     // the volume's own ".depot" alias, so the card was never consulted for the
     // majority of requests. Deriving it from the primary instead of storing it
     // costs nothing and covers every path, whichever alias owns the slot.
+    //
+    // It is derived by appLocalPath() -- the SAME function the write
+    // redirect uses -- so the file a guest writes to the card and the file
+    // the guest reads back are the same path by construction, not by two
+    // derivations that happen to agree today.
     const char* primary = resolution.primary;
     if (primary != nullptr && std::strncmp(primary, "sdmc:", 5) != 0) {
-        const char* rel = std::strstr(primary, ":/files/");
-        if (rel != nullptr) {
-            rel += 8;   // past ":/files/"
-            char card[0x500]{};
-            const int n = std::snprintf(card, sizeof(card),
-                                       "sdmc:/switch/rr3-native-rehost/%s", rel);
-            if (n > 0 && static_cast<size_t>(n) < sizeof(card)) {
-                result = callback(card);
-                lastErrno = errno;
-                if (result == 0) {
-                    if (servedOut != nullptr) {
-                        *servedOut = card;
-                    }
-                    if (assetList) {
-                        logAssetListRequest(guestPath, resolution, false, 0,
-                                            lastErrno);
-                    }
-                    return 0;
+        char card[0x500]{};
+        if (appLocalPath(primary, card, sizeof(card))) {
+            result = callback(card);
+            lastErrno = errno;
+            if (result == 0) {
+                if (servedOut != nullptr) {
+                    *servedOut = card;
                 }
-                // Same retraction as the volume candidate above, and for the
-                // same reason: a ".z" request must not be answered with the
-                // uncompressed file. The guest inflates unconditionally.
+                if (assetList) {
+                    logAssetListRequest(guestPath, resolution, false, 0,
+                                        lastErrno);
+                }
+                return 0;
             }
+            // Same retraction as the volume candidate above, and for the
+            // same reason: a ".z" request must not be answered with the
+            // uncompressed file. The guest inflates unconditionally.
         }
     }
     if (result != 0 && errno == 0) {
@@ -2158,6 +2301,206 @@ bool rejectReadOnlyWrite(const Resolution& resolution, bool writing) {
         return true;
     }
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// BULK READ for large files.
+//
+// WHY IT EXISTS.
+//
+// libnx's fsdev read path asks the FS service for the WHOLE requested size
+// in one request. The service refuses a size it will not transfer and
+// answers 0xD401, and libnx then falls back to reading the file in
+// 4096-byte pieces -- one synchronous service round trip each. That fallback
+// is visible in the NRO: fsdev_read compares the service's answer with
+// 0xD401 and, on a match, calls fsdev_read_safe, whose loop is
+//     cmp x20, #0x1, lsl #12        ; 4096
+//     csel x26, x20, x25, ls
+//     bl   fsFileRead
+// i.e. one fsFileRead IPC per 4 KiB.
+//
+// The guest's read of files/.depot/asset_list_base.txtCache.txt -- 4,212,795
+// bytes -- is therefore ~1029 service round trips, and the port's main
+// thread sits in all of them.
+//
+// MEASURED, archive 20261021-205414-eden-stab3 (the stalled run):
+//   * the last thing the port logged was the open of that file
+//     (fopen-other size=4212795 served=rr3core:/files/.depot/...)
+//   * the port's own heartbeat (guest-boot.progress) stopped at t=25.56 s
+//     and the emulator's log stopped at t=26.04 s, while the run went on
+//     to 153 s at 0.6 CPU/s
+//   * census-ord ordinal=0: the root thread's last import was fread
+//   * census-ord ordinal=4: a guest thread stuck in pthread_cond_wait for
+//     12.26 s, holding a guest mutex (census-mutex-held held_ms=12259)
+//   * census-wait: signalled=0 deficit=1 -- the condvar it waits on is never
+//     signalled, because the thread that has to signal it is the one stuck
+//     in the read
+// So the read is what the guest is waiting on, and the wait never ends.
+//
+// WHAT THIS DOES. The port does the read ITSELF, in pieces of a size the
+// service serves in ONE round trip, and hands the guest a memory-backed
+// stream. The guest's own freads then cost nothing at all, and the port's
+// main thread is out of the service loop.
+//
+// THE PIECE SIZE IS ADAPTED, NOT GUESSED. The service's maximum is not
+// documented in the vendored headers, so the read measures itself: each
+// piece is timed, and the next piece is doubled when the last one came
+// back in less than half the time (a request served in one round trip
+// costs about the same whatever its size) and halved when it took more
+// than twice as long (a request the service refuses costs proportionally
+// more, because libnx chunks it internally). The starting size is the one
+// rr3::md5File() already uses against the same volumes.
+//
+// The result is logged, so the next run knows what the service really
+// served and what one piece cost.
+// ---------------------------------------------------------------------------
+
+// Below this a file is not worth a bulk read: the service overhead of one
+// request dominates and the ordinary fopen path is already cheap.
+constexpr unsigned long long kBulkReadMinBytes = 256ull * 1024ull;
+// Above this the buffer is not worth holding.
+constexpr unsigned long long kBulkReadMaxFileBytes = 8ull * 1024ull * 1024ull;
+// The total the bulk path is allowed to hold at once.
+constexpr unsigned long long kBulkReadMaxTotalBytes = 32ull * 1024ull * 1024ull;
+// The starting piece size, and the largest one tried.
+constexpr size_t kBulkReadStartChunk = 64 * 1024;
+constexpr size_t kBulkReadMaxChunk = 1024 * 1024;
+
+// The bulk-read cache.
+//
+// The entries are NEVER freed. A guest FILE* handed out earlier points into
+// the buffer, and the port has no way to know when the guest closed it, so
+// freeing on eviction would be a use-after-free waiting to happen. The
+// table is small, the per-file size is capped, and the total is capped;
+// past either cap the bulk path is simply not used and the ordinary fopen
+// path answers.
+struct BulkReadEntry {
+    char path[0x600]{};
+    void* data{};
+    size_t size{};
+};
+constexpr unsigned kBulkReadSlots = 4;
+BulkReadEntry gBulkReads[kBulkReadSlots]{};
+unsigned gBulkReadNext = 0;
+unsigned long long gBulkReadTotalBytes = 0;
+unsigned gBulkReadCount = 0;
+
+unsigned long long systemTickMillis(uint64_t ticks) {
+    const uint64_t frequency = armGetSystemTickFreq();
+    if (frequency == 0) {
+        return 0;
+    }
+    return (ticks * 1000ull) / frequency;
+}
+
+// Open a large file into memory and hand back a memory-backed stream.
+//
+// Returns false when the file is not bulk-worthy, or when the bulk path is
+// out of budget; the caller then falls back to the ordinary fopen.
+bool bulkOpenFile(const char* candidate, const char* mode, std::FILE** out) {
+    if (candidate == nullptr || out == nullptr || mode == nullptr) {
+        return false;
+    }
+    if (std::strchr(mode, 'w') != nullptr || std::strchr(mode, 'a') != nullptr) {
+        return false;
+    }
+    // Already read? Then reuse the bytes rather than paying for them again.
+    for (unsigned index = 0; index < kBulkReadSlots; ++index) {
+        const BulkReadEntry& entry = gBulkReads[index];
+        if (entry.data != nullptr && std::strcmp(entry.path, candidate) == 0) {
+            std::FILE* stream = ::fmemopen(entry.data, entry.size, "rb");
+            if (stream == nullptr) {
+                return false;
+            }
+            *out = stream;
+            return true;
+        }
+    }
+    const int fd = ::open(candidate, O_RDONLY);
+    if (fd < 0) {
+        return false;
+    }
+    struct stat info{};
+    if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) ||
+        static_cast<unsigned long long>(info.st_size) < kBulkReadMinBytes ||
+        static_cast<unsigned long long>(info.st_size) > kBulkReadMaxFileBytes) {
+        ::close(fd);
+        return false;
+    }
+    const size_t total = static_cast<size_t>(info.st_size);
+    if (gBulkReadTotalBytes + total > kBulkReadMaxTotalBytes) {
+        ::close(fd);
+        return false;
+    }
+    void* buffer = std::malloc(total);
+    if (buffer == nullptr) {
+        ::close(fd);
+        return false;
+    }
+    // THE READ.
+    size_t done = 0;
+    size_t chunk = kBulkReadStartChunk;
+    unsigned long long previousMillis = 0;
+    unsigned pieces = 0;
+    const uint64_t started = armGetSystemTick();
+    while (done < total) {
+        const size_t want = chunk < total - done ? chunk : total - done;
+        const uint64_t before = armGetSystemTick();
+        const ssize_t got = ::read(fd, static_cast<char*>(buffer) + done, want);
+        const unsigned long long millis = systemTickMillis(armGetSystemTick() - before);
+        if (got <= 0) {
+            ::close(fd);
+            std::free(buffer);
+            return false;
+        }
+        done += static_cast<size_t>(got);
+        ++pieces;
+        // ADAPT THE PIECE SIZE. A request the service serves in one round
+        // trip costs about the same whatever its size, so a piece that came
+        // back in less than half the time means the service can take more
+        // than that in one go. A request it refuses costs proportionally
+        // more -- libnx chunks it into 4 KiB pieces -- so a piece that took
+        // more than twice as long means the size is too big.
+        if (previousMillis != 0) {
+            if (millis * 2 < previousMillis && chunk < kBulkReadMaxChunk) {
+                chunk *= 2;
+            }
+            else if (millis > previousMillis * 2 && chunk > 4096) {
+                chunk /= 2;
+            }
+        }
+        previousMillis = millis;
+    }
+    const unsigned long long totalMillis = systemTickMillis(armGetSystemTick() - started);
+    ::close(fd);
+    std::FILE* stream = ::fmemopen(buffer, total, "rb");
+    if (stream == nullptr) {
+        std::free(buffer);
+        return false;
+    }
+    // Cache it. The slot may already hold an entry; that entry's buffer is
+    // NOT freed -- a guest stream may still point into it.
+    BulkReadEntry& entry = gBulkReads[gBulkReadNext];
+    gBulkReadNext = (gBulkReadNext + 1) % kBulkReadSlots;
+    std::snprintf(entry.path, sizeof(entry.path), "%s", candidate);
+    entry.data = buffer;
+    entry.size = total;
+    gBulkReadTotalBytes += total;
+    ++gBulkReadCount;
+    // The first few, and then every sixteenth, so the line is there without
+    // turning into a log of its own.
+    if (gBulkReadCount <= 4 || (gBulkReadCount % 16) == 0) {
+        char details[768];
+        std::snprintf(details, sizeof(details),
+                      "path=%s size=%zu pieces=%u piece_kb=%zu ms=%llu "
+                      "bytes_per_ms=%llu",
+                      candidate, total, pieces, chunk / 1024, totalMillis,
+                      totalMillis != 0 ? total / totalMillis : total);
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "bulk-read", gBulkReadCount, 0, details);
+    }
+    *out = stream;
+    return true;
 }
 
 // --- one-shot startup evidence for the apk/res -> .depot fallback -----------
@@ -2268,34 +2611,70 @@ void logApkResReachabilityOnce() {
 
 // The dirent regression guard, public so that the boot line can report it.
 //
-// It depends on nothing but the converter: a known host entry goes in, and
-// the bytes are read back at the offsets the GUEST reads (d_type at 0x12,
-// d_name at 0x13). It needs no volume, no deployed data and no guest run, so
-// a future edit that shifts a field fails here instead of silently making
-// every directory entry invisible to the guest again.
+// It depends on nothing but the converter and the real header: a known host
+// entry goes in, and the bytes are read back at the offsets the GUEST reads
+// (d_type at 0x12, d_name at 0x13), while the HOST's own fields are checked
+// at the offsets they really have (d_type at 2, d_name at 3 -- a two-byte
+// ino_t, MEASURED with this toolchain, not remembered). It needs no volume,
+// no deployed data and no guest run, so a future edit that shifts a field
+// fails here instead of silently making every directory entry invisible to
+// the guest again.
 bool bionicDirentLayoutSelfTest() {
+    // 1. THE HOST LAYOUT, at the offsets MEASURED with this toolchain:
+    //    d_type at 2, d_name at 3, and a TWO-BYTE ino_t. This is the half
+    //    the old version of this test got wrong: it looked for the host's
+    //    fields at 0x08/0x09, which is where they would be if ino_t were 8
+    //    bytes. They are not, so the old check was reading bytes of d_ino
+    //    and passed for the wrong reason.
+    //
+    //    The static_asserts next to BionicDirent already fail the BUILD if
+    //    this layout moves. This test checks the same thing at RUN time, on
+    //    the bytes themselves rather than on the compiler's word, so the
+    //    boot line reports the layout that is actually in force.
     struct dirent host{};
     host.d_ino = 0x0123456789abULL;
     host.d_type = DT_DIR;
     std::strcpy(host.d_name, "480x320");
+    unsigned char hostRaw[sizeof(struct dirent)];
+    std::memcpy(hostRaw, &host, sizeof(hostRaw));
+    if (hostRaw[2] != DT_DIR) {
+        return false;
+    }
+    if (std::strcmp(reinterpret_cast<const char*>(hostRaw + 3), "480x320") != 0) {
+        return false;
+    }
+    // 2. THE CONVERTED RECORD, at the offsets the GUEST reads: d_type at
+    //    0x12 and d_name at 0x13.
     BionicDirent converted{};
     writeBionicDirent(host, converted);
     unsigned char raw[sizeof(BionicDirent)];
     std::memcpy(raw, &converted, sizeof(raw));
-    // The guest's own offsets.
     if (raw[0x12] != DT_DIR) {
         return false;
     }
     if (std::strcmp(reinterpret_cast<const char*>(raw + 0x13), "480x320") != 0) {
         return false;
     }
-    if (converted.d_ino != 0x0123456789abULL) {
+    // The ino_t is 2 bytes on the host, so the value that goes in is the low
+    // 16 bits of what was assigned -- 0x9ab -- and the converter widens it
+    // to the guest's 64-bit d_ino. Asserting the WIDENED value is what
+    // makes this a test of the conversion rather than of the assignment.
+    if (converted.d_ino != 0x9abULL) {
         return false;
     }
-    // The host's offsets must NOT be what the guest reads, or the fix is a
-    // no-op: the host's d_type is at 0x08 and its d_name at 0x09.
-    if (raw[0x08] == DT_DIR &&
-        std::strcmp(reinterpret_cast<const char*>(raw + 0x09), "480x320") == 0) {
+    // 3. THE TWO LAYOUTS MUST DISAGREE, or the conversion is a no-op. The
+    //    host's fields are at 2 and 3; the guest's are at 0x12 and 0x13.
+    //    Read the host's offsets out of the CONVERTED record: they must NOT
+    //    look like the host's entry.
+    if (raw[2] == DT_DIR &&
+        std::strcmp(reinterpret_cast<const char*>(raw + 3), "480x320") == 0) {
+        return false;
+    }
+    // 4. AND THE CONVERSION MUST ACTUALLY MOVE THE NAME. The guest's d_name
+    //    offset (0x13) minus the host's (3) is 16: that is the 16 bytes the
+    //    guest used to lose off every name, and it is the number the
+    //    track-name measurements were explained with.
+    if (offsetof(BionicDirent, d_name) - offsetof(struct dirent, d_name) != 16) {
         return false;
     }
     return true;
@@ -2557,8 +2936,16 @@ std::FILE* guestFopen(const char* path, const char* mode) {
     // WHICH CANDIDATE ANSWERED. The resolver builds up to three of them
     // (the volume primary, the volume alias, the SD card) and the caller
     // used to see only the RESULT, so a line could not say which tree served
-    // the bytes. The pointer is into the Resolution, which outlives the
-    // call.
+    // the bytes.
+    //
+    // THE BUFFER IS THIS FUNCTION'S, NOT withReadFallback's. The third
+    // candidate -- the app-local card copy -- is a LOCAL buffer inside
+    // withReadFallback, so the pointer it hands back dies with the call.
+    // Reading it afterwards was a read of a dead stack slot, and it is read
+    // AFTERWARDS: the size probe and the "served=" field of the open trace
+    // both come after withReadFallback has returned. So the path is copied
+    // out here, while it is still alive, into a buffer this function owns.
+    char servedPath[0x600]{};
     const char* served = nullptr;
     if (writing) {
         file = std::fopen(resolution.primary, mode);
@@ -2573,10 +2960,27 @@ std::FILE* guestFopen(const char* path, const char* mode) {
         // Same reason as guestOpen: the read path needs the trailing-".z"
         // retry, and that lives only in withReadFallback. See the long note
         // there -- this is the same 71-failure shape reached through fopen.
+        //
+        // The bulk read comes FIRST inside the callback, so it applies to
+        // whichever candidate answers: the volume copy, the alias, or the
+        // card copy. It only takes over for a file big enough to be worth
+        // it, and it hands back a memory-backed stream, so the guest's own
+        // freads cost nothing.
+        const char* servedPointer = nullptr;
         withReadFallback(resolution, path, [&file, mode](const char* candidate) {
+            if (bulkOpenFile(candidate, mode, &file)) {
+                return 0;
+            }
             file = std::fopen(candidate, mode);
             return file == nullptr ? -1 : 0;
-        }, &served);
+        }, &servedPointer);
+        // Copy the served path out of withReadFallback's frame. See the note
+        // on servedPath above: for the card candidate that pointer is a local
+        // of that function, and it is dead by the time the line below runs.
+        if (servedPointer != nullptr) {
+            std::snprintf(servedPath, sizeof(servedPath), "%s", servedPointer);
+            served = servedPath;
+        }
     }
     if (file == nullptr && path != nullptr && path[0] != '\0') {
         appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
