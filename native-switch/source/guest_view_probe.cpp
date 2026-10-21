@@ -10,6 +10,7 @@
 #include <cstring>
 
 #include "rr3/elf_preflight.hpp"
+#include "rr3/guest_res_probe.hpp"
 #include "rr3/rr3_deinfo_probe.hpp"
 #include "rr3/gfx_backend.hpp"
 #include "rr3/guest_input.hpp"
@@ -1318,6 +1319,11 @@ void sampleMenuGateTerms(uint64_t frames, const char* carrier);
 // the host sampler -- carry it.
 void sampleMenuAssetGateTerms(uint64_t frames, const char* carrier);
 
+// The guest's cc::ImageResManager resolution list, and the two ends of the
+// menu chain (the RookieChampionshipManager pointer and the Cloudcell's
+// +0x4c1 byte). Defined in guest_res_probe.cpp; the header is included at the
+// top of this file so the two declarations cannot drift.
+
 void samplerWorker(void* opaque) {
     const Handle target = static_cast<Handle>(reinterpret_cast<uintptr_t>(opaque));
     uint64_t sinceFlush = 0;
@@ -1422,6 +1428,13 @@ void samplerWorker(void* opaque) {
         // the reader can still say which part of the run it describes.
         sampleMenuGateTerms(g_guestFrameNumber.load(std::memory_order_relaxed),
                             "sampler");
+        // The guest's own GUI-resolution list, on the same carrier. The
+        // list is built once, during the guest's init, so a time series is
+        // what says whether it was EVER populated -- and the same line
+        // carries the RookieChampionshipManager pointer and the Cloudcell's
+        // +0x4c1 byte, so one line answers the whole chain.
+        sampleImageResList(g_guestFrameNumber.load(std::memory_order_relaxed),
+                           "sampler");
         const Result pauseResult =
             svcSetThreadActivity(target, ThreadActivity_Paused);
         if (R_FAILED(pauseResult)) {
@@ -4860,6 +4873,9 @@ void* frameLoopDriver(void* opaque) {
             // stops around frame 120 and this tick then never comes round
             // again.
             sampleMenuGateTerms(frames, "frame");
+            // The GUI-resolution list on the guest's own frame carrier too,
+            // so the sample is anchored to the guest's frame counter.
+            sampleImageResList(frames, "frame");
         }
         // The download-phase gate probe is NOT called here any more. It used
         // to be, under `if ((frames % 240) == 0)`, and the frame loop dies

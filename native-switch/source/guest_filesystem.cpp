@@ -38,6 +38,87 @@ bool g_injectGui2048 = false;
 int g_injectIndex = 0;
 dirent g_fakeGuiEntry{};
 
+// ---------------------------------------------------------------------------
+// BIONIC'S struct dirent. The host's cannot be handed to the guest.
+//
+// MEASURED FROM THE GUEST BINARY, not from a header and not from a
+// remembered Android layout. Four independent guest call sites read the
+// directory entry at bionic's offsets:
+//
+//   0x12a5c60  add  x24, x25, #0x13   ; d_name
+//   0x12a5c84  ldrb w8, [x25, #0x12]  ; d_type
+//   0x12b553c  ldrb w8, [x25, #0x12]  ; d_type
+//   0x12b5550  add  x25, x25, #0x13   ; d_name
+//   0x1892b48  add  x25, x22, #0x13   ; d_name
+//   0x1b5e12c  add  x1, x0, #0x13     ; d_name
+//
+// so the guest's dirent is {d_ino@0x00, d_off@0x08, d_reclen@0x10,
+// d_type@0x12, d_name@0x13}: bionic's layout.
+//
+// The HOST's is devkitPro newlib's: {d_ino@0x00, d_type@0x08,
+// d_name@0x09} (devkitA64 .../include/sys/dirent.h). The port used to
+// return the host's entry unchanged, so the guest read d_type out of the
+// host's d_name[9] -- always 0, i.e. DT_UNKNOWN -- and d_name out of the
+// host's d_name[10] -- always "". EVERY directory entry was therefore
+// INVISIBLE to the guest.
+//
+// THE MEASURED CONSEQUENCE. The guest's directory walks filter on d_type:
+// 0x12a5bb0 keeps d_type == DT_DIR into one vector and everything else into
+// another, and 0x12b5504 keeps d_type == DT_REG or DT_DIR. With the host's
+// layout both walks saw an empty name and an unknown type, so the guest's
+// gui_assets enumeration (0x12a5bb0, reached from 0x10f8cf8) produced an
+// EMPTY candidate vector. The guest therefore never reached its own
+// sscanf("%ux%u") parse at 0x10f8ebc, and the cc::ImageResManager list was
+// empty -- which is exactly why the guest printed "Res order:" with no
+// entries under it.
+//
+// The fix: convert the host entry into bionic's layout on the way out.
+// ---------------------------------------------------------------------------
+struct BionicDirent {
+    uint64_t d_ino;
+    int64_t d_off;
+    uint16_t d_reclen;
+    uint8_t d_type;
+    char d_name[256];
+};
+
+static_assert(offsetof(BionicDirent, d_type) == 0x12,
+              "bionic dirent layout drifted: the guest reads d_type at 0x12");
+static_assert(offsetof(BionicDirent, d_name) == 0x13,
+              "bionic dirent layout drifted: the guest reads d_name at 0x13");
+static_assert(sizeof(BionicDirent) == 280,
+              "bionic dirent size drifted: 275 bytes of data, padded to 8");
+
+// The buffers the converted entries are published from.
+//
+// The guest copies the name out before it calls readdir again (0x12a5bb0
+// memcpy's into its own std::string before the next readdir at 0x12a5c50),
+// so one buffer per call would do for a single lister. A small ring is used
+// instead, because the HOST's own readdir kept one buffer PER DIRECTORY, and
+// two guest threads listing two different directories at the same time must
+// not clobber each other. Sixteen slots covers that; the guest has no more
+// than a handful of concurrent directory walks.
+constexpr unsigned kBionicDirentPoolSize = 16;
+BionicDirent g_bionicDirentPool[kBionicDirentPoolSize]{};
+std::atomic<unsigned> g_bionicDirentNext{0};
+
+void writeBionicDirent(const struct dirent& source, BionicDirent& target) {
+    target.d_ino = static_cast<uint64_t>(source.d_ino);
+    // The guest imports no telldir/seekdir/rewinddir, so d_off and d_reclen
+    // are never read; they are filled in with the values bionic would use so
+    // that a future guest user sees something sane rather than a zero.
+    target.d_off = 0;
+    target.d_reclen = static_cast<uint16_t>(
+        offsetof(BionicDirent, d_name) + std::strlen(source.d_name) + 1);
+    target.d_type = source.d_type;
+    std::memset(target.d_name, 0, sizeof(target.d_name));
+    std::strncpy(target.d_name, source.d_name, sizeof(target.d_name) - 1);
+}
+
+// The regression guard that checks this converter is public, so that the
+// boot line can report it. It is defined after this anonymous namespace
+// closes, and depends on nothing but the converter.
+
 struct Volume {
     const char* device;
     const char* file;
@@ -2185,6 +2266,41 @@ void logApkResReachabilityOnce() {
 
 } // namespace
 
+// The dirent regression guard, public so that the boot line can report it.
+//
+// It depends on nothing but the converter: a known host entry goes in, and
+// the bytes are read back at the offsets the GUEST reads (d_type at 0x12,
+// d_name at 0x13). It needs no volume, no deployed data and no guest run, so
+// a future edit that shifts a field fails here instead of silently making
+// every directory entry invisible to the guest again.
+bool bionicDirentLayoutSelfTest() {
+    struct dirent host{};
+    host.d_ino = 0x0123456789abULL;
+    host.d_type = DT_DIR;
+    std::strcpy(host.d_name, "480x320");
+    BionicDirent converted{};
+    writeBionicDirent(host, converted);
+    unsigned char raw[sizeof(BionicDirent)];
+    std::memcpy(raw, &converted, sizeof(raw));
+    // The guest's own offsets.
+    if (raw[0x12] != DT_DIR) {
+        return false;
+    }
+    if (std::strcmp(reinterpret_cast<const char*>(raw + 0x13), "480x320") != 0) {
+        return false;
+    }
+    if (converted.d_ino != 0x0123456789abULL) {
+        return false;
+    }
+    // The host's offsets must NOT be what the guest reads, or the fix is a
+    // no-op: the host's d_type is at 0x08 and its d_name at 0x09.
+    if (raw[0x08] == DT_DIR &&
+        std::strcmp(reinterpret_cast<const char*>(raw + 0x09), "480x320") == 0) {
+        return false;
+    }
+    return true;
+}
+
 ExternalDataStatus mountExternalData() {
     fsTrace("[rr3fs] enter\n");
     unmountExternalData();
@@ -3265,7 +3381,7 @@ DIR* guestOpendir(const char* path) {
     return directory;
 }
 
-struct dirent* guestReaddir(DIR* directory) {
+void* guestReaddir(DIR* directory) {
     gResolveApi = "guestReaddir";
     struct dirent* entry = ::readdir(directory);
     if (entry == nullptr && g_injectIndex < 2 &&
@@ -3287,12 +3403,21 @@ struct dirent* guestReaddir(DIR* directory) {
         appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                             "readdir-inject", 0,
                             static_cast<unsigned long long>(DT_DIR), name);
-        return &g_fakeGuiEntry;
+        entry = &g_fakeGuiEntry;
     }
-    if (entry != nullptr && entry->d_name[0] != '\0') {
+    if (entry == nullptr) {
+        return nullptr;
+    }
+    if (entry->d_name[0] != '\0') {
         static unsigned s_readdirLog = 0;
         // RomFS may report DT_UNKNOWN; guests that filter DT_DIR then skip
         // every child. Recover type via stat on the last gui opendir path.
+        //
+        // NOTE: the recovery writes the HOST's d_type, at the host's offset
+        // 0x08. That is the right place for the host's layout, and the
+        // conversion below copies it to the guest's offset 0x12. Recovering
+        // it into the guest's offset without converting would have been the
+        // same mistake the whole conversion exists to fix.
         if (entry->d_type == DT_UNKNOWN && g_lastOpendirPath != nullptr) {
             char full[0x480]{};
             std::snprintf(full, sizeof(full), "%s/%s", g_lastOpendirPath,
@@ -3308,15 +3433,27 @@ struct dirent* guestReaddir(DIR* directory) {
             const bool guiDir = g_lastOpendirPath != nullptr &&
                 std::strstr(g_lastOpendirPath, "gui_assets") != nullptr;
             if (guiDir || s_readdirLog <= 8) {
+                // The numbers logged here are the ones the GUEST will read:
+                // the converted d_type and the converted d_name.
+                BionicDirent converted{};
+                writeBionicDirent(*entry, converted);
                 appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                                     guiDir ? "readdir-gui" : "readdir",
                                     s_readdirLog,
-                                    static_cast<unsigned long long>(entry->d_type),
-                                    entry->d_name);
+                                    static_cast<unsigned long long>(converted.d_type),
+                                    converted.d_name);
             }
         }
     }
-    return entry;
+    // Publish the entry in BIONIC's layout. The guest reads d_type at 0x12
+    // and d_name at 0x13; the host's entry has d_type at 0x08 and d_name at
+    // 0x09, so handing the host's pointer over would have made every entry
+    // invisible to the guest. See the BionicDirent comment above.
+    BionicDirent& slot =
+        g_bionicDirentPool[g_bionicDirentNext.fetch_add(1, std::memory_order_relaxed) %
+                           kBionicDirentPoolSize];
+    writeBionicDirent(*entry, slot);
+    return &slot;
 }
 
 long guestPathconf(const char* path, int name) {

@@ -17,6 +17,7 @@
 #include "rr3/jump_bridge.hpp"
 #include "rr3/graphics_probe.hpp"
 #include "rr3/guest_filesystem.hpp"
+#include "rr3/guest_res_probe.hpp"
 #include "rr3/libcxx_shims.hpp"
 #include "rr3/native_contract.hpp"
 #include "rr3/native_ui.hpp"
@@ -677,6 +678,17 @@ int main(int argc, char** argv) {
     const uint64_t bionicSelfTest = rr3::bionicShimSelfTest();
     bootPrintf("Bionic shim selftest=%03llx expected=3ff\n",
                 static_cast<unsigned long long>(bionicSelfTest));
+    // The dirent layout the GUEST reads. The guest's own code reads d_type at
+    // 0x12 and d_name at 0x13 (bionic's struct dirent), and the host's
+    // devkitPro newlib layout has them at 0x08 and 0x09 -- so the port
+    // converts on the way out. This guard needs no volume and no guest run.
+    const bool direntLayoutSelfTest = rr3::bionicDirentLayoutSelfTest();
+    bootPrintf("Bionic dirent layout selftest=%s expected=1\n",
+                direntLayoutSelfTest ? "1" : "0");
+    // JOB 0: the port's own sscanf, with the exact inputs the guest feeds
+    // it. The guest's sscanf import is bound to the host newlib's sscanf, so
+    // this measures the same function the guest calls.
+    rr3::runSscanfProbe();
     const uint64_t pthreadSelfTest = rr3::pthreadBridgeSelfTest();
     bootPrintf("Pthread bridge selftest=%03llx expected=7ff\n",
                 static_cast<unsigned long long>(pthreadSelfTest));

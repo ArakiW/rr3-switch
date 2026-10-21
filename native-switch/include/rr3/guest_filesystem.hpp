@@ -47,7 +47,18 @@ bool bionicStatLayoutSelfTest();
 int statBionicModeForLog();
 int guestMkdir(const char* path, mode_t mode);
 DIR* guestOpendir(const char* path);
-struct dirent* guestReaddir(DIR* directory);
+// The guest's readdir returns a POINTER to a dirent in BIONIC's layout --
+// d_type at 0x12, d_name at 0x13 -- because the guest reads those offsets
+// (measured at 0x12a5c60, 0x12a5c84, 0x12b553c, 0x1892b48, 0x1b5e12c) and the
+// host's devkitPro newlib layout has d_type at 0x08 and d_name at 0x09.
+// Returning the host's entry unchanged made every directory entry invisible
+// to the guest. The return type is void* because the value is a
+// bionic-layout record, not a host `struct dirent`.
+void* guestReaddir(DIR* directory);
+// Verifies that the converted dirent carries d_type at 0x12 and d_name at
+// 0x13, the offsets the guest reads. Depends on nothing but the converter,
+// so it needs no volume and no guest run.
+bool bionicDirentLayoutSelfTest();
 long guestPathconf(const char* path, int name);
 ssize_t guestReadlink(const char* path, char* output, size_t size);
 char* guestRealpath(const char* path, char* output);
