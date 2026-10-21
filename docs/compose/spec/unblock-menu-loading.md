@@ -4268,3 +4268,203 @@ sample in every archive was found by the `+0x78` shape fallback instead.
 The fallback works, so the bug was invisible; the constant is now
 `0x1f65b98` and the selector does what it says.
 
+
+## S30 - the BODY: the port never delivered one, and it is not the blocker (2026-10-21)
+
+### What was missing
+
+The guest's own Java class answers a request in THREE steps, and the port
+was only doing two of them. `com/firemonkeys/cloudcellapi/HttpThread.java`
+(`reverse/java/sources/com/firemonkeys/cloudcellapi/HttpThread.java:92-104`
+and `:319-321`) calls, in this order:
+
+    headerCallback(ptr, contentLength, headers)
+    dataCallback(ptr, bytes, len)          <- the BODY, once per read
+    completeCallback(ptr, httpStatus)
+
+The port delivered the header and the completion and NEVER a body. The
+guest's own native for the body is present in the image and is resolved
+the same way the three siblings are:
+
+    Java_com_firemonkeys_cloudcellapi_HttpRequest_dataCallback
+        guest raw 0x1ce493c, signature (JNIEnv*, jobject, jlong,
+        jbyteArray, jint)
+
+### What the guest's dataCallback actually does (read out of the image)
+
+```
+0x1ce4968  mov  w19, w4            ; the length
+0x1ce4970  sxtw x0, w19
+0x1ce497c  bl   0x1e17fd0          ; malloc(length)
+0x1ce4980  ldr  x8, [x22]          ; env->functions
+0x1ce4990  ldr  x8, [x8, #0x640]   ; <-- JNIEnv slot 0x640 = index 200
+0x1ce4994  mov  w2, wzr            ; start = 0
+0x1ce4998  mov  w3, w19            ; length
+0x1ce499c  mov  x4, x23            ; destination buffer
+0x1ce49a0  blr  x8
+0x1ce49a4  ldr  x8, [x20]          ; the worker's vtable
+0x1ce49b4  ldr  x8, [x8, #0x20]    ; vfunc4
+0x1ce49b8  blr  x8                 ; worker->vfunc4(worker, buffer, length)
+0x1ce49d0  b    0x1e17d30          ; free(buffer)
+```
+
+**Slot 0x640 is `GetByteArrayRegion`, not `GetByteArrayElements`.**
+`GetByteArrayElements` is slot 184 (0x5b0); `GetByteArrayRegion` is slot
+200 (0x640). The five arguments - `(env, array, start, length, buf)` -
+are GetByteArrayRegion's, and the port's own JNIEnv table
+(`jni_compat/jni.h` is the stock AOSP `JNINativeInterface`, so the
+indices are the stock ones) puts `jniGetByteArrayRegion` at exactly that
+slot. The guest's JNIEnv is the port's `g_jniTable`
+(`jni_bridge.cpp:4421`), whose byte-array slots are 171 GetArrayLength,
+176 NewByteArray, 184 GetByteArrayElements, 192 ReleaseByteArrayElements,
+200 GetByteArrayRegion, 208 SetByteArrayRegion - the stock indices.
+
+**So the port's array has to be a real array in the GUEST's own pool.**
+`env->NewByteArray` (slot 176) and `env->SetByteArrayRegion` (slot 208)
+are the port's env, because the managed methods are dispatched with the
+JNIEnv the guest passed (`jni_bridge.cpp:4238` hands
+`reinterpret_cast<JNIEnv*>(env)` to the dispatcher). That is the same
+trap as the request body: the guest's own byte[] is not a port array
+object, so the port's GetArrayLength answered 0 for every request.
+
+### The change
+
+`jni_compat/classes/cc_http_request.cpp` now delivers a body through the
+guest's own dataCallback, BETWEEN the header and the completion, which
+is the Java order. The body bytes are a build-time selector
+(`RR3_SRV_BODY`): 0 = empty, 1 = 24 zero bytes, 2 = 24 bytes holding
+the epoch seconds as a little-endian double, 3 = the server time as
+ASCII decimal.
+
+### WHAT THE BODY IS NOT: the gate on the response-complete event
+
+`cc::HttpRequestManager::Poll` (guest raw `0x1ce29b4`, vfunc15 of the
+manager, vtable base `0x1f64848`) delivers the response-complete
+delegate - the ServerTimeManager's handler, at record+0x100 - like this:
+
+```
+0x1ce2a88  ldrb w8, [x21, #0xc8]     ; the response-complete flag
+0x1ce2a8c  cbz  w8, #0x1ce2a2c      ; c8 == 0  -> not yet
+0x1ce2a90  ldrb w8, [x21, #0xc9]     ; "already delivered"
+0x1ce2a94  cbnz w8, #0x1ce2a2c      ; c9 != 0  -> already done
+0x1ce2a98  ldr  x8, [x21, #0x100]    ; the handler delegate
+0x1ce2a9c  strb w24, [x21, #0xc9]    ; c9 = 1  (delivered)
+0x1ce2aac  ldr  w8, [x21, #0xd4]     ; the pending body byte count
+0x1ce2ab0  cbz  w8, #0x1ce2abc       ; count == 0 -> deliver (NULL, 0)
+0x1ce2ab4  ldr  x9, [x21, #0x130]    ; the BODY delegate
+0x1ce2ae0  ldr  x9, [x21, #0xd8]     ; the body buffer
+0x1ce2af4  ldr  x0, [x21, #0x100]    ; the handler delegate
+0x1ce2b10  blr  x8                  ; handler(token, dataPtr, &count)
+```
+
+**The gate is `c8 != 0 && c9 == 0` and nothing else.** A body changes
+the ARGUMENTS the handler is called with, not whether it is called: with
+record+0xd4 == 0 the handler gets (NULL, 0), with a body it gets
+(dataPtr, count). And the ServerTimeManager's handler
+(`0x1cef2f8`) reads NONE of them - it uses x0 (the manager), x3 (the
+token) and the manager's own fields (this+0x80, this+0x78, this+0x88,
+this+0x70, this+0x90, this+0x150/+0x158). x1 (dataPtr) and x2 (&count)
+are never read.
+
+So the body can change WHAT the handler is told, never WHETHER it runs.
+The measured record already says the response is accepted (`c8 = 1`,
+the handler delegate IS installed at record+0x100, the parser IS
+installed at record+0x160, the status is 200) and that the event has
+not fired (`c9 = 0`).
+
+### The runs
+
+* `20261021-104950-eden-srvbody1` - `RR3_SRV_BODY=0`, an EMPTY body.
+* `20261021-105547-eden-srvbody2` - `RR3_SRV_BODY=1`, 24 zero bytes.
+
+Both runs: the body WAS delivered - the port's `NewByteArray` line is in
+the archive (24 bytes on the second run) and the guest's dataCallback ran
+(it queries `isClosed` from inside the delivery). And NOTHING moved:
+`c9` stayed 0, `cnt90` stayed 0, "CC: Server time returned" stayed
+absent, `cc-http-init` stayed 1, "MainMenu" stayed 0, and
+`cc-probe-req` stayed byte-for-byte the same shape
+(`c8=1 c9=0 d4=0 handler100=<set> body130=0x0 parser160=<set>
+status=0xc8`).
+
+**And the body did not even reach the request record: `d4` stayed 0.**
+That is not a port bug - the GUEST drops it. `cc::HttpRequestWorker`'s
+`vtable[4]` is `0x1ce3ea8` (the vtable is at `0x1f64b28`: vfunc3 =
+`0x1ce3df0`, vfunc4 = `0x1ce3ea8`, vfunc5 = `0x1ce4c60` =
+CompletionCallback). `0x1ce3ea8` checks the response's content type
+against the worker's own and then calls `0x1ce4bf0`, which is:
+
+```
+0x1ce4c0c  ldr  w8, [x0, #0xa0]     ; the status
+0x1ce4c10  ldr  x9, [x0, #8]        ; the record
+0x1ce4c14  str  w8, [x9, #0x170]    ; record+0x170 = the status
+0x1ce4c18  ldr  x0, [x0, #0x60]     ; THE BODY DELEGATE (worker+0x60)
+0x1ce4c1c  cbz  x0, #0x1ce4c3c      ; NULL -> RETURN, the bytes are DROPPED
+0x1ce4c38  blr  x8                  ; delegate(dataPtr, &len)
+```
+
+**worker+0x60 is NULL for this request**, so the 24 bytes never reach
+record+0xd8 and record+0xd4 stays 0. And that is the NORMAL state: the
+Cloudcell request API only takes TWO closures. The ServerTimeManager's
+TimeCallback (`0x1cef068`) builds the handler (`0x1cef2f8`) and the
+parser (`0x1cef8a4`) and hands both to `cloudcell->vtable[3](path,
+closureA, &token, closureB)` at `0x1cef254`; `QueueRequest`
+(`0x1ce1a84`) -> `0x1ce13a4` puts closureA at record+0x100 and closureB
+at record+0x160. **No body delegate is ever installed** - so record+0x130
+is 0 and worker+0x60 is 0, in every run, and the guest's own design
+throws the body away.
+
+The one place the body WOULD have mattered is `Poll`'s handler call:
+
+```
+0x1ce2aac  ldr  w8, [x21, #0xd4]    ; the pending body count
+0x1ce2ab0  cbz  w8, #0x1ce2abc      ; count == 0 -> handler(NULL, 0)
+0x1ce2ab4  ldr  x9, [x21, #0x130]   ; the body delegate
+0x1ce2ab8  cbz  x9, #0x1ce2ae0      ; no body delegate -> handler(body, count)
+```
+
+and even there the ServerTimeManager's handler (`0x1cef2f8`) reads
+NEITHER argument: it uses x0 (the manager), x3 (the token) and the
+manager's own fields. x1 (dataPtr) and x2 (&count) are never read.
+
+**So the body could not have been the blocker, and now it is delivered
+anyway.**
+
+### The next blocker is therefore not the body
+
+It is the question the previous section already reached: who calls
+`cc::HttpRequestManager::vfunc15` (`Poll`) on the manager instance that
+holds the `/time` record. The Cloudcell instance is a global - the GOT
+slot `0x1f6d5d0` resolves to the .bss address `0x1fc6e98` - and the
+manager is a sub-object of it, which is why the probe's manager global
+(`0x1f97818`) is the WRONG object: its vptr is the GluRevSDKWrapper's,
+not the HTTP manager's.
+
+The measurements that close this out:
+
+| signal | baseline `20261021-101257-eden-srvvt` | `srvbody1` (empty) | `srvbody2` (24 B) |
+| --- | --- | --- | --- |
+| "CC: Server time returned" | absent | absent | absent |
+| "CC: AUTH INFO [MemberId: %u]" | 0 | 0 | 0 |
+| "CC: Invalid DeviceId!" | 5 | 5 | 5 |
+| "CC: Sub Sync Queued" | 15 (13, 11, 10738, 13, 13) | 15 (identical) | 15 (identical) |
+| "MainMenu" | 0 | 0 | 0 |
+| `cc-http-init` | 1 | 1 | 1 |
+| `cc-auth-req` | 0 | 0 | 0 |
+| "CC: [1] POST complete" | 1 | 1 | 1 |
+| `cc-srvtime` | 4 | 6 (4 + 2 body lines) | 6 (4 + 2 body lines) |
+| `cc-probe-req` c8 / **c9** / d4 | 1 / **0** / 0 | 1 / **0** / 0 | 1 / **0** / 0 |
+| `cnt90` | 0 | 0 | 0 |
+| `m88` (the parsed server time) | 1792548799.743963 | 1792551011.938532 | 1792551366.153487 |
+| last `gfx-stats` frames | 15960 | 1080 (the run died at t=45s) | 16200 |
+
+`srvbody1` died at t=45s with 1080 frames. **That is the project's known
+Eden flake, not a regression**: the guest's own narrative log is
+IDENTICAL to the 300 s baseline's line for line (993 vs 992
+`guest-log-any` lines, one extra line in the baseline), there is no new
+fault signature in `eden_log.txt.tail` (30 vs 290 "Unmapped Read64"
+lines, proportional to the shorter run), and five earlier archives died
+the same way (`eden-srvtime4` t=90s/3960 frames, `eden-srvtime5`
+t=161s/8280, `eden-srvtime6` t=70s/3120, `eden-srvhandler` t=20s/64,
+`eden-srvreq` t=20s/240). `srvbody2` ran the full 300 s at 16200
+frames, inside the 15960-16320 no-probe baseline, so the probe cost is
+unchanged.

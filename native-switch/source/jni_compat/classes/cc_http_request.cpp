@@ -1286,6 +1286,165 @@ extern "C" bool rr3ServerTimeManagerProbe(const char *phase)
     return took;
 }
 
+/* ------------------------------------------------------------------ *
+ * The /time response BODY
+ * ------------------------------------------------------------------ */
+
+/*
+ * WHICH BODY THE PORT SHIPS - a build-time selector, because every
+ * candidate is worth one Eden run and a run cannot answer two questions
+ * at once.
+ *
+ *   RR3_SRV_BODY 0  EMPTY - no bytes at all
+ *   RR3_SRV_BODY 1  24 zero bytes
+ *   RR3_SRV_BODY 2  24 bytes holding the current epoch seconds as a
+ *                   little-endian double, the rest zero
+ *   RR3_SRV_BODY 3  the server time as ASCII decimal, zero padded
+ *
+ * WHY THE SELECTOR EXISTS: "is a body delivered at all" and "what the body
+ * holds" are two different questions. The port was answering neither, and
+ * the guest's own contract (HttpThread.run, reverse/java/sources/com/
+ * firemonkeys/cloudcellapi/HttpThread.java:92-104 and :319-321) answers
+ * both at once: headerCallback, then dataCallback (the BODY), then
+ * completeCallback.
+ *
+ * WHAT THE GUEST DOES WITH THE BYTES, read out of the image:
+ *
+ *   Java_com_firemonkeys_cloudcellapi_HttpRequest_dataCallback
+ *   (guest raw 0x1ce493c) mallocs the length, copies the array out
+ *   through JNIEnv slot 0x640 - index 200, which in THIS guest's JNIEnv
+ *   layout is GetByteArrayRegion - calls the worker's vtable[4] with
+ *   (worker, buffer, length) and frees the buffer.
+ *
+ *   That worker slot is cc::HttpRequestManager's body append
+ *   (guest raw 0x1ce2cc4), which grows the record's pending body buffer
+ *   at record+0xd8 and its byte count at record+0xd4.
+ *
+ *   cc::HttpRequestManager::Poll (guest raw 0x1ce29b4) then hands the
+ *   record's handler delegate (record+0x100) the body, and hands the
+ *   BODY delegate (record+0x130) the same bytes; with record+0xd4 == 0
+ *   it hands the handler a NULL body and a zero count instead.
+ *
+ * The guest's own ServerTimeManager handler (guest raw 0x1cef2f8) reads
+ * the server time out of this+0x88 and the token out of this+0x70 and
+ * never looks at the body - so the CONTENT of the body cannot be what
+ * makes the handler run. Whether a body is DELIVERED is still a
+ * different thing from that, and this is the change that makes the
+ * delivery happen at all.
+ */
+#ifndef RR3_SRV_BODY
+#define RR3_SRV_BODY 1
+#endif
+
+/* The body the port ships. Returns how many bytes it wrote. */
+static size_t serverTimeBody(uint8_t *out, size_t cap)
+{
+    struct timespec ts;
+    ts.tv_sec  = 0;
+    ts.tv_nsec = 0;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        ts.tv_sec  = 1793000000;
+        ts.tv_nsec = 125000000;
+    }
+
+#if RR3_SRV_BODY == 0
+    (void)out;
+    (void)cap;
+    return 0u;
+#elif RR3_SRV_BODY == 1
+    if (cap < 24u) {
+        return 0u;
+    }
+    memset(out, 0, 24u);
+    return 24u;
+#elif RR3_SRV_BODY == 2
+    if (cap < 24u) {
+        return 0u;
+    }
+    memset(out, 0, 24u);
+    {
+        const double seconds = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+        memcpy(out, &seconds, sizeof(seconds));
+    }
+    return 24u;
+#elif RR3_SRV_BODY == 3
+    {
+        char text[48];
+        const int written = __builtin_snprintf(
+            text, sizeof(text), "%lld.%06lld\n", (long long)ts.tv_sec,
+            (long long)(ts.tv_nsec / 1000));
+        if (written <= 0 || (size_t)written > cap) {
+            return 0u;
+        }
+        memcpy(out, text, (size_t)written);
+        return (size_t)written;
+    }
+#else
+#error "RR3_SRV_BODY must be 0, 1, 2 or 3"
+#endif
+}
+
+/*
+ * Deliver the response BODY through the guest's own dataCallback.
+ *
+ * THE ARRAY HAS TO BE A REAL ONE. The guest's dataCallback copies it out
+ * through GetByteArrayRegion, so a raw pointer would be read as a byte[]
+ * handle and the copy would land on whatever the handle happened to be.
+ * This is the same trap as the REQUEST body: the guest's own byte[] is
+ * not a port array object, so the port's GetArrayLength answered 0 for
+ * every request.
+ *
+ * The array is therefore built with the port's own env, and the port's
+ * env IS the guest's env: the managed methods are dispatched with the
+ * JNIEnv the guest passed (jni_bridge.cpp's jniCallVoidMethodV hands
+ * `reinterpret_cast<JNIEnv*>(env)` to the dispatcher), and that env's
+ * table is the guest's own g_jniTable. Its NewByteArray is slot 176 and
+ * its SetByteArrayRegion is slot 208, so the array lands in the guest's
+ * OWN byte-array pool - the same pool the guest's GetByteArrayRegion
+ * (slot 200) reads back.
+ *
+ * Returns false when the native is missing or the array could not be
+ * built. The caller completes the request either way: the completion is
+ * what marks the response complete (the guest's record+0xc8), and the
+ * response is still a response without a body.
+ */
+static bool deliverResponseBody(JNIEnv *env, CCHttpRequest *req,
+                                const uint8_t *data, size_t len)
+{
+    static CCHttpDataFn data_callback = cloudcell_native<CCHttpDataFn>(
+        kCCHttpDataCallback);
+
+    if (data_callback == nullptr) {
+        warning("HttpRequest: dataCallback export missing; no body delivered\n");
+        return false;
+    }
+
+    jbyteArray array = env->NewByteArray((jsize)len);
+    if (array == nullptr) {
+        warning("HttpRequest: could not allocate the response byte array\n");
+        return false;
+    }
+    if (len > 0u) {
+        env->SetByteArrayRegion(array, 0, (jsize)len, (const jbyte *)data);
+    }
+
+    data_callback(env, (jobject)req, req->callback, array, (jint)len);
+
+    if (authLogBudget()) {
+        trace("cc-srvtime-body: delivered %zu bytes to the guest", (unsigned)len);
+    }
+    {
+        char details[128];
+        __builtin_snprintf(details, sizeof(details),
+                           "body=%u bytes delivered before the completion",
+                           (unsigned)len);
+        rr3::guestViewWideLog("cc-srvtime-body",
+                              static_cast<unsigned long long>(req->callback),
+                              static_cast<unsigned long long>(len), details);
+    }
+    return true;
+}
+
 /*
  * Answer the /time request.
  *
@@ -1296,11 +1455,13 @@ extern "C" bool rr3ServerTimeManagerProbe(const char *phase)
  * and converts the value with strtod (guest raw 0x1cef9d0). The value is
  * therefore ASCII decimal seconds.
  *
- * The delivery order is the Java one (HttpThread.run): headerCallback, then
- * the body, then completeCallback. The /time response has no body the guest
- * reads, so only the header and the completion are delivered - matching the
- * Java contract, where ReadHttpData never calls dataCallback for a body that
- * is empty.
+ * THE DELIVERY ORDER IS THE JAVA ONE (HttpThread.run): headerCallback, then
+ * the BODY (dataCallback), then completeCallback. The port used to deliver
+ * the first and the last and never the body, which is not a shape the
+ * guest's Java class can produce: ReadHttpData calls dataCallback for
+ * every chunk it reads, and the guest's own dataCallback is the only
+ * thing that grows the request record's pending body buffer
+ * (record+0xd8) and its byte count (record+0xd4).
  *
  * No Content-Type is sent: the guest's completion handler compares the
  * response's content type against the one the worker expects
@@ -1361,6 +1522,18 @@ static bool deliverServerTime(JNIEnv *env, CCHttpRequest *req)
      * reads it out of that map and nothing else, so this is the measurement
      * that says whether the answer can reach this+0x88 at all. */
     ccprobe::probeWorker((uintptr_t)req->callback, "after-header");
+
+    /* THE BODY, between the header and the completion - the guest's own
+     * HttpThread.run() order. The guest's dataCallback copies it into the
+     * request record's pending body buffer (record+0xd8) and grows its byte
+     * count (record+0xd4), which is what cc::HttpRequestManager::Poll hands
+     * to the response-complete delegate. */
+    {
+        uint8_t body[64];
+        const size_t bodyLen = serverTimeBody(body, sizeof(body));
+        deliverResponseBody(env, req, body, bodyLen);
+    }
+
     complete_callback(env, (jobject)req, req->callback, 200);
     ccprobe::probeWorker((uintptr_t)req->callback, "after-complete");
 
