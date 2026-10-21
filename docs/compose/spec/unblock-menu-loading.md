@@ -5120,3 +5120,170 @@ from the Cloudcell one.
    device id sit in it? The guest now prints `CC: Device Id: 0` after the
    response lands.
 6. **Does the menu require a successful login at all?** - still open.
+
+### S34 - THE PATH LAYER, not the Cloudcell layer (2026-10-21)
+
+S33 ended with the blocker still in the Cloudcell chain. It is not. Two
+defects in the **path resolution** moved the guest from "reads a stale
+manifest and wants 384.9 MB it cannot have" to "reads the shipped manifest
+and wants 4.6 MB it cannot have". This section records that, plus what four
+independent agents established about the menu itself.
+
+#### 1. The doubled separator (commit `0d642dfb`)
+
+The guest joins a directory that ends in `/` with an asset name that starts
+with `/`. The path therefore arrives with `//` in it:
+
+```
+guest_path = sdmc:/switch/rr3-native-rehost/.depot//asset_list_base.txtCache.txt
+primary    = rr3core:/files/.depot//asset_list_base.txtCache.txt
+fopen-other size=-1
+```
+
+**The volume ships that file** - `files/.depot/asset_list_base.txtCache.txt`
+is in `core.romfs` - but a ROMFS lookup with `//` in it MISSES, so the
+request fell through to the SD card, where a **stale** copy of the manifest
+cache sits. The guest then read the stale manifest, asked for **that** build's
+flat `/gui/*.gui` names, and the volumes ship `/gui/processed/...` instead -
+so every menu asset missed, one name at a time.
+
+`compactSlashes()` now collapses interior `//` in the app-root path and in
+the package-files path. One slash was the whole difference.
+
+| | before | after |
+|---|---|---|
+| `/gui/processed/...` requested | 0 | **15** |
+| `/gui/processed/...` opened | 0 | **2** (GlobalStyles 16,597 B, SpriteAnimation 16,605 B) |
+| `nBytesToDownload` | 384,851,916 | **159,228,845** |
+
+#### 2. The reverse alias (same commit)
+
+The volume ships **two** trees, `files/.depot/` and `files/apk/res/`. The
+alias only covered an `apk/res/` request naming a file the volume keeps
+under `.depot/`. The other direction was missing, and it is the direction
+the asset lists come from: **ten** asset-list files the guest asks for under
+`.depot/` exist in the volume **only** under `files/apk/res/`
+(`asset_list_audio.txt`, `asset_list_audio_base.txt`,
+`asset_list_track_data_common.txt`, `asset_list_track_laguna_seca_common.txt`,
+`asset_list_track_laguna_seca_high.txt`, `asset_list_vector_images.txt`,
+`asset_list_vehicle_common.txt`, `asset_list_vehicle_data.txt`,
+`asset_list_vehicle_shaders.txt`, `asset_list_vehicle_wheels.txt`). All ten
+came back `errno=2` while their `apk/res/` copies sat in `core.romfs` the
+whole time.
+
+| | before | after |
+|---|---|---|
+| `nBytesToDownload` | 159,228,845 | **4,629,803** (98.8 % gone) |
+| asset-list requests still ENOENT | 11 | **4**, all of them `asset_list_updates.txt` |
+
+`asset_list_updates.txt` is in **none** of the three data packs, so its
+ENOENT is correct - the shipping game does not have it either.
+
+#### 3. The SD card carries a tree from a DIFFERENT build
+
+The card's loose `.depot/` is 1,469 MB / 8,159 files and matches **none** of
+the three packs (`gametext.txt` 111,222 B on the card against 1,785,677 B in
+the pack; `menu_transition.banim` 8,148 B against 102,003 B; `materials.bin`
+58,023 B against 135,065 B). It is a fourth source, and it is what the
+doubled separator was letting the guest read. The volumes, by contrast, are
+built from `DXT_960x640+2048x1536_data_260530-7723.zip` and ship
+everything the guest asks for - including
+`files/.depot/gui/processed/main_menu/main_menu_twosquare.gui` (37,706 B) and
+`files/.depot/gui/processed/` (2,824 files).
+
+#### 4. Where the menu actually is (four agents, all independent)
+
+* **The main-menu gate is `0x13833cc`**, a three-term predicate over a
+  `cc::RookieChampionship::RookieChampionshipManager` (GOT `0x1f6d840` ->
+  `.bss 0x1f95cd8`):
+  ```
+  0x13833d4  ldrb w8, [x0, #8]     ; mgr+8   must be != 0
+  0x13833dc  ldr  w8, [x0, #0xc]   ; mgr+0xc must be != 5   (4 = career page,
+  0x13833e4  b.eq -> return 0                                  5 = rookie page)
+  0x13833e8  bl   #0x10ab9a8       ; CGlobal+0x478
+  0x13833ec  ldr  w8, [x0, #4]     ; CGlobal+0x47c must be != 20
+  0x13833f4  b.ne -> return 1
+  ```
+  It is reached from `FrontEnd::EventMapScreen::vfunc66/vfunc69`
+  (`0xdb8cc4`, `0xdb8d08`) and again at `0xdacf3c`. `0x1384b38` closes all
+  three at once (it is a "reset the rookie-championship state and suppress
+  the main menu" routine: 146 per-event flags cleared, state -> 5).
+* **The menu asset is `main_menu/main_menu_twosquare.xml`**, loaded by
+  `0xdacf08`, and the shipped manifest maps it to
+  `/gui/processed/main_menu/main_menu_twosquare.gui`.
+* **The draw gate is `CGlobalAndroid+0x83` and `+0x84`**, and both the
+  submitter (`0x13b9128`) and the drawer (`0x13b9370`) check them, so with
+  them closed the guest cannot even submit a menu sprite. `+0x83`'s only
+  writer (`0x14048c8`) is **Cloudcell-gated**: it needs `+0x82 != 0` AND
+  `Cloudcell->vfunc22()` to return an ODD value (`0x1cbfafc` =
+  `ldr x0,[x0,#0x2a8]; ret`).
+* **The menu does not require a Cloudcell login.** No Cloudcell object, no
+  auth state and no `Cloudcell+0x4c1` appears anywhere on the path from
+  `FrontEnd::EventMapScreen::vfunc69` to the `main_menu_twosquare.xml`
+  open. What Cloudcell gates is the **drawing**.
+
+#### 5. Corrections to earlier sections (from the adversarial review)
+
+* **"upstream of the HTTP transport" is wrong.** The newest archive shows the
+  guest POSTing `CC_Sync.php` and the port answering it - over a different
+  call path than `AuthenticateCloudcellSync`. The right wording is
+  "upstream of the **authenticate** path".
+* **"the device id theory is dead" was not established.** What IS
+  established: `GetEADeviceId` has no dataflow to `ServerInfo+0x8`. What is
+  NOT established: that the field is correctly populated - it is still 0 at
+  runtime (`CC: Device Id: 0`), and the `Invalid DeviceId!` 5 -> 0 drop was a
+  change of **branch**, not of value.
+* **"the line is absent from every archive" holds only where the log quota
+  was not exhausted.** `CC: ` lines do not match the content filter's
+  "interesting" set and are served by a content-independent quota
+  (`kAndroidLogAnyBudget = 4000`). Quota per archive: `mgrprobe4` 992/4000,
+  `getinfo2` 994/4000, `srvbody2` 992/4000 - all unexhausted, so absence IS
+  proof there; `getinfobool` 3997/4000 with 4 `dropped_by_content_filter`
+  reports - EXHAUSTED, so absence proves nothing there.
+* **`0xd9c92c` is `FrontEnd::ESPortsMainMenu::vfunc66`** (typeinfo
+  `0x1e6b110` = `N9FrontEnd215ESPortsMainMenuE`), **not**
+  `FrontEnd::MainMenuManager::vfunc3` (`MainMenuManager` is a different
+  class, vptr `0x1edd008`, vfunc17 `0x14c4370`).
+* **`renderer+0x1f5a9` is NOT a splash/menu flag.** It is the dirty bit of
+  `CGlobal::system_TOGGleAccelerometer` (`0x12bac38 strb w10,[x9]`, logging
+  `"CGlobal:system_TOGGleAccelerometer( Enable = %s )"`), and **the guest
+  does set it**. The port's per-frame force-write of it is therefore a
+  semantically wrong write.
+* **Two project tools are broken and must not be trusted.**
+  `.build/rr3vfind.py` looks a section up by index, so it always reports 0
+  hits (its positive control fails). `.build/cc4b8.py` reads the instruction
+  word at `pc - TEXT_O` instead of doing a vaddr->file mapping, so it FAILS
+  its own positive control (`POSITIVE CONTROL ... FAIL`, total=0) - and the
+  "no writer at all" claim it supported had to be re-derived with a
+  corrected scanner (the conclusion survived: only three accesses to
+  `+0x4b8` exist in the Cloudcell region).
+* **`ffd471dd`'s scope was understated.** Six JNI static slots never consult
+  the ManagedMethod table (118/117, 130/129, 142/141, 115/114, 146, 150), so
+  **twelve registered static methods are unreachable** - `GetInfo`'s ten
+  string methods, `cc_activity.getNetworkConnectivity` and
+  `cc_activity.startDownloadService`. The commit added one name
+  (`IsInitialized`) and not the class.
+
+#### 6. Where the blocker is now
+
+The guest reads the shipped manifest, opens the `/gui/processed/` assets, and
+asks for **4,629,803 bytes** it does not have. Then:
+
+```
+AssetDownloadService::ShowNoWifiMessage
+AssetDownloadService:: ShowConsentMessage - No connection available
+CheckNetworkAvailability::Network interface Network is NOT available   (x548)
+```
+
+and the download queue is **stuck at `qCount=35` with its head on
+`asset_list_updates.txt`**, never draining. The port answers the platform's
+network question `false` on purpose. Two things are open: **what the 4.6 MB
+is** (very likely the `gui_assets` sprite atlases - the volumes ship
+`480x320`, `960x640` and `2048x1536`, and the Switch is **1280x720**, which
+does not exist), and **whether the download can be satisfied locally** so no
+network is needed at all.
+
+The sprite-atlas walk also went quiet: it used to open 756 atlases and now
+opens none, because the guest now follows the shipped manifest instead of
+the stale one, and the manifest's `gui_assets` folder is not the one the
+guest wants.
