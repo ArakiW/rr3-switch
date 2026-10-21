@@ -5777,3 +5777,165 @@ should be fixed as one, not by reverting the answer.
 5. **The per-frame download accounting** that cost 100x the frame time.
 6. The pack-hash endpoint's response shape (the five paths are now decoded
    and logged; nothing has been invented).
+
+### S38 - THE ROOT CAUSE WAS A `struct dirent` ABI MISMATCH (2026-10-21)
+
+**The guest could not see a single directory entry, and that one fact caused
+the atlas failures, the stuck loading screen, the missing front end and the
+missing main menu.**
+
+#### 1. The mismatch
+
+| | `d_type` | `d_name` |
+|---|---|---|
+| host (devkitA64 newlib `struct dirent`) | **0x08** | 0x09 |
+| guest (bionic `struct dirent`) | **0x12** | 0x13 |
+
+The guest's `d_type` read is at **five independent sites** - `0x12a5c60`,
+`0x12a5c84`, `0x12b553c`, `0x12b5550`, `0x1892b48`, `0x1b5e12c` - all
+`ldrb w8,[xN,#0x12]`, and `d_name` at `+0x13`.
+
+So the guest read `d_type` out of the host's `d_name[9]` (always 0 =
+`DT_UNKNOWN`) and `d_name` out of `d_name[10]` (always the empty string).
+**Every directory entry was invisible to the guest.** Its two directory walks
+(`0x12a5bb0` keeps `DT_DIR`, `0x12b5504` keeps `DT_REG`/`DT_DIR`) therefore
+returned nothing, the `gui_assets` enumeration produced an **empty** candidate
+vector, the parse loop at `0x10f8e54` never ran - and **`sscanf` was never
+called at all.**
+
+`guestReaddir` now converts the entry into bionic's layout on the way out,
+with `static_assert(offsetof(...))` guards and a `bionicDirentLayoutSelfTest()`.
+
+#### 2. Two hypotheses measured and REFUTED
+
+* **`sscanf("%ux%u")`.** Measured on the port's own newlib - the exact
+  function the guest's PLT resolves to:
+  ```
+  gui in=480x320    fmt=%ux%u r=2 w=480  h=320
+  gui in=960x640    fmt=%ux%u r=2 w=960  h=640
+  gui in=2048x1536  fmt=%ux%u r=2 w=2048 h=1536
+  gui in=1280x720   fmt=%ux%u r=2 w=1280 h=720
+  ctl-neg in=12x          r=1     <- the probe can report failure
+  ctl-neg in=notanumber   r=0
+  ```
+  `r == 2` for every real input, so **no shim is needed - and installing one
+  would have been actively harmful**: the guest makes **169** `sscanf` calls
+  with many different formats.
+* **The sort's comparator.** The slot at `0x12c0eec`'s `sp+0x10` **is**
+  uninitialised (the prologue writes only `sp+0x20..0x6f` plus the canary at
+  `sp+0x18`) - but it is **inert**: the whole sort chain
+  (`0xbeedf4 -> 0xbefd44 -> 0xbefaf8 -> 0xbef7c0`) contains **no `blr` at
+  all**; every comparison is `bl #0x1e17cd0` = `memcmp` on the string bytes.
+  The pointer is threaded through and never dereferenced.
+* The filter thresholds are **correct**: `w20`/`w21` are the device
+  width/height read through the display object's vtable, and the guest prints
+  `Res base: 1280x720`.
+
+#### 3. What the fix produced
+
+| signal | before | after |
+|---|---|---|
+| `Res order:` entries | **0** | **3** (`1280x720`, `960x640`, `480x320`) |
+| `Failed to load image from atlas` | 69 | **0** |
+| atlas file requests | 238 | 281 |
+| `sprites_` | 102 | **382** |
+| `gui/processed` | 23 | **58** |
+| `RookieChampionshipManager` (`*.bss 0x1f95cd8`) | **0** in 40/40 samples | **`0x211dac1780`** - the guest constructs it |
+| `Cloudcell+0x4c1` | - | **220** |
+| `MainMenu` / `twosquare` / `EventMapScreen` | 0 | **0** |
+
+The guest's own list is now:
+```
+Res order:
+(1280.000000, 720.000000) - 1.777778 - gui_assets/1280x720/
+(960.000000, 640.000000) - 1.500000 - gui_assets/960x640/
+(480.000000, 320.000000) - 1.500000 - gui_assets/480x320/
+```
+
+#### 4. The guest is still inside `game_LoadGameData`, and it is still the front end's precondition
+
+`cc::RookieChampionship::RookieChampionshipManager`'s constructor `0x1382a74`
+has exactly one caller - `0x10b0ec4`, the **last statement** of
+`game_LoadGameData` (`0x10b0ca8`). So the manager's absence is a **symptom**:
+`game_LoadGameData` has not returned.
+
+`game_LoadGameData` is reached from `0x10ac804` (whose only caller is the
+24-byte thunk `0x13b56a0`, an `.init_array` entry - it runs at library load)
+and its failure path logs **`game_LoadGameData(failedToLoadAssets)`**
+(`.rodata 0x3cc7a4`) - **which never appears in any archive, because the
+function has not returned yet.**
+
+**The live frame walk proves where it is:**
+```
+fpwalk-frame i=1  off=0x10b09bc   (inside 0x10b07f4, returning from bl 0x991c8c)
+fpwalk-frame i=2  off=0x10b0d3c   (inside 0x10b0ca8, returning from bl 0x10b07f4)
+fpwalk-frame i=3  off=0x10ac84c   (inside 0x10ac804, returning from bl 0x10b0ca8)
+fpwalk-frame i=4  off=0x13b56ac   (inside 0x13b56a0, returning from bl 0x10ac804)
+```
+and the log ends with **163** x `TrackDesc::load unable to load track desc file:
+'Tracks/data/<name>.bin.nct'` + `LoadReadOnlyMappedFile failed getting full
+path`.
+
+**And the track names the guest generates are MALFORMED** - each is the tail
+of the real name with a variable-length prefix removed:
+
+| guest asked for | the volume ships | prefix lost |
+|---|---|---|
+| `Tracks/data/t-noon-30.bin.nct` | `melbourne-circuit-noon-30.bin.nct` | 16 |
+| `Tracks/data/unset-136.bin.nct` | `lemans-circuit-sunset-136.bin.nct` | 13 |
+| `Tracks/data/uit-morning-174.bin.nct` | `newyork2021-circuit-morning-174.bin.nct` | 14 |
+| `Tracks/data/ternoon-115.bin.nct` | `redbull-south-afternoon-115.bin.nct` | 13 |
+
+**0 of 20 sampled guest names exist in the 50,184-entry volume.** `ttk.dat.nct`
+DOES resolve, so the path prefix is right and only the *names* are corrupt -
+the signature of a **mis-parsed name table** (offset or stride), not a missing
+file. The name table is in `data.bin` / `dataoffsets.txt` / `ctd.dat` /
+`coll.bin` / `*.dat`.
+
+**Checked and CLEARED:** the card's loose `.depot/` copies of `data.bin`
+(1,184 B), `dataoffsets.txt` (1,805 B) and `18.dat` (516 B) are
+**byte-identical** to the ROMFS copies. (A first comparison said DIFF; that
+was a bug in the comparison script - it used the file-table offset where the
+data offset belonged. The data is not corrupt.) `asset_list_base.txtCache.txt`
+genuinely differs in size (779,974 B on the card vs **4,212,795 B** in
+`core.romfs`) - the card's copy is the **stale build's**, and the guest
+reads the ROMFS one.
+
+#### 5. A second, independent failure mode: the guest fetches the atlases from CLOUDCELL
+
+`CC_AssetManager_Class::AssetDownloadError` fires 60 times against
+`/assets_2048x1536/.../sprites.android.atlas`,
+`/assets_480x320/common/sprites.android.atlas`,
+`/assets_960x640/...` - the guest routes the **atlas** request to the **server**,
+not to the filesystem, and the port answers `reason=no-known-answer-shape`.
+So even with the resolution list populated, the atlases must be **served as
+pack hashes**; the five request paths are decoded and logged (S36 §6), but no
+response body has been invented.
+
+#### 6. Corrections
+
+* **The menu-asset gate's third term is `mgr+4`, not `CGlobal+0x47c`.** The
+  gate is `mgr+8 != 0 && mgr+0xc != 5 && mgr+4 != 20`, where `mgr+4` is the
+  word at offset 4 of the manager - **which the constructor never
+  initialises** (the object comes from `operator new`). The earlier reading
+  (`CGlobal+0x47c`) was a mis-decode of `ldr w8,[x0,#4]`.
+* **The `original [n] ...` / `actual [n] ...` table is NOT the GUI atlas
+  resolution table.** It is printed by a different function (`0x12bd104` /
+  `0x12bd574`), a screen-resolution manager. The port's comment at
+  `guest_filesystem.cpp:433-448` treats it as the atlas table and derives
+  `rewriteGuiResolutionPath`'s list from it - a **misattribution**, and the
+  rewrite list is built on the wrong table.
+* `ImageResManager+0x10` is **not a count**: the raw word is the float pair
+  480.0f / 320.0f. `+0x00` = tail, `+0x08` = head.
+
+#### 7. What is open now
+
+1. **The pack-hash response shape** - the guest wants the atlases as server
+   packs, and the port answers nothing. This is the remaining blocker for the
+   loading screen.
+2. **The track-name table** - find the file whose name table the guest
+   mis-parses, and the offset/stride that is wrong. Until `game_LoadGameData`
+   returns, the front end is never entered, so the main menu is unreachable
+   no matter what else is fixed.
+3. **The per-frame download accounting** that cost 100x the frame time.
+4. `mgr+4` is read uninitialised by the gate - who is supposed to write it.
