@@ -3891,6 +3891,149 @@ address is `(*(jlong+0x08)) + 0x178`: the jlong the guest hands `init()` is
 the request record, `record+0x08` is the `CC_AndroidHttpRequestWorker_Class*`,
 and the map is that worker's own field at `+0x178`.
 
+### S27 -- THE SERVER TIME WAS NEVER THE BLOCKER (2026-10-21)
+
+#### 1. The hypothesis, and the change
+
+The port answered the guest's `/time` request with a hard-coded
+`X-Request-Start: 1793000000.125000`. The guest's own clock read
+`1792539735` in archive `20261021-074157-eden-srvtime7` -- 460265 s (5.3
+days) apart. The working hypothesis was that the guest's server-time sanity
+window rejected the answer.
+
+The constant is gone. `ccheaders::serverTimeEntry()`
+(`jni_compat/classes/cc_http_request.cpp`) reads the host's
+`CLOCK_REALTIME` at DELIVERY time and formats it as ASCII decimal seconds
+with a microsecond fraction; a non-positive clock falls back to a plausible
+epoch second, because the guest treats a non-positive server time as "no
+answer". The storage is a process-lifetime slot, because the header map
+keeps the pointer and the characters -- a stack buffer would die before the
+guest reads the value.
+
+MEASURED in archive `20261021-080025-eden-srvtime8`: the port sent
+`1792540843.345517` and the guest's own clock read `1792540843.201727` -- the
+server/local difference is now **0.14 s instead of 460265 s**.
+
+#### 2. The adjudicator did not move
+
+`CC: Server time returned; server time: %f server-local time diff: %f` is
+still **absent** (0 occurrences, same as the baseline). So the hypothesis is
+**WRONG**: the server-time VALUE gates nothing on the path to that log line.
+
+That is now a STATIC fact, not an inference. The handler at guest raw
+`0x1cef2f8` reaches the logger (`0x1cefd8c` -> `0x1cefb80`) only from its
+success path, and that path is gated on four things:
+
+```
+0x1cef35c  |now - (this+0x80)| <  5.0    the parse happened recently
+0x1cef37c  (this+0x88) > 0.0             the server time was parsed
+0x1cef384  (this+0x70) == x3             the token still matches
+0x1cef390  |now - (this+0x78)| <  5.0    the response came back fast
+```
+
+`now` is the SAME clock function in all three places (`0x1cef348`,
+`0x1cef8f4`, `0x1cef1cc` all call the singleton's vtable slot 0), and the
+measured values prove it: `this+0x78 = 1792540843.201727` and
+`this+0x80 = 1792540843.355646` are LOCAL times, 0.154 s apart. **The
+server-time value appears in none of the four gates.** A constant that was
+5.3 days out could not change the outcome, and it did not.
+
+#### 3. What the extended probe showed
+
+The probe now also reports the fields the handler itself reads, so a run can
+say whether the handler RAN rather than only whether it succeeded. From
+`20261021-080025-eden-srvtime8` (all three phases identical):
+
+```
+before-header / after-header / after-complete
+  token=0x1  m88=1792540843.345517  flag60=0x1  cnt90=0x0
+  ma0=0.000000  ma8=0.000000  me8=-1.000000
+  pend=0x211029eba0/0x211029ebd0
+```
+
+MEASURED consequences:
+
+| field | value | what it says |
+|---|---|---|
+| `this+0x70` (token) | `0x1`, unchanged | the success path (`0x1cef398`) never ran |
+| `this+0x88` (server time) | still set | the success path (`0x1cef3a4`) never ran |
+| `this+0x60` (flag byte) | still `1` | the success path (`0x1cef3b4`) never ran |
+| `this+0x90` (sample count) | `0` | `0x1cefd8c` (the ring push) never ran |
+| `this+0x150`/`+0x158` | unchanged, non-empty | the pending list was never popped (`0x1cef79c`) |
+
+**Every exit path of the handler writes one of those fields.** `0x1cef70c`
+clears `+0x60` and `+0x70`; `0x1cef79c` writes `+0x158`; the success path
+clears `+0x70`/`+0x88`/`+0x60` and bumps `+0x90`. None of them moved, so the
+handler was **not entered at all** during the exchange -- it is not a
+rejected answer, it is an answer nobody asked for.
+
+#### 4. The chain, corrected
+
+The completion path is `completeCallback (0x1ce4a3c)` -> `OnJNICompletion
+(0x1ce3f68)` -> `CompletionCallback (0x1ce4c60)`, and the last one is
+decisive:
+
+```
+0x1ce4c88  ldr x0, [x0, #0x90]     ; the ServerTimeManager's bind
+0x1ce4c8c  cbz x0, #0x1ce4ca8     ; no bind -> nothing happens
+0x1ce4c90  and w8, w1, #1         ; the success flag
+0x1ce4c94  strb w8, [sp, #4]
+0x1ce4ca0  ldr x8, [x8, #0x30]    ; the bind's invoke
+0x1ce4ca4  blr x8                 ; -> the bind -> the parser AND the handler
+```
+
+The bind takes ONE argument -- a pointer to the success flag -- and it is
+the bind that reaches BOTH `0x1cef8a4` (the parser) and `0x1cef2f8` (the
+handler). The parser ran (it is the only writer of `this+0x80`/`this+0x88`,
+and both are set). The handler did not. Both are called from the same bind,
+so the question is no longer "is the token right" -- it is "why does the
+bind call one and not the other".
+
+`0x1cef8a4` and `0x1cef2f8` have **zero direct `bl` callers**: both are
+reached through the closures the manager builds at request time
+(`0x1cef1e4`-`0x1cef23c`, `sp+0xc0`/`fp-0x80`, the target function pointers
+`0x1cef8a4` and `0x1cef2f8` written into the closures), and the bind's
+invoke is the only thing that calls through them.
+
+#### 5. The late sample: the handler never runs at all
+
+Archive `20261021-081553-eden-srvtime9` adds a LATE sample of the same
+manager on the host's own poll (four samples, thousands of frames after the
+exchange). The late samples are **bit-identical** to the exchange-time one:
+
+```
+before-header / after-header / after-complete / late-poll x4
+  token=0x1  m88=1792541772.348445  flag60=0x1  cnt90=0xaaaaaaaa00000000
+  ma0=0.000000  ma8=0.000000  me8=-1.000000
+  pend=0x2110abb140/0x2110abb170
+```
+
+Nothing moved, at any point in the 16,200-frame run. MEASURED conclusion:
+**the handler at `0x1cef2f8` is never entered** -- not rejected, not late,
+not on any tick of the guest's state machine. The guest's parser
+(`0x1cef8a4`) runs, the guest logs `CC: [1] POST complete [Succeeded=True]`,
+and the second callback that would consume the parsed value is simply never
+invoked.
+
+The pending list at `+0x150`/`+0x158` is NOT empty and never changes; its
+first element carries the guest's own path string
+(`itch/rr3-native-rehost/d...` at the record's `+0x08`), so it is the
+ServerTimeManager's outstanding request record, still waiting.
+
+#### 6. What is still open
+
+1. **Why the bind calls the parser and not the handler.** The bind at
+   `record+0x90` is invoked with one argument (a pointer to the success
+   flag, `0x1ce4c88`-`0x1ce4ca4`), and it is the bind that reaches both
+   `0x1cef8a4` and `0x1cef2f8`. The parser runs, the handler does not, from
+   the same bind. That is a guest-side dispatch question, not a port-side
+   one, and it is the next thing to find.
+
+Neither of these changes the port's behaviour: the port now sends the
+current wall clock, which is correct regardless of whether the guest ever
+looks at it.
+
+
 
 
 

@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <new>
 #include <string.h>
+#include <time.h>
 #include <vector>
 
 #include <switch.h>
@@ -90,13 +91,65 @@ namespace ccheaders {
 /*
  * The server time the port answers the /time request with.
  *
- * ASCII decimal seconds, because the guest's parser converts the header value
- * with strtod() (guest raw 0x1cef9d0 -> PLT strtod at 0x1e18b80) and stores
- * the result as a double at this+0x88. 1793000000.125000 is
- * 2026-10-24T00:53:20Z: a plausible epoch, comfortably positive (the guest
- * treats a non-positive server time as "no answer" and never logs it).
+ * ASCII decimal seconds, because the guest's parser converts the header
+ * value with strtod() (guest raw 0x1cef9d0 -> PLT strtod at 0x1e18b80) and
+ * stores the result as a double at this+0x88.
+ *
+ * The value is the CURRENT wall clock, read here at DELIVERY time. The host
+ * and the guest share the wall clock, so the answer is the guest's own local
+ * time to within the delivery latency; the guest's ServerTimeManager
+ * measures the server time against its own clock, so a CONSTANT would show
+ * up as a permanent offset. (The constant this replaced, 1793000000.125000,
+ * was 460265 s - 5.3 days - ahead of the guest's own clock, which read
+ * 1792539735 in archive 20261021-074157-eden-srvtime7.)
+ *
+ * If the host's clock comes back non-positive the answer falls back to a
+ * plausible epoch second: the guest treats a non-positive server time as
+ * "no answer" and never logs it.
  */
-const Entry kServerTime = { "X-Request-Start", "1793000000.125000" };
+namespace {
+
+/*
+ * The storage for the answer.
+ *
+ * The header map the port builds keeps the pointer to the Entry AND the
+ * characters the value points at, so the storage has to outlive the
+ * delivery. It is a process-lifetime slot (the port answers one /time
+ * request per run, and the guest copies the value into its own map inside
+ * the header callback), which is why a stack buffer is not used here.
+ */
+struct ServerTimeSlot {
+    Entry entry;
+    char  text[48];
+};
+
+ServerTimeSlot g_serverTimeSlot;
+
+/* Used only when the host's clock is unusable. A plausible epoch second,
+ * comfortably positive (the guest treats a non-positive server time as "no
+ * answer" and never logs it). */
+const char kFallbackServerTime[] = "1793000000.125000";
+
+} // namespace
+
+const Entry* serverTimeEntry(void)
+{
+    struct timespec ts;
+    ts.tv_sec  = 0;
+    ts.tv_nsec = 0;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0 || ts.tv_sec <= 0 ||
+        ts.tv_nsec < 0) {
+        __builtin_snprintf(g_serverTimeSlot.text, sizeof(g_serverTimeSlot.text),
+                           "%s", kFallbackServerTime);
+    } else {
+        __builtin_snprintf(g_serverTimeSlot.text, sizeof(g_serverTimeSlot.text),
+                           "%lld.%06lld", (long long)ts.tv_sec,
+                           (long long)(ts.tv_nsec / 1000));
+    }
+    g_serverTimeSlot.entry.name  = "X-Request-Start";
+    g_serverTimeSlot.entry.value = g_serverTimeSlot.text;
+    return &g_serverTimeSlot.entry;
+}
 
 namespace {
 
@@ -866,24 +919,71 @@ static void reportManagerCandidate(uintptr_t p, const char *phase)
     uint64_t raw88 = 0;
     uint64_t raw60 = 0;
     uint64_t raw70 = 0;
+    uint64_t raw90 = 0;
+    uint64_t raw98 = 0;
+    uint64_t rawa0 = 0;
+    uint64_t rawa8 = 0;
+    uint64_t rawe8 = 0;
+    uint64_t raw150 = 0;
+    uint64_t raw158 = 0;
     readU64(p + 0x70u, &raw70);
     readU64(p + 0x78u, &raw78);
     readU64(p + 0x80u, &raw80);
     readU64(p + 0x88u, &raw88);
     readU64(p + 0x60u, &raw60);
+    /* The fields the guest's own handler at raw 0x1cef2f8 reads. That
+     * handler's success path clears +0x70 (the token), +0x88 (the server
+     * time) and the byte at +0x60, and its failure path leaves them, so
+     * they say whether the handler ran. +0x90 is the sample counter the
+     * handler bumps, and +0x150/+0x158 are the pending-record list the
+     * handler walks (and pops). */
+    readU64(p + 0x90u, &raw90);
+    readU64(p + 0x98u, &raw98);
+    readU64(p + 0xa0u, &rawa0);
+    readU64(p + 0xa8u, &rawa8);
+    readU64(p + 0xe8u, &rawe8);
+    readU64(p + 0x150u, &raw150);
+    readU64(p + 0x158u, &raw158);
     double m78 = 0.0;
     double m80 = 0.0;
     double m88 = 0.0;
+    double ma0 = 0.0;
+    double ma8 = 0.0;
+    double me8 = 0.0;
     memcpy(&m78, &raw78, sizeof(m78));
     memcpy(&m80, &raw80, sizeof(m80));
     memcpy(&m88, &raw88, sizeof(m88));
-    char line[256];
+    memcpy(&ma0, &rawa0, sizeof(ma0));
+    memcpy(&ma8, &rawa8, sizeof(ma8));
+    memcpy(&me8, &rawe8, sizeof(me8));
+
+    /* The first pending record, when the list is not empty: the handler
+     * walks it (stride 0x30) and reads the callback object at +0x20. */
+    uint64_t rec[5] = { 0, 0, 0, 0, 0 };
+    const bool havePending = (raw150 != 0 && raw150 != raw158);
+    if (havePending) {
+        for (unsigned i = 0; i < 5u; ++i) {
+            readU64(static_cast<uintptr_t>(raw150) + i * 8u, &rec[i]);
+        }
+    }
+
+    char line[512];
     __builtin_snprintf(line, sizeof(line),
                        "%s mgr=0x%llx token=0x%llx m78=%.6f m80=%.6f m88=%.6f "
-                       "m60=0x%llx",
+                       "m60=0x%llx flag60=0x%llx cnt90=0x%llx m98=0x%llx "
+                       "ma0=%.6f ma8=%.6f me8=%.6f pend=0x%llx/0x%llx "
+                       "rec0=0x%llx rec1=0x%llx rec2=0x%llx rec3=0x%llx "
+                       "rec4=0x%llx",
                        phase != nullptr ? phase : "-", (unsigned long long)p,
                        (unsigned long long)raw70, m78, m80, m88,
-                       (unsigned long long)raw60);
+                       (unsigned long long)raw60,
+                       (unsigned long long)(raw60 & 0xffu),
+                       (unsigned long long)raw90, (unsigned long long)raw98,
+                       ma0, ma8, me8,
+                       (unsigned long long)raw150, (unsigned long long)raw158,
+                       (unsigned long long)rec[0], (unsigned long long)rec[1],
+                       (unsigned long long)rec[2], (unsigned long long)rec[3],
+                       (unsigned long long)rec[4]);
     rr3::guestViewWideLog("cc-probe-mgr", (unsigned long long)p, raw88, line);
     g_managerAddr = p;
 }
@@ -1001,6 +1101,32 @@ static void probeWorker(uintptr_t worker, const char *phase)
 } // namespace ccprobe
 
 /*
+ * A LATE sample of the ServerTimeManager, for the host's periodic hook.
+ *
+ * The three ccprobe samples inside the /time exchange all happen inside the
+ * guest's own JNI call, so they cannot say whether the guest's handler at
+ * raw 0x1cef2f8 runs LATER - on a tick of the guest's own state machine
+ * rather than inside the response delivery. This samples the manager once
+ * the host is back on its own thread, which is the only way to separate
+ * "the handler never ran" from "the handler ran after the exchange".
+ *
+ * It is cheap: the manager's address is remembered by the hunt, and every
+ * field it reads lives in the manager's own page, so the page query is
+ * already cached and no new syscall is spent.
+ *
+ * Returns true when a sample was taken.
+ */
+extern "C" bool rr3ServerTimeManagerProbe(const char *phase)
+{
+    if (ccprobe::g_managerAddr == 0) {
+        return false;
+    }
+    ccprobe::reportManagerCandidate(ccprobe::g_managerAddr,
+                                    phase != nullptr ? phase : "late");
+    return true;
+}
+
+/*
  * Answer the /time request.
  *
  * MEASURED: the guest's ServerTimeManager does not read the server time out
@@ -1036,7 +1162,16 @@ static bool deliverServerTime(JNIEnv *env, CCHttpRequest *req)
         return false;
     }
 
-    const uintptr_t map = ccheaders::createMap(&ccheaders::kServerTime, 1u);
+    /* The value is the CURRENT wall clock, read here at delivery time - the
+     * host and the guest share the wall clock, so the guest's own clock and
+     * this answer agree to within the delivery latency. */
+    const ccheaders::Entry *server_time = ccheaders::serverTimeEntry();
+    if (server_time == nullptr) {
+        warning("HttpRequest: could not build the /time answer\n");
+        return false;
+    }
+
+    const uintptr_t map = ccheaders::createMap(server_time, 1u);
     if (map == 0) {
         warning("HttpRequest: could not build the response header map\n");
         return false;
@@ -1044,15 +1179,13 @@ static bool deliverServerTime(JNIEnv *env, CCHttpRequest *req)
 
     if (authLogBudget()) {
         trace("cc-srvtime: answering /time with header %s=%s (map=%p)",
-              ccheaders::kServerTime.name, ccheaders::kServerTime.value,
-              (void *)map);
+              server_time->name, server_time->value, (void *)map);
     }
     {
         char details[192];
         __builtin_snprintf(details, sizeof(details),
                            "url=%s header=%s value=%s map=%p", req->url,
-                           ccheaders::kServerTime.name,
-                           ccheaders::kServerTime.value, (void *)map);
+                           server_time->name, server_time->value, (void *)map);
         rr3::guestViewWideLog("cc-srvtime",
                               static_cast<unsigned long long>(req->callback),
                               static_cast<unsigned long long>(req->bodyLen),

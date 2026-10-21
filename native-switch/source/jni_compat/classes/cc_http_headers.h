@@ -58,11 +58,24 @@ struct Entry {
 /*
  * The server time the port answers the /time request with.
  *
- * A plausible epoch-seconds double in ASCII form: 1793000000.125000 is
- * 2026-10-24T00:53:20Z, which is inside the guest's plausible window and
- * far from 0 (the guest treats a non-positive server time as "no answer").
+ * The value is the CURRENT wall clock, read at DELIVERY time, not a
+ * constant. The host and the guest share the wall clock (the guest's own
+ * local clock read 1792539735 in archive 20261021-074157-eden-srvtime7,
+ * which is the same date the host sees), so the answer is the guest's own
+ * local time to within the delivery latency. The guest's ServerTimeManager
+ * measures the server time against its own clock, so a constant would show
+ * up as a permanent offset - the old hardcoded 1793000000.125000 was
+ * 460265 s (5.3 days) ahead of the guest's clock.
+ *
+ * The wire form is ASCII decimal seconds with a fractional part, because the
+ * guest's parser converts the value with strtod (guest raw 0x1cef9d0) and
+ * stores the result as a double at this+0x88.
+ *
+ * The returned pointer, and the characters it points at, stay valid for the
+ * lifetime of the process: the header map keeps them, so a stack buffer
+ * would die before the guest reads the value.
  */
-extern const Entry kServerTime;
+const Entry* serverTimeEntry(void);
 
 /*
  * Build the java/util/Map handed to the guest's native headerCallback.

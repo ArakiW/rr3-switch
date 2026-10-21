@@ -897,6 +897,11 @@ constexpr const char* kChangedExport =
 extern "C" void reportSegmentOwnerSlave();
 extern "C" void rr3RootPcSamplerStart(void);
 extern "C" void* guestCodeWritableAddress(uintptr_t guestAddress);
+// Defined in jni_compat/classes/cc_http_request.cpp. Takes a LATE sample of
+// the guest's Cloudcell ServerTimeManager, so a run can tell "the guest's
+// server-time handler never ran" from "it ran after the response
+// exchange". Returns true when a sample was taken.
+extern "C" bool rr3ServerTimeManagerProbe(const char* phase);
 
 constexpr const char* kRenderExport =
     "Java_com_firemint_realracing_MainActivity_onViewRenderJNI";
@@ -4260,6 +4265,25 @@ void* frameLoopDriver(void* opaque) {
             //
             appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                                 cc, 74, 0);
+            // A LATE sample of the guest's Cloudcell ServerTimeManager.
+            //
+            // The three samples taken inside the /time exchange all happen
+            // inside the guest's own JNI call, so they cannot say whether the
+            // guest's server-time handler (raw 0x1cef2f8) runs LATER - on a
+            // tick of the guest's own state machine rather than inside the
+            // response delivery. This is the only place that can separate
+            // "the handler never ran" from "the handler ran after the
+            // exchange".
+            //
+            // Bounded to a handful of polls, so the run's frame budget is
+            // untouched: the manager's address is already known and every
+            // field read lives in the manager's own page, whose page query
+            // is already cached.
+            static unsigned s_lateSamples = 0u;
+            if (s_lateSamples < 4u &&
+                rr3ServerTimeManagerProbe("late-poll")) {
+                ++s_lateSamples;
+            }
         }
         // The download-phase gate probe is NOT called here any more. It used
         // to be, under `if ((frames % 240) == 0)`, and the frame loop dies
