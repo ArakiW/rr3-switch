@@ -4468,3 +4468,309 @@ t=161s/8280, `eden-srvtime6` t=70s/3120, `eden-srvhandler` t=20s/64,
 `eden-srvreq` t=20s/240). `srvbody2` ran the full 300 s at 16200
 frames, inside the 15960-16320 no-probe baseline, so the probe cost is
 unchanged.
+
+### S31 - S27 and S30 are corrected by an adversarial review (2026-10-21)
+
+This round did NOT extend the story. It was sent to attack it: a read-only
+verifier was given S27/S30 and told to find what is wrong with them, rather
+than to find the next blocker. It found that **three load-bearing sentences
+were wrong and the probe that was supposed to support them could not have
+supported them.** The corrections are written down here before the next
+experiment, because three of them change what the next experiment has to
+measure.
+
+The framing survives - "the blocker is who calls `Poll`" is still the right
+question - but the sub-story built on it, and the instrument behind it, were
+not.
+
+#### 1. The parser is NOT delivered by Poll. The server time proves nothing about Poll.
+
+This is the most consequential correction, and it invalidates the premise of
+S27's "open question #1".
+
+`record+0x160` (the PARSER delegate) is invoked at **exactly one site in the
+entire image**:
+
+```
+0x1ce2c68  ldr  x0, [x19, #0x160]    ; the parser delegate
+0x1ce2c6c  str  w20, [x19, #0xd0]    ; record+0xd0 = the status
+0x1ce2c70  cbz  x0, #0x1ce2c90
+0x1ce2c78  add  x1, x19, #0x178      ; &record+0x178 (the header map)
+0x1ce2c8c  blr  x8
+```
+
+which lives in the function at **`0x1ce2c28`** - the manager's `onHeaders`
+callback - and **not** in `Poll` (`0x1ce29b4`..`0x1ce2bec`). `Poll` contains
+no access to `+0x160` at all. By contrast `record+0x100` (the HANDLER
+delegate) is invoked only at `0x1ce2a98` / `0x1ce2acc` / `0x1ce2af4`, all
+inside `Poll`.
+
+The wiring is on the WORKER, not on the manager:
+
+```
+0x1ce4ab8  str  x8, [x19, #0x30]    ; worker+0x30 = onHeaders      (0x1ce2c28)
+0x1ce4ad0  str  x8, [x19, #0x60]    ; worker+0x60 = onBody         (0x1ce2cc4)
+0x1ce4ae8  str  x8, [x19, #0x90]    ; worker+0x90 = onComplete     (0x1ce2da0)
+0x1ce4aa4  stp  x8, x1, [x0]        ; worker+0x00 = vtable, worker+0x08 = the record
+```
+
+and the worker's header callback invokes `worker+0x30`:
+
+```
+0x1ce3df0 (worker vfunc3, OnHeaders) -> 0x1ce4b88
+0x1ce4bb0  ldr  x0, [x0, #0x30]
+0x1ce4bc8  blr  x8
+```
+
+So the two callbacks are reached from **two different events by two
+different pieces of code**: the parser from the HEADERS event, the handler
+from the RESPONSE-COMPLETE event. S27's "the bind reaches BOTH `0x1cef8a4`
+and `0x1cef2f8`" was wrong, and so was S9's table row that put `+0x160` in
+"the same poll".
+
+**Consequence.** The measurement "the server time arrived at the guest"
+(`m88 = 1792548799.743963`) is the **parser's** work. The sample counter
+`ServerTimeManager+0x90` is bumped by the **handler**, which has never run
+(`cnt90 = 0`). The guest therefore holds the parsed time but has never
+counted a sample, never averaged, and never scheduled the 5000 ms retry -
+which is exactly why the whole 300 s run contains **one** `/time` request
+and not sixty.
+
+**And this inverts the conclusion S30 drew.** `record+0xc9` has exactly one
+writer in the whole image - `0x1ce2a9c`, inside `Poll`. So `c9 = 0` is a
+sound negative about Poll's *effect*. It is **not** evidence that Poll ran
+once and then stopped. "Poll was never called at all" is equally consistent
+with every sample we have.
+
+#### 2. Poll's gate is FIVE conditions, not two.
+
+S30 L4360 said "**The gate is `c8 != 0 && c9 == 0` and nothing else.**" The
+full disassembly (`0x1ce29b4`-`0x1ce2bec`, 580 bytes) gives:
+
+| # | condition | address |
+|---|---|---|
+| G1 | the manager's vector at `+0x38`/`+0x40` is non-empty | `0x1ce29dc` / `0x1ce29e4` |
+| G2 | a **TRY-LOCK** on the global mutex at `0x1fc7118` must succeed | `0x1ce29f4` / `0x1ce29f8` |
+| G3 | `record+0xc8 != 0` | `0x1ce2a88` |
+| G4 | `record+0xc9 == 0` | `0x1ce2a90` |
+| G5 | `record+0x100 != 0` | `0x1ce2a98` |
+
+Two facts S30 did not state at all:
+
+* **`c9` is set BEFORE the null check** (`0x1ce2a9c strb w24,[x21,#0xc9]`
+  precedes `0x1ce2aa0 cbz x8`). A NULL handler still burns the one-shot.
+* **Poll removes and FREES the record after a successful delivery**
+  (`0x1ce2b50`..`0x1ce2b90`). A record still readable at a late sample was
+  never delivered.
+
+`0x1c76fc4` is provably a try-lock (`cmp w0,#0 ; cset w0,eq`). A single lost
+try-lock loses that frame's delivery, so G2 is a candidate blocker on its
+own.
+
+#### 3. `worker+0x60` is NOT NULL, and `d4 = 0` is therefore UNEXPLAINED.
+
+S30 L4405/L4412 claimed "worker+0x60 is NULL for this request ... No body
+delegate is ever installed - so record+0x130 is 0 and worker+0x60 is 0". The
+worker constructor installs the manager's body-append callback at
+`worker+0x60` **unconditionally**:
+
+```
+0x1ce4ad0  str  x8, [x19, #0x60]    ; the manager's onBody, fn 0x1ce2cc4
+```
+
+`record+0x130` (the RECORD's body delegate) really is 0 - that part is
+measured. The spec conflated two different slots. The body-append path's only
+gate is `manager+0x58 == 0` (`0x1ce2cf8`), and that flag was 0 (because
+`c8 = 1` required it clear at `0x1ce2e28`).
+
+**So `d4` staying 0 after a 24-byte body delivery has no explanation yet.**
+It is now an open question, not a closed one. The conclusion "the body is not
+the blocker" survives; the mechanism behind it did not.
+
+#### 4. The probe was DEAD for 94 % of the run.
+
+S27 L4011 said "**Nothing moved, at any point in the 16,200-frame run.**"
+Two facts make that false:
+
+* The cadence is **every 240 frames (about 4.4 s)**, not 1 Hz
+  (`guest_view_probe.cpp:4059`, `if ((frames % 240) == 0)`).
+* Both counters cap at 4 (`s_lateSamples < 4`, and `s_samples >= 4u` in
+  `cc_http_request.cpp`), so the probe stops calling itself from about frame
+  **960** onward.
+
+The three archived samples land at guest frames 240-360 / 480-600 / 720-840.
+The POST request happens at frame ~1-2. Frames 960..16200 - **94 % of the
+run** - were never observed. The probe was silent, not negative.
+
+**And no sample ever showed `c8 = 0`.** Across 7 archives, 19/19 samples
+are `c8=1 c9=0`, byte-identical three times per run. The 0 -> 1 transition
+was never caught, and no Poll counter exists anywhere. "Poll ran once before
+the response completed and was never called again" was therefore an
+**inference**, and the weakest kind: it is also consistent with the opposite.
+
+#### 5. `invec=0` was vacuous, and the HTTP manager was never located.
+
+The old probe walked `this+0x38`/`+0x40` on the object at `.bss 0x1f97818`,
+whose vptr is `0x1e4b948` = `GluRevSDKWrapper`. On that object `end > begin`
+is false, so the loop body never executed and `invec=0` is a **default
+value, not a measurement**. The old code also never compared `mgrvptr` to
+the expected `0x1f64858`, despite the comment saying it would.
+
+Separately, the probe's "hunt" found the **ServerTimeManager**
+(`kManagerVtableElf = 0x1f65b98`, confirmed by `m78/m80/m88` being epoch
+seconds). **The real `cc::HttpRequestManager` was never located in any run.**
+"is the record in the vector Poll walks?" is still an OPEN question.
+
+#### 6. Static facts worth keeping (typeinfo-confirmed)
+
+```
+cc::HttpRequestManager   vtable base 0x1f64848   vptr 0x1f64858
+                         typeinfo 0x1f64918 = "N2cc18HttpRequestManagerE"
+                         17 virtuals (vfunc0..vfunc16)
+                         vfunc3  0x1ce1a84 (QueueRequest)
+                         vfunc13 0x1ce2e4c (thunk: add x0,x0,#0x10 ; ret)
+                         vfunc15 0x1ce29b4 (POLL)   <- slot 0x1f648d0
+cc::AndroidHttpRequestWorker
+                         vtable base 0x1f64b18   vptr 0x1f64b28
+                         typeinfo 0x1f64b78 = "N2cc24AndroidHttpRequestWorkerE"
+                         6 virtuals: vfunc3 0x1ce3df0 (headers)
+                                     vfunc4 0x1ce3ea8 (body)
+                                     vfunc5 0x1ce4c60 (completion)
+```
+
+* `0x1ce29b4` appears in **exactly ONE** vtable slot in the whole image
+  (`0x1f648d0`). Poll is reachable only through an `HttpRequestManager`
+  vptr; no other class overrides it. That is why "who calls vfunc15" is the
+  load-bearing question.
+* **The three manager callbacks are loaded from consecutive GOT slots** -
+  `GOT+0x128 -> 0x1ce2c28`, `GOT+0x138 -> 0x1ce2cc4`, `GOT+0x148 ->
+  0x1ce2da0` - all referenced by `adrp@0x1ce1ca0` plus `ldr` at
+  `0x1ce1ca8` / `0x1ce1cdc` / `0x1ce1d10`. **`rr3fast.py xrefs` misses
+  these**, because it looks for `adrp`+`add` and these are `adrp`+`ldr`
+  (a GOT load). A scanner that only knows `adrp`+`add` reports 0 for the
+  real call sites. That trap is now recorded here for every scanner in this
+  project.
+* `record+0xc0` **IS** the `cc::HttpRequestManager` that owns that record:
+  `0x1ce13d8 str x23,[x19,#0xc0]`, written in exactly one place in the HTTP
+  module (inside `QueueRequest`). One hop, and immune to the owner object
+  being replaced.
+* `record+0xd0` is written ONLY by the header-delivery path
+  (`0x1ce2c6c`), never by `Poll`. It is a **Poll-independent witness** of
+  the header event - the one observable that finally separates "the header
+  path ran" from "Poll ran".
+* The record's path string is stored `data[16] @ +0x08`, `size @ +0x18`,
+  `ptr @ +0x20` (base ctor `0x1ce1500`). The port's existing
+  `readGuestString()` expects `flags/len/data` at `+0/+8/+0x10` and **will
+  mis-read it**; a dedicated reader is required.
+
+#### 7. Host-side measurements taken this round (archive `20261021-105547-eden-srvbody2`)
+
+* **The "MainMenu 0" instrument is sound.** Positive control:
+  `LoadingScreen_Init.gui`, `GlobalStyles.gui`, `SpriteAnimation.gui` all
+  appear in the log, so the instrument can see a menu-ish asset name.
+  `MainMenu.gui` (3,674 B), `menu_transition.banim` (8,148 B) and
+  `fresnel_gloss.rgb.pvr` (4,148 B) are all present on the SD card. The
+  guest never asks for them.
+* **The asset pipeline is healthy.** Exactly **one**
+  `mtResourceCache: Failed to load resource file` in the whole 300 s run
+  (`Tracks/common/detail/detailmap_road_surface_norm_b.pvr`). 1,269 stat
+  calls, 788 distinct candidates. Assets are not the gate.
+* **The guest issues exactly ONE Cloudcell request.** `cc-http-init` = 1,
+  `cc-auth-req` = 0 (any non-`/time` request would have left a line), and
+  the guest's own log has exactly one `CC: [1] POST request [.../time]`. The
+  authenticate request to `CC_Sync.php` is **never built**.
+* **The guest's final narrative is a retry loop**, verbatim:
+  `CC: App resumed` / `CC: Invalid DeviceId! Have we connected to cloudcell
+  yet?` / `CC: Sub Sync Queued: 13` / `CC: Unable to send Sync, Social
+  Media not initialised.` - **five** times, and it is the LAST activity in the
+  run (the guest then goes quiet). Exact counts for the whole 300 s:
+  `App resumed` 5, `Invalid DeviceId!` 5, `Sub Sync Queued` 15,
+  `Unable to send Sync` 7, `Initialized SocialMedia` 1,
+  `Initialization complete` 1. **The two fives pair 1:1** - each resume
+  produces exactly one device-id complaint. It is a five-iteration stall,
+  not an unbounded loop, and the phrase "infinite loop" must not be used for
+  it.
+* `CC: Initialized SocialMedia` **does** appear (once), yet the sync manager
+  still says "Social Media not initialised". Two different components; which
+  one the sync manager asks is still open.
+* `CC_SYNC_MANAGER_AUTHENTICATION : DISABLED` is **one line of a server
+  config feature-flag dump** (the neighbours are
+  `CC_FACEBOOK_MANAGER_ENABLE : ENABLED`, `CC_PIRACY_MANAGER_ENABLE :
+  ENABLED`, `CC_STORE_MANAGER_ENABLE : DISABLED`, ...). It is a
+  configuration value, not a runtime state, and must not be read as
+  "authentication is off".
+* **Nothing is deadlocked.** Eden's process CPU climbs from 14 % to 199 % of
+  one core-equivalent over the 300 s and the log keeps growing (~870 KB
+  over the run, almost all of it the port's own probe lines - the guest
+  contributed 992 lines). Note the CPU figure is **Eden-wide**, not the
+  guest's, so it says "no deadlock" and nothing more; it must not be quoted
+  as "the guest is hot-spinning".
+
+#### 8. The request BODY is structurally unreadable, so the fake authenticate response has NEVER been delivered
+
+This is a confirmed latent blocker sitting **directly behind** the gate above,
+and it would have bitten the moment the gate opened.
+
+`http_init` reads the body like this:
+
+```
+req->bodyLen = 0;
+if (body != nullptr) {
+    jsize len = env->GetArrayLength(body);
+    if (len > 0) { ... env->GetByteArrayRegion(...); req->bodyLen = take; }
+}
+```
+
+and `jniGetArrayLength` (`jni_bridge.cpp:521`) is
+
+```
+FakeByteArray* array = asByteArray(arrayHandle);
+return array != nullptr ? array->length : 0;
+```
+
+`asByteArray` rejects any handle that is not one of our own 32 `FakeByteArray`
+records ("ARRB" magic plus membership in `g_byteArrays`). The guest's own
+`byte[]` is a raw guest-memory pointer, so it is **always** rejected.
+
+**Measured: `cc-http-init: body=0 url=https://connect-dev-ss.cloudcell.com:443/time`.**
+The body is 0 bytes for every request, always.
+
+**And the consequence that matters:** `cccloud::parseAuthRequest(req->body,
+req->bodyLen=0, info)` can never be auth-shaped. So `deliverAuthSuccess()` -
+the fake Cloudcell authenticate response built in `079243e7` (S28) - **has
+never been delivered to the guest. Not once. It has never been exercised end
+to end.** When the authenticate request finally arrives, the port classifies
+it as "not the authenticate request", falls through to `error_callback`, and
+the guest logs "CC: Invalid DeviceId!" - for a completely different reason
+than the one being fixed.
+
+The fix has two halves, and they are now split between two owners:
+
+* **URL-based fallback** (in `cc_http_request.cpp`): when the URL contains
+  `CC_Sync.php` and no authenticate response has been delivered yet, answer
+  with the default fake authenticate response and say so honestly in the log
+  (`matched-by-url`), never pretending the body matched.
+* **Reading the guest's `byte[]` for real**: the layout is defined by the
+  guest's own code (there is no JVM on this path - the host IS the Java
+  side), so it has to be read out of the guest image before it can be used.
+
+#### 9. What is open now
+
+1. Who calls `cc::HttpRequestManager::vfunc15` (slot `0x1f648d0`), and is
+   the manager it polls **the same instance** that owns the `/time` record
+   (`record+0xc0`)?
+2. Is the `/time` record in that manager's vector at `+0x38`/`+0x40`? (The
+   question was never actually asked.)
+3. Does `Poll` run **at all** - and if it runs, which of the five gates
+   (G1 vector, G2 try-lock, G3 c8, G4 c9, G5 handler) is the one that fails?
+4. Is the authenticate request gated on the 5-sample averaging, or on
+   something else? (If on something else, the `/time` chain is a side
+   quest.)
+5. Why is `record+0xd4` still 0 after a 24-byte body delivery?
+
+**The instrument has to change before any of these can be answered.** The
+next probe must (a) take the manager from `record+0xc0`, (b) read
+`+0xc8/+0xc9/+0xd0/+0xd4` and the manager's `+0x38/+0x40/+0x58`, (c) sample
+on EVERY 240-frame tick for the WHOLE run - the 4-sample caps are the
+single worst defect in the project right now - and (d) print the record's
+path with a purpose-built reader.
