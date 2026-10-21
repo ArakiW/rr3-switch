@@ -750,7 +750,80 @@ static bool parseAssetRequests(const std::vector<uint8_t> &payload,
  * 2. The volume tree with the same relative name: "files/.depot" + path.
  * 3. The gui_assets tree, for the server's "/assets_<res>/" spelling: the
  *    volumes ship "files/.depot/gui_assets/<res>/...".
+ *
+ * AND THE REVERSE ALIAS, FOR THE GUEST'S OWN SPELLING.
+ *
+ * MEASURED 2026-10-22, archive 20261022-031343-eden-gfsalias-r1 and
+ * 20261022-032739-eden-gfsalias2-r1: the last 12 "didn't match its MD5"
+ * failures were ONE asset -- /gui_assets/960x640/common/sprites.android.atlas
+ * -- and here is why.
+ *
+ * The guest asks for it under the "gui_assets/<res>/" spelling, but the ONLY
+ * manifest that names that asset names it under the other spelling:
+ * "/assets_960x640/common/sprites.android.atlas" in asset_list_updates.txt.
+ * The source files/apk/res/asset_list_gui_assets_core.txt (365,312 bytes, 3,292
+ * entries, md5 8e5323fd000fbfb95d0340dc8e9f9158) has NO entry for the bare
+ * "gui_assets/<res>/common/sprites.android.atlas" at all -- only sub-paths
+ * like gui_assets/960x640/formula_e/common/... So the guest applies the game's
+ * own spelling rule (gui_assets/<res>/X is assets_<res>/X) and checks the
+ * bytes it received for the "gui_assets" request against the digest published
+ * for the "assets_960x640" entry. ONE digest, TWO spellings.
+ *
+ * So the two spellings have to reach the SAME file, and this is the file:
+ *
+ *   .depot/assets_960x640/common/sprites.android.atlas   24,689 B  md5 43213527...
+ *   files/.depot/gui_assets/960x640/common/sprites.android.atlas
+ *                                                      39,199 B  md5 c7256882...
+ *
+ * Two different revisions. The card's copy is the one the engine renders from
+ * -- with the card's copy in the manifest the guest resolved 1,190 sprite
+ * references and 265 gui/processed references, against 606 and 58 with the
+ * volume's (archive 20261022-015912-eden-md5alias-r3 vs
+ * 20261022-014615-eden-md5fix-v3-r1) -- so the card's copy is the one the
+ * digest has to describe.
+ *
+ * Before this change the candidate list for "/gui_assets/<res>/X" held only
+ * the card's gui_assets tree (which does not ship that atlas) and the
+ * volume's gui_assets tree (which ships a different revision), so the guest's
+ * requested digest matched NEITHER and the endpoint answered with the volume's
+ * bytes -- hence "didn't match its MD5". Adding the card's assets_<res> copy
+ * as a candidate lets the digest tie-breaker below find it.
+ *
+ * ORDER MATTERS for the fallback (the first candidate that exists wins when no
+ * digest matches): the card's assets_<res> copy goes LAST, because it is the
+ * stale revision -- see the note at its insertion point.
+ *
+ * THE LIST MUST STAY IN LOCKSTEP with the manifest-rewrite resolver in
+ * native-switch/source/guest_filesystem.cpp (assetCandidates() there). The
+ * digest written into the list is the digest of the bytes this endpoint
+ * sends; two copies of the list in two files can only ever agree by accident.
  */
+static bool isResolutionSegment(const char *text)
+{
+    if (text == nullptr) {
+        return false;
+    }
+    const char *cursor = text;
+    int digits = 0;
+    while (*cursor >= '0' && *cursor <= '9') {
+        ++cursor;
+        ++digits;
+    }
+    if (digits == 0 || *cursor != 'x') {
+        return false;
+    }
+    ++cursor;
+    digits = 0;
+    while (*cursor >= '0' && *cursor <= '9') {
+        ++cursor;
+        ++digits;
+    }
+    if (digits == 0) {
+        return false;
+    }
+    return *cursor == '\0' || *cursor == '/';
+}
+
 static unsigned assetCandidates(const char *path, char out[4][384])
 {
     unsigned count = 0;
@@ -772,6 +845,51 @@ static unsigned assetCandidates(const char *path, char out[4][384])
                 __builtin_snprintf(out[count], sizeof(out[count]),
                                    "files/.depot/gui_assets/%s%s", resolution, rest);
                 ++count;
+            }
+        }
+    }
+    /* THE REVERSE ALIAS GOES LAST, NOT SECOND.
+     *
+     * The card's "assets_<res>" tree is the game's INSTALLED revision and the
+     * volume's "gui_assets/<res>" tree is the shipped data-pack revision. For
+     * 960x640 they are DIFFERENT files:
+     *
+     *   .depot/assets_960x640/common/sprites.android.atlas        24,689 B
+     *       md5 4321352770b573a6b71d57547b2b3885   -- 165 image entries,
+     *       and MISSING ten menu sprites (gradient.png, common_info_button.png,
+     *       common_info_button_down.png, fb_logo.png, apple_sign_in_icon.png,
+     *       ...). Serving this one cost 20 "Failed to load image from atlas"
+     *       errors over 10 distinct sprites (archive
+     *       20261022-031343-eden-gfsalias-r1).
+     *   files/.depot/gui_assets/960x640/common/sprites.android.atlas
+     *                                                            39,199 B
+     *       md5 c72568828875f4e2a6b11f5c944e27e0   -- 248 image entries, the
+     *       sprite-complete one, and byte-identical to the card's
+     *       .depot/gui_assets/960x640/common/sprites_0.rgb.pvr.z.
+     *
+     * So the card's assets_<res> copy is a STALE revision and is a LAST-RESORT
+     * fallback only. Putting it second made it win the endpoint's "first
+     * candidate that exists" fallback, which is what the fallback is FOR when
+     * no digest matches -- and it put a digest in the manifests that the
+     * runtime read path (which serves the volume) could never produce.
+     *
+     * The endpoint's md5 tie-breaker makes the ORDER irrelevant when a digest
+     * matches; it is the fallback that the order decides, so the stale copy
+     * goes last.
+     */
+    if (strncmp(path, "/gui_assets/", 12) == 0) {
+        const char *rest = strchr(path + 12, '/');
+        if (rest != nullptr) {
+            char resolution[32];
+            const size_t n = (size_t)(rest - (path + 12));
+            if (n < sizeof(resolution)) {
+                memcpy(resolution, path + 12, n);
+                resolution[n] = '\0';
+                if (isResolutionSegment(resolution)) {
+                    __builtin_snprintf(out[count], sizeof(out[count]),
+                                       ".depot/assets_%s%s", resolution, rest);
+                    ++count;
+                }
             }
         }
     }

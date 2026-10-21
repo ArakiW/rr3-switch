@@ -313,6 +313,32 @@ $summary = [ordered]@{
     edenLogFirstTs  = '-'
     edenLogLastTs   = '-'
     edenLogOldLines = 0
+    # MILESTONES. The guest's own progress markers, counted, so a reader never
+    # has to grep a 20 MB log to learn whether the run got past the load.
+    #
+    # WHY A SEPARATE BLOCK AND NOT "MainMenu": the literal string "MainMenu" is
+    # a WEAK instrument. It was 2 in an old build because of a legacy flat name
+    # and 0 in a newer one, and it stays 0 even when the front end IS up -- the
+    # guest never logs that word. The milestones below are the strings the guest
+    # actually prints when it reaches each stage, so a count of 0 there means
+    # "did not reach", not "the instrument is quiet".
+    msLoadComplete      = 0   # "Total load time to end of load scene_DoIncrementalLoad fns"
+    msMd5Mismatch       = 0   # "didn't match its MD5"
+    msAssetComplete     = 0   # "ASSET COMPLETE"
+    msCannotOpenDl      = 0   # "Cannot open downloaded asset file."
+    msDownloadFailed    = 0   # "Download failed - incomplete Download."
+    msStat22            = 0   # "unknown error stat(22)"
+    msAssetListsAdded   = 0   # "Assets are added"
+    msTwosquare         = 0   # "twosquare"   (the front-end XML the guest opens)
+    msEventMapScreen    = 0   # "EventMapScreen"
+    msMainMenuLiteral   = 0   # "MainMenu"    (WEAK -- see the note above)
+    msAstFilesOnCard    = 0   # *.ast on the card: the physical proof the .ast round trip works
+    # The last front-end gate reading, verbatim. This is THE measurement that says
+    # which of the three gates in the guest's front-end entry (0xa679a0) is
+    # closed, and it is a long line -- so it is copied verbatim instead of being
+    # squeezed into a counter.
+    feGateLast          = '(none)'
+    loadStateLast       = '(none)'
 }
 $probes = [ordered]@{}
 if (Test-Path $guestLog -PathType Leaf) {
@@ -332,6 +358,7 @@ if (Test-Path $guestLog -PathType Leaf) {
                      'phase=mmap-file-ok', 'phase=mmap-file-fail',
                      'phase=stat-layout',
                      'phase=menu-gate:', 'phase=masset-gate:',
+                     'phase=fe-gate:', 'phase=loadstate:',
                      'phase=manifest-build', 'phase=manifest-asset',
                      'phase=guest-thread ', 'phase=guest-thread-start ')) {
         $probes["guest:$p"] = ([regex]::Matches($guestText, [regex]::Escape($p))).Count
@@ -390,6 +417,51 @@ if (Test-Path $guestLog -PathType Leaf) {
         $summary.trackDescFailures = $trackDesc.Count
         $summary.trackDescLastNames = (($trackDesc | ForEach-Object { $_.Groups[1].Value } | Select-Object -Last 10) -join ' ')
     }
+    # THE MILESTONE COUNTERS.
+    #
+    # Each of these is a string the guest itself prints when it reaches a stage,
+    # so 0 means "the run did not reach that stage" and not "the probe is
+    # quiet". The list is deliberately short and each entry answers a question
+    # that has actually been asked of a run:
+    #
+    #   msLoadComplete   -- did the incremental-load scene finish?
+    #   msMd5Mismatch    -- did a downloaded asset fail the guest's own md5 check?
+    #   msAssetComplete  -- how many assets passed that check?
+    #   msCannotOpenDl   -- could the guest re-open the file it had just written?
+    #   msStat22         -- did the guest hit a path the port could not resolve?
+    #   msTwosquare      -- did the guest ask for the front-end menu layout?
+    #   msEventMapScreen -- did the guest ever name the front-end screen?
+    #   msMainMenuLiteral-- WEAK, kept only so the change in it stays visible.
+    $summary.msLoadComplete    = [regex]::Matches($guestText, 'Total load time to end of load').Count
+    $summary.msMd5Mismatch     = [regex]::Matches($guestText, "didn't match its MD5").Count
+    $summary.msAssetComplete   = [regex]::Matches($guestText, 'ASSET COMPLETE').Count
+    $summary.msCannotOpenDl    = [regex]::Matches($guestText, 'Cannot open downloaded asset file').Count
+    $summary.msDownloadFailed  = [regex]::Matches($guestText, 'Download failed - incomplete Download').Count
+    $summary.msStat22          = [regex]::Matches($guestText, 'stat\(22\)').Count
+    $summary.msAssetListsAdded = [regex]::Matches($guestText, 'Assets are added').Count
+    $summary.msTwosquare       = [regex]::Matches($guestText, 'twosquare').Count
+    $summary.msEventMapScreen  = [regex]::Matches($guestText, 'EventMapScreen').Count
+    $summary.msMainMenuLiteral = [regex]::Matches($guestText, 'MainMenu').Count
+    # The last front-end gate line and the last loading-state line, verbatim.
+    # "ctrl=ok" is the probe's own positive control; "ctrl=fail" invalidates
+    # the whole line, so the line has to be read together with its control.
+    $feLines = [regex]::Matches($guestText, 'phase=fe-gate:[^\r\n]*')
+    if ($feLines.Count -gt 0) {
+        $summary.feGateLast = $feLines[$feLines.Count - 1].Value
+    }
+    $lsLines = [regex]::Matches($guestText, 'phase=loadstate:[^\r\n]*')
+    if ($lsLines.Count -gt 0) {
+        $summary.loadStateLast = $lsLines[$lsLines.Count - 1].Value
+    }
+}
+# The .ast files on the card are the PHYSICAL check that the download cache
+# round trip works: the guest writes "<asset>.ast" on the card and reads it
+# back. If the count is 0 after a run in which the guest downloaded assets,
+# the write did not persist -- which no log line can show as clearly.
+try {
+    $summary.msAstFilesOnCard = @(Get-ChildItem -LiteralPath $appDir -Recurse -File -Filter '*.ast' -ErrorAction SilentlyContinue).Count
+} catch {
+    $summary.msAstFilesOnCard = -1
 }
 if (Test-Path (Join-Path $archive 'eden_log.txt.tail') -PathType Leaf) {
     $edenText = [IO.File]::ReadAllText((Join-Path $archive 'eden_log.txt.tail'))
@@ -455,6 +527,25 @@ $runSummaryPath = Join-Path $archive 'run-summary.txt'
     ('eden log       {0} lines, spans t={1}..{2} s of emulator time (capped file: a count taken from it is a count over that window, not over the run)' -f `
         $summary.edenLogLines, $summary.edenLogFirstTs, $summary.edenLogLastTs)
     ('eden log old   {0} lines (Eden''s startup-created file; it is NOT the earlier part of this run)' -f $summary.edenLogOldLines)
+    ''
+    'milestones'
+    ('  load scene finished      {0}   ("Total load time to end of load")' -f $summary.msLoadComplete)
+    ('  md5 mismatch             {0}   (want 0)' -f $summary.msMd5Mismatch)
+    ('  ASSET COMPLETE           {0}' -f $summary.msAssetComplete)
+    ('  cannot open downloaded   {0}   (want 0)' -f $summary.msCannotOpenDl)
+    ('  download failed          {0}   (want 0)' -f $summary.msDownloadFailed)
+    ('  stat(22)                 {0}   (want 0)' -f $summary.msStat22)
+    ('  asset lists added        {0}' -f $summary.msAssetListsAdded)
+    ('  .ast files on the card   {0}   (want > 0 when assets were downloaded)' -f $summary.msAstFilesOnCard)
+    ('  front-end layout opened  {0}   ("twosquare" -- want > 0 for the menu)' -f $summary.msTwosquare)
+    ('  EventMapScreen           {0}   (want > 0 for the menu)' -f $summary.msEventMapScreen)
+    ('  "MainMenu" literal       {0}   (WEAK instrument, see the note in this script)' -f $summary.msMainMenuLiteral)
+    ''
+    'front-end gate (last reading; ctrl=ok is the probe positive control)'
+    ('  {0}' -f $summary.feGateLast)
+    ''
+    'loading state (last reading)'
+    ('  {0}' -f $summary.loadStateLast)
 ) | Set-Content -LiteralPath $runSummaryPath -Encoding ascii
 Write-Host ("summary : run-summary.txt  (wall={0}s end={1})" -f $runSeconds, $exitReason)
 

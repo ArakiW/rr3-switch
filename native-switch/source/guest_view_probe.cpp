@@ -3876,6 +3876,12 @@ void pollDownloadPhaseGate() {
 // they end at are heap objects, not image addresses.
 constexpr uint64_t kMenuGateLoaderGotElfVa = 0x1F6DF50ULL;
 constexpr uint64_t kMenuGateCloudGotElfVa  = 0x1F6D5D0ULL;
+// The .bss CELLS those two GOT slots point at. Both are R_AARCH64_RELATIVE
+// relocations whose addend is the cell, so the slot holds loadBias + cell
+// after the loader runs; the probeResolveCell() call accepts that form and
+// the unrelocated one, and says which it saw.
+constexpr uint64_t kMenuGateLoaderCellElfVa = 0x1FB5BF8ULL;
+constexpr uint64_t kMenuGateCloudCellElfVa  = 0x1FC6E98ULL;
 // The Cloudcell object's own fields the gate reads.
 constexpr uint64_t kMenuGateCloudWord280Off = 0x280ULL;
 constexpr uint64_t kMenuGateCloudFlag4c1Off = 0x4C1ULL;
@@ -3887,93 +3893,314 @@ constexpr uint64_t kMenuGateLoaderSlot21Off = 0xA8ULL;
 // uses, so the project has one definition of "inside the guest".
 constexpr uint64_t kGuestWindowRadius = 0x1000000000ULL;
 
-// Is this guest page mapped and readable RIGHT NOW?
+// ===========================================================================
+// THE TRUSTED READ, AND THE TWO PROBES BUILT ON IT.
 //
-// TWO CHECKS, BOTH REQUIRED:
-//   (1) the address is inside the guest's own 64-bit window, and
-//   (2) svcQueryMemory says the page is mapped with read permission.
+// Everything below reads the guest through ONE primitive, and every value
+// that comes out of it carries the provenance that makes it believable.
 //
-// (1) alone is not enough under Eden: the kernel is asked about the HOST's
-// mapping of the address and Eden's emulated guest MMU has its own idea of
-// what is mapped, so a host address that happens to be readable can still be
-// unmapped as far as the guest is concerned. (2) alone is not enough either:
-// the host's heap is perfectly readable and is not the guest's.
+// WHAT WENT WRONG WITH THE PROBES ABOVE, precisely:
 //
-// The page query is cached one page deep, for the reason the Cloudcell probe
-// gives: this runs on a host thread and every syscall it spends is a syscall
-// the guest's frame loop does not get. The cache is invalidated when the
-// window (and therefore the bias) changes.
-bool menuGatePageReadable(uint64_t bias, uintptr_t address) {
-    static uint64_t s_cachedBias = 0;
-    static uintptr_t s_cachedPage = 0;
-    static bool s_cachedReadable = false;
-    static bool s_cachedValid = false;
-    if (bias == 0 || address == 0) {
-        return false;
+//   1. THEY PRINTED A NUMBER WITH NO OK FLAG. The menu-asset line's `mgr=`
+//      and `cg=` had NO read flag at all, so `mgr=0` could not be
+//      distinguished from "the manager pointer could not be read" -- and
+//      those are not the same observation. The one value that "contradicts"
+//      the confirmed constructor call is exactly the value the line could
+//      not vouch for.
+//
+//   2. THEY USED '?' AS A VALUE. A term that could not be read came out as
+//      '?', and so did the gate verdict. A reader skimming a log cannot
+//      tell a '?' from a typo, and "could not be read" and "the gate is
+//      closed" are different claims that the old line collapsed into one
+//      token.
+//
+//   3. THEY READ ONCE. A single volatile load is a snapshot, and this probe
+//      runs on a host thread CONCURRENTLY with a guest that is running, so
+//      a torn read was reported as a value.
+//
+//   4. THEY REFUSED EVERYTHING THE KERNEL COULD NOT SEE. The old helpers
+//      required svcQueryMemory to report Perm_R before ANY read --
+//      including for addresses inside the guest image, where the loader's
+//      own PT_LOAD table is the exact answer and costs no syscall at all.
+//      A refusal is not a value, but a refusal that is wrong in the
+//      direction of "unreadable" is how a field the guest plainly wrote
+//      comes out as "could not be read".
+//
+//   5. THEIR CHANGE FILTERS COMPARED VALUES ONLY. A field that went from
+//      "unreadable" to "readable, and the value happens to be 0" compared
+//      EQUAL, so the probe stayed silent across exactly the transition a
+//      reader is waiting for.
+//
+// WHAT THIS PRIMITIVE GUARANTEES, per field:
+//   ok      the read happened AND the two volatile loads agreed
+//   reason  why it did not: null | align | outside-guest | unmapped |
+//           mismatch | no-bias
+//   map     what proved the page was there: img (the loader's own PT_LOAD
+//           table) | kern (svcQueryMemory reported Perm_R) | none
+//
+// TWO INDEPENDENT INSTRUMENTS, for every field, positive or negative:
+//   1. the mapping test, and
+//   2. the DOUBLE VOLATILE LOAD, whose two halves must agree.
+//
+// THE POSITIVE CONTROL is a .rodata constant whose bytes are known from the
+// file on disk: "EventMapScreen" at 0x3fcc66. A probe that reads it back
+// correctly has PROVED that its read path works. One that does not has
+// proved that nothing else it says can be believed -- which is why the
+// control's verdict rides on every line.
+// ===========================================================================
+
+enum class ProbeMap : uint8_t {
+    kNone = 0,
+    kImage = 1,   // the loader's own PT_LOAD table says so (exact, no syscall)
+    kKernel = 2,  // svcQueryMemory reported Perm_R
+};
+
+struct ProbeValue {
+    bool ok{};
+    ProbeMap map{};
+    const char* reason{"unread"};
+    uint64_t value{};
+};
+
+// The kernel's page query, cached.
+//
+// EIGHT entries, direct-mapped by page. The cache is FLUSHED at the start of
+// every sample, so a stale answer lives at most one sample: the guest frees
+// heap pages, and a page that was readable a second ago can be gone now.
+//
+// The flush is what makes the cache safe rather than merely fast. The
+// project's own measurement (docs/compose/spec/unblock-menu-loading.md) is
+// that a probe spending ~1500 svcQueryMemory calls dropped a run to 3120
+// frames; a sample here costs a handful.
+//
+// The entries are single 64-bit words so that the sampler thread and the
+// guest's frame carrier can share the cache without tearing it: the page
+// identity and the verdict live in one atomic word.
+//
+//   bits [63:2]  page identity (address >> 12)
+//   bit  [1]     readable
+//   bit  [0]     1 = "not readable" (so the word is never 0 when valid)
+//   value 0      empty slot
+constexpr size_t kProbePageSlots = 8;
+uint64_t g_probePages[kProbePageSlots] = {0};
+
+void probeFlushPageCache() {
+    for (size_t index = 0; index < kProbePageSlots; ++index) {
+        __atomic_store_n(&g_probePages[index], 0ULL, __ATOMIC_RELAXED);
     }
+}
+
+bool probeKernelReadable(uintptr_t address) {
     const uintptr_t page = address & ~static_cast<uintptr_t>(0xFFF);
-    if (s_cachedValid && page == s_cachedPage && bias == s_cachedBias) {
-        return s_cachedReadable;
+    const uint64_t pageId = static_cast<uint64_t>(page) >> 12;
+    const size_t slot = static_cast<size_t>(pageId % kProbePageSlots);
+    const uint64_t cached = __atomic_load_n(&g_probePages[slot], __ATOMIC_RELAXED);
+    if (cached != 0 && (cached >> 2) == pageId) {
+        return (cached & 2ULL) != 0;
     }
+    MemoryInfo info{};
+    u32 pageInfo = 0;
     bool readable = false;
-    const uintptr_t lo = static_cast<uintptr_t>(bias - kGuestWindowRadius);
-    const uintptr_t hi = static_cast<uintptr_t>(bias + kGuestWindowRadius);
-    if (address >= lo && address < hi) {
-        MemoryInfo info{};
-        u32 pageInfo = 0;
-        if (!R_FAILED(svcQueryMemory(&info, &pageInfo, static_cast<u64>(address)))) {
-            readable = (info.perm & Perm_R) != 0;
-        }
+    if (!R_FAILED(svcQueryMemory(&info, &pageInfo, static_cast<u64>(address)))) {
+        readable = (info.perm & Perm_R) != 0;
     }
-    s_cachedBias = bias;
-    s_cachedPage = page;
-    s_cachedReadable = readable;
-    s_cachedValid = true;
+    __atomic_store_n(&g_probePages[slot],
+                     (pageId << 2) | (readable ? 2ULL : 1ULL),
+                     __ATOMIC_RELAXED);
     return readable;
 }
 
-bool menuGateReadWord(uint64_t bias, uintptr_t address, uint64_t* out) {
-    if (out == nullptr || address == 0 || (address & 7u) != 0u) {
-        return false;
+// THE READ. One field, one verdict, one reason.
+ProbeValue probeReadGuest(uintptr_t bias, uintptr_t address, unsigned bytes) {
+    ProbeValue out{};
+    if (address == 0) {
+        out.reason = "null";
+        return out;
     }
-    if (!menuGatePageReadable(bias, address)) {
-        return false;
+    if (bytes != 1 && bytes != 4 && bytes != 8) {
+        out.reason = "align";
+        return out;
     }
-    *out = *reinterpret_cast<const volatile uint64_t*>(address);
-    return true;
+    if ((address & (bytes - 1u)) != 0u) {
+        out.reason = "align";
+        return out;
+    }
+    if (guestImageContains(address, bytes)) {
+        // The loader's own PT_LOAD table. Exact, and free.
+        out.map = ProbeMap::kImage;
+    } else {
+        if (bias == 0) {
+            out.reason = "no-bias";
+            return out;
+        }
+        // The guest's own 64-bit window: the host's heap is readable and is
+        // not the guest's, so a pointer-shaped address outside this window
+        // is refused.
+        const uintptr_t lo = static_cast<uintptr_t>(bias - kGuestWindowRadius);
+        const uintptr_t hi = static_cast<uintptr_t>(bias + kGuestWindowRadius);
+        if (address < lo || address >= hi) {
+            out.reason = "outside-guest";
+            return out;
+        }
+        if (!probeKernelReadable(address)) {
+            out.reason = "unmapped";
+            return out;
+        }
+        out.map = ProbeMap::kKernel;
+    }
+    // The double read. Both halves are volatile loads of the same address
+    // with a compiler barrier between them, so the compiler may not merge
+    // them and may not move the second before the first. A concurrent
+    // writer in the guest is what this catches.
+    uint64_t first = 0;
+    uint64_t second = 0;
+    if (bytes == 1) {
+        const volatile uint8_t* const p =
+            reinterpret_cast<const volatile uint8_t*>(address);
+        first = *p;
+        __asm__ __volatile__("" ::: "memory");
+        second = *p;
+    } else if (bytes == 4) {
+        const volatile uint32_t* const p =
+            reinterpret_cast<const volatile uint32_t*>(address);
+        first = *p;
+        __asm__ __volatile__("" ::: "memory");
+        second = *p;
+    } else {
+        const volatile uint64_t* const p =
+            reinterpret_cast<const volatile uint64_t*>(address);
+        first = *p;
+        __asm__ __volatile__("" ::: "memory");
+        second = *p;
+    }
+    if (first != second) {
+        out.reason = "mismatch";
+        return out;
+    }
+    out.value = first;
+    out.ok = true;
+    out.reason = "ok";
+    return out;
 }
 
-bool menuGateReadByte(uint64_t bias, uintptr_t address, uint8_t* out) {
-    if (out == nullptr || address == 0) {
-        return false;
+// A field's value, or the REASON it has none. A number is never printed for
+// a field that was not read, so "0" can only ever mean "read, and it was 0".
+const char* probeText(const ProbeValue& value, char* buffer, size_t capacity,
+                      bool hex) {
+    if (value.ok) {
+        if (hex) {
+            __builtin_snprintf(buffer, capacity, "0x%llx",
+                               (unsigned long long)value.value);
+        } else {
+            __builtin_snprintf(buffer, capacity, "%llu",
+                               (unsigned long long)value.value);
+        }
+        return buffer;
     }
-    if (!menuGatePageReadable(bias, address)) {
-        return false;
-    }
-    *out = *reinterpret_cast<const volatile uint8_t*>(address);
-    return true;
+    __builtin_snprintf(buffer, capacity, "%s",
+                       value.reason != nullptr ? value.reason : "unread");
+    return buffer;
 }
+
+// A .bss cell reached through an R_AARCH64_RELATIVE GOT slot.
+//
+// After the loader has run, the slot holds loadBias + <addend>: a RUNTIME
+// address of the cell. If the relocation was never applied the slot still
+// holds the raw addend, which is an ELF VADDR -- and dereferencing that
+// would read the host's memory at a low address, which is how a probe turns
+// a measurement into a crash. Both forms are accepted and re-based here,
+// and the form that was used is reported, so the line says WHICH address
+// was read.
+struct ProbeCell {
+    uintptr_t address{};
+    const char* form{"none"};
+};
+
+ProbeCell probeResolveCell(uintptr_t bias, uint64_t slotValue,
+                            uint64_t expectElfVa) {
+    ProbeCell out{};
+    if (bias == 0 || slotValue == 0) {
+        return out;
+    }
+    if (slotValue == expectElfVa) {
+        out.address = static_cast<uintptr_t>(bias) + expectElfVa;
+        out.form = "unrelocated";
+        return out;
+    }
+    if (slotValue == static_cast<uint64_t>(bias) + expectElfVa) {
+        out.address = static_cast<uintptr_t>(slotValue);
+        out.form = "relocated";
+        return out;
+    }
+    return out;   // an unknown shape is NOT dereferenced
+}
+
+// THE POSITIVE CONTROL. "EventMapScreen" lives in .rodata at 0x3fcc66 and
+// its bytes are known from the file on disk, so reading it back and
+// comparing is a proof that this probe's read path works -- without it,
+// every other number on the line is unfalsifiable.
+constexpr uint64_t kFeGateControlElfVa = 0x3FCC66ULL;
+constexpr char kFeGateControlText[] = "EventMapScreen";
+
+// 'ok' when the control was read back EXACTLY, 'fail' when it was read and
+// did not match (which invalidates every other value on the line), and
+// 'unread' when it could not be read at all.
+const char* probeControlVerdict(uintptr_t bias, char* buffer, size_t capacity) {
+    if (bias == 0) {
+        __builtin_snprintf(buffer, capacity, "unread");
+        return buffer;
+    }
+    const uintptr_t base = static_cast<uintptr_t>(bias + kFeGateControlElfVa);
+    for (size_t index = 0; index < sizeof(kFeGateControlText); ++index) {
+        const ProbeValue byte = probeReadGuest(bias, base + index, 1);
+        if (!byte.ok) {
+            __builtin_snprintf(buffer, capacity, "unread");
+            return buffer;
+        }
+        if (byte.value != static_cast<uint64_t>(
+                             static_cast<uint8_t>(kFeGateControlText[index]))) {
+            __builtin_snprintf(buffer, capacity, "fail");
+            return buffer;
+        }
+    }
+    __builtin_snprintf(buffer, capacity, "ok");
+    return buffer;
+}
+
+// The menu-gate's two reads used to live here: menuGateReadWord() and
+// menuGateReadByte(). They are GONE, and the probes below call the trusted
+// primitive directly instead, because the primitive carries the reason a
+// read failed and the wrappers could not.
+//
+// They also used to ask svcQueryMemory for EVERY address, including the
+// ones inside the guest image where the loader's own PT_LOAD table is the
+// exact answer, and they took ONE volatile load and reported it. Both are
+// fixed by the primitive: the mapping test is the strongest one that
+// applies, and the read is taken twice and the two halves must agree.
+//
+// The old helpers' one-page cache is gone with them. The primitive's cache
+// holds eight pages and is flushed once per sample, so a page the guest
+// freed between two samples cannot be reported as readable because it was
+// readable last time.
 
 // One reading of the gate. Every field carries its own "was it readable"
 // flag, so a refused read is reported as UNKNOWN and never as a value: a
 // "term 2 = 0" that really means "term 2 could not be read" is exactly the
 // confusion this probe exists to remove.
+//
+// The fields are ProbeValue now, not a bool plus a number, because a bool
+// plus a number cannot say WHY a read failed and cannot survive the change
+// from "unreadable" to "readable and zero" without the filter below missing
+// the transition.
 struct MenuGateSample {
-    bool loaderCellRead{};
-    bool loaderRead{};
-    bool loaderVptrRead{};
-    bool cloudCellRead{};
-    bool cloudRead{};
-    bool flagRead{};
-    bool word280Read{};
-    uint64_t loaderCell{};
-    uint64_t loader{};
-    uint64_t loaderVptr{};
-    uint64_t loaderSlot21{};
-    uint64_t cloudCell{};
-    uint64_t cloud{};
-    uint8_t  cloudFlag4c1{};
-    uint64_t cloudWord280{};
+    ProbeValue loaderCell{};
+    ProbeValue loader{};
+    ProbeValue loaderVptr{};
+    ProbeValue loaderSlot21{};
+    ProbeValue cloudCell{};
+    ProbeValue cloud{};
+    ProbeValue cloudFlag4c1{};
+    ProbeValue cloudWord280{};
 };
 
 // The guest's frame counter is published in g_guestFrameNumber, next to the
@@ -3986,43 +4213,46 @@ MenuGateSample sampleMenuGate(uint64_t bias) {
     }
     // TERM 1's chain: the GOT slot holds the .bss CELL, and the cell holds
     // the menu-loader object. Two levels, exactly as the gate does it.
-    s.loaderCellRead = menuGateReadWord(
-        bias, static_cast<uintptr_t>(bias + kMenuGateLoaderGotElfVa), &s.loaderCell);
-    if (s.loaderCellRead) {
-        s.loaderRead = menuGateReadWord(bias, static_cast<uintptr_t>(s.loaderCell),
-                                        &s.loader);
-    }
-    if (s.loaderRead) {
-        s.loaderVptrRead = menuGateReadWord(
-            bias, static_cast<uintptr_t>(s.loader), &s.loaderVptr);
-    }
-    if (s.loaderVptrRead) {
-        menuGateReadWord(
-            bias, static_cast<uintptr_t>(s.loaderVptr + kMenuGateLoaderSlot21Off),
-            &s.loaderSlot21);
-    }
+    s.loaderCell = probeReadGuest(
+        bias, static_cast<uintptr_t>(bias + kMenuGateLoaderGotElfVa), 8);
+    const ProbeCell loaderCell = probeResolveCell(
+        bias, s.loaderCell.value, kMenuGateLoaderCellElfVa);
+    s.loader = probeReadGuest(bias, loaderCell.address, 8);
+    s.loaderVptr = probeReadGuest(
+        bias, static_cast<uintptr_t>(s.loader.ok ? s.loader.value : 0), 8);
+    s.loaderSlot21 = probeReadGuest(
+        bias,
+        static_cast<uintptr_t>((s.loaderVptr.ok ? s.loaderVptr.value : 0) +
+                               kMenuGateLoaderSlot21Off),
+        8);
     // TERM 2's chain: the same shape, the Cloudcell cell and the object.
-    s.cloudCellRead = menuGateReadWord(
-        bias, static_cast<uintptr_t>(bias + kMenuGateCloudGotElfVa), &s.cloudCell);
-    if (s.cloudCellRead) {
-        s.cloudRead = menuGateReadWord(bias, static_cast<uintptr_t>(s.cloudCell),
-                                       &s.cloud);
-    }
-    if (s.cloudRead) {
-        s.flagRead = menuGateReadByte(
-            bias, static_cast<uintptr_t>(s.cloud + kMenuGateCloudFlag4c1Off),
-            &s.cloudFlag4c1);
-        s.word280Read = menuGateReadWord(
-            bias, static_cast<uintptr_t>(s.cloud + kMenuGateCloudWord280Off),
-            &s.cloudWord280);
-    }
+    s.cloudCell = probeReadGuest(
+        bias, static_cast<uintptr_t>(bias + kMenuGateCloudGotElfVa), 8);
+    const ProbeCell cloudCell = probeResolveCell(
+        bias, s.cloudCell.value, kMenuGateCloudCellElfVa);
+    s.cloud = probeReadGuest(bias, cloudCell.address, 8);
+    s.cloudFlag4c1 = probeReadGuest(
+        bias,
+        static_cast<uintptr_t>((s.cloud.ok ? s.cloud.value : 0) +
+                               kMenuGateCloudFlag4c1Off),
+        1);
+    s.cloudWord280 = probeReadGuest(
+        bias,
+        static_cast<uintptr_t>((s.cloud.ok ? s.cloud.value : 0) +
+                               kMenuGateCloudWord280Off),
+        8);
     return s;
 }
 
-// '1' the term is satisfied, '0' it is not, '?' it could not be read.
+// '1' the term is satisfied, '0' it is not, 'u' it could not be read.
+//
+// 'u', NOT '?'. A '?' in a log line is indistinguishable from a typo or a
+// truncated field, and the old line used it for BOTH a term that was not
+// readable and the overall gate verdict -- so "the gate could not be
+// evaluated" and "the gate is closed" were the same token on the page.
 char menuGateTerm(bool known, bool satisfied) {
     if (!known) {
-        return '?';
+        return 'u';
     }
     return satisfied ? '1' : '0';
 }
@@ -4030,54 +4260,597 @@ char menuGateTerm(bool known, bool satisfied) {
 // THE ONE LINE. All four terms, the two object pointers, the menu-loader's
 // vtable address point, and the readability mask that says which of the
 // reads behind the numbers actually happened.
+//
+// EVERY VALUE CARRIES ITS OWN OK FLAG NOW, including the ones that never
+// had one. The old line printed `mlvtab=` and `mls21=` with no flag at all,
+// and printed `t1=`/`t2=` with a flag that could not say WHY the read
+// failed. A value that could not be read is printed as the REASON, never as
+// a number.
 void emitMenuGateSample(uint64_t frames, const char* carrier,
                          const MenuGateSample& s) {
-    const bool t1Known = s.loaderRead;
-    const bool t2Known = s.cloudRead;
-    const bool t3Known = s.flagRead;
-    const bool t4Known = s.word280Read;
-    const bool t1 = t1Known && s.loader != 0;
-    const bool t2 = t2Known && s.cloud != 0;
-    const bool t3 = t3Known && s.cloudFlag4c1 != 0;
-    const bool t4 = t4Known && (s.cloudWord280 & 1ULL) == 0ULL;
+    const bool t1Known = s.loader.ok;
+    const bool t2Known = s.cloud.ok;
+    const bool t3Known = s.cloudFlag4c1.ok;
+    const bool t4Known = s.cloudWord280.ok;
+    const bool t1 = t1Known && s.loader.value != 0;
+    const bool t2 = t2Known && s.cloud.value != 0;
+    const bool t3 = t3Known && s.cloudFlag4c1.value != 0;
+    const bool t4 = t4Known && (s.cloudWord280.value & 1ULL) == 0ULL;
     const bool allKnown = t1Known && t2Known && t3Known && t4Known;
     const bool allSatisfied = t1 && t2 && t3 && t4;
-    const char* gate = allKnown ? (allSatisfied ? "1" : "0") : "?";
+    const char* gate = allKnown ? (allSatisfied ? "1" : "0") : "unknown";
     // The vtable's address point, as an ELF vaddr when it is inside the
     // image, so it can be compared with the disassembly.
     const uint64_t bias = static_cast<uint64_t>(resolveMainImageLoadBias());
     char vtabElfText[32] = "-";
     const char* vtabElf = vtabElfText;
-    if (s.loaderVptrRead && s.loaderVptr >= bias &&
-        s.loaderVptr - bias < 0x4000000ULL) {
+    if (s.loaderVptr.ok && bias != 0 && s.loaderVptr.value >= bias &&
+        s.loaderVptr.value - bias < 0x4000000ULL) {
         __builtin_snprintf(vtabElfText, sizeof(vtabElfText), "rr3+0x%llx",
-                           (unsigned long long)(s.loaderVptr - bias));
+                           (unsigned long long)(s.loaderVptr.value - bias));
     }
     unsigned mask = 0;
-    mask |= s.loaderCellRead ? 1u : 0u;
-    mask |= s.loaderRead ? 2u : 0u;
-    mask |= s.loaderVptrRead ? 4u : 0u;
-    mask |= s.cloudCellRead ? 8u : 0u;
-    mask |= s.cloudRead ? 16u : 0u;
-    mask |= s.flagRead ? 32u : 0u;
-    mask |= s.word280Read ? 64u : 0u;
+    mask |= s.loaderCell.ok ? 1u : 0u;
+    mask |= s.loader.ok ? 2u : 0u;
+    mask |= s.loaderVptr.ok ? 4u : 0u;
+    mask |= s.cloudCell.ok ? 8u : 0u;
+    mask |= s.cloud.ok ? 16u : 0u;
+    mask |= s.cloudFlag4c1.ok ? 32u : 0u;
+    mask |= s.cloudWord280.ok ? 64u : 0u;
+    char t1Text[32];
+    char t2Text[32];
+    char t3Text[24];
+    char t4Text[32];
+    char mlvtabText[32];
+    char mls21Text[32];
     char line[640];
     __builtin_snprintf(
         line, sizeof(line),
-        "menu-gate: f=%llu via=%s t1=%llx t1ok=%c t2=%llx t2ok=%c"
-        " t3=4c1=%u t3ok=%c t4=280=%llx t4bit=%u t4ok=%c gate=%s"
-        " mlvtab=%llx mlvtabElf=%s mls21=%llx rd=0x%02x",
+        "menu-gate: f=%llu via=%s t1=%s t1ok=%c t2=%s t2ok=%c"
+        " t3=4c1=%s t3ok=%c t4=280=%s t4bit=%u t4ok=%c gate=%s"
+        " mlvtab=%s mlvtabok=%c mlvtabElf=%s mls21=%s mls21ok=%c rd=0x%02x",
         (unsigned long long)frames,
-        carrier != nullptr ? carrier : "?",
-        (unsigned long long)s.loader, menuGateTerm(t1Known, t1),
-        (unsigned long long)s.cloud, menuGateTerm(t2Known, t2),
-        (unsigned)s.cloudFlag4c1, menuGateTerm(t3Known, t3),
-        (unsigned long long)s.cloudWord280,
-        (unsigned)(s.cloudWord280 & 1ULL), menuGateTerm(t4Known, t4), gate,
-        (unsigned long long)s.loaderVptr, vtabElf,
-        (unsigned long long)s.loaderSlot21, mask);
+        carrier != nullptr ? carrier : "unknown",
+        probeText(s.loader, t1Text, sizeof(t1Text), true),
+        menuGateTerm(t1Known, t1),
+        probeText(s.cloud, t2Text, sizeof(t2Text), true),
+        menuGateTerm(t2Known, t2),
+        probeText(s.cloudFlag4c1, t3Text, sizeof(t3Text), false),
+        menuGateTerm(t3Known, t3),
+        probeText(s.cloudWord280, t4Text, sizeof(t4Text), true),
+        (unsigned)(s.cloudWord280.value & 1ULL), menuGateTerm(t4Known, t4),
+        gate,
+        probeText(s.loaderVptr, mlvtabText, sizeof(mlvtabText), true),
+        s.loaderVptr.ok ? '1' : '0', vtabElf,
+        probeText(s.loaderSlot21, mls21Text, sizeof(mls21Text), true),
+        s.loaderSlot21.ok ? '1' : '0', mask);
     appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                         line, 96, 0);
+}
+
+
+// ---------------------------------------------------------------------------
+// THE FRONT-END GATE: guest 0xa679a0.
+//
+// WHAT THE GUEST ACTUALLY DOES, DISASSEMBLED. 0xa679a0 is the front-end
+// entry and it is TAIL-CALLED from 0xa67468, 0xa67fcc, 0xa685c4 and
+// 0xa81d20, so it is not a virtual function and no vtable says anything
+// about it.
+//
+//   0xa679ac  adrp x19,#0x1f6d000
+//   0xa679b0  ldr  x19,[x19,#0xc88]   ; GOT 0x1f6dc88 -> .bss 0x1fa1d00
+//   0xa679b4  ldr  x8,[x19]           ; G = *(0x1fa1d00)
+//   0xa679b8  ldr  w9,[x8,#0x47c]     ; GATE A input
+//   0xa679bc  cmp  w9,#0x14           ; == 20 ?
+//   0xa679c0  b.eq 0xa67a50           ; *** GATE A: bail
+//   0xa679c4  add  x0,x8,#0x478
+//   0xa679c8  mov  w1,#1
+//   0xa679cc  bl   0x15340f4          ; *(G+0x478) = 1
+//   0xa679fc  ldr  x8,[x8,#0x5d8]     ; GOT 0x1f6d5d8 -> .bss 0x1fb2688
+//   0xa67a08  ldr  x8,[x8]            ; the SAME object as G
+//   0xa67a0c  ldr  x0,[x8,#0x17f8]    ; the screen manager
+//   0xa67a10  bl   0x14a7d5c          ; ScreenManager::Find("EventMapScreen")
+//   0xa67a14  cbz  x0,#0xa67a50       ; *** GATE B: bail
+//   0xa67a2c  bl   0x1e17c80          ; dynamic_cast<EventMapScreen*>
+//   0xa67a30  cbz  x0,#0xa67a50       ; *** GATE C: bail
+//   0xa67a3c  bl   0xdac364           ; EventMapScreen::Enter(1)
+//   0xa67a50  ldp  x29,x30,[sp],#0x20
+//   0xa67a58  ret                    ; ALL THREE GATES LAND HERE
+//
+// So the front end either enters EventMapScreen or does nothing at all, and
+// "does nothing" is exactly what a run that never reaches the menu looks
+// like from the outside.
+//
+// THE TWO CELLS HOLD THE SAME OBJECT. 0x1fa1d00 and 0x1fb2688 are two
+// different .bss words that both hold G: the front-end entry reads the
+// first, and the predicate (0x13833cc, through its helper 0x10ab9a8) and
+// the loading watchdog (0xb05810) read the second. The probe reads BOTH and
+// says whether they agree, because a line that reports one as 0 and the
+// other as non-zero is reporting a broken read, not a broken guest.
+//
+// GATE B AND GATE C CANNOT BE READ FROM OUTSIDE. Both need a CALL INTO THE
+// GUEST: 0x14a7d5c walks the screen manager's registry and 0x1e17c80 is
+// __dynamic_cast. Calling guest code from the host sampler thread would run
+// guest code on a thread the guest never created, against a guest that is
+// mid-frame. The probe says "not-probed" instead of guessing.
+// ---------------------------------------------------------------------------
+
+// Every address below is an ELF VADDR. The runtime address is always
+// bias + vaddr, and bias comes from resolveMainImageLoadBias(), never from
+// a constant.
+constexpr uint64_t kFeGateGameGotElfVa     = 0x1F6DC88ULL;  // -> .bss 0x1fa1d00
+constexpr uint64_t kFeGateGameCellElfVa    = 0x1FA1D00ULL;
+constexpr uint64_t kFeGateCGlobalGotElfVa  = 0x1F6D5D8ULL;  // -> .bss 0x1fb2688
+constexpr uint64_t kFeGateCGlobalCellElfVa = 0x1FB2688ULL;
+constexpr uint64_t kFeGateMgrCellElfVa     = 0x1F95CD8ULL;  // the manager's cell
+constexpr uint64_t kFeGateMgrGotElfVa      = 0x1F6D840ULL;  // -> .bss 0x1f95cd8
+constexpr uint64_t kFeGateState478Off      = 0x478ULL;
+constexpr uint64_t kFeGateState47cOff      = 0x47CULL;
+constexpr uint64_t kFeGateScreenMgrOff     = 0x17F8ULL;
+constexpr uint64_t kFeGateMgrByte8Off      = 0x8ULL;
+constexpr uint64_t kFeGateMgrWord0cOff     = 0xCUL;
+// The two values that SHUT a gate.
+constexpr uint32_t kFeGateStateBlocked     = 20U;
+constexpr uint32_t kFeGateMgrBlocked       = 5U;
+
+struct FeGateSample {
+    ProbeValue gSlot{};
+    ProbeValue g{};
+    ProbeValue g2Slot{};
+    ProbeValue g2{};
+    ProbeValue st478{};
+    ProbeValue st47c{};
+    ProbeValue mgr{};
+    ProbeValue mgr8{};
+    ProbeValue mgr0c{};
+    ProbeValue screenMgr{};
+    bool gMatch{false};
+    bool mgrCellMatch{false};
+    const char* gForm{"none"};
+    const char* g2Form{"none"};
+    unsigned readable{0};
+    unsigned total{8};
+};
+
+FeGateSample sampleFeGate(uintptr_t bias) {
+    FeGateSample s{};
+    if (bias == 0) {
+        return s;
+    }
+    // The two cells. Each one is read through its GOT slot and then
+    // resolved, so a line that reports a cell address also reports WHICH
+    // form of the relocation it saw.
+    s.gSlot = probeReadGuest(bias,
+        static_cast<uintptr_t>(bias + kFeGateGameGotElfVa), 8);
+    s.g2Slot = probeReadGuest(bias,
+        static_cast<uintptr_t>(bias + kFeGateCGlobalGotElfVa), 8);
+    const ProbeCell cell1 =
+        probeResolveCell(bias, s.gSlot.value, kFeGateGameCellElfVa);
+    const ProbeCell cell2 =
+        probeResolveCell(bias, s.g2Slot.value, kFeGateCGlobalCellElfVa);
+    s.gForm = cell1.form;
+    s.g2Form = cell2.form;
+    s.g = probeReadGuest(bias, cell1.address, 8);
+    s.g2 = probeReadGuest(bias, cell2.address, 8);
+    s.gMatch = s.g.ok && s.g2.ok && s.g.value == s.g2.value;
+
+    const uint64_t g = s.g.ok ? s.g.value : 0;
+    if (s.g.ok && g != 0) {
+        s.st478 = probeReadGuest(bias,
+            static_cast<uintptr_t>(g + kFeGateState478Off), 4);
+        s.st47c = probeReadGuest(bias,
+            static_cast<uintptr_t>(g + kFeGateState47cOff), 4);
+        s.screenMgr = probeReadGuest(bias,
+            static_cast<uintptr_t>(g + kFeGateScreenMgrOff), 8);
+    } else {
+        // The dependent fields report WHY they have no value: the reason G
+        // itself could not be read, or "null" when G was read and was zero.
+        const char* why = s.g.ok ? "null" : s.g.reason;
+        s.st478.reason = why;
+        s.st47c.reason = why;
+        s.screenMgr.reason = why;
+    }
+
+    // The RookieChampionshipManager. The CELL is read directly, because that
+    // is where the guest's own constructor (0x1382a74: `str x0,[x8]` with
+    // x8 = the .bss cell 0x1f95cd8) publishes it -- and the GOT slot that
+    // points at that cell is read too, so the two can be checked against
+    // each other instead of one of them being taken on faith.
+    s.mgr = probeReadGuest(bias,
+        static_cast<uintptr_t>(bias + kFeGateMgrCellElfVa), 8);
+    const ProbeValue mgrSlot = probeReadGuest(bias,
+        static_cast<uintptr_t>(bias + kFeGateMgrGotElfVa), 8);
+    const ProbeCell mgrResolved =
+        probeResolveCell(bias, mgrSlot.value, kFeGateMgrCellElfVa);
+    s.mgrCellMatch = mgrResolved.address ==
+        static_cast<uintptr_t>(bias + kFeGateMgrCellElfVa);
+    if (s.mgr.ok && s.mgr.value != 0) {
+        s.mgr8 = probeReadGuest(bias,
+            static_cast<uintptr_t>(s.mgr.value + kFeGateMgrByte8Off), 1);
+        s.mgr0c = probeReadGuest(bias,
+            static_cast<uintptr_t>(s.mgr.value + kFeGateMgrWord0cOff), 4);
+    } else {
+        const char* why = s.mgr.ok ? "null" : s.mgr.reason;
+        s.mgr8.reason = why;
+        s.mgr0c.reason = why;
+    }
+
+    s.readable = 0;
+    if (s.g.ok) { ++s.readable; }
+    if (s.g2.ok) { ++s.readable; }
+    if (s.st478.ok) { ++s.readable; }
+    if (s.st47c.ok) { ++s.readable; }
+    if (s.mgr.ok) { ++s.readable; }
+    if (s.mgr8.ok) { ++s.readable; }
+    if (s.mgr0c.ok) { ++s.readable; }
+    if (s.screenMgr.ok) { ++s.readable; }
+    return s;
+}
+
+// THE PREDICATE AT 0x13833cc, DERIVED FROM THREE READS INSTEAD OF CALLED.
+//
+//   0x13833d4  ldrb w8,[x0,#8]     ; mgr+8   must be NON-ZERO
+//   0x13833dc  ldr  w8,[x0,#0xc]   ; mgr+0xc must be != 5
+//   0x13833e8  bl   0x10ab9a8      ; returns G+0x478, or 0 when G is null
+//   0x13833ec  ldr  w8,[x0,#4]     ; -> *(G+0x47c); must be != 20
+//   0x1383404  mov  w0,#1          ; otherwise return 1
+//
+// The guest's own call is not made -- it is guest code, and this probe runs
+// on a host thread -- but the predicate is three loads and two compares, so
+// it is REPRODUCED here from three validated reads. The line says
+// "pred13833cc_src=derived", because a derived value and a called one are
+// not the same evidence and a reader must be able to tell them apart.
+//
+// (The helper 0x10ab9a8 was checked: it loads GOT 0x1f6d5d8, dereferences
+// the cell 0x1fb2688 to get G, adds 0x478, and returns 0 when G is null.
+// So the third term really is *(G+0x47c) -- the SAME field GATE A reads.)
+const char* feGateDerivedPredicate(const FeGateSample& s, char* buffer,
+                                   size_t capacity) {
+    if (!s.mgr8.ok || !s.mgr0c.ok || !s.st47c.ok) {
+        __builtin_snprintf(buffer, capacity, "not-probed");
+        return buffer;
+    }
+    const bool open = s.mgr8.value != 0 &&
+                      s.mgr0c.value != kFeGateMgrBlocked &&
+                      s.st47c.value != kFeGateStateBlocked;
+    __builtin_snprintf(buffer, capacity, "%s", open ? "1" : "0");
+    return buffer;
+}
+
+// ONE LINE, and every field on it carries its own ok flag.
+void emitFeGateSample(uint64_t frames, const char* carrier,
+                      const FeGateSample& s, uint64_t elapsedMs) {
+    char gText[32];
+    char g2Text[32];
+    char st478Text[24];
+    char st47cText[24];
+    char mgrText[32];
+    char mgr8Text[24];
+    char mgr0cText[24];
+    char screenMgrText[32];
+    char controlText[16];
+    char predText[16];
+
+    // GATE A's verdict. '-' means "could not be read", and st47cok says so
+    // next to it; it is never a guess.
+    char gateAText[8];
+    if (!s.st47c.ok) {
+        __builtin_snprintf(gateAText, sizeof(gateAText), "-");
+    } else {
+        __builtin_snprintf(gateAText, sizeof(gateAText), "%d",
+                           s.st47c.value == kFeGateStateBlocked ? 1 : 0);
+    }
+
+    char line[640];
+    __builtin_snprintf(
+        line, sizeof(line),
+        "fe-gate: f=%llu t=%llu via=%s g=%s gok=%c gsrc=%s g2=%s g2ok=%c"
+        " gmatch=%c st478=%s st478ok=%c st47c=%s st47cok=%c gateA_bail=%s"
+        " mgr=%s mgrok=%c mgrcellok=%c mgr8=%s mgr8ok=%c mgr0c=%s mgr0cok=%c"
+        " screenmgr=%s screenmgr_ok=%c screen_find=not-probed"
+        " pred13833cc=%s pred13833cc_src=derived readable=%u/%u ctrl=%s",
+        (unsigned long long)frames,
+        (unsigned long long)elapsedMs,
+        carrier != nullptr ? carrier : "unknown",
+        probeText(s.g, gText, sizeof(gText), true), s.g.ok ? '1' : '0',
+        s.gForm,
+        probeText(s.g2, g2Text, sizeof(g2Text), true), s.g2.ok ? '1' : '0',
+        s.gMatch ? '1' : '0',
+        probeText(s.st478, st478Text, sizeof(st478Text), false),
+        s.st478.ok ? '1' : '0',
+        probeText(s.st47c, st47cText, sizeof(st47cText), false),
+        s.st47c.ok ? '1' : '0',
+        gateAText,
+        probeText(s.mgr, mgrText, sizeof(mgrText), true), s.mgr.ok ? '1' : '0',
+        s.mgrCellMatch ? '1' : '0',
+        probeText(s.mgr8, mgr8Text, sizeof(mgr8Text), false),
+        s.mgr8.ok ? '1' : '0',
+        probeText(s.mgr0c, mgr0cText, sizeof(mgr0cText), false),
+        s.mgr0c.ok ? '1' : '0',
+        probeText(s.screenMgr, screenMgrText, sizeof(screenMgrText), true),
+        s.screenMgr.ok ? '1' : '0',
+        feGateDerivedPredicate(s, predText, sizeof(predText)),
+        s.readable, s.total,
+        probeControlVerdict(resolveMainImageLoadBias(), controlText,
+                             sizeof(controlText)));
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        line, 98, 0);
+}
+
+// The front-end gate's own carrier: a CHANGE or a 1 s heartbeat, the same
+// rule the other probes use, so a run in which nothing changes still says
+// so once a second.
+//
+// The change test compares the READ FLAGS as well as the values. A field
+// that went from "unreadable" to "readable, and the value happens to be 0"
+// compares EQUAL on the value alone, and that is exactly the transition a
+// reader is waiting for.
+void sampleFeGateTerms(uint64_t frames, const char* carrier) {
+    const uintptr_t bias = resolveMainImageLoadBias();
+    if (bias == 0) {
+        return;
+    }
+    const FeGateSample s = sampleFeGate(bias);
+    if (carrier != nullptr && std::strcmp(carrier, "sampler") == 0) {
+        struct Last {
+            bool valid{};
+            FeGateSample sample{};
+            uint64_t tick{};
+        };
+        static Last s_last{};
+        static unsigned s_lines = 0;
+        static uint64_t s_firstTick = 0;
+        constexpr unsigned kMaxLines = 200;
+        if (s_lines >= kMaxLines) {
+            return;
+        }
+        const uint64_t now = armGetSystemTick();
+        const uint64_t freq = armGetSystemTickFreq();
+        const uint64_t elapsedMs = (now - s_last.tick) * 1000ULL /
+                                   (freq != 0 ? freq : 1);
+        const bool heartbeatDue = s_last.valid && elapsedMs >= 1000ULL;
+        const FeGateSample& p = s_last.sample;
+        const bool changed =
+            !s_last.valid ||
+            p.g.ok != s.g.ok || p.g.value != s.g.value ||
+            p.g2.ok != s.g2.ok || p.g2.value != s.g2.value ||
+            p.st478.ok != s.st478.ok || p.st478.value != s.st478.value ||
+            p.st47c.ok != s.st47c.ok || p.st47c.value != s.st47c.value ||
+            p.mgr.ok != s.mgr.ok || p.mgr.value != s.mgr.value ||
+            p.mgr8.ok != s.mgr8.ok || p.mgr8.value != s.mgr8.value ||
+            p.mgr0c.ok != s.mgr0c.ok || p.mgr0c.value != s.mgr0c.value ||
+            p.screenMgr.ok != s.screenMgr.ok ||
+            p.screenMgr.value != s.screenMgr.value;
+        if (!changed && !heartbeatDue) {
+            return;
+        }
+        s_last.valid = true;
+        s_last.sample = s;
+        s_last.tick = now;
+        if (s_firstTick == 0) {
+            s_firstTick = now;
+        }
+        ++s_lines;
+        emitFeGateSample(frames, carrier, s,
+                         (now - s_firstTick) * 1000ULL / (freq != 0 ? freq : 1));
+        return;
+    }
+    emitFeGateSample(frames, carrier, s, 0);
+}
+
+// ---------------------------------------------------------------------------
+// THE LOADING STATE: the triple the guest itself prints.
+//
+// "Slow loading detected: [%d, %d, %d]" (format string 0x4051ed) is printed
+// at 0xb058b8, from the function at 0xb05810:
+//
+//   0xb05850  mov  x19,x0           ; x19 = the object's base
+//   0xb05854  add  x28,x0,x9        ; x9 = 0x10378, so x28 = x19 + 0x10378
+//   0xb05888  ldr  w22,[x19,#0x1b38]; ARGUMENT 1: the LOAD_STATE enum
+//   0xb05890  ldr  w23,[x28,#0x900] ; ARGUMENT 2: *(x19 + 0x10378 + 0x900)
+//   0xb05878  adrp x8,#0x1f6d000
+//   0xb0587c  ldr  x8,[x8,#0x5d8]   ; the SAME global chain as the front end
+//   0xb0588c  ldr  x8,[x8]          ; G
+//   0xb05898  ldr  x8,[x8,x9]       ; x9 = 0x113a0 -> *(G + 0x113a0)
+//   0xb0589c  cbz  x8,#0xb058b0     ; null -> argument 3 is -1
+//   0xb058a4  bl   0x991c8c         ; otherwise argument 3 = 0x991c8c(x+8)
+//   0xb058b0  mov  w3,#-1
+//   0xb058bc  mov  w1,w22 ; mov w2,w23 ; bl 0x10a0034
+//
+// x19 IS G. The chain is closed by the caller: 0x13b713c loads GOT
+// 0x1f6d5d8 into x24, 0x13b7230 does `ldr x0,[x24]` -- that is G -- and
+// passes it to 0x10afd44, which passes it to 0xb05810, which does
+// `mov x19,x0`. So the state fields below are read off the SAME object the
+// front-end gate reads.
+//
+// ARGUMENT 3 IS NOT CALLABLE FROM HERE. 0x991c8c is guest code that walks a
+// container, so the probe reports the pointer the guest would call it with
+// and says "not-probed" -- EXCEPT when that pointer is null, because then
+// the guest's own branch (`cbz x8,#0xb058b0`) makes the value -1 with no
+// call at all, and that one IS derivable.
+//
+// IT IS RATE-LIMITED, and the line says so: the guest only prints when at
+// least 30 s have passed since the last one (0xb05848 reads the last stamp
+// from .bss 0x1f97340, 0xb05870 compares (now-last)>>4 against 0x753 =
+// 1875, i.e. 30000 ticks). So "the guest never printed" is a statement
+// about the run, and the stamp below is what makes it checkable.
+//
+// NOTE ON THE SECOND ARGUMENT'S OFFSET. It is *(x19 + 0x10c78), because
+// x28 = x19 + 0x10378 (the guest builds 0x10378 with `mov w9,#0x378` and
+// `movk w9,#1,lsl#16`) and the load adds 0x900. An earlier note in this
+// project put this field at x19 + 0x138100; that is a different offset and
+// it is not the one the guest reads.
+// ---------------------------------------------------------------------------
+
+constexpr uint64_t kLoadState1ElfVa        = 0x1B38ULL;
+constexpr uint64_t kLoadState2ElfVa        = 0x10C78ULL;
+constexpr uint64_t kLoadState3ElfVa        = 0x113A0ULL;
+constexpr uint64_t kLoadWatchdogStampElfVa = 0x1F97340ULL;
+
+struct LoadStateSample {
+    ProbeValue x19{};
+    ProbeValue ls1{};
+    ProbeValue ls2{};
+    ProbeValue ls3p{};
+    ProbeValue ls3{};
+    ProbeValue stamp{};
+    const char* ls3Src{"not-probed"};
+    unsigned readable{0};
+    unsigned total{4};
+};
+
+LoadStateSample sampleLoadState(uintptr_t bias) {
+    LoadStateSample s{};
+    if (bias == 0) {
+        return s;
+    }
+    // The same global chain the guest's own watchdog uses.
+    const ProbeValue slot = probeReadGuest(bias,
+        static_cast<uintptr_t>(bias + kFeGateCGlobalGotElfVa), 8);
+    const ProbeCell cell =
+        probeResolveCell(bias, slot.value, kFeGateCGlobalCellElfVa);
+    s.x19 = probeReadGuest(bias, cell.address, 8);
+    const uint64_t x19 = s.x19.ok ? s.x19.value : 0;
+    if (s.x19.ok && x19 != 0) {
+        s.ls1 = probeReadGuest(bias,
+            static_cast<uintptr_t>(x19 + kLoadState1ElfVa), 4);
+        s.ls2 = probeReadGuest(bias,
+            static_cast<uintptr_t>(x19 + kLoadState2ElfVa), 4);
+        s.ls3p = probeReadGuest(bias,
+            static_cast<uintptr_t>(x19 + kLoadState3ElfVa), 8);
+    } else {
+        const char* why = s.x19.ok ? "null" : s.x19.reason;
+        s.ls1.reason = why;
+        s.ls2.reason = why;
+        s.ls3p.reason = why;
+    }
+    // The third argument. A null pointer makes the guest take its own
+    // `mov w3,#-1` branch with no call, so -1 is derived, not guessed. A
+    // non-null pointer needs 0x991c8c, which is guest code, so it is not
+    // probed at all.
+    if (s.ls3p.ok) {
+        if (s.ls3p.value == 0) {
+            s.ls3.ok = true;
+            s.ls3.value = static_cast<uint64_t>(static_cast<int64_t>(-1));
+            s.ls3.reason = "ok";
+            s.ls3Src = "guest-null-branch";
+        } else {
+            s.ls3.reason = "not-probed";
+            s.ls3Src = "guest-call-not-probed";
+        }
+    } else {
+        s.ls3.reason = "not-probed";
+        s.ls3Src = "guest-call-not-probed";
+    }
+    // The watchdog's own "last print" stamp, so "the guest never printed"
+    // is checkable rather than assumed.
+    s.stamp = probeReadGuest(bias,
+        static_cast<uintptr_t>(bias + kLoadWatchdogStampElfVa), 8);
+
+    s.readable = 0;
+    if (s.ls1.ok) { ++s.readable; }
+    if (s.ls2.ok) { ++s.readable; }
+    if (s.ls3.ok) { ++s.readable; }
+    if (s.ls3p.ok) { ++s.readable; }
+    return s;
+}
+
+void emitLoadStateSample(uint64_t frames, const char* carrier,
+                         const LoadStateSample& s, uint64_t elapsedMs) {
+    char x19Text[32];
+    char ls1Text[24];
+    char ls2Text[24];
+    char ls3Text[24];
+    char ls3pText[32];
+    char stampText[32];
+    char controlText[16];
+
+    // The third argument is a SIGNED int in the guest's own printf, so it is
+    // printed signed: the guest's null branch makes it -1, and "18446744
+    // 073709551615" would be a different number from the one the guest
+    // prints.
+    if (s.ls3.ok) {
+        __builtin_snprintf(ls3Text, sizeof(ls3Text), "%d",
+                           static_cast<int32_t>(s.ls3.value));
+    } else {
+        __builtin_snprintf(ls3Text, sizeof(ls3Text), "%s", s.ls3.reason);
+    }
+
+    char line[560];
+    __builtin_snprintf(
+        line, sizeof(line),
+        "loadstate: f=%llu t=%llu via=%s x19=%s x19ok=%c"
+        " x19src=global:got+0x1f6d5d8->bss+0x1fb2688"
+        " ls1=%s ls1ok=%c ls2=%s ls2ok=%c ls2off=0x10c78"
+        " ls3=%s ls3ok=%c ls3src=%s ls3p=%s ls3pok=%c"
+        " wdtstamp=%s wdtstampok=%c readable=%u/%u ctrl=%s",
+        (unsigned long long)frames,
+        (unsigned long long)elapsedMs,
+        carrier != nullptr ? carrier : "unknown",
+        probeText(s.x19, x19Text, sizeof(x19Text), true), s.x19.ok ? '1' : '0',
+        probeText(s.ls1, ls1Text, sizeof(ls1Text), false), s.ls1.ok ? '1' : '0',
+        probeText(s.ls2, ls2Text, sizeof(ls2Text), false), s.ls2.ok ? '1' : '0',
+        ls3Text, s.ls3.ok ? '1' : '0',
+        s.ls3Src,
+        probeText(s.ls3p, ls3pText, sizeof(ls3pText), true), s.ls3p.ok ? '1' : '0',
+        probeText(s.stamp, stampText, sizeof(stampText), false),
+        s.stamp.ok ? '1' : '0',
+        s.readable, s.total,
+        probeControlVerdict(resolveMainImageLoadBias(), controlText,
+                             sizeof(controlText)));
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        line, 99, 0);
+}
+
+// The loading state's own carrier: a CHANGE or a 1 s heartbeat.
+void sampleLoadStateTerms(uint64_t frames, const char* carrier) {
+    const uintptr_t bias = resolveMainImageLoadBias();
+    if (bias == 0) {
+        return;
+    }
+    const LoadStateSample s = sampleLoadState(bias);
+    if (carrier != nullptr && std::strcmp(carrier, "sampler") == 0) {
+        struct Last {
+            bool valid{};
+            LoadStateSample sample{};
+            uint64_t tick{};
+        };
+        static Last s_last{};
+        static unsigned s_lines = 0;
+        static uint64_t s_firstTick = 0;
+        constexpr unsigned kMaxLines = 200;
+        if (s_lines >= kMaxLines) {
+            return;
+        }
+        const uint64_t now = armGetSystemTick();
+        const uint64_t freq = armGetSystemTickFreq();
+        const uint64_t elapsedMs = (now - s_last.tick) * 1000ULL /
+                                   (freq != 0 ? freq : 1);
+        const bool heartbeatDue = s_last.valid && elapsedMs >= 1000ULL;
+        const LoadStateSample& p = s_last.sample;
+        const bool changed =
+            !s_last.valid ||
+            p.x19.ok != s.x19.ok || p.x19.value != s.x19.value ||
+            p.ls1.ok != s.ls1.ok || p.ls1.value != s.ls1.value ||
+            p.ls2.ok != s.ls2.ok || p.ls2.value != s.ls2.value ||
+            p.ls3p.ok != s.ls3p.ok || p.ls3p.value != s.ls3p.value ||
+            p.ls3.ok != s.ls3.ok || p.ls3.value != s.ls3.value;
+        if (!changed && !heartbeatDue) {
+            return;
+        }
+        s_last.valid = true;
+        s_last.sample = s;
+        s_last.tick = now;
+        if (s_firstTick == 0) {
+            s_firstTick = now;
+        }
+        ++s_lines;
+        emitLoadStateSample(frames, carrier, s,
+                            (now - s_firstTick) * 1000ULL /
+                                (freq != 0 ? freq : 1));
+        return;
+    }
+    emitLoadStateSample(frames, carrier, s, 0);
 }
 
 // The guest's own 240-frame tick, plus a host-thread carrier.
@@ -4094,19 +4867,27 @@ void emitMenuGateSample(uint64_t frames, const char* carrier,
 // so once a second.
 void sampleMenuGateTerms(uint64_t frames, const char* carrier) {
     const uint64_t bias = static_cast<uint64_t>(resolveMainImageLoadBias());
+    // ONE cache flush per sample, here, and not inside the four probes: the
+    // probes share the page cache within a sample, so the guest's own object
+    // page is asked about once instead of four times, and the flush still
+    // bounds a stale "readable" answer to a single sample.
+    probeFlushPageCache();
     // The MENU-ASSET gate, on the same carriers, sampled BEFORE the render
     // gate's own change filter: the two gates are independent, and a filter
     // that belongs to one of them must not silence the other.
     sampleMenuAssetGateTerms(frames, carrier);
+    // The FRONT-END gate and the LOADING state, on the same carriers and
+    // with the same change-or-heartbeat rule. They are sampled BEFORE the
+    // render gate's filter for the same reason the menu-asset gate is: each
+    // probe owns its own filter, so one probe's silence can never hide
+    // another's change.
+    sampleFeGateTerms(frames, carrier);
+    sampleLoadStateTerms(frames, carrier);
     const MenuGateSample s = sampleMenuGate(bias);
     if (carrier != nullptr && std::strcmp(carrier, "sampler") == 0) {
         struct Last {
             bool valid{};
-            uint64_t loader{};
-            uint64_t loaderVptr{};
-            uint64_t cloud{};
-            uint32_t flag4c1{};
-            uint64_t word280{};
+            MenuGateSample sample{};
             uint64_t tick{};
         };
         static Last s_last{};
@@ -4120,19 +4901,31 @@ void sampleMenuGateTerms(uint64_t frames, const char* carrier) {
         const uint64_t elapsedMs = (now - s_last.tick) * 1000ULL /
                                    (freq != 0 ? freq : 1);
         const bool heartbeatDue = s_last.valid && elapsedMs >= 1000ULL;
+        // The READ FLAGS are part of the comparison, not just the values.
+        // The old filter compared values only, so a field that went from
+        // "unreadable" to "readable, and the value is 0" compared EQUAL and
+        // the probe stayed silent across exactly the transition a reader is
+        // waiting for.
+        const MenuGateSample& p = s_last.sample;
         const bool changed =
-            !s_last.valid || s_last.loader != s.loader ||
-            s_last.loaderVptr != s.loaderVptr || s_last.cloud != s.cloud ||
-            s_last.flag4c1 != s.cloudFlag4c1 || s_last.word280 != s.cloudWord280;
+            !s_last.valid ||
+            p.loaderCell.ok != s.loaderCell.ok ||
+            p.loaderCell.value != s.loaderCell.value ||
+            p.loader.ok != s.loader.ok || p.loader.value != s.loader.value ||
+            p.loaderVptr.ok != s.loaderVptr.ok ||
+            p.loaderVptr.value != s.loaderVptr.value ||
+            p.cloudCell.ok != s.cloudCell.ok ||
+            p.cloudCell.value != s.cloudCell.value ||
+            p.cloud.ok != s.cloud.ok || p.cloud.value != s.cloud.value ||
+            p.cloudFlag4c1.ok != s.cloudFlag4c1.ok ||
+            p.cloudFlag4c1.value != s.cloudFlag4c1.value ||
+            p.cloudWord280.ok != s.cloudWord280.ok ||
+            p.cloudWord280.value != s.cloudWord280.value;
         if (!changed && !heartbeatDue) {
             return;
         }
         s_last.valid = true;
-        s_last.loader = s.loader;
-        s_last.loaderVptr = s.loaderVptr;
-        s_last.cloud = s.cloud;
-        s_last.flag4c1 = s.cloudFlag4c1;
-        s_last.word280 = s.cloudWord280;
+        s_last.sample = s;
         s_last.tick = now;
         ++s_lines;
     }
@@ -4186,13 +4979,23 @@ void sampleMenuGateTerms(uint64_t frames, const char* carrier) {
 //
 // and the gate then reads the word at +4 from that, i.e. CGlobal+0x47c.
 //
-// EVERY READ BELOW goes through menuGateReadWord/menuGateReadByte, which
-// check the guest's own 64-bit window AND ask svcQueryMemory for Perm_R on
-// the page. A read that cannot be satisfied is reported as UNKNOWN ('?'),
-// never as a value: "term 2 = 0" and "term 2 could not be read" must never
-// be the same observation.
+// EVERY READ BELOW goes through the trusted primitive: the mapping test
+// that applies (the loader's own PT_LOAD table inside the image, the
+// kernel's page query outside it), and then a DOUBLE volatile load whose two
+// halves must agree. A read that cannot be satisfied is reported as the
+// REASON, never as a value: "term 2 = 0" and "term 2 could not be read"
+// must never be the same observation.
+//
+// THE MANAGER'S CELL IS READ DIRECTLY as well as through its GOT slot.
+// The guest's own constructor (0x1382a74: `adrp x8,#0x1f6d000; ldr
+// x8,[x8,#0x840]; str x0,[x8]`) publishes the manager into the .bss cell
+// 0x1f95cd8, and the GOT slot 0x1f6d840 is an R_AARCH64_RELATIVE
+// relocation whose addend is that same cell -- so the two routes must agree,
+// and the line says whether they did.
 constexpr uint64_t kMenuAssetGateMgrGotElfVa = 0x1F6D840ULL;
 constexpr uint64_t kMenuAssetGateCGlobalGotElfVa = 0x1F6D5D8ULL;
+constexpr uint64_t kMenuAssetGateMgrCellElfVa = 0x1F95CD8ULL;
+constexpr uint64_t kMenuAssetGateCGlobalCellElfVa = 0x1FB2688ULL;
 constexpr uint64_t kMenuAssetGateMgrByte8Off = 0x8ULL;
 constexpr uint64_t kMenuAssetGateMgrWord0cOff = 0xCULL;
 constexpr uint64_t kMenuAssetGateCGlobalWord47cOff = 0x47CULL;
@@ -4201,20 +5004,13 @@ constexpr uint32_t kMenuAssetGateMgrBlockedValue = 5U;
 constexpr uint32_t kMenuAssetGateCGlobalBlockedValue = 20U;
 
 struct MenuAssetGateSample {
-    bool mgrCellRead{};
-    bool mgrRead{};
-    bool byte8Read{};
-    bool word0cRead{};
-    bool cglobalCellRead{};
-    bool cglobalRead{};
-    bool word47cRead{};
-    uint64_t mgrCell{};
-    uint64_t mgr{};
-    uint64_t cglobalCell{};
-    uint64_t cglobal{};
-    uint8_t byte8{};
-    uint32_t word0c{};
-    uint32_t word47c{};
+    ProbeValue mgrCell{};
+    ProbeValue mgr{};
+    ProbeValue byte8{};
+    ProbeValue word0c{};
+    ProbeValue cglobalCell{};
+    ProbeValue cglobal{};
+    ProbeValue word47c{};
 };
 
 MenuAssetGateSample sampleMenuAssetGate(uint64_t bias) {
@@ -4222,70 +5018,91 @@ MenuAssetGateSample sampleMenuAssetGate(uint64_t bias) {
     if (bias == 0) {
         return s;
     }
-    // The manager: GOT slot -> .bss cell -> the manager object.
-    s.mgrCellRead = menuGateReadWord(
-        bias, static_cast<uintptr_t>(bias + kMenuAssetGateMgrGotElfVa), &s.mgrCell);
-    if (s.mgrCellRead) {
-        s.mgrRead = menuGateReadWord(bias, static_cast<uintptr_t>(s.mgrCell), &s.mgr);
-    }
-    if (s.mgrRead && s.mgr != 0) {
-        uint8_t byte8Value = 0;
-        uint64_t word0cValue = 0;
-        s.byte8Read = menuGateReadByte(
-            bias, static_cast<uintptr_t>(s.mgr + kMenuAssetGateMgrByte8Off), &byte8Value);
-        s.word0cRead = menuGateReadWord(
-            bias, static_cast<uintptr_t>(s.mgr + kMenuAssetGateMgrWord0cOff), &word0cValue);
-        s.byte8 = byte8Value;
-        s.word0c = static_cast<uint32_t>(word0cValue);
+    // The manager: the .bss CELL directly (that is where the guest's own
+    // constructor publishes it), and the GOT slot that points at the cell,
+    // so the two routes can be checked against each other.
+    s.mgrCell = probeReadGuest(
+        bias, static_cast<uintptr_t>(bias + kMenuAssetGateMgrCellElfVa), 8);
+    const ProbeValue mgrSlot = probeReadGuest(
+        bias, static_cast<uintptr_t>(bias + kMenuAssetGateMgrGotElfVa), 8);
+    const ProbeCell mgrResolved = probeResolveCell(
+        bias, mgrSlot.value, kMenuAssetGateMgrCellElfVa);
+    s.mgr = probeReadGuest(bias, mgrResolved.address, 8);
+    if (s.mgr.ok && s.mgr.value != 0) {
+        s.byte8 = probeReadGuest(bias,
+            static_cast<uintptr_t>(s.mgr.value + kMenuAssetGateMgrByte8Off), 1);
+        s.word0c = probeReadGuest(bias,
+            static_cast<uintptr_t>(s.mgr.value + kMenuAssetGateMgrWord0cOff), 4);
+    } else {
+        s.byte8.reason = "null";
+        s.word0c.reason = "null";
     }
     // CGlobal: GOT slot -> .bss cell -> the CGlobal object.
-    s.cglobalCellRead = menuGateReadWord(
-        bias, static_cast<uintptr_t>(bias + kMenuAssetGateCGlobalGotElfVa), &s.cglobalCell);
-    if (s.cglobalCellRead) {
-        s.cglobalRead = menuGateReadWord(bias, static_cast<uintptr_t>(s.cglobalCell),
-                                         &s.cglobal);
-    }
-    if (s.cglobalRead && s.cglobal != 0) {
-        uint64_t word47cValue = 0;
-        s.word47cRead = menuGateReadWord(
-            bias, static_cast<uintptr_t>(s.cglobal + kMenuAssetGateCGlobalWord47cOff),
-            &word47cValue);
-        s.word47c = static_cast<uint32_t>(word47cValue);
+    s.cglobalCell = probeReadGuest(
+        bias, static_cast<uintptr_t>(bias + kMenuAssetGateCGlobalGotElfVa), 8);
+    const ProbeCell cglobalResolved = probeResolveCell(
+        bias, s.cglobalCell.value, kMenuAssetGateCGlobalCellElfVa);
+    s.cglobal = probeReadGuest(bias, cglobalResolved.address, 8);
+    if (s.cglobal.ok && s.cglobal.value != 0) {
+        s.word47c = probeReadGuest(bias,
+            static_cast<uintptr_t>(s.cglobal.value +
+                                   kMenuAssetGateCGlobalWord47cOff),
+            4);
+    } else {
+        s.word47c.reason = "null";
     }
     return s;
 }
 
 // ONE LINE: the manager pointer, mgr+8, mgr+0xc, CGlobal+0x47c, and whether
 // the gate would return 1, with the guest's own frame number.
+//
+// EVERY VALUE CARRIES ITS OWN OK FLAG. The old line printed `mgr=` and
+// `cg=` with NO flag at all, so "the manager pointer is 0" and "the manager
+// pointer could not be read" were the same observation on the page -- and
+// the manager pointer is the one field whose value contradicted the
+// confirmed constructor call. A field that could not be read is now printed
+// as the REASON.
 void emitMenuAssetGateSample(uint64_t frames, const char* carrier,
                              const MenuAssetGateSample& s) {
-    const bool t1Known = s.byte8Read;
-    const bool t2Known = s.word0cRead;
-    const bool t3Known = s.word47cRead;
-    const bool t1 = t1Known && s.byte8 != 0;
-    const bool t2 = t2Known && s.word0c != kMenuAssetGateMgrBlockedValue;
-    const bool t3 = t3Known && s.word47c != kMenuAssetGateCGlobalBlockedValue;
+    const bool t1Known = s.byte8.ok;
+    const bool t2Known = s.word0c.ok;
+    const bool t3Known = s.word47c.ok;
+    const bool t1 = t1Known && s.byte8.value != 0;
+    const bool t2 = t2Known && s.word0c.value != kMenuAssetGateMgrBlockedValue;
+    const bool t3 = t3Known &&
+                    s.word47c.value != kMenuAssetGateCGlobalBlockedValue;
     const bool allKnown = t1Known && t2Known && t3Known;
     const bool allSatisfied = t1 && t2 && t3;
-    const char* gate = allKnown ? (allSatisfied ? "1" : "0") : "?";
+    const char* gate = allKnown ? (allSatisfied ? "1" : "0") : "unknown";
     unsigned mask = 0;
-    mask |= s.mgrCellRead ? 1u : 0u;
-    mask |= s.mgrRead ? 2u : 0u;
-    mask |= s.byte8Read ? 4u : 0u;
-    mask |= s.word0cRead ? 8u : 0u;
-    mask |= s.cglobalCellRead ? 16u : 0u;
-    mask |= s.cglobalRead ? 32u : 0u;
-    mask |= s.word47cRead ? 64u : 0u;
+    mask |= s.mgrCell.ok ? 1u : 0u;
+    mask |= s.mgr.ok ? 2u : 0u;
+    mask |= s.byte8.ok ? 4u : 0u;
+    mask |= s.word0c.ok ? 8u : 0u;
+    mask |= s.cglobalCell.ok ? 16u : 0u;
+    mask |= s.cglobal.ok ? 32u : 0u;
+    mask |= s.word47c.ok ? 64u : 0u;
+    char mgrText[32];
+    char m8Text[24];
+    char m0cText[24];
+    char cgText[32];
+    char cg47cText[24];
     char line[512];
     __builtin_snprintf(
         line, sizeof(line),
-        "masset-gate: f=%llu via=%s mgr=%llx m8=%u m8ok=%c m0c=%u m0cok=%c"
-        " cg=%llx cg47c=%u cg47cok=%c gate=%s rd=0x%02x",
+        "masset-gate: f=%llu via=%s mgr=%s mgrok=%c m8=%s m8ok=%c m0c=%s"
+        " m0cok=%c cg=%s cgok=%c cg47c=%s cg47cok=%c gate=%s rd=0x%02x",
         (unsigned long long)frames,
-        carrier != nullptr ? carrier : "?",
-        (unsigned long long)s.mgr, (unsigned)s.byte8, menuGateTerm(t1Known, t1),
-        (unsigned)s.word0c, menuGateTerm(t2Known, t2),
-        (unsigned long long)s.cglobal, (unsigned)s.word47c,
+        carrier != nullptr ? carrier : "unknown",
+        probeText(s.mgr, mgrText, sizeof(mgrText), true), s.mgr.ok ? '1' : '0',
+        probeText(s.byte8, m8Text, sizeof(m8Text), false),
+        menuGateTerm(t1Known, t1),
+        probeText(s.word0c, m0cText, sizeof(m0cText), false),
+        menuGateTerm(t2Known, t2),
+        probeText(s.cglobal, cgText, sizeof(cgText), true),
+        s.cglobal.ok ? '1' : '0',
+        probeText(s.word47c, cg47cText, sizeof(cg47cText), false),
         menuGateTerm(t3Known, t3), gate, mask);
     appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                         line, 97, 0);
@@ -4293,17 +5110,18 @@ void emitMenuAssetGateSample(uint64_t frames, const char* carrier,
 
 // The same change/heartbeat rule the render gate uses, so a run in which
 // nothing changes still says so once a second.
+//
+// The READ FLAGS are part of the comparison, not just the values: the old
+// filter compared values only, so the manager going from "unreadable" to
+// "readable, and the value is 0" compared EQUAL and the probe stayed
+// silent across exactly that transition.
 void sampleMenuAssetGateTerms(uint64_t frames, const char* carrier) {
     const uint64_t bias = static_cast<uint64_t>(resolveMainImageLoadBias());
     const MenuAssetGateSample s = sampleMenuAssetGate(bias);
     if (carrier != nullptr && std::strcmp(carrier, "sampler") == 0) {
         struct Last {
             bool valid{};
-            uint64_t mgr{};
-            uint32_t byte8{};
-            uint32_t word0c{};
-            uint64_t cglobal{};
-            uint32_t word47c{};
+            MenuAssetGateSample sample{};
             uint64_t tick{};
         };
         static Last s_last{};
@@ -4317,19 +5135,24 @@ void sampleMenuAssetGateTerms(uint64_t frames, const char* carrier) {
         const uint64_t elapsedMs = (now - s_last.tick) * 1000ULL /
                                    (freq != 0 ? freq : 1);
         const bool heartbeatDue = s_last.valid && elapsedMs >= 1000ULL;
+        const MenuAssetGateSample& p = s_last.sample;
         const bool changed =
-            !s_last.valid || s_last.mgr != s.mgr || s_last.byte8 != s.byte8 ||
-            s_last.word0c != s.word0c || s_last.cglobal != s.cglobal ||
-            s_last.word47c != s.word47c;
+            !s_last.valid ||
+            p.mgrCell.ok != s.mgrCell.ok ||
+            p.mgrCell.value != s.mgrCell.value ||
+            p.mgr.ok != s.mgr.ok || p.mgr.value != s.mgr.value ||
+            p.byte8.ok != s.byte8.ok || p.byte8.value != s.byte8.value ||
+            p.word0c.ok != s.word0c.ok || p.word0c.value != s.word0c.value ||
+            p.cglobalCell.ok != s.cglobalCell.ok ||
+            p.cglobalCell.value != s.cglobalCell.value ||
+            p.cglobal.ok != s.cglobal.ok || p.cglobal.value != s.cglobal.value ||
+            p.word47c.ok != s.word47c.ok ||
+            p.word47c.value != s.word47c.value;
         if (!changed && !heartbeatDue) {
             return;
         }
         s_last.valid = true;
-        s_last.mgr = s.mgr;
-        s_last.byte8 = s.byte8;
-        s_last.word0c = s.word0c;
-        s_last.cglobal = s.cglobal;
-        s_last.word47c = s.word47c;
+        s_last.sample = s;
         s_last.tick = now;
         ++s_lines;
     }

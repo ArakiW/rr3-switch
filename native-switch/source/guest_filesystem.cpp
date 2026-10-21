@@ -6,6 +6,7 @@
 #include "rr3/rr3_md5.hpp"
 #include "bionic_errno.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstdarg>
@@ -15,8 +16,11 @@
 #include <cstring>
 #include <dirent.h>
 #include <fcntl.h>
+#include <string>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <utility>
+#include <vector>
 
 namespace rr3 {
 namespace {
@@ -175,6 +179,24 @@ constexpr Volume kVolumes[kExternalDataVolumeCount] = {
 struct Resolution {
     char primary[0x600]{};
     char fallback[0x600]{};
+    // NO THIRD SLOT, AND THAT IS A MEASURED DECISION.
+    //
+    // A third 1,536-byte path was tried here and the guest STOPPED BOOTING:
+    // 0 "phase=guest-log-any" lines in 200 s against 2,933 in a healthy run,
+    // with the self-test mask still 0x1fff and the port's own boot work
+    // (45 asset-list entries, 58 manifest assets) completing normally.
+    //
+    // The reason is the struct's SIZE. A Resolution lives on the stack of
+    // every path-taking entry point, and those entry points run on the
+    // GUEST's threads, whose stacks are the guest's own (Android-sized) ones.
+    // Growing the struct by 1,536 bytes multiplies that by the depth of the
+    // port's own call chain (guestFopen -> resolvePath -> resolvePathImpl ->
+    // withReadFallback), and the guest died before it ever entered the
+    // bridge.
+    //
+    // The two slots are enough: the card-first order puts the card's two
+    // trees in them, and the app-local card copy of the primary is still
+    // reachable as the derived candidate at the END of the read chain.
     bool readOnly{};
     bool mapped{};
 };
@@ -791,6 +813,265 @@ bool isCacheRelative(const char* relative) {
 
 constexpr const char* kAppRoot = "sdmc:/switch/rr3-native-rehost";
 
+// ---------------------------------------------------------------------------
+// THE DOUBLED-DEVICE-PATH RULE.
+//
+// A guest path that already names a device ("sdmc:/...") and then names one
+// AGAIN -- or repeats the app root -- is a doubled path. The guest probes
+// each of its search roots with the path it has ALREADY resolved, so
+//
+//   "sdmc:/switch/rr3-native-rehost/.depot/sdmc:/switch/rr3-native-rehost/.depot/vehicles/X"
+//
+// is a real request. MEASURED, archive 20261022-012740-eden-md5list-base-r3:
+// 60 such requests in one run -- 20 under ".depot/", 20 under "apk/res/" and
+// 20 under "doc/" -- and every one of them was answered with errno=22
+// (EINVAL) and printed
+//
+//   unknown error stat(22) checking the path 'sdmc:/switch/rr3-native-rehost/.depot/sdmc:/...'
+//
+// WHY EINVAL: the port mapped the doubled path into a content tree
+// ("rr3core:/files/.depot/sdmc:/switch/...") or handed it to the host
+// verbatim, and the host's FAT layer rejects a path with a second colon in
+// it. The guest's own first probe of the same asset -- the well-formed
+// "<app root>/.depot/vehicles/X" -- succeeds, so the doubled probe is
+// pure loss.
+//
+// THE RULE: a path that carries a second device prefix, or that repeats the
+// app root, is REFUSED here with ENOENT. It is not mapped into a content
+// tree and it is not handed to the host. ENOENT is exactly what the
+// guest's other probes of the same asset already get, so the guest moves on
+// to the next root instead of seeing a hard stat error.
+//
+// THE RULE IS NARROW: only a second device prefix or a repeated app root
+// qualifies. A path that starts with the app root and then names a
+// RELATIVE tail ("<app root>/.depot/vehicles/X") is untouched, and so is
+// every path that does not name a device at all.
+// ---------------------------------------------------------------------------
+bool isDoubledDevicePath(const char* path) {
+    if (path == nullptr) {
+        return false;
+    }
+    const char* first = std::strchr(path, ':');
+    if (first == nullptr) {
+        return false;
+    }
+    const char* rest = first + 1;
+    // A SECOND device prefix: a colon followed by a separator or by the end
+    // of the text. A colon inside a file name is not one.
+    for (const char* cursor = rest; *cursor != '\0'; ++cursor) {
+        if (*cursor != ':') {
+            continue;
+        }
+        const char next = cursor[1];
+        if (next == '\0' || next == '/') {
+            return true;
+        }
+    }
+    // The app root spelled out a second time.
+    return std::strstr(rest, kAppRoot) != nullptr;
+}
+
+constexpr const char* kAssetSegment = "/assets_";
+constexpr const char* kGuiAssetSegment = "/gui_assets/";
+
+// TRUE for a resolution segment: "<digits>x<digits>", optionally followed by
+// a separator. "960x640" and "2048x1536" are resolutions; "assets_something"
+// is not, and must not be rewritten.
+bool isResolutionSegment(const char* text) {
+    if (text == nullptr) {
+        return false;
+    }
+    const char* cursor = text;
+    int digits = 0;
+    while (*cursor >= '0' && *cursor <= '9') {
+        ++cursor;
+        ++digits;
+    }
+    if (digits == 0 || *cursor != 'x') {
+        return false;
+    }
+    ++cursor;
+    digits = 0;
+    while (*cursor >= '0' && *cursor <= '9') {
+        ++cursor;
+        ++digits;
+    }
+    if (digits == 0) {
+        return false;
+    }
+    return *cursor == '\0' || *cursor == '/';
+}
+
+// The "gui_assets/<res>/<rest>" spelling of an "assets_<res>/<rest>" path, or
+// the other way round.
+//
+// THE SEGMENT IS THE FIRST ONE. The tail handed in here has already had the
+// volume's "files/.depot/" prefix dropped, so it starts with "assets_" or
+// "gui_assets/" -- NOT with a separator. The first version of this function
+// searched for "/gui_assets/", with a leading separator, and therefore never
+// matched: the alias silently did nothing, the self-test's two assertions
+// failed, the boot gate saw fsTest=0x1ff9 instead of 0x1fff, and the guest
+// NEVER STARTED (0 "phase=guest-log-any" lines in 200 s, with the port's own
+// boot work completing normally).
+bool alternateAssetSpelling(const char* text, char* out, size_t outSize) {
+    if (text == nullptr || out == nullptr || outSize == 0) {
+        return false;
+    }
+    if (std::strncmp(text, "assets_", 7) == 0) {
+        const char* tail = text + 7;
+        if (!isResolutionSegment(tail)) {
+            return false;
+        }
+        const int written = std::snprintf(out, outSize, "gui_assets/%s", tail);
+        return written > 0 && static_cast<size_t>(written) < outSize;
+    }
+    if (std::strncmp(text, "gui_assets/", 11) == 0) {
+        const char* tail = text + 11;
+        if (!isResolutionSegment(tail)) {
+            return false;
+        }
+        const int written = std::snprintf(out, outSize, "assets_%s", tail);
+        return written > 0 && static_cast<size_t>(written) < outSize;
+    }
+    return false;
+}
+
+// Puts the three card-and-volume candidates of an asset path into the
+// resolution's three slots, in the order the pack endpoint tries them.
+//
+// `contentRelative` is the VOLUME-relative form the resolver was built from
+// ("files/.depot/gui_assets/960x640/common/X" or
+// "files/.depot/assets_960x640/common/X"). The card's own copies are named
+// from the same tail, so the two trees are reached through one rule.
+//
+// FILES ONLY. A DIRECTORY keeps the volume's tree, and that is not a
+// detail: the guest enumerates "<app root>/.depot/gui_assets/<res>" to build
+// its atlas registry, and the card's copy of that tree holds three folders
+// (common, loading_icon, splash) against the volume's fifty-three. Let the
+// card's tree answer the enumeration and the guest's registry collapses.
+//
+// MEASURED 2026-10-22: the first build with the card-first order applied to
+// every path did NOT boot -- 0 "phase=guest-log-any" lines in 200 s against
+// 2,933 in a healthy run, with the self-test mask still 0x1fff. The
+// distinguishing property of a FILE here is its extension: every file in
+// these trees is named "<something>.<ext>" ("sprites.android.atlas",
+// "sprites_0.rgb.pvr.z", "GlobalStyles.gui") and no directory in them is.
+void applyCardFirstAssetOrder(Resolution& resolution, const char* contentRelative) {
+    if (contentRelative == nullptr) {
+        return;
+    }
+    // A FILE has an extension in its last segment; a directory does not.
+    const char* leaf = std::strrchr(contentRelative, '/');
+    leaf = (leaf != nullptr) ? leaf + 1 : contentRelative;
+    if (std::strchr(leaf, '.') == nullptr) {
+        return;
+    }
+    // The card's relative tail: the volume's "files/.depot/" prefix dropped.
+    const char* tail = contentRelative;
+    const char* prefix = "files/.depot/";
+    if (std::strncmp(tail, prefix, std::strlen(prefix)) == 0) {
+        tail += std::strlen(prefix);
+    }
+    // The OTHER spelling of the same logical asset, on the card and in the
+    // volume.
+    char other[0x500]{};
+    if (!alternateAssetSpelling(tail, other, sizeof(other))) {
+        return;
+    }
+    char cardOwn[0x600]{};
+    std::snprintf(cardOwn, sizeof(cardOwn), "%s/.depot/%s", kAppRoot, tail);
+    char cardOther[0x600]{};
+    std::snprintf(cardOther, sizeof(cardOther), "%s/.depot/%s", kAppRoot, other);
+
+    // THE CARD'S "assets_<res>" TREE IS ALWAYS THE PRIMARY, for BOTH
+    // spellings, and the card's "gui_assets/<res>" tree is the fallback.
+    //
+    // WHY IT CANNOT BE THE PATH'S OWN SPELLING: the card's gui_assets tree
+    // holds the guest's own DOWNLOADS, and a download that was served from an
+    // older revision leaves a STALE copy there. MEASURED 2026-10-22: the
+    // card's .depot/gui_assets/960x640/common/sprites_0.rgb.pvr.z was
+    // 471,920 B with md5 4e063961 (the volume's revision, downloaded by an
+    // earlier build), while the card's
+    // .depot/assets_960x640/common/sprites_0.rgb.pvr.z is 574,733 B with md5
+    // 09ec9c79 -- and the update list names 09ec9c79. So the base list and
+    // the update list named two different digests for the same texture, the
+    // guest compared one against the other, and the asset failed with
+    // "didn't match its MD5".
+    //
+    // With the card's assets_<res> tree first, BOTH spellings name the same
+    // file, and it is the one the server's update list describes.
+    char cardAssets[0x600]{};
+    char cardGui[0x600]{};
+    if (std::strncmp(tail, "gui_assets/", 11) == 0) {
+        std::snprintf(cardGui, sizeof(cardGui), "%s", cardOwn);
+        std::snprintf(cardAssets, sizeof(cardAssets), "%s", cardOther);
+    }
+    else {
+        std::snprintf(cardAssets, sizeof(cardAssets), "%s", cardOwn);
+        std::snprintf(cardGui, sizeof(cardGui), "%s", cardOther);
+    }
+    std::snprintf(resolution.primary, sizeof(resolution.primary), "%s", cardAssets);
+    std::snprintf(resolution.fallback, sizeof(resolution.fallback), "%s", cardGui);
+    resolution.readOnly = true;
+    resolution.mapped = true;
+}
+
+// THE DIGEST HELPER FOR THE ".ast" INSTRUMENT.
+//
+// rr3::md5File() reads into "unsigned char buffer[64 * 1024]" -- 64 KiB OF
+// STACK. Called from the guest's thread, inside the guest's own call chain,
+// that is a stack fault waiting for the asset-download phase: the guest dies,
+// Eden exits on its own, and the run is 92 seconds long.
+//
+// This one reads 4 KiB at a time out of a FILE-SCOPE buffer, so it costs the
+// guest's stack NOTHING.
+//
+// The buffer is not reentrant, and two threads may hash at once. That is
+// acceptable for a diagnostic: the flag makes the second caller skip the
+// digest rather than report a torn one.
+bool digestFileShallow(const char* path, char out[33], size_t outSize,
+                       unsigned long long* sizeOut) {
+    static unsigned char buffer[4 * 1024];
+    static volatile bool busy = false;
+    if (path == nullptr || out == nullptr || outSize < 33) {
+        return false;
+    }
+    if (busy) {
+        out[0] = '\0';
+        return false;
+    }
+    busy = true;
+    std::FILE* file = std::fopen(path, "rb");
+    if (file == nullptr) {
+        busy = false;
+        return false;
+    }
+    Md5 digest;
+    digest.begin();
+    unsigned long long total = 0;
+    for (;;) {
+        const size_t got = std::fread(buffer, 1, sizeof(buffer), file);
+        if (got > 0) {
+            digest.update(buffer, got);
+            total += got;
+        }
+        if (got < sizeof(buffer)) {
+            break;
+        }
+    }
+    const bool failed = std::ferror(file) != 0;
+    std::fclose(file);
+    busy = false;
+    if (failed) {
+        return false;
+    }
+    digest.finish(out);
+    if (sizeOut != nullptr) {
+        *sizeOut = total;
+    }
+    return true;
+}
+
 // THE APP-LOCAL PATH for a resolved path. ONE function, used by BOTH the
 // write redirect and the read fallback, so the two CANNOT disagree.
 //
@@ -877,6 +1158,10 @@ void redirectWriteToAppLocal(Resolution& resolution) {
     if (std::strcmp(local, resolution.primary) == 0) {
         // Already app-local: nothing to move, and nothing to unlock.
         resolution.readOnly = false;
+        // A WRITE has no candidate chain: the file it writes is the one the
+        // guest named. Leaving the other slots filled would let a later read
+        // of the same path answer from a different tree.
+        resolution.fallback[0] = '\0';
         return;
     }
     ensureParentDirectories(local);
@@ -895,8 +1180,16 @@ void redirectWriteToAppLocal(Resolution& resolution) {
 // absolute sdmc: paths under it. isDevicePath used to pass those straight to
 // FAT, so files/.depot/gui_assets/** never reached the seven romfs volumes.
 // Save trees (doc/, cache/, .depot/CC_Data, *.dat) stay on SD.
-bool mapAppRootToContent(const char* path, Resolution& resolution) {
+bool mapAppRootToContent(const char* path, bool writing, Resolution& resolution) {
     if (path == nullptr || !startsWith(path, kAppRoot)) {
+        return false;
+    }
+    // THE DOUBLED-PATH EXEMPTION. A path that names a device twice, or that
+    // repeats the app root, is refused HERE -- before any content tree is
+    // built out of it. See the note on isDoubledDevicePath() for the
+    // measurement and for why the answer is ENOENT and not EINVAL.
+    if (isDoubledDevicePath(path)) {
+        errno = kGuestErrnoENOENT;
         return false;
     }
     const char* rest = path + std::strlen(kAppRoot);
@@ -1071,6 +1364,29 @@ bool mapAppRootToContent(const char* path, Resolution& resolution) {
     }
     const bool ok = writeContentPath(resolution.primary, sizeof(resolution.primary),
                                      effectiveRelative);
+    // THE APP-ROOT FORM IS NOT ALIASED, AND THAT IS DELIBERATE.
+    //
+    // The card-first order belongs to the ASSET path space -- the relative
+    // forms the pack endpoint and the manifest rewrite use. The app-root form
+    // is what the guest's RUNTIME reads use, and the runtime reads the
+    // volume's copy of the tree: the volume's 960x640 "common" atlas has 248
+    // image entries and carries gradient.png, common_info_button.png,
+    // fb_logo.png, apple_sign_in_icon.png and btn_google_play_login.png, and
+    // the card's copy of the same file has 165 entries and NONE of them
+    // (searched for the literal names in both files' bytes).
+    //
+    // MEASURED: aliasing the app-root form as well cost the guest 20 "Failed
+    // to load image from atlas" errors over those ten sprites (archive
+    // 20261022-031343-eden-gfsalias-r1), and the run did not boot at all when
+    // the alias was applied to DIRECTORIES as well (0 "guest-log-any" lines
+    // in 200 s against 2,933 in a healthy run, with the self-test mask still
+    // 0x1fff). The asset path space and the runtime path space are different
+    // jobs, and the md5 check is the asset path space's job alone.
+    //
+    // The .ast ROUND TRIP still works here: the primary is the volume's path,
+    // so the write lands on the card's app-local copy of it (appLocalPath),
+    // and the read-back reaches the same card copy through the derived
+    // candidate -- the same file, by construction.
     // THE 2048x1536 -> 960x640 RULE, AS A FALLBACK AND NOT AS A REWRITE.
     //
     // It is decided here, once, and applied below: the request for a
@@ -1523,8 +1839,23 @@ bool resolvePathImpl(const char* path, bool writing, Resolution& resolution) {
         return true;
     }
     if (isDevicePath(path) || isSystemPath(path)) {
-        if (mapAppRootToContent(path, resolution)) {
+        if (mapAppRootToContent(path, writing, resolution)) {
             return true;
+        }
+        // THE DOUBLED-PATH EXEMPTION, second line of defence.
+        //
+        // mapAppRootToContent() refuses a doubled path, but it refuses it by
+        // returning false, and the line below would then hand the path to the
+        // host VERBATIM -- and the host's FAT layer answers a path with a
+        // second colon in it with EINVAL, which the guest reports as
+        // "unknown error stat(22) checking the path '...'".
+        //
+        // So the refusal has to survive the fallthrough: a doubled path is
+        // ENOENT, the same answer the guest's other, well-formed probes of
+        // the same asset get. See isDoubledDevicePath().
+        if (isDoubledDevicePath(path)) {
+            errno = kGuestErrnoENOENT;
+            return false;
         }
         std::snprintf(resolution.primary, sizeof(resolution.primary), "%s", path);
         return true;
@@ -1578,7 +1909,36 @@ bool resolvePathImpl(const char* path, bool writing, Resolution& resolution) {
         std::snprintf(prefixed, sizeof(prefixed), "files/%s", relative);
         resolution.readOnly = true;
         resolution.mapped = true;
-        return writeContentPath(resolution.primary, sizeof(resolution.primary), prefixed);
+        if (!writeContentPath(resolution.primary, sizeof(resolution.primary),
+                              prefixed)) {
+            return false;
+        }
+        // THE CARD-FIRST ORDER, ON THE ASSET PATH SPACE ONLY.
+        //
+        // This branch is the one the pack endpoint and the manifest rewrite
+        // use: their candidates are named ".depot/<...>", with no "files/"
+        // prefix. The guest's own runtime requests are named
+        // "files/.depot/<...>" (the api-touch trace shows
+        // "files/.depot/gui_assets/480x320/...") and they are a DIFFERENT
+        // job: the guest renders from the volume's tree, and the volume's
+        // 960x640 "common" atlas has 248 image entries and carries
+        // gradient.png, common_info_button.png, fb_logo.png,
+        // apple_sign_in_icon.png and btn_google_play_login.png, where the
+        // card's copy of the same file has 165 entries and NONE of them
+        // (searched for the literal names in both files' bytes).
+        //
+        // MEASURED: aliasing the guest's runtime form as well cost the guest
+        // 20 "Failed to load image from atlas" errors over those ten sprites
+        // (archive 20261022-031343-eden-gfsalias-r1), and a build that
+        // aliased DIRECTORIES as well did not boot at all (0 "guest-log-any"
+        // lines in 200 s against 2,933 in a healthy run, with the self-test
+        // mask still 0x1fff).
+        //
+        // So: the asset path space gets the card's copy, the runtime path
+        // space keeps the volume's, and the two lists and the endpoint all
+        // name the same bytes because they all live in the asset path space.
+        applyCardFirstAssetOrder(resolution, prefixed);
+        return true;
     }
     if (startsWith(relative, "res/")) {
         char prefixed[0x500]{};
@@ -1610,6 +1970,13 @@ bool resolvePathImpl(const char* path, bool writing, Resolution& resolution) {
                               contentRelative)) {
             return false;
         }
+        // NO CARD-FIRST ORDER HERE. This branch serves the guest's own
+        // runtime requests -- "files/.depot/<...>", the form the api-touch
+        // trace shows -- and those keep the volume's copy, which is the
+        // revision the guest's atlas registry is built from. The asset path
+        // space (the ".depot/<...>" form, one branch up) is where the card's
+        // copy belongs. See the note on the branch above.
+        //
         // THE 2048x1536 -> 960x640 FALLBACK, for the RELATIVE form of the
         // request. mapAppRootToContent() has the same rule for the app-root
         // form; this is the same rule on the other path into the resolver,
@@ -1620,7 +1987,8 @@ bool resolvePathImpl(const char* path, bool writing, Resolution& resolution) {
         // the manifest's md5s describe -- and the 960x640 copy on the SD volume
         // answers when the HD tree does not have the file. See the long note
         // in mapAppRootToContent() and in rewriteGuiResolutionPath().
-        if (startsWith(contentRelative, "files/.depot/gui_assets/2048x1536")) {
+        if (startsWith(contentRelative, "files/.depot/gui_assets/2048x1536") &&
+            resolution.fallback[0] == '\0') {
             char alias[0x500]{};
             const char* const kHd = "files/.depot/gui_assets/2048x1536";
             const char* const kSd = "files/.depot/gui_assets/960x640";
@@ -1919,6 +2287,72 @@ const char* completedManifestPath() {
     return gCompletedManifestReady ? kCompletedManifestPath : nullptr;
 }
 
+// The asset paths the guest has downloaded, one per line.
+constexpr const char* kAssetPathFile =
+    "sdmc:/switch/rr3-native-rehost/cache/asset_paths.txt";
+
+// The asset paths the guest has asked for, with the digest of the bytes the
+// port serves for each of them.
+//
+// ONE function, used by BOTH the base-list rewrite and the completed
+// gui-assets manifest, so the two cannot disagree about a digest.
+//
+// The digest comes from the SAME resolver the pack endpoint uses, so the
+// bytes a list names and the bytes the endpoint sends are the same bytes by
+// construction.
+void collectAssetOverrides(std::vector<std::pair<std::string, std::string>>& out) {
+    out.clear();
+    std::vector<std::string> requested;
+    std::FILE* file = std::fopen(kAssetPathFile, "rb");
+    if (file == nullptr) {
+        return;
+    }
+    char line[1024];
+    while (std::fgets(line, sizeof(line), file) != nullptr) {
+        std::string path = line;
+        while (!path.empty() &&
+               (path.back() == '\n' || path.back() == '\r')) {
+            path.pop_back();
+        }
+        size_t begin = 0;
+        while (begin < path.size() && path[begin] == '/') {
+            ++begin;
+        }
+        if (begin >= path.size()) {
+            continue;
+        }
+        path = "/" + path.substr(begin);
+        if (path[0] != '/') {
+            continue;
+        }
+        requested.push_back(path);
+    }
+    std::fclose(file);
+    // DEDUPLICATE BEFORE RESOLVING. The card's asset_paths.txt is APPENDED to
+    // on every download, so it carries the same path many times over:
+    // MEASURED 2026-10-22, 1,388 lines and 47 distinct paths. Resolving every
+    // line read and hashed the same file 1,388 times.
+    std::sort(requested.begin(), requested.end());
+    requested.erase(std::unique(requested.begin(), requested.end()),
+                    requested.end());
+    for (const std::string& path : requested) {
+        char source[0x600]{};
+        char digest[33]{};
+        unsigned long long size = 0;
+        if (!resolveAssetLocalFile(path.c_str(), source, sizeof(source), digest,
+                                  &size)) {
+            continue;
+        }
+        out.emplace_back(path, std::string(digest));
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+}
+
+// A forward declaration: the definition sits next to the base-list rewrite,
+// where the recorded-path file is in scope.
+void collectAssetOverrides(std::vector<std::pair<std::string, std::string>>& out);
+
 // Build the completed manifest and write it to the card. Returns true when
 // the completed file exists and can be served.
 bool buildCompletedGuiAssetsManifest() {
@@ -2008,6 +2442,86 @@ bool buildCompletedGuiAssetsManifest() {
     if (used > 0 && text[used - 1] != '\n') {
         text[used++] = '\n';
     }
+    // 2b. THE SHIPPED LINES' MD5 COLUMN, FOR THE ASSETS THE GUEST ASKS FOR.
+    //
+    // THE GUEST CHECKS ITS DOWNLOAD AGAINST *THIS* MANIFEST. The shipped
+    // manifest (files/apk/res/asset_list_gui_assets_core.txt, 365,312 B, 3,292
+    // entries) carries EA's own digests for the game's own build, and the port
+    // serves a DIFFERENT revision of some of those files -- so the guest
+    // compared the bytes it received against a digest that names bytes this
+    // port does not have, and answered "didn't match its MD5".
+    //
+    // MEASURED: the shipped manifest names
+    //   /gui_assets/960x640/common/sprites.android.atlas
+    // with md5 bba63527235d60c88863fa10e111abc6, which is NEITHER the
+    // card's copy (43213527..., 24,689 B) NOR the volume's (c7256882...,
+    // 39,199 B). No bytes the port can serve match it, so the asset could
+    // never pass its own check.
+    //
+    // The rewrite touches only the paths the guest actually asked for (47 of
+    // them, MEASURED), so the manifest keeps its shipped layout, its entry
+    // count and its order -- only the md5 and the size of an entry the port
+    // serves differently change, and they change to the digest of the file
+    // the port really serves there.
+    {
+        std::vector<std::pair<std::string, std::string>> overrides;
+        collectAssetOverrides(overrides);
+        if (!overrides.empty()) {
+            const auto byPath = [](const std::pair<std::string, std::string>& entry,
+                                  const std::string& path) {
+                return entry.first < path;
+            };
+            std::string patched;
+            patched.reserve(used + 4096);
+            size_t position = 0;
+            unsigned patchedCount = 0;
+            while (position < used) {
+                const size_t end = std::strchr(text + position, '\n') != nullptr
+                    ? (std::strchr(text + position, '\n') - text) : used;
+                const std::string line(text + position, end - position);
+                position = (end < used) ? end + 1 : used;
+                const size_t tab = line.find('\t');
+                if (tab == std::string::npos) {
+                    patched += line;
+                    patched += '\n';
+                    continue;
+                }
+                const std::string path = line.substr(0, tab);
+                auto it = std::lower_bound(overrides.begin(), overrides.end(),
+                                           path, byPath);
+                if (it == overrides.end() || it->first != path) {
+                    patched += line;
+                    patched += '\n';
+                    continue;
+                }
+                // THE PORT-SERVED DIGEST, and the size the port really sends.
+                char source[0x600]{};
+                char digest[33]{};
+                unsigned long long size = 0;
+                if (!resolveAssetLocalFile(path.c_str(), source, sizeof(source),
+                                          digest, &size)) {
+                    patched += line;
+                    patched += '\n';
+                    continue;
+                }
+                patched += path;
+                patched += '\t';
+                patched += digest;
+                patched += '\t';
+                patched += std::to_string(size);
+                patched += '\t';
+                patched += std::to_string(size);
+                patched += '\n';
+                ++patchedCount;
+            }
+            std::memcpy(text, patched.data(), patched.size());
+            used = patched.size();
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                "manifest-patch", patchedCount, 0,
+                                "the shipped gui-assets manifest's md5 column "
+                                "rewritten to the port-served digests");
+        }
+    }
     unsigned emitted = 0;
     unsigned absent = 0;
     unsigned logged = 0;
@@ -2019,7 +2533,32 @@ bool buildCompletedGuiAssetsManifest() {
         unsigned long long size = 0;
         bool found = false;
         const char* source = nullptr;
-        for (unsigned candidate = 0; candidate < candidateCount; ++candidate) {
+        // THE RESOLVER FIRST.
+        //
+        // The manifest's md5 has to describe the bytes the guest will READ
+        // for that path, and the guest reads through the resolver -- so the
+        // manifest has to ask the resolver, not the volume directly.
+        //
+        // It matters because of the GUI-ASSETS SPELLING ALIAS: the two
+        // spellings of one logical asset now answer with ONE file, and that
+        // file is the card's copy of it (the revision the server's update
+        // list describes). A manifest that named the volume's copy would
+        // name bytes the guest can no longer read, and the guest's own
+        // validation of the manifest would fail on the difference.
+        //
+        // The explicit volume candidates stay as the FALLBACK, for the files
+        // the resolver cannot reach at all (the volume's
+        // files/apk/res/gui_assets/<res>/ tree holds .rgb.pvr.z files the
+        // gui_assets tree does not).
+        {
+            char resolved[0x600]{};
+            if (resolveAssetLocalFile(assets[index].logical, resolved,
+                                      sizeof(resolved), digest, &size)) {
+                found = true;
+                source = resolved;
+            }
+        }
+        for (unsigned candidate = 0; !found && candidate < candidateCount; ++candidate) {
             struct stat info{};
             if (::stat(candidates[candidate], &info) != 0) {
                 continue;
@@ -2115,6 +2654,225 @@ bool isGuiAssetsManifestPath(const char* guestPath) {
            std::strcmp(pathBasename(guestPath), kGuiAssetsManifestLeaf) == 0;
 }
 
+// The asset list the guest checks its downloads against. The guest's own log
+// names it: "Assets are added asset_list_updates.txt".
+constexpr const char* kUpdatesListLeaf = "asset_list_updates.txt";
+// The guest path the list is read under.
+constexpr const char* kUpdatesListGuestPath = "files/.depot/asset_list_updates.txt";
+// The rewritten copy, on the card. The cache root is already a writable root
+// (ensureWritableRoots), so this needs no new directory.
+//
+// IT IS NOT WRITTEN OVER THE ORIGINAL on purpose: the guest owns
+// .depot/asset_list_updates.txt and may write it, and a rewritten copy that
+// the guest can overwrite would put the server's md5s back. This copy is
+// served INSTEAD of the original, the same way the completed gui-assets
+// manifest is.
+constexpr const char* kConsistentListPath =
+    "sdmc:/switch/rr3-native-rehost/cache/asset_list_updates.txt";
+constexpr const char* kConsistentListTempPath =
+    "sdmc:/switch/rr3-native-rehost/cache/asset_list_updates.txt.tmp";
+
+// The rewritten list, when there is one. Empty until the build finishes.
+const char* gConsistentListServed = nullptr;
+
+// True when the guest path is the asset list the port rewrites.
+bool isConsistentListPath(const char* guestPath) {
+    return guestPath != nullptr &&
+           std::strcmp(pathBasename(guestPath), kUpdatesListLeaf) == 0;
+}
+
+// ---------------------------------------------------------------------------
+// THE BASE ASSET LIST -- THE BIG ONE -- AND THE LAZY WAY TO KEEP IT TRUE.
+//
+// WHY IT EXISTS.
+//
+//   The guest does not only read asset_list_updates.txt. It also reads
+//   files/.depot/asset_list_base.txtCache.txt (4,212,795 B, 40,862 entries,
+//   "<path>\t<md5>") and uses THAT list's md5s for the assets it downloads
+//   next -- the sprite atlases, MEASURED 2026-10-22 in archive
+//   20261022-005538-eden-md5list-r3: the guest wrote
+//   .depot/gui_assets/960x640/splash/formula_e/sprites.android.atlas.ast.
+//
+//   MEASURED, and this is the finding that makes the rewrite necessary: that
+//   list describes the SERVER's newer revision, and the port's bytes are the
+//   260530 build. For /gui_assets/960x640/splash/formula_e/
+//   sprites.android.atlas the list says 98e585e2... and the file the port
+//   serves hashes to b8a3896c... -- so the guest's md5 check would fail on
+//   every atlas. (For most of the OTHER entries -- /crew.bin, /economy.bin,
+//   the tracks, the vehicles -- the list's md5 DOES match the port's bytes,
+//   because those files came out of the same data pack. The atlases are the
+//   ones the server has moved on from.)
+//
+// THE COST, MEASURED, AND WHY THE REWRITE CANNOT BE DONE IN FULL AT BOOT.
+//
+//   Every one of the 40,862 entries resolves to a local file, and together
+//   they are 9.394 GB (measured on the deployed data set, 2026-10-21). Hashing
+//   that on Eden costs 22-45 MB/s -- the update list's 3.894 GB... no: its
+//   3.894 MB took 173 ms, which is 22.5 MB/s -- so the full rewrite is
+//   210-420 SECONDS of boot time. The guest is on the critical path and a
+//   multi-second stall is not acceptable, so the full rewrite is out.
+//
+//   So the rewrite is LAZY, and it is driven by the one thing the port knows
+//   for certain: WHICH ASSETS THE GUEST ACTUALLY ASKED FOR. The guest writes
+//   every downloaded asset to "<asset path>.ast" before it checks it, so the
+//   filesystem layer sees the asset path at the moment it is asked for -- no
+//   change to the Cloudcell layer is needed, and the record is on the card
+//   before the guest can ask again.
+//
+//   The recorded paths are hashed ONCE, at the next boot, and the base list is
+//   rewritten with those digests. The entries the guest has not asked for
+//   keep the server's md5, which is what they are today: the port is not
+//   claiming to have them.
+//
+// THE SPELLING. The two lists spell the same file two ways: the update list
+//   says "/assets_2048x1536/common/sprites.android.atlas" and the base list
+//   says "/gui_assets/2048x1536/common/sprites.android.atlas". They are the
+//   same file -- that is exactly what the resolver's third candidate says
+//   ("files/.depot/gui_assets/<res>" + rest) -- so a lookup that misses is
+//   retried with the other spelling.
+// ---------------------------------------------------------------------------
+
+// The base asset list, the leaf the guest reads it under.
+constexpr const char* kBaseListLeaf = "asset_list_base.txtCache.txt";
+// The guest path the base list is read under.
+constexpr const char* kBaseListGuestPath = "files/.depot/asset_list_base.txtCache.txt";
+// The rewritten base list, on the card.
+constexpr const char* kConsistentBaseListPath =
+    "sdmc:/switch/rr3-native-rehost/cache/asset_list_base.txtCache.txt";
+// The key of the override set the rewritten base list was built from.
+// Beside the list itself, so a card that is wiped loses the cache with it.
+constexpr const char* kBaseListKeyPath =
+    "sdmc:/switch/rr3-native-rehost/cache/asset_list_base.txtCache.txt.key";
+
+// TRUE when the rewritten base list on the card was built from THIS override
+// set, and the pass can be skipped.
+//
+// The rewritten list is a pure function of the shipped list (read-only, never
+// changes) and the override set, so an unchanged override set means the
+// file on the card is already correct. The key file is 33 bytes; reading it
+// and the list's own size is the whole cost of the check.
+//
+// The list's OWN size is checked too, because the key alone would happily
+// bless a list that was deleted or truncated after the key was written.
+bool baseListCacheIsCurrent(const char* key) {
+    if (key == nullptr || key[0] == '\0') {
+        return false;
+    }
+    std::FILE* keyFile = std::fopen(kBaseListKeyPath, "rb");
+    if (keyFile == nullptr) {
+        return false;
+    }
+    char stored[64]{};
+    size_t got = std::fread(stored, 1, sizeof(stored) - 1, keyFile);
+    std::fclose(keyFile);
+    if (got == 0) {
+        return false;
+    }
+    while (got > 0 && (stored[got - 1] == '\n' || stored[got - 1] == '\r' ||
+                       stored[got - 1] == ' ')) {
+        stored[--got] = '\0';
+    }
+    if (std::strcmp(stored, key) != 0) {
+        return false;
+    }
+    struct stat info{};
+    if (::stat(kConsistentBaseListPath, &info) != 0 || info.st_size <= 0) {
+        return false;
+    }
+    return true;
+}
+
+// Records the override set the rewritten base list was built from.
+void writeBaseListCacheKey(const char* key) {
+    if (key == nullptr || key[0] == '\0') {
+        return;
+    }
+    char tempPath[0x600]{};
+    std::snprintf(tempPath, sizeof(tempPath), "%s.tmp", kBaseListKeyPath);
+    std::FILE* file = std::fopen(tempPath, "wb");
+    if (file == nullptr) {
+        return;
+    }
+    std::fprintf(file, "%s\n", key);
+    std::fclose(file);
+    std::remove(kBaseListKeyPath);
+    std::rename(tempPath, kBaseListKeyPath);
+}
+
+// The rewritten base list, when there is one.
+const char* gConsistentBaseListServed = nullptr;
+
+// True when the guest path is the base asset list the port rewrites.
+bool isConsistentBaseListPath(const char* guestPath) {
+    return guestPath != nullptr &&
+           std::strcmp(pathBasename(guestPath), kBaseListLeaf) == 0;
+}
+
+// THE ASSET PATH behind a guest path, in the spelling the asset lists use.
+//
+// The guest writes a downloaded asset to "<asset path>.ast", under its own
+// app root ("sdmc:/switch/rr3-native-rehost/.depot/...") or under the depot
+// root ("files/.depot/..."). Both are stripped, and the ".ast" goes, so what
+// is left is the path the lists name.
+bool assetPathFromGuestPath(const char* guestPath, char* out, size_t outSize) {
+    if (guestPath == nullptr || out == nullptr || outSize == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    std::string path = guestPath;
+    // The ".ast" suffix.
+    if (path.size() < 5u || path.compare(path.size() - 4u, 4u, ".ast") != 0) {
+        return false;
+    }
+    path.erase(path.size() - 4u);
+    // The app root, then the depot root.
+    const std::string appRoot = std::string(kAppRoot) + "/.depot/";
+    const std::string depotRoot = "files/.depot/";
+    size_t start = 0;
+    if (path.compare(0, appRoot.size(), appRoot) == 0) {
+        start = appRoot.size();
+    }
+    else if (path.compare(0, depotRoot.size(), depotRoot) == 0) {
+        start = depotRoot.size();
+    }
+    else {
+        return false;
+    }
+    if (start >= path.size()) {
+        return false;
+    }
+    // The guest joins a directory that ends in "/" with a name that starts
+    // in "/", so the remainder can begin with a second separator. MEASURED:
+    // the first version of this wrote "//MenuBannerData.xml" and every one
+    // of those keys missed the list, so the rewrite changed nothing.
+    while (start < path.size() && path[start] == '/') {
+        ++start;
+    }
+    if (start >= path.size()) {
+        return false;
+    }
+    const int written = std::snprintf(out, outSize, "/%s", path.c_str() + start);
+    return written > 0 && static_cast<size_t>(written) < outSize;
+}
+
+// Record the asset path the guest has just downloaded.
+//
+// THE CARD IS THE MEMORY: the list has to survive the run, because the
+// rewrite happens at the NEXT boot -- the guest has already read the list by
+// the time it downloads anything.
+void recordAssetPath(const char* guestPath) {
+    char assetPath[512];
+    if (!assetPathFromGuestPath(guestPath, assetPath, sizeof(assetPath))) {
+        return;
+    }
+    std::FILE* file = std::fopen(kAssetPathFile, "a");
+    if (file == nullptr) {
+        return;
+    }
+    std::fprintf(file, "%s\n", assetPath);
+    std::fclose(file);
+}
+
 template <typename Callback>
 int withReadFallback(const Resolution& resolution, const char* guestPath,
                      Callback callback, const char** servedOut = nullptr) {
@@ -2155,7 +2913,11 @@ int withReadFallback(const Resolution& resolution, const char* guestPath,
         }
         return rc;
     };
+    // THE TWO CANDIDATES: the volume primary and its alias. The app-local
+    // card copy of the primary is still tried at the END of the chain (see
+    // below), which is where the guest's own downloads live.
     const char* const candidates[2] = {resolution.primary, resolution.fallback};
+    const int candidateCount = 2;
     int result = -1;
     int firstError = ENOENT;
     // THE COMPLETED GUI-ASSETS MANIFEST, SERVED INSTEAD OF THE VOLUME COPY.
@@ -2205,7 +2967,50 @@ int withReadFallback(const Resolution& resolution, const char* guestPath,
             }
         }
     }
-    for (int i = 0; i < 2; ++i) {
+    // THE CONSISTENT ASSET LISTS, served INSTEAD of the shipped ones.
+    //
+    // The guest MD5s what it receives and compares it with the md5 in an
+    // asset list, so that list has to describe the bytes the port serves --
+    // and the port serves the bytes it has. The rewritten copies are on the
+    // card and are offered FIRST, so the guest never reads the shipped list.
+    //
+    // They are offered before the volume candidates and not after them
+    // because the shipped copies live on READ-ONLY volumes: the rewritten
+    // copies are the only ones the port can write, so they have to be the
+    // ones it serves.
+    {
+        const char* consistent = nullptr;
+        if (gConsistentListServed != nullptr && isConsistentListPath(guestPath)) {
+            consistent = gConsistentListServed;
+        }
+        else if (gConsistentBaseListServed != nullptr &&
+                 isConsistentBaseListPath(guestPath)) {
+            consistent = gConsistentBaseListServed;
+        }
+        if (consistent != nullptr) {
+            ++attempts;
+            const int rc = attempt(consistent);
+            {
+                char diag[640];
+                std::snprintf(diag, sizeof(diag),
+                              "guest=%.200s consistent=%.200s rc=%d errno=%d",
+                              guestPath != nullptr ? guestPath : "-",
+                              consistent, rc, errno);
+                appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                    "assetlist-serve", 0, 0, diag);
+            }
+            if (rc == 0) {
+                if (servedOut != nullptr) {
+                    *servedOut = consistent;
+                }
+                if (assetList) {
+                    logAssetListRequest(guestPath, resolution, false, 0, lastErrno);
+                }
+                return 0;
+            }
+        }
+    }
+    for (int i = 0; i < candidateCount; ++i) {
         const char* candidate = candidates[i];
         if (candidate == nullptr || candidate[0] == '\0') {
             continue;
@@ -2217,6 +3022,73 @@ int withReadFallback(const Resolution& resolution, const char* guestPath,
             }
             if (assetList) {
                 logAssetListRequest(guestPath, resolution, false, 0, lastErrno);
+            }
+            // THE ".ast" ROUND-TRIP INSTRUMENT.
+            //
+            // One line that says, for a path ending in ".ast": what the guest
+            // asked for, which candidate answered, the SIZE and the MD5 of
+            // the bytes that came back, and -- for the card candidate -- the
+            // size and the md5 of the file that is PHYSICALLY on the card at
+            // that path.
+            //
+            // WHY IT IS NEEDED: the "size=" field of the open trace is the
+            // stat of the PRIMARY, so a read-back that was answered by a
+            // different file looks like a successful open of the right size.
+            // That is the instrument mistake this project keeps making, and
+            // it is the one that left the "the write did not persist" and "the
+            // read served the wrong file" hypotheses indistinguishable.
+            //
+            // NO STACK, AND THAT IS THE POINT. The FIRST version of this
+            // instrument called rr3::md5File(), whose buffer is
+            // "unsigned char buffer[64 * 1024]" -- 64 KiB OF STACK, on the
+            // GUEST's thread, inside the guest's own call chain. The guest
+            // died with a stack fault during the asset-download phase (the
+            // phase the .ast read-back happens in), Eden exited on its own,
+            // and three runs in a row died that way: 163 s, 92 s, 92 s, with
+            // the guest's log stopping mid-"StartListDownload()". The port's
+            // own frames are a few kilobytes; 64 KiB is not.
+            //
+            // So the digest is computed here, from a file-scope buffer, with
+            // a 4 KiB read chunk and no allocation on the stack at all.
+            if (guestPath != nullptr && std::strstr(guestPath, ".ast") != nullptr) {
+                char digest[33] = {0};
+                unsigned long long bytes = 0;
+                if (digestFileShallow(candidate, digest, sizeof(digest), &bytes)) {
+                    char cardSize[32] = {"-"};
+                    char cardDigest[40] = {"-"};
+                    for (int slot = 0; slot < candidateCount; ++slot) {
+                        const char* cardCandidate = candidates[slot];
+                        if (cardCandidate == nullptr || cardCandidate[0] == '\0') {
+                            continue;
+                        }
+                        if (std::strncmp(cardCandidate, "sdmc:", 5) != 0) {
+                            continue;
+                        }
+                        struct stat onCard{};
+                        if (::stat(cardCandidate, &onCard) != 0) {
+                            continue;
+                        }
+                        char cardMd5[33] = {0};
+                        if (!digestFileShallow(cardCandidate, cardMd5,
+                                              sizeof(cardMd5), nullptr)) {
+                            continue;
+                        }
+                        std::snprintf(cardSize, sizeof(cardSize), "%lld",
+                                      static_cast<long long>(onCard.st_size));
+                        std::snprintf(cardDigest, sizeof(cardDigest), "%s", cardMd5);
+                        break;
+                    }
+                    char diag[1400];
+                    std::snprintf(diag, sizeof(diag),
+                                  "guest=%.200s primary=%.200s fallback=%.200s "
+                                  "served=%.200s bytes=%llu md5=%s "
+                                  "card_bytes=%s card_md5=%s",
+                                  guestPath, resolution.primary, resolution.fallback,
+                                  candidate, bytes, digest,
+                                  cardSize, cardDigest);
+                    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                        "ast-readback", 0, 0, diag);
+                }
             }
             return 0;
         }
@@ -2609,6 +3481,737 @@ void logApkResReachabilityOnce() {
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// THE SHARED ASSET RESOLVER, AND THE ASSET LIST THAT MATCHES IT.
+//
+// WHY IT EXISTS.
+//
+//   The port TERMINATES the Cloudcell asset protocol. It answers
+//   assetManDownloadPackHash.php with bytes taken off the card and the
+//   volumes, so for every asset the guest downloads the port decides WHICH
+//   bytes the guest gets. The guest then MD5s what it received and compares
+//   it with an md5 from an asset list; when the two disagree it answers
+//
+//       CC: ASSET DOWNLOAD ERROR! ... [MSG: didn't match its MD5,
+//       corrupt sync?] ... Asset (/MenuBannerData.xml) didn't match its MD5
+//
+//   and DELETES the .ast it has just written.
+//
+//   MEASURED 2026-10-21, archive 20261021-234544-eden-fsfix3: the md5 the
+//   guest asks for is the one in files/.depot/asset_list_updates.txt (3,854
+//   B, 45 entries) -- all 41 requested assets are in that list and all 41
+//   wanted md5s match it, 41 of 41. The same wanted md5s are in NEITHER
+//   asset_list_base.txtCache.txt (4,212,795 B, 40,862 entries) NOR any of
+//   the 1,237 other asset lists on the card and in the volumes: that list
+//   does not name /MenuBannerData.xml, /events.dat or /crew.bin at all.
+//
+//   So the list the guest checks its downloads against is
+//   asset_list_updates.txt, and it describes the SERVER's newer revision
+//   while the card holds the 260530 build. The port is the authority for
+//   the bytes it serves, so the list it hands the guest has to describe
+//   those bytes.
+//
+//   This is NOT a way of making the guest accept wrong content: every md5
+//   written is the real md5 of a real local file, and the content is the
+//   real content of that file. The inconsistency being fixed is the port
+//   serving a manifest from one revision and files from another.
+// ---------------------------------------------------------------------------
+
+// The local files that can back a requested asset path, in the order the pack
+// endpoint tries them.
+//
+// THIS IS THE ENDPOINT'S ORDER, CHARACTER FOR CHARACTER
+// (cc_http_request.cpp assetCandidates):
+//
+//   1. the guest's OWN depot on the card, under the same relative name:
+//      ".depot" + path
+//   2. the volume tree with the same relative name: "files/.depot" + path
+//   3. the gui_assets tree, for the server's "/assets_<res>/" spelling:
+//      "files/.depot/gui_assets/<res>" + rest
+//
+// It is spelled out HERE as well because the list and the endpoint have to
+// agree on it: the list's md5 is the digest of the file the endpoint picks,
+// so a different order on the two sides would put the digest of one file
+// next to the bytes of another.
+// THE CANDIDATE LIST, CHARACTER FOR CHARACTER THE SAME AS THE PACK ENDPOINT'S.
+//
+// cc_http_request.cpp assetCandidates() (owned by another area) offers, for
+// the guest's "/gui_assets/<res>/X" spelling:
+//
+//   1. ".depot/gui_assets/<res>/X"        the card's gui_assets tree
+//   2. ".depot/assets_<res>/X"            the card's installed tree
+//   3. "files/.depot/gui_assets/<res>/X"  the volume
+//
+// and, for the "/assets_<res>/X" spelling:
+//
+//   1. ".depot/assets_<res>/X"            the card's installed tree
+//   2. "files/.depot/assets_<res>/X"      the volume
+//   3. "files/.depot/gui_assets/<res>/X"  the volume's alias
+//
+// THIS LIST MUST STAY IN LOCKSTEP WITH THAT ONE. The digest the manifest
+// rewrite writes into the list is the digest of the bytes the endpoint sends;
+// two copies of a list in two files can only ever agree by accident, and when
+// they disagree the guest md5s one revision and renders another.
+//
+// WHY THE REVERSE ALIAS IS IN THE LIST: the guest asks for the asset under
+// the "gui_assets/<res>/X" spelling, but the ONLY manifest that names it
+// names it under the other one ("/assets_960x640/common/sprites.android.atlas"
+// in asset_list_updates.txt) -- the shipped files/apk/res/
+// asset_list_gui_assets_core.txt (365,312 B, 3,292 entries) has no entry for
+// the bare "gui_assets/<res>/common/sprites.android.atlas" at all. So the
+// guest applies the game's own spelling rule and checks the bytes it
+// received against the digest published for the other spelling. ONE digest,
+// TWO spellings, so the two spellings MUST reach the same file.
+//
+// THE RESOLVER (applyCardFirstAssetOrder) puts the same three strings into
+// the resolution's three slots, in the same order, so the candidate that
+// answers here is the candidate that answers there.
+static void assetCandidates(const char* path, char out[4][384], unsigned& countOut) {
+    countOut = 0;
+    if (path == nullptr) {
+        return;
+    }
+    std::snprintf(out[countOut], sizeof(out[countOut]), ".depot%s", path);
+    ++countOut;
+    // THE REVERSE ALIAS, before the volume's copy of the same logical asset.
+    if (std::strncmp(path, "/gui_assets/", 12) == 0) {
+        const char* rest = std::strchr(path + 12, '/');
+        if (rest != nullptr) {
+            char resolution[32];
+            const size_t length = static_cast<size_t>(rest - (path + 12));
+            if (length < sizeof(resolution)) {
+                std::memcpy(resolution, path + 12, length);
+                resolution[length] = '\0';
+                if (isResolutionSegment(resolution)) {
+                    std::snprintf(out[countOut], sizeof(out[countOut]),
+                                  ".depot/assets_%s%s", resolution, rest);
+                    ++countOut;
+                }
+            }
+        }
+    }
+    std::snprintf(out[countOut], sizeof(out[countOut]), "files/.depot%s", path);
+    ++countOut;
+    if (std::strncmp(path, "/assets_", 8) == 0) {
+        const char* rest = std::strchr(path + 8, '/');
+        if (rest != nullptr) {
+            char resolution[32];
+            const size_t length = static_cast<size_t>(rest - (path + 8));
+            if (length < sizeof(resolution)) {
+                std::memcpy(resolution, path + 8, length);
+                resolution[length] = '\0';
+                if (isResolutionSegment(resolution)) {
+                    std::snprintf(out[countOut], sizeof(out[countOut]),
+                                  "files/.depot/gui_assets/%s%s", resolution, rest);
+                    ++countOut;
+                }
+            }
+        }
+    }
+}
+
+bool resolveAssetLocalFile(const char* assetPath, char* outPath, size_t outPathSize,
+                           char digest[33], unsigned long long* sizeOut) {
+    if (assetPath == nullptr || outPath == nullptr || outPathSize == 0 ||
+        digest == nullptr) {
+        return false;
+    }
+    outPath[0] = '\0';
+    digest[0] = '\0';
+    if (sizeOut != nullptr) {
+        *sizeOut = 0;
+    }
+    char candidates[4][384];
+    unsigned count = 0;
+    assetCandidates(assetPath, candidates, count);
+    // THE FIRST CANDIDATE THAT EXISTS WINS -- the same rule the endpoint
+    // falls back on, so the digest written in the list is the digest of the
+    // bytes the endpoint serves.
+    //
+    // THE LAST CANDIDATE (the alias) WAS TRIED HERE AND MEASURED WORSE: with
+    // the alias's digest in the lists the endpoint's tie-break serves the
+    // VOLUME's copy of the atlases, and the guest then loads FEWER of them
+    // (606 sprite references and 58 gui/processed references, against 1,190
+    // and 265 with the first candidate -- archive
+    // 20261022-015912-eden-md5alias-r3 against 20261022-014615-eden-md5fix-v3-r1).
+    // The atlases the guest renders come out of the card's tree, so the card's
+    // copy is the one the digest has to describe.
+    //
+    // The cost of this rule is that the two spellings of one asset can name
+    // two different files -- "/assets_960x640/common/sprites.android.atlas"
+    // reaches the card's 24,689 B copy and "/gui_assets/960x640/common/
+    // sprites.android.atlas" reaches the volume's 39,199 B copy -- and the
+    // guest checks both against ONE md5. That is where the 12 residual
+    // "didn't match its MD5" come from, and closing it needs the two
+    // spellings to name one file, which is a decision about which tree is
+    // authoritative and not a decision this function can make on its own.
+    for (unsigned index = 0; index < count; ++index) {
+        Resolution resolution{};
+        if (!resolvePath(candidates[index], false, resolution)) {
+            continue;
+        }
+        // The SAME read chain the endpoint uses: the volume primary, its
+        // alias, and the app-local card copy derived from the primary. So the
+        // bytes hashed here are the bytes the endpoint will send.
+        std::vector<unsigned char> bytes;
+        char served[0x600]{};
+        const int rc = withReadFallback(
+            resolution, candidates[index],
+            [&bytes, &served](const char* candidate) -> int {
+                std::FILE* file = std::fopen(candidate, "rb");
+                if (file == nullptr) {
+                    return -1;
+                }
+                if (std::fseek(file, 0, SEEK_END) != 0) {
+                    std::fclose(file);
+                    return -1;
+                }
+                const long size = std::ftell(file);
+                if (size < 0 || std::fseek(file, 0, SEEK_SET) != 0) {
+                    std::fclose(file);
+                    return -1;
+                }
+                bytes.resize(static_cast<size_t>(size));
+                const size_t got = (size > 0)
+                    ? std::fread(bytes.data(), 1, static_cast<size_t>(size), file)
+                    : 0u;
+                std::fclose(file);
+                if (got != static_cast<size_t>(size)) {
+                    bytes.clear();
+                    return -1;
+                }
+                std::snprintf(served, sizeof(served), "%s", candidate);
+                return 0;
+            });
+        if (rc != 0) {
+            continue;
+        }
+        Md5 md5;
+        md5.begin();
+        if (!bytes.empty()) {
+            md5.update(bytes.data(), bytes.size());
+        }
+        md5.finish(digest);
+        std::snprintf(outPath, outPathSize, "%s", served);
+        if (sizeOut != nullptr) {
+            *sizeOut = static_cast<unsigned long long>(bytes.size());
+        }
+        return true;
+    }
+    return false;
+}
+
+// The asset list the guest checks its downloads against -- its leaf name,
+// its guest path and the card path of the rewritten copy are declared above
+// withReadFallback, which is where the copy is served from.
+
+bool buildConsistentAssetList(const char* listPath, const char* outputPath,
+                               unsigned* rewrittenOut, unsigned* unresolvedOut) {
+    if (rewrittenOut != nullptr) {
+        *rewrittenOut = 0;
+    }
+    if (unresolvedOut != nullptr) {
+        *unresolvedOut = 0;
+    }
+    if (listPath == nullptr || outputPath == nullptr) {
+        return false;
+    }
+    const uint64_t startTick = armGetSystemTick();
+    const uint64_t tickFreq = armGetSystemTickFreq();
+
+    // 1. THE LIST, read through the port's own resolver, so the bytes are the
+    //    bytes the guest would have read.
+    Resolution resolution{};
+    if (!resolvePath(listPath, false, resolution)) {
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "assetlist-rewrite", 0, 0,
+                            "FAILED reason=resolve list=files/.depot/asset_list_updates.txt");
+        return false;
+    }
+    std::string text;
+    char served[0x600]{};
+    const int rc = withReadFallback(
+        resolution, listPath,
+        [&text, &served](const char* candidate) -> int {
+            std::FILE* file = std::fopen(candidate, "rb");
+            if (file == nullptr) {
+                return -1;
+            }
+            if (std::fseek(file, 0, SEEK_END) != 0) {
+                std::fclose(file);
+                return -1;
+            }
+            const long size = std::ftell(file);
+            if (size < 0 || std::fseek(file, 0, SEEK_SET) != 0) {
+                std::fclose(file);
+                return -1;
+            }
+            text.assign(static_cast<size_t>(size), '\0');
+            const size_t got = (size > 0)
+                ? std::fread(&text[0], 1, static_cast<size_t>(size), file)
+                : 0u;
+            std::fclose(file);
+            if (got != static_cast<size_t>(size)) {
+                text.clear();
+                return -1;
+            }
+            std::snprintf(served, sizeof(served), "%s", candidate);
+            return 0;
+        });
+    if (rc != 0) {
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "assetlist-rewrite", 0, 0,
+                            "FAILED reason=read list=files/.depot/asset_list_updates.txt");
+        return false;
+    }
+
+    // 2. THE LINES. Each one keeps its path text, its place in the file and
+    //    its field layout; only the md5 (and the size fields, when the layout
+    //    has them) is replaced, and only when the path resolves to a local
+    //    file. An entry that resolves to nothing keeps the server's md5:
+    //    there is no real digest to put there.
+    std::string out;
+    out.reserve(text.size() + 4096);
+    unsigned rewritten = 0;
+    unsigned unresolved = 0;
+    unsigned entries = 0;
+    unsigned logged = 0;
+    size_t position = 0;
+    while (position < text.size()) {
+        const size_t end = text.find('\n', position);
+        const size_t lineEnd = (end == std::string::npos) ? text.size() : end;
+        const std::string line = text.substr(position, lineEnd - position);
+        position = (end == std::string::npos) ? text.size() : end + 1;
+
+        // The fields, split on TAB. The path is field 0, the md5 is field 1,
+        // and the two size fields (when the layout has them) are 2 and 3.
+        std::vector<std::string> fields;
+        size_t fieldStart = 0;
+        for (;;) {
+            const size_t tab = line.find('\t', fieldStart);
+            if (tab == std::string::npos) {
+                fields.push_back(line.substr(fieldStart));
+                break;
+            }
+            fields.push_back(line.substr(fieldStart, tab - fieldStart));
+            fieldStart = tab + 1;
+        }
+        if (fields.size() < 2u || fields[0].empty()) {
+            // A line that is not an entry (a header, a blank line) is copied
+            // through untouched: the count and the order must not change.
+            out += line;
+            out += '\n';
+            continue;
+        }
+        ++entries;
+        const std::string& path = fields[0];
+        const std::string& wanted = fields[1];
+        char source[0x600]{};
+        char digest[33]{};
+        unsigned long long size = 0;
+        if (!resolveAssetLocalFile(path.c_str(), source, sizeof(source), digest, &size)) {
+            ++unresolved;
+            out += line;
+            out += '\n';
+            if (logged < 80u) {
+                ++logged;
+                char diag[768];
+                std::snprintf(diag, sizeof(diag),
+                              "path=%s md5=%s kept=SERVER size=- source=none",
+                              path.c_str(), wanted.c_str());
+                appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                    "assetlist-entry", logged, 0, diag);
+            }
+            continue;
+        }
+        ++rewritten;
+        out += fields[0];
+        out += '\t';
+        out += digest;
+        for (size_t field = 2; field < fields.size(); ++field) {
+            // The size fields describe the transfer. The port sends the file
+            // RAW, so both fields are the number of bytes it sends: an entry
+            // that claims a compressed size the port never uses is a claim
+            // about bytes that are not on the wire.
+            out += '\t';
+            out += std::to_string(static_cast<unsigned long long>(size));
+        }
+        out += '\n';
+        if (logged < 80u) {
+            ++logged;
+            char diag[1024];
+            std::snprintf(diag, sizeof(diag),
+                          "path=%s md5=%s->%s size=%llu source=%s",
+                          path.c_str(), wanted.c_str(), digest, size, source);
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                "assetlist-entry", logged, 0, diag);
+        }
+    }
+
+    // 3. WRITE IT, through a temporary name, so a reader never sees a
+    //    half-written list.
+    //
+    //    THE TARGET IS REMOVED FIRST: libnx's fsdev rename does NOT overwrite
+    //    an existing file (measured 2026-10-21, archive
+    //    20261021-184611-eden-massetgate-manifest3), so a rename onto an
+    //    existing target would leave the PREVIOUS run's list in place and the
+    //    guest would read a stale list that looks like a fresh one.
+    char tempPath[0x600]{};
+    std::snprintf(tempPath, sizeof(tempPath), "%s.tmp", outputPath);
+    std::FILE* output = std::fopen(tempPath, "wb");
+    bool written = false;
+    int writeErrno = 0;
+    if (output != nullptr) {
+        const size_t bytes = out.empty() ? 0u : std::fwrite(out.data(), 1, out.size(), output);
+        const bool flushed = (bytes == out.size());
+        const int closeResult = std::fclose(output);
+        writeErrno = errno;
+        written = flushed && (closeResult == 0);
+        if (written) {
+            std::remove(outputPath);
+            written = std::rename(tempPath, outputPath) == 0;
+            if (!written) {
+                writeErrno = errno;
+            }
+        }
+    }
+    else {
+        writeErrno = errno;
+    }
+    const uint64_t elapsedMs = (armGetSystemTick() - startTick) * 1000ULL /
+                               (tickFreq != 0 ? tickFreq : 1);
+    char diag[768];
+    std::snprintf(diag, sizeof(diag),
+                  "entries=%u rewritten=%u kept_server=%u bytes=%zu ms=%llu written=%d "
+                  "errno=%d source=%s out=%s",
+                  entries, rewritten, unresolved, out.size(),
+                  (unsigned long long)elapsedMs, written ? 1 : 0, writeErrno,
+                  served, outputPath);
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "assetlist-rewrite", 0, 0, diag);
+    if (rewrittenOut != nullptr) {
+        *rewrittenOut = rewritten;
+    }
+    if (unresolvedOut != nullptr) {
+        *unresolvedOut = unresolved;
+    }
+    if (!written) {
+        return false;
+    }
+    // COPIED, not aliased: the caller owns the buffer it passed in, and this
+    // pointer outlives the call.
+    static char servedPath[0x600]{};
+    std::snprintf(servedPath, sizeof(servedPath), "%s", outputPath);
+    gConsistentListServed = servedPath;
+    return true;
+}
+
+// Rewrite the base asset list so that every entry the guest has ACTUALLY
+// asked for describes the bytes the port serves.
+//
+// The entries the guest has not asked for keep the server's md5: the port is
+// not claiming to have a digest for a file it has not resolved.
+bool buildConsistentBaseList(unsigned* rewrittenOut, unsigned* unresolvedOut) {
+    if (rewrittenOut != nullptr) {
+        *rewrittenOut = 0;
+    }
+    if (unresolvedOut != nullptr) {
+        *unresolvedOut = 0;
+    }
+    const uint64_t startTick = armGetSystemTick();
+    const uint64_t tickFreq = armGetSystemTickFreq();
+
+    // 1. THE ASSET PATHS the guest has downloaded, with the digest of the
+    //    bytes the port serves for each of them.
+    //
+    //    The digest comes from the SAME resolver the pack endpoint uses, so
+    //    the two sides cannot disagree about which file backs a path.
+    //
+    //    THE PATHS ARE DEDUPLICATED BEFORE THEY ARE RESOLVED. The card's
+    //    asset_paths.txt is APPENDED to on every download, so it carries
+    //    the same path many times over: MEASURED 2026-10-22, 1,388 lines
+    //    and 47 distinct paths. Resolving every line meant reading and
+    //    hashing the same file 1,388 times -- the pass cost 2,709 ms on
+    //    Eden (archive 20261022-023023-eden-md5ship-r6) and the guest was
+    //    waiting for it on the boot path. The distinct set is 30x smaller.
+    std::vector<std::string> requested;
+    {
+        std::FILE* file = std::fopen(kAssetPathFile, "rb");
+        if (file != nullptr) {
+            char line[1024];
+            while (std::fgets(line, sizeof(line), file) != nullptr) {
+                std::string path = line;
+                while (!path.empty() &&
+                       (path.back() == '\n' || path.back() == '\r')) {
+                    path.pop_back();
+                }
+                // The path is normalised here as well as where it is
+                // written: a list written by an older build can carry the
+                // doubled separator, and a key that misses the manifest is
+                // a rewrite that does not happen.
+                size_t begin = 0;
+                while (begin < path.size() && path[begin] == '/') {
+                    ++begin;
+                }
+                if (begin >= path.size()) {
+                    continue;
+                }
+                path = "/" + path.substr(begin);
+                if (path[0] != '/') {
+                    continue;
+                }
+                requested.push_back(path);
+            }
+            std::fclose(file);
+        }
+    }
+    std::sort(requested.begin(), requested.end());
+    requested.erase(std::unique(requested.begin(), requested.end()), requested.end());
+    const uint64_t overridesTick = armGetSystemTick();
+    std::vector<std::pair<std::string, std::string>> overrides;
+    for (const std::string& path : requested) {
+        char source[0x600]{};
+        char digest[33]{};
+        unsigned long long size = 0;
+        if (!resolveAssetLocalFile(path.c_str(), source, sizeof(source),
+                                   digest, &size)) {
+            if (unresolvedOut != nullptr) {
+                ++*unresolvedOut;
+            }
+            continue;
+        }
+        overrides.emplace_back(path, std::string(digest));
+    }
+    const uint64_t overridesMs = (armGetSystemTick() - overridesTick) * 1000ULL /
+                                 (tickFreq != 0 ? tickFreq : 1);
+    // Sorted, so the rewrite can look an entry up with a binary search
+    // instead of scanning the map for every one of the 40,862 entries.
+    std::sort(overrides.begin(), overrides.end());
+    overrides.erase(std::unique(overrides.begin(), overrides.end()), overrides.end());
+
+    // 1b. THE CACHE KEY: a digest of the OVERRIDE SET.
+    //
+    // The rewrite is a pure function of two things: the shipped list (which
+    // never changes -- it is inside a read-only volume) and the override
+    // set. So when the override set is unchanged, the rewritten list on the
+    // card is already correct and the whole pass -- read 4.2 MB, parse
+    // 40,868 lines, write 4.2 MB back -- can be skipped.
+    //
+    // The key is the digest of the sorted "path\tdigest" lines, so a change
+    // in EITHER the paths or the bytes behind them invalidates it.
+    //
+    // MEASURED 2026-10-22, archive 20261022-023023-eden-md5ship-r6: the pass
+    // cost 2,709 ms of the guest's boot. The guest is on the critical path
+    // and hundreds of ms are acceptable while seconds are not.
+    char overrideKey[33]{};
+    {
+        Md5 md5;
+        md5.begin();
+        for (const auto& entry : overrides) {
+            const std::string line = entry.first + "\t" + entry.second + "\n";
+            md5.update(line.data(), line.size());
+        }
+        md5.finish(overrideKey);
+    }
+    // The key is kept beside the rewritten list, in its own tiny file, so a
+    // card that is wiped loses the cache with it and the next boot rebuilds
+    // the list from scratch.
+    if (baseListCacheIsCurrent(overrideKey)) {
+        const uint64_t elapsedMs = (armGetSystemTick() - startTick) * 1000ULL /
+                                   (tickFreq != 0 ? tickFreq : 1);
+        char diag[768];
+        std::snprintf(diag, sizeof(diag),
+                      "entries=0 rewritten=0 overrides=%zu bytes=0 ms=%llu "
+                      "overrides_ms=%llu written=1 cached=1 key=%.32s out=%s",
+                      overrides.size(), (unsigned long long)elapsedMs,
+                      (unsigned long long)overridesMs, overrideKey,
+                      kConsistentBaseListPath);
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "baselist-rewrite", 0, 0, diag);
+        if (rewrittenOut != nullptr) {
+            *rewrittenOut = 0;
+        }
+        if (unresolvedOut != nullptr) {
+            *unresolvedOut = 0;
+        }
+        static char servedPath[0x600]{};
+        std::snprintf(servedPath, sizeof(servedPath), "%s", kConsistentBaseListPath);
+        gConsistentBaseListServed = servedPath;
+        return true;
+    }
+
+    // 2. THE LIST, read through the port's own resolver.
+    Resolution resolution{};
+    if (!resolvePath(kBaseListGuestPath, false, resolution)) {
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "baselist-rewrite", 0, 0, "FAILED reason=resolve");
+        return false;
+    }
+    std::string text;
+    char served[0x600]{};
+    const int rc = withReadFallback(
+        resolution, kBaseListGuestPath,
+        [&text, &served](const char* candidate) -> int {
+            std::FILE* file = std::fopen(candidate, "rb");
+            if (file == nullptr) {
+                return -1;
+            }
+            if (std::fseek(file, 0, SEEK_END) != 0) {
+                std::fclose(file);
+                return -1;
+            }
+            const long size = std::ftell(file);
+            if (size < 0 || std::fseek(file, 0, SEEK_SET) != 0) {
+                std::fclose(file);
+                return -1;
+            }
+            text.assign(static_cast<size_t>(size), '\0');
+            const size_t got = (size > 0)
+                ? std::fread(&text[0], 1, static_cast<size_t>(size), file)
+                : 0u;
+            std::fclose(file);
+            if (got != static_cast<size_t>(size)) {
+                text.clear();
+                return -1;
+            }
+            std::snprintf(served, sizeof(served), "%s", candidate);
+            return 0;
+        });
+    if (rc != 0) {
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "baselist-rewrite", 0, 0, "FAILED reason=read");
+        return false;
+    }
+
+    // 3. THE LINES. The path text, the order, the count and the field layout
+    //    are preserved exactly; only the md5 of an entry the guest has asked
+    //    for changes, and only to the digest of the bytes the port serves.
+    const auto byPath = [](const std::pair<std::string, std::string>& entry,
+                           const std::string& path) {
+        return entry.first < path;
+    };
+    // THE KEY IS THE PATH THE GUEST ASKED FOR, AND NOTHING ELSE.
+    //
+    // THE FIRST VERSION OF THIS LOOKED THE ENTRY UP UNDER THE OTHER SPELLING
+    // TOO -- "/assets_<res>/..." and "/gui_assets/<res>/..." name what a
+    // reader would call the same asset -- and that was WRONG, and measurably
+    // so. The two spellings do NOT resolve to the same file in this port:
+    //
+    //   "/assets_960x640/common/sprites.android.atlas"
+    //       -> ".depot/assets_960x640/..." -> the CARD's loose tree, 24,689 B
+    //          md5 43213527...
+    //   "/gui_assets/960x640/common/sprites.android.atlas"
+    //       -> ".depot/gui_assets/960x640/..." -> the gui VOLUME, 39,199 B
+    //          md5 c7256882...
+    //
+    // Two different revisions of one logical asset. An override computed for
+    // one of them and applied to the other puts the digest of one file next
+    // to the bytes of the other, and the guest's md5 check then fails on an
+    // asset the port answered CORRECTLY (measured, archive
+    // 20261022-013604-eden-md5fix-final-r1: 12 "didn't match its MD5" on
+    // /gui_assets/960x640/common/sprites.android.atlas, with the port's own
+    // cc-asset-req line saying md5_match=1 for the bytes it sent).
+    //
+    // So the override is looked up by the EXACT path, and the digest in it is
+    // the digest of the file the resolver picks for THAT path -- which is the
+    // file the pack endpoint serves for it.
+    const auto lookup = [&overrides, &byPath](const std::string& path) -> const std::string* {
+        auto it = std::lower_bound(overrides.begin(), overrides.end(), path, byPath);
+        if (it != overrides.end() && it->first == path) {
+            return &it->second;
+        }
+        return nullptr;
+    };
+    std::string out;
+    out.reserve(text.size() + 4096);
+    unsigned entries = 0;
+    unsigned rewritten = 0;
+    size_t position = 0;
+    while (position < text.size()) {
+        const size_t end = text.find('\n', position);
+        const size_t lineEnd = (end == std::string::npos) ? text.size() : end;
+        const std::string line = text.substr(position, lineEnd - position);
+        position = (end == std::string::npos) ? text.size() : end + 1;
+        const size_t tab = line.find('\t');
+        if (tab == std::string::npos) {
+            // A header line: copied through untouched.
+            out += line;
+            out += '\n';
+            continue;
+        }
+        ++entries;
+        const std::string path = line.substr(0, tab);
+        const std::string* digest = lookup(path);
+        if (digest == nullptr) {
+            out += line;
+            out += '\n';
+            continue;
+        }
+        ++rewritten;
+        out += path;
+        out += '\t';
+        out += *digest;
+        // The rest of the line, if the layout has more fields.
+        const size_t next = line.find('\t', tab + 1);
+        if (next != std::string::npos) {
+            out += line.substr(next);
+        }
+        out += '\n';
+    }
+
+    // 4. WRITE IT, through a temporary name, and REMOVE the target first:
+    //    libnx's fsdev rename does NOT overwrite an existing file.
+    char tempPath[0x600]{};
+    std::snprintf(tempPath, sizeof(tempPath), "%s.tmp", kConsistentBaseListPath);
+    std::FILE* output = std::fopen(tempPath, "wb");
+    bool written = false;
+    int writeErrno = 0;
+    if (output != nullptr) {
+        const size_t bytes = out.empty() ? 0u : std::fwrite(out.data(), 1, out.size(), output);
+        const bool flushed = (bytes == out.size());
+        const int closeResult = std::fclose(output);
+        writeErrno = errno;
+        written = flushed && (closeResult == 0);
+        if (written) {
+            std::remove(kConsistentBaseListPath);
+            written = std::rename(tempPath, kConsistentBaseListPath) == 0;
+            if (!written) {
+                writeErrno = errno;
+            }
+        }
+    }
+    else {
+        writeErrno = errno;
+    }
+    const uint64_t elapsedMs = (armGetSystemTick() - startTick) * 1000ULL /
+                               (tickFreq != 0 ? tickFreq : 1);
+    char diag[768];
+    std::snprintf(diag, sizeof(diag),
+                  "entries=%u rewritten=%u overrides=%zu bytes=%zu ms=%llu "
+                  "overrides_ms=%llu written=%d cached=0 key=%.32s errno=%d "
+                  "source=%s out=%s",
+                  entries, rewritten, overrides.size(), out.size(),
+                  (unsigned long long)elapsedMs, (unsigned long long)overridesMs,
+                  written ? 1 : 0, overrideKey, writeErrno,
+                  served, kConsistentBaseListPath);
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "baselist-rewrite", 0, 0, diag);
+    if (rewrittenOut != nullptr) {
+        *rewrittenOut = rewritten;
+    }
+    if (!written) {
+        return false;
+    }
+    // THE KEY IS RECORDED ONLY AFTER THE LIST IT DESCRIBES IS ON THE CARD.
+    // Writing it first would let a later boot bless a list that was never
+    // written.
+    writeBaseListCacheKey(overrideKey);
+    static char servedPath[0x600]{};
+    std::snprintf(servedPath, sizeof(servedPath), "%s", kConsistentBaseListPath);
+    gConsistentBaseListServed = servedPath;
+    return true;
+}
+
 // The dirent regression guard, public so that the boot line can report it.
 //
 // It depends on nothing but the converter and the real header: a known host
@@ -2773,6 +4376,42 @@ ExternalDataStatus mountExternalData() {
     // A failure here costs the completion and nothing else: the shipped
     // manifest is still served, and the log line says why.
     gCompletedManifestReady = buildCompletedGuiAssetsManifest();
+    // THE ASSET LIST THE GUEST CHECKS ITS DOWNLOADS AGAINST, made to describe
+    // the bytes the port will actually send.
+    //
+    // MEASURED 2026-10-21, archive 20261021-234544-eden-fsfix3: the md5 the
+    // guest asks for is the one in files/.depot/asset_list_updates.txt (45
+    // entries), and all 41 requested assets are in that list with the wanted
+    // md5 -- 41 of 41. The 4,212,795 B asset_list_base.txtCache.txt names
+    // none of them.
+    //
+    // It is built HERE, on the boot thread, with the volumes already mounted,
+    // for the same reason the completed gui-assets manifest is: the build
+    // hashes the files it describes, and doing that inside a guest request
+    // would stall whichever guest thread happened to ask for the list.
+    //
+    // A failure here costs the consistency and nothing else: the shipped list
+    // is still served, and the log line says why.
+    {
+        unsigned rewritten = 0;
+        unsigned unresolved = 0;
+        buildConsistentAssetList(kUpdatesListGuestPath, kConsistentListPath,
+                                  &rewritten, &unresolved);
+    }
+    // THE BASE ASSET LIST, made to describe the bytes the port serves for the
+    // assets the guest has asked for.
+    //
+    // The full rewrite of this list is 9.394 GB of hashing -- 210-420 seconds
+    // on Eden -- so it cannot happen at boot. It is done LAZILY, for the
+    // assets the guest has actually downloaded, which the port records from
+    // the guest's own ".ast" writes. See the note on the base list above for
+    // the measurement and for why the update list's 3.894 MB was affordable
+    // and this list's 9.394 GB is not.
+    {
+        unsigned rewritten = 0;
+        unsigned unresolved = 0;
+        buildConsistentBaseList(&rewritten, &unresolved);
+    }
     return gStatus;
 }
 
@@ -2825,20 +4464,42 @@ uint64_t guestFilesystemSelfTest() {
     if (resolvePath("/storage/emulated/0/Android/data/com.ea.games.r3_row/files/.depot/langs.utf8", false, value) &&
         std::strcmp(value.primary, "rr3core:/files/.depot/langs.utf8") == 0) bits |= 1;
     value = {};
-    if (resolvePath("files/.depot/gui_assets/2048x1536/test", false, value) &&
-        startsWith(value.primary, "rr3gui0:/") &&
-        // AND the 2048x1536 -> 960x640 FALLBACK is installed. Both halves of
-        // the rule are asserted here, so the boot gate (main.cpp: the guest
-        // does not start unless filesystemTest == 0x1fff) fails if either
-        // half breaks. Before this, the rule was a REWRITE, which cost this
-        // very bit -- fsTest 0x1ffd -- and stopped the guest from starting
-        // at all (archive 20261021-174619-eden-menugate-terms).
-        startsWith(value.fallback, "rr3gui1:/files/.depot/gui_assets/960x640/")) {
+    if (resolvePath(".depot/gui_assets/2048x1536/probe.bin", false, value) &&
+        startsWith(value.primary, "sdmc:/switch/rr3-native-rehost/.depot/assets_2048x1536/") &&
+        // AND the card's installed copy of the same logical asset is the
+        // fallback, with the HD volume's copy behind it. Both halves of the
+        // rule are asserted here, so the boot gate (main.cpp: the guest does
+        // not start unless filesystemTest == 0x1fff) fails if either half
+        // breaks. Before this, the rule was a REWRITE, which cost this very
+        // bit -- fsTest 0x1ffd -- and stopped the guest from starting at all
+        // (archive 20261021-174619-eden-menugate-terms).
+        startsWith(value.fallback, "sdmc:/switch/rr3-native-rehost/.depot/gui_assets/2048x1536/")) {
         bits |= 2;
     }
     value = {};
-    if (resolvePath("files/.depot/gui_assets/960x640/test", false, value) &&
-        startsWith(value.primary, "rr3gui1:/")) bits |= 4;
+    // THE TWO SPELLINGS OF ONE LOGICAL ASSET MUST MEET AT ONE FILE.
+    //
+    // "files/.depot/gui_assets/960x640/X" and "files/.depot/assets_960x640/X"
+    // are the same asset, and the port's manifest rewrite, the pack endpoint
+    // and the guest's read-back all have to name the same bytes. When they
+    // did not, the guest wrote the volume's atlas, compared it with the
+    // card's digest and answered "didn't match its MD5" -- 12 times, on that
+    // one asset (archive 20261022-023023-eden-md5ship-r6).
+    //
+    // The two chains are each other's: the "gui_assets" spelling falls back
+    // to the card's "assets_<res>" copy, and the "assets_<res>" spelling
+    // falls back to the card's "gui_assets" tree, and both end at the
+    // volume's copy of the same logical asset.
+    if (resolvePath(".depot/gui_assets/960x640/probe.bin", false, value) &&
+        startsWith(value.primary, "sdmc:/switch/rr3-native-rehost/.depot/assets_960x640/") &&
+        startsWith(value.fallback, "sdmc:/switch/rr3-native-rehost/.depot/gui_assets/960x640/")) {
+        Resolution alias{};
+        if (resolvePath(".depot/assets_960x640/probe.bin", false, alias) &&
+            startsWith(alias.primary, "sdmc:/switch/rr3-native-rehost/.depot/assets_960x640/") &&
+            startsWith(alias.fallback, "sdmc:/switch/rr3-native-rehost/.depot/gui_assets/960x640/")) {
+            bits |= 4;
+        }
+    }
     value = {};
     if (resolvePath("Tracks/Menu/processed/menu_transition.banim", false, value) &&
         startsWith(value.primary, "rr3track:/")) bits |= 8;
@@ -2896,7 +4557,28 @@ uint64_t guestFilesystemSelfTest() {
     if (resolvePath("/dev/null", true, value) &&
         std::strcmp(value.primary, "/dev/null") == 0) bits |= 512;
     value = {};
-    if (!resolvePath("files/.depot/../secret", false, value) && errno == EACCES) bits |= 1024;
+    // TWO REFUSALS, ONE BIT: the resolver must refuse a path it must refuse.
+    //
+    // (a) A traversal. Unchanged since 2026-10-04.
+    //
+    // (b) A DOUBLED path -- one that names a device twice, or that repeats
+    // the app root. MEASURED, archive 20261022-012740-eden-md5list-base-r3:
+    // 60 of them in one run, every one answered with errno=22 (EINVAL) and
+    // printed "unknown error stat(22) checking the path '...'". The answer
+    // has to be ENOENT, because that is what the guest's other probes of the
+    // same asset get, and the guest moves on to the next root. See
+    // isDoubledDevicePath().
+    {
+        const bool traversalRefused =
+            !resolvePath("files/.depot/../secret", false, value) && errno == EACCES;
+        value = {};
+        char doubled[0x600];
+        std::snprintf(doubled, sizeof(doubled), "%s/.depot/%s/.depot/vehicles/x",
+                      kAppRoot, kAppRoot);
+        const bool doubledRefused =
+            !resolvePath(doubled, false, value) && errno == ENOENT;
+        if (traversalRefused && doubledRefused) bits |= 1024;
+    }
     value = {};
     if (resolvePath(".depot/text_cn-Hans.txt", false, value) && value.readOnly) bits |= 2048;
     return bits;
@@ -2950,6 +4632,15 @@ std::FILE* guestFopen(const char* path, const char* mode) {
     if (writing) {
         file = std::fopen(resolution.primary, mode);
         served = (file != nullptr) ? resolution.primary : nullptr;
+        if (file != nullptr) {
+            // THE ASSET THE GUEST ASKED FOR. A downloaded asset is written to
+            // "<asset path>.ast" before the guest checks it, so this is the
+            // one place in the port that learns which assets the guest wants
+            // -- and the base asset list's md5 for those assets has to
+            // describe the bytes the port serves. See the note on the base
+            // list above.
+            recordAssetPath(path);
+        }
         if (isAssetListPath(path)) {
             // The write path does not go through withReadFallback, so the
             // write is traced here instead.
