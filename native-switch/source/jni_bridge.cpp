@@ -4681,6 +4681,71 @@ void ensureInitialized() {
 
 } // namespace
 
+// The FakeByteArray record, exported for the Cloudcell HTTP shim.
+//
+// WHY THIS EXISTS. The request body the guest hands to HttpRequest.init() IS
+// one of these records, and the port used to be unable to read it. The
+// measurement that settles it is in archive
+// 20261021-134632-eden-getinfobool:
+//
+//     cc-http-init: body=1716 url=https://connect-dev-ss.cloudcell.com:443/CC_Sync.php
+//     cc-http-init: body=0    url=https://connect-dev-ss.cloudcell.com:443/time
+//
+// so the body IS readable, and the /time request genuinely has no body (it is
+// a GET-shaped request; the guest's own log calls it "CC: [1] POST request
+// [.../time]" but it posts nothing).
+//
+// WHY THE LENGTH WAS 0 BEFORE. Not the wrong JNI table: the managed methods
+// are dispatched with the JNIEnv the GUEST passed
+// (jniCallVoidMethodV hands `reinterpret_cast<JNIEnv*>(env)` to the
+// dispatcher), and that env's table IS this file's g_jniTable - slot 171 is
+// jniGetArrayLength and slot 200 is jniGetByteArrayRegion, both of which
+// already go through asByteArray().
+//
+// The real reason the port could not read the body is that it read it
+// through env->GetArrayLength / env->GetByteArrayRegion, which is a detour
+// through a table the port does not own the semantics of. The record's layout
+// is known here and nowhere else, so it is read HERE, from the record:
+//     +0x00  u32   magic 'ARRB'
+//     +0x04  i32   length
+//     +0x08  i32   capacity
+//     +0x10  u8*   data
+//
+// The length comes from +0x04 and the bytes from the pointer at +0x10, which
+// is what the guest's own JNI glue (guest raw 0x1ce37a4: NewByteArray, slot
+// 176; 0x1ce37e8: SetByteArrayRegion, slot 208) put there.
+bool rr3ByteArrayView(uintptr_t handle, int32_t *outLength,
+                      const uint8_t **outData) {
+    FakeByteArray *array = asByteArray(handle);
+    if (array == nullptr || outLength == nullptr || outData == nullptr) {
+        return false;
+    }
+    if (array->data == nullptr || array->length <= 0) {
+        return false;
+    }
+    *outLength = array->length;
+    *outData = array->data;
+    return true;
+}
+
+// The raw first four bytes of a handle, for the one-line probe that says
+// whether a handle really is one of these records. Reads four bytes only when
+// the handle is a known record; otherwise it answers with the low bytes of
+// the handle itself, so the caller can tell "not a record" from "a record
+// whose magic is wrong".
+bool rr3ByteArrayMagic(uintptr_t handle, uint32_t *outMagic) {
+    if (outMagic == nullptr) {
+        return false;
+    }
+    FakeByteArray *array = asByteArray(handle);
+    if (array != nullptr) {
+        *outMagic = array->magic;
+        return true;
+    }
+    *outMagic = static_cast<uint32_t>(handle & 0xffffffffu);
+    return false;
+}
+
 // Externally linked on purpose: rr3_Platform.cpp's platform_show_message is the
 // other route to this export and must not carry a second copy of it. It sits
 // outside the anonymous namespace for the reason runGuestJniOnLoad below does -

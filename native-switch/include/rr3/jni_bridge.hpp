@@ -168,4 +168,21 @@ JniSlotHistogram captureJniHistogram();
 JniSlotHistogram diffJniHistograms(const JniSlotHistogram& after,
                                    const JniSlotHistogram& before);
 
+// The port's fake jbyteArray record, read from the outside.
+//
+// A jbyteArray handle the guest passes back to the port is one of the port's
+// own FakeByteArray records (magic 'ARRB', length at +0x04, capacity at
+// +0x08, data pointer at +0x10). The record's layout is known only inside
+// jni_bridge.cpp, so the Cloudcell HTTP shim reads the body through these two
+// helpers instead of guessing at the layout or going through a JNIEnv table
+// it does not own.
+//
+// rr3ByteArrayView returns false for a handle that is not one of these
+// records; rr3ByteArrayMagic answers with the record's magic when it is one
+// and with the low half of the handle itself when it is not, so a caller can
+// tell "not a record" from "a record whose magic is wrong".
+bool rr3ByteArrayView(uintptr_t handle, int32_t* outLength,
+                      const uint8_t** outData);
+bool rr3ByteArrayMagic(uintptr_t handle, uint32_t* outMagic);
+
 } // namespace rr3

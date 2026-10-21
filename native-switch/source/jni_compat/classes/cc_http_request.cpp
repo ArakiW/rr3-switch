@@ -9,6 +9,7 @@
 #include "../../eap_port/platform_adapter.h"
 #include "../../eap_port/so_util_adapter.h"
 #include "../../eap_port/trace_adapter.h"
+#include "../../../include/rr3/jni_bridge.hpp"
 #include "../jni.h"
 #include "../jni_internals.h"
 #include "cc_cloudcell_auth.h"
@@ -354,19 +355,18 @@ public:
     size_t   bodyLen  = 0;
 
     /*
-     * The request URL, which is what tells the /time request apart from the
-     * authenticate request.
+     * The request URL.
      *
      * The guest builds the URL at runtime (snprintf("%04u-%s%s.cloudcell.com",
      * envId, role, stage) at guest raw 0x1cf0e60) and the path is appended by
      * the caller, so the two requests do NOT share a path: the guest's own log
      * in the measured run prints
      *     CC: [1] POST request [https://connect-dev-ss.cloudcell.com:443/time]
-     * while the authenticate request goes to CC_Sync.php. The URL is the only
-     * reliable discriminator, because the port cannot read the request body
-     * at all: the guest's byte[] is not a port array object, so
-     * GetArrayLength answers 0 for every request (the measured
-     * "cc-http-init: body=0").
+     * while the authenticate and sync requests go to CC_Sync.php.
+     *
+     * The URL used to be the ONLY discriminator, because the port could not
+     * read the request body. It can now (see http_init), so the URL is the
+     * fallback and the body's shape is the primary.
      */
     char     url[256];
     size_t   urlLen = 0;
@@ -413,11 +413,26 @@ using CCHttpCompleteFn = void (*)(JNIEnv *, jobject, jlong, jint);
  * The int is the content length and the jobject is the Map. */
 using CCHttpHeaderFn   = void (*)(JNIEnv *, jobject, jlong, jint, jobject);
 
-/* The member id the guest compares the response against when the request
+/* The member id the port compares the response against when the request
  * carries none. The guest compares it at 0x1d01dc4 against a read-only
  * constant of 1 at guest raw 0x600f30 (through the GOT slot 0x1f6e270), so 1
  * is the value that satisfies that comparison. */
 static const uint32_t kDefaultMemberId = 1u;
+
+/*
+ * The device id this port issues.
+ *
+ * The guest's account manager keeps a server-issued device id, and a device
+ * id of 0 is the one value it treats as "no device id at all": the guest
+ * then logs "CC: Invalid DeviceId! Have we connected to cloudcell yet?"
+ * and the sync queue never drains.
+ *
+ * The port is standing in for the server here, so the id is the port's to
+ * issue. It is a fixed, non-zero value because there is one guest and one
+ * account; a value that is not 0 and is not the member id, so that a log
+ * line can tell the two apart.
+ */
+static const uint32_t kLocalDeviceId = 1001u;
 
 /* Bounded log budget, in the spirit of the other Cloudcell probes (a few
  * dozen lines for a whole run). */
@@ -493,27 +508,108 @@ static void http_init(JNIEnv *env, jobject self, jstring /*userAgent*/,
         }
     }
 
-    /* Keep the body. Without it http_post() cannot tell the authenticate
-     * request from the sync request, and the two share the same URL path
-     * (CC_Sync.php, guest raw 0x3e3551) and the same first four words. */
+    /* Keep the body.
+     *
+     * MEASURED, archive 20261021-134632-eden-getinfobool:
+     *
+     *     cc-http-init: body=1716 url=https://connect-dev-ss.cloudcell.com:443/CC_Sync.php
+     *     cc-http-init: body=0    url=https://connect-dev-ss.cloudcell.com:443/time
+     *
+     * so the body IS readable, and the /time request genuinely carries no
+     * body at all. The record the guest hands over is one of the port's own
+     * FakeByteArray records: the guest's own JNI glue creates it with slot
+     * 176 (NewByteArray, guest raw 0x1ce37a4) and fills it with slot 208
+     * (SetByteArrayRegion, guest raw 0x1ce37e8), and both of those slots are
+     * this port's own jniNewByteArray / jniSetByteArrayRegion.
+     *
+     * The length is therefore read from the record's own layout - length at
+     * +0x04, data pointer at +0x10 - rather than through a JNIEnv table.
+     * The JNIEnv route is kept as a fallback so the port still works if the
+     * handle ever comes from somewhere else.
+     */
     req->bodyLen = 0;
     if (body != nullptr) {
-        jsize len = env->GetArrayLength(body);
-        if (len > 0) {
-            size_t take = ((size_t)len < kMaxBodyBytes) ? (size_t)len : kMaxBodyBytes;
-            env->GetByteArrayRegion(body, 0, (jsize)take,
-                                    (jbyte *)req->body);
-            req->bodyLen = take;
+        int32_t      viewLen  = 0;
+        const uint8_t *viewPtr = nullptr;
+        if (rr3::rr3ByteArrayView((uintptr_t)body, &viewLen, &viewPtr)) {
+            size_t take = ((size_t)viewLen < kMaxBodyBytes) ? (size_t)viewLen
+                                                             : kMaxBodyBytes;
+            if (take > 0u && viewPtr != nullptr) {
+                memcpy(req->body, viewPtr, take);
+                req->bodyLen = take;
+            }
+        } else {
+            /* The fallback: the same two JNI calls the port used before. */
+            jsize len = env->GetArrayLength(body);
+            if (len > 0) {
+                size_t take = ((size_t)len < kMaxBodyBytes) ? (size_t)len
+                                                            : kMaxBodyBytes;
+                env->GetByteArrayRegion(body, 0, (jsize)take,
+                                        (jbyte *)req->body);
+                req->bodyLen = take;
+            }
+        }
+    }
+
+    /* THE ONE-LINE HANDLE PROBE.
+     *
+     * The first four bytes of the handle decide whether the body is a port
+     * byte-array record at all: 'ARRB' (0x42525241) means it is one, and
+     * the length is then at +0x04. Anything else means the handle is not a
+     * record and the length of 0 is the port's own answer, not the guest's
+     * fault. */
+    {
+        uint32_t magic = 0;
+        const bool isRecord =
+            rr3::rr3ByteArrayMagic((uintptr_t)body, &magic);
+        if (authLogBudget()) {
+            trace("cc-body-probe: handle=%p magic=%08x %s len=%zu",
+                  (void *)body, magic,
+                  isRecord ? "(ARRB record)" : "(not a record)",
+                  (unsigned)req->bodyLen);
+        }
+        {
+            char details[192];
+            __builtin_snprintf(details, sizeof(details),
+                               "handle=%p magic=%08x %s bodyLen=%u",
+                               (void *)body, magic,
+                               isRecord ? "ARRB-record" : "not-a-record",
+                               (unsigned)req->bodyLen);
+            rr3::guestViewWideLog("cc-body-probe",
+                                  (unsigned long long)(uintptr_t)body,
+                                  (unsigned long long)magic, details);
         }
     }
 
     /* One line per request, so "the guest never calls this class" is a
      * MEASURED statement and not an inference from the absence of the
      * http.post deferral line. The URL is on the same line because it is
-     * what identifies the request. */
+     * what identifies the request, and the first sixteen body bytes are on
+     * it because the body's own head is what says what the request is. */
     if (authLogBudget()) {
-        trace("cc-http-init: body=%zu url=%s", (unsigned)req->bodyLen,
-              req->urlLen > 0u ? req->url : "(none)");
+        char head[80];
+        const size_t headLen = (req->bodyLen < 16u) ? req->bodyLen : 16u;
+        for (size_t i = 0; i < headLen; ++i) {
+            __builtin_snprintf(head + (i * 2), 3u, "%02x", req->body[i]);
+        }
+        head[headLen * 2u] = '\0';
+        trace("cc-http-init: body=%zu head=%s url=%s", (unsigned)req->bodyLen,
+              head, req->urlLen > 0u ? req->url : "(none)");
+    }
+    {
+        char details[256];
+        char head[80];
+        const size_t headLen = (req->bodyLen < 16u) ? req->bodyLen : 16u;
+        for (size_t i = 0; i < headLen; ++i) {
+            __builtin_snprintf(head + (i * 2), 3u, "%02x", req->body[i]);
+        }
+        head[headLen * 2u] = '\0';
+        __builtin_snprintf(details, sizeof(details),
+                           "bodyLen=%u head=%s url=%s",
+                           (unsigned)req->bodyLen, head,
+                           req->urlLen > 0u ? req->url : "(none)");
+        rr3::guestViewWideLog("cc-http-init", (unsigned long long)req->bodyLen,
+                              0, details);
     }
 
     /* Start the cc::HttpRequestManager census, and tell it which
@@ -531,38 +627,35 @@ static void http_add_header(JNIEnv *, jobject, jstring, jstring) {}
 /*
  * THE AUTHENTICATE RESPONSE, AND THE URL FALLBACK FOR IT.
  *
- * The body-based match is the PRIMARY discriminator and stays first:
- * cccloud::parseAuthRequest() reads the tail of the posted blob, and it
- * is the only thing that can tell the authenticate request from the
- * ordinary sync request, because the two share the same path
- * (CC_Sync.php) and the same first four words.
+ * The body-based match is the PRIMARY discriminator: cccloud::parseRequest()
+ * unboxes the body and reads its shape, and it is the only thing that can
+ * tell the authenticate request from the ordinary sync request, because the
+ * two share the same path (CC_Sync.php) and the same first four words.
  *
- * BUT THE BODY IS CURRENTLY UNREADABLE.  http_init() reads the body
- * with GetArrayLength / GetByteArrayRegion, and those only accept the
- * port's OWN fake byte arrays ("ARRB" magic, membership in
- * g_byteArrays).  The guest's byte[] is a raw guest-memory pointer, so
- * it is always rejected and the body length is ALWAYS 0.  MEASURED: every
- * archive shows "cc-http-init: body=0".
+ * The body is READABLE.  MEASURED, archive 20261021-134632-eden-getinfobool:
  *
- * With bodyLen == 0 the body-based match can NEVER be auth-shaped, so
- * the fake authenticate response (deliverAuthSuccess) has NEVER been
- * delivered - not once.  It has never been exercised end to end, and
- * when the authenticate request finally arrives the port would classify
- * it as "not the authenticate request" and fall through to
- * error_callback, and the guest would still log "CC: Invalid DeviceId!"
- * for a completely different reason than the one being fixed.
+ *     cc-http-init: body=1716 url=https://connect-dev-ss.cloudcell.com:443/CC_Sync.php
  *
- * So the URL is the fallback discriminator, and the log says WHICH
- * discriminator was used, because "matched" and "matched-by-url" are
- * different claims and this project keeps confusing them:
+ * What used to go wrong is not that the body was unreadable but that it was
+ * read as if it were the PAYLOAD while the bytes on the wire are a BinaryBlob
+ * BOX.  The first word of the wire bytes is the box's checksum, not the
+ * request's tag, so every parse failed, the port fell through to the URL
+ * fallback, and the port answered the ordinary SYNC request with the
+ * authenticate response.  The guest unpacked that with its sync reader, read
+ * the member id out of the authenticate state word, and then ran off the end
+ * of the blob: 2980 "UnpackData" assertions at BinaryBlob.cpp line 375.
+ *
+ * So the URL is the LAST resort, and the log says WHICH discriminator was
+ * used, because "matched" and "matched-by-url" are different claims and
+ * this project keeps confusing them:
  *
  *   cc-auth-req: matched          the body had the authenticate shape
- *   cc-auth-req: matched-by-url   the URL named CC_Sync.php and the body
- *                                 was unreadable
+ *   cc-req-class: kind=sync       the body had the sync shape
+ *   cc-auth-req: matched-by-url   the request carried no body to read
  *
- * The fallback is ONE-SHOT: the authenticate response is delivered at
- * most once per process, so a later CC_Sync.php request (the ordinary
- * sync) is not answered with a second authenticate response.
+ * The fallback is ONE-SHOT: the authenticate response is delivered at most
+ * once per process, so a later CC_Sync.php request is not answered with a
+ * second authenticate response.
  */
 static bool g_authDelivered = false;
 
@@ -634,10 +727,76 @@ static bool deliverAuthSuccess(JNIEnv *env, CCHttpRequest *req,
     return true;
 }
 
+/*
+ * Deliver the SYNC response.
+ *
+ * The guest's own log says which request this answers: "CC: Sending Sync
+ * with SubSyncs:" (archive 20261021-134632-eden-getinfobool) is printed
+ * before the request goes out, and "CC: [2] Sync response received" when
+ * the answer comes back.
+ *
+ * The delivery is the Java one: the body first, then the completion, the
+ * same order deliverAuthSuccess uses and the same order the guest's own
+ * HttpThread.run() uses.
+ */
+static bool deliverSyncResponse(JNIEnv *env, CCHttpRequest *req,
+                                 uint32_t memberId, uint32_t deviceId)
+{
+    static CCHttpDataFn data_callback = cloudcell_native<CCHttpDataFn>(
+        kCCHttpDataCallback);
+    static CCHttpCompleteFn complete_callback = cloudcell_native<CCHttpCompleteFn>(
+        kCCHttpCompleteCallback);
+
+    if (data_callback == nullptr || complete_callback == nullptr) {
+        warning("HttpRequest: success natives missing (data=%p complete=%p); "
+                "sync request %p stays pending\n",
+                (void *)data_callback, (void *)complete_callback, (void *)req);
+        rr3::guestViewWideLog("cc-sync-fail", memberId, deviceId,
+                               "natives missing (data/complete export)");
+        return false;
+    }
+
+    std::vector<uint8_t> body;
+    if (!cccloud::buildSyncResponse(memberId, deviceId, body)) {
+        warning("HttpRequest: could not build the sync response\n");
+        rr3::guestViewWideLog("cc-sync-fail", memberId, deviceId,
+                               "could not build the sync response");
+        return false;
+    }
+
+    if (authLogBudget()) {
+        trace("cc-sync-resp: produced member=%u device=%u body=%zu",
+              memberId, deviceId, (unsigned)body.size());
+    }
+    rr3::guestViewWideLog("cc-sync-resp", memberId, (unsigned long long)body.size(),
+                           "sync response built for the guest");
+
+    jbyteArray array = env->NewByteArray((jsize)body.size());
+    if (array == nullptr) {
+        warning("HttpRequest: could not allocate the response byte array\n");
+        rr3::guestViewWideLog("cc-sync-fail", memberId,
+                               (unsigned long long)body.size(),
+                               "could not allocate the response byte array");
+        return false;
+    }
+    env->SetByteArrayRegion(array, 0, (jsize)body.size(),
+                             (const jbyte *)body.data());
+
+    data_callback(env, (jobject)req, req->callback, array, (jint)body.size());
+    complete_callback(env, (jobject)req, req->callback, 200);
+
+    if (authLogBudget()) {
+        trace("cc-sync-sent: member=%u device=%u bytes=%zu status=200",
+              memberId, deviceId, (unsigned)body.size());
+    }
+    rr3::guestViewWideLog("cc-sync-sent", memberId, (unsigned long long)body.size(),
+                           "sync response delivered to the guest");
+    return true;
+}
+
 /* ------------------------------------------------------------------ *
  * The response-header probe
  * ------------------------------------------------------------------ */
-
 /*
  * WHAT THIS PROBES, AND WHY
  * ==========================
@@ -2385,13 +2544,10 @@ static size_t serverTimeBody(uint8_t *out, size_t cap)
  * THE ARRAY HAS TO BE A REAL ONE. The guest's dataCallback copies it out
  * through GetByteArrayRegion, so a raw pointer would be read as a byte[]
  * handle and the copy would land on whatever the handle happened to be.
- * This is the same trap as the REQUEST body: the guest's own byte[] is
- * not a port array object, so the port's GetArrayLength answered 0 for
- * every request.
  *
- * The array is therefore built with the port's own env, and the port's
- * env IS the guest's env: the managed methods are dispatched with the
- * JNIEnv the guest passed (jni_bridge.cpp's jniCallVoidMethodV hands
+ * The array is built with the port's own env, and the port's env IS the
+ * guest's env: the managed methods are dispatched with the JNIEnv the guest
+ * passed (jni_bridge.cpp's jniCallVoidMethodV hands
  * `reinterpret_cast<JNIEnv*>(env)` to the dispatcher), and that env's
  * table is the guest's own g_jniTable. Its NewByteArray is slot 176 and
  * its SetByteArrayRegion is slot 208, so the array lands in the guest's
@@ -2584,9 +2740,10 @@ static void http_post(JNIEnv *env, jobject self)
         /* The /time request. The URL is the discriminator: the guest's own
          * log prints "CC: [1] POST request
          * [https://connect-dev-ss.cloudcell.com:443/time]" while the
-         * authenticate request goes to CC_Sync.php. The body cannot be used:
-         * the guest's byte[] is not a port array object, so the port reads a
-         * length of 0 for every request. */
+         * authenticate and sync requests go to CC_Sync.php.
+         *
+         * MEASURED: the /time request carries NO body ("cc-http-init:
+         * body=0"), so there is nothing in it to classify. */
         if (strstr(req->url, "/time") != nullptr) {
             if (deliverServerTime(env, req)) {
                 return;
@@ -2595,11 +2752,69 @@ static void http_post(JNIEnv *env, jobject self)
             trace("cc-http-req: not the /time request url=%s", req->url);
         }
 
+        /* The request the guest posted.
+         *
+         * The body is a BinaryBlob BOX, so it is unboxed before its shape
+         * means anything. The port used to parse the wire bytes as if they
+         * were the payload, so the first word it read was the box's
+         * checksum instead of the tag, EVERY parse failed, and the port
+         * fell through to matching the URL - which is how the port ended up
+         * answering the ordinary SYNC request with the authenticate
+         * response. The guest then unpacked that as a sync response, read
+         * the member id out of the authenticate state word, and ran off the
+         * end of the blob: 2980 "UnpackData" assertions at BinaryBlob.cpp
+         * line 375 (the guest's pointer-returning reader, 0x1cbdecc). */
         cccloud::AuthRequest info;
-        const bool authShaped =
-            cccloud::parseAuthRequest(req->body, req->bodyLen, info);
+        const cccloud::RequestKind kind =
+            cccloud::parseRequest(req->body, req->bodyLen, info);
 
-        if (authShaped) {
+        {
+            const char *kindName =
+                (kind == cccloud::RequestKind::Authenticate) ? "authenticate"
+                : (kind == cccloud::RequestKind::Sync)       ? "sync"
+                                                            : "unknown";
+            /* The payload's first words, so a run says what the request
+             * actually said instead of leaving it to be re-derived. */
+            char words[192];
+            words[0] = '\0';
+            std::vector<uint8_t> payload;
+            if (cccloud::unboxBlob(req->body, req->bodyLen, payload) &&
+                payload.size() >= 32u) {
+                for (size_t i = 0; i < 8u; ++i) {
+                    const uint32_t w = (uint32_t)payload[i * 4u] |
+                                       ((uint32_t)payload[i * 4u + 1u] << 8) |
+                                       ((uint32_t)payload[i * 4u + 2u] << 16) |
+                                       ((uint32_t)payload[i * 4u + 3u] << 24);
+                    __builtin_snprintf(words + (i * 9), 10u, "%08x ", w);
+                }
+            } else if (!payload.empty() && payload.size() >= 16u) {
+                for (size_t i = 0; i < 4u; ++i) {
+                    const uint32_t w = (uint32_t)payload[i * 4u] |
+                                       ((uint32_t)payload[i * 4u + 1u] << 8) |
+                                       ((uint32_t)payload[i * 4u + 2u] << 16) |
+                                       ((uint32_t)payload[i * 4u + 3u] << 24);
+                    __builtin_snprintf(words + (i * 9), 10u, "%08x ", w);
+                }
+            }
+            char details[512];
+            __builtin_snprintf(details, sizeof(details),
+                               "kind=%s bodyLen=%u boxed=%d boxMode=%u "
+                               "payloadLen=%u env1=%u env2=%u client=%u "
+                               "tailWords=%u member=%u head=[%s]",
+                               kindName, (unsigned)req->bodyLen,
+                               info.boxed ? 1 : 0, (unsigned)info.boxMode,
+                               (unsigned)info.payloadSize, (unsigned)info.env1,
+                               (unsigned)info.env2, (unsigned)info.clientId,
+                               (unsigned)info.tailWords,
+                               info.hasMemberId ? info.memberId : 0u, words);
+            rr3::guestViewWideLog("cc-req-class", (unsigned)kind,
+                                  (unsigned long long)info.payloadSize, details);
+            if (authLogBudget()) {
+                trace("cc-req-class: %s", details);
+            }
+        }
+
+        if (kind == cccloud::RequestKind::Authenticate) {
             /* THE BODY MATCH - the primary discriminator. */
             if (authLogBudget()) {
                 trace("cc-auth-req: matched env=%u,%u x=%u headers=%zu body=%zu "
@@ -2619,33 +2834,46 @@ static void http_post(JNIEnv *env, jobject self)
             if (ok) {
                 return;
             }
-        } else {
-            /* THE URL FALLBACK.
+        } else if (kind == cccloud::RequestKind::Sync) {
+            /* THE SYNC REQUEST. Not the authenticate request, so it must
+             * not be answered with the authenticate response: the guest's
+             * two readers read different fields and the guest unpacks the
+             * answer with the reader that matches the request it sent. */
+            const uint32_t memberId = info.hasMemberId ? info.memberId
+                                                       : kDefaultMemberId;
+            const bool ok = deliverSyncResponse(env, req, memberId,
+                                                kLocalDeviceId);
+            rr3::guestViewWideLog("cc-sync-deliver", ok ? 1 : 0,
+                                  (unsigned long long)req->bodyLen,
+                                  ok ? "delivered (by=body, kind=sync)"
+                                     : "FAILED (by=body, kind=sync)");
+            if (ok) {
+                return;
+            }
+        } else if (req->bodyLen == 0u) {
+            /* THE URL FALLBACK - the LAST resort.
              *
-             * The body cannot be read at all (the guest's byte[] is not a
-             * port array object, so the length is always 0), so the body
-             * match can never fire.  The guest's own path string for this
-             * endpoint is CC_Sync.php (guest raw 0x3e3551) and the /time
-             * request goes to .../time, so the URL tells the two apart.
+             * The body could not be read at all (there was none), so the
+             * body match cannot fire and the URL is all that is left. The
+             * guest's own path string for this endpoint is CC_Sync.php
+             * (guest raw 0x3e3551) and the /time request goes to .../time.
              *
-             * ONE-SHOT: only the first CC_Sync.php request is answered with
-             * the authenticate response, so the ordinary sync request that
-             * follows is not answered with a second one.
+             * ONE-SHOT: only the first such request is answered, so a later
+             * request is not answered with a second one.
              *
-             * The log says WHICH discriminator was used.  "matched-by-url"
-             * is NOT "matched": the body was never read. */
+             * The log says WHICH discriminator was used. "matched-by-url" is
+             * NOT "matched": the body was never read. */
             const bool urlSaysAuth =
                 (strstr(req->url, kAuthUrlMarker) != nullptr);
             if (urlSaysAuth && !g_authDelivered) {
                 if (authLogBudget()) {
                     trace("cc-auth-req: matched-by-url body=%zu url=%s "
-                          "(the body is unreadable: the guest's byte[] is not a "
-                          "port array object, so the length is always 0)",
+                          "(the request carried no body to read)",
                           (unsigned)req->bodyLen, req->url);
                 }
                 rr3::guestViewWideLog("cc-auth-req", 2,
                                        (unsigned long long)req->bodyLen,
-                                       "matched-by-url (body unreadable)");
+                                       "matched-by-url (no body to read)");
                 cccloud::AuthRequest byUrl;   /* default: no member id */
                 const bool ok = deliverAuthSuccess(env, req, byUrl);
                 rr3::guestViewWideLog("cc-auth-deliver", ok ? 1 : 0,
@@ -2656,9 +2884,18 @@ static void http_post(JNIEnv *env, jobject self)
                     return;
                 }
             } else if (authLogBudget()) {
-                trace("cc-auth-req: not the authenticate request body=%zu url=%s",
+                trace("cc-auth-req: no body and no url match body=%zu url=%s",
                       (unsigned)req->bodyLen, req->url);
             }
+        } else if (authLogBudget()) {
+            /* The body WAS readable and it is neither request shape. The
+             * port does not know what to answer, and it says so instead of
+             * guessing. */
+            trace("cc-req-class: readable body that is neither shape "
+                  "bodyLen=%zu url=%s", (unsigned)req->bodyLen, req->url);
+            rr3::guestViewWideLog("cc-req-class", 3,
+                                  (unsigned long long)req->bodyLen,
+                                  "readable body, unknown shape: not answered");
         }
 
         static CCHttpErrorFn error_callback = cloudcell_native<CCHttpErrorFn>(
@@ -2696,9 +2933,29 @@ static void http_shutdown(JNIEnv *, jobject self)
 
 static const ManagedMethod http_methods[] = {
     ManagedMethod::RegisterNonVirtual<&http_ctor>(CCHttpRequest::clazz, "<init>", "()V"),
+    /*
+     * The guest's OWN signature for init, read out of its disassembly at
+     * guest raw 0x1ce35ac:
+     *
+     *     (Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[BIJZDZZI)V
+     *
+     * which is the Java one (HttpRequest.java: init(String userAgent,
+     * String method, String url, byte[] body, int readCapacity, long
+     * callback, boolean, double serverTime, boolean, boolean, int
+     * timeoutSeconds)). The port used to register the SEVEN-argument
+     * spelling, which is not the signature the guest binds: the guest
+     * resolves "init" with the eleven-argument one, so the port's spelling
+     * only ever mattered as the fallback in the guest-argument decoder.
+     * It is corrected here so the fallback is right too.
+     *
+     * The managed method still takes the first seven arguments, which are
+     * the ones the port needs: the body (index 3) and the callback
+     * (index 5). The four the port does not use - the server time, two
+     * flags and the timeout - are read past.
+     */
     ManagedMethod::Register<&http_init>(
         CCHttpRequest::clazz, "init",
-        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[BIJZ)V"),
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[BIJZDZZI)V"),
     ManagedMethod::Register<&http_add_header>(
         CCHttpRequest::clazz, "addHeader",
         "(Ljava/lang/String;Ljava/lang/String;)V"),
