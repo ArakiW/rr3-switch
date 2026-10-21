@@ -5426,3 +5426,200 @@ resolves, **five moved from the stale build to the correct build** - sizes
    input, then with the network answer now true the menu may become
    reachable **without any further change** - which would make the
    "no connection" popup, not the gate, the real blocker all along.
+
+### S36 - the render-path gate is OPEN; there are TWO menu gates (2026-10-21)
+
+#### 1. The render-path menu gate is measured, and it is open
+
+The gate at `0x12aefc0..0x12af010` (the tail of the render entry
+`0x12aea7c`) has four terms:
+
+```
+0x12aefc0  ldr  x8, [x23]          ; TERM 1: the menu-loader object  (x23 = the global
+0x12aefc4  cbz  x8, #0x12af014     ;        must be non-NULL)          cell 0x1fb5bf8)
+0x12aeccc  ldr  x8, [x8, #0x5d0]    ; GOT 0x1f6d5d0 -> .bss 0x1fc6e98
+0x12aefd0  ldr  x0, [x8]           ; TERM 2: the Cloudcell instance, must be non-NULL
+0x12aefd4  cbz  x0, #0x12af014
+0x12aefd8  ldrb w8, [x0, #0x4c1]   ; TERM 3: Cloudcell+0x4c1, must be NON-ZERO
+0x12aefdc  cbz  w8, #0x12af014
+0x12aefe0  Cloudcell->vfunc6()
+0x12aeff0  Cloudcell->vfunc17()    ; slot address 0x1f63be0 -> 0x1cbfad4
+                                    ;   = ldr x0,[x0,#0x280]; ret
+0x12aeff8  tbnz w0, #0, #0x12af014 ; TERM 4: the low bit of *(Cloudcell+0x280) must be CLEAR
+0x12af00c  ldr  x8, [x8, #0xa8]     ; vtable slot 21
+0x12af010  blr  x8                  ; the call
+```
+
+**Measured, archive `20261021-175803-eden-menugate-fallback`: ALL FOUR ARE
+SATISFIED from the moment the Cloudcell constructor finishes** (`gate=1`,
+34 samples, frames 0..209), and the guest calls the menu loader every frame.
+**This gate is not the blocker.**
+
+The old instrument could not see it: the existing `cc-cell-poll` lives under
+`if ((frames % 240) == 0)` inside the frame loop, and the loop stops at
+frame ~120-209, so it sampled **once, at f=0**, before the Cloudcell existed.
+
+**The menu loader's own slot 21 resolves to ELF `0xE851E8`.** The
+`0x14851E8` (`mt::RenderGL`) figure carried in S33/S35 belongs to a
+**different object's** slot 21 - the same "pointed at the wrong object" error
+class that has now appeared three times in this project.
+
+#### 2. There are TWO menu gates, and the journal conflated them
+
+| gate | path | terms | state |
+|---|---|---|---|
+| `0x12aefc0` | the RENDER path | 4, on the Cloudcell | **OPEN** (measured) |
+| `0x13833cc` | the MENU-ASSET path (`FrontEnd::EventMapScreen::vfunc66/vfunc69` -> `0xdac56c` -> `0xdacf08` -> the `main_menu/main_menu_twosquare.xml` open) | 3, on `cc::RookieChampionship::RookieChampionshipManager` | **NEVER MEASURED** |
+
+`0x13833cc`: `mgr+8 != 0`, `mgr+0xc != 5` (4 = career page, 5 = the rookie
+page, which suppresses the shared `main_menu_twosquare.xml`), and
+`CGlobal+0x47c != 20`. The manager is the guest global at GOT `0x1f6d840` ->
+`.bss 0x1f95cd8`; `CGlobal` is the global at GOT `0x1f6d5d8` ->
+`.bss 0x1fb2688`. `0x1384b38` closes all three terms at once (146 per-event
+flags cleared under `CGlobal+0x478`, state -> 5, `CGlobal+0x47c` -> 20) and
+is said to be a "reset the rookie-championship state and suppress the main
+menu" routine; `0x1385898` sets the state to 4 (gate open).
+
+#### 3. The network answer: a judgement call presented as a discovery
+
+The boolean is defensible - the project policy forbids forging a **Cloudcell
+success**, and a device-connectivity question is a different kind of question
+(`com.firemint.realracing.Platform.isNetworkAvailable(int)` is a
+ConnectivityManager query, "is there an active network of the requested
+type"). But three things have to be said plainly:
+
+* **It is a REDEFINITION, not a truthful answer.** The port has no network:
+  `connect()` is refused for every non-loopback destination by an allowlist,
+  and the port's HTTP is not a network at all - it is a JNI-level replacement
+  of the guest's HTTP client. The guest then acts on the redefinition: it
+  fetches from `firemonkeys.akamaized.net` and from
+  `connect-dev-ss.cloudcell.com/assetman/assetManDownloadPackHash.php`,
+  neither of which is served. Measured 1:1 in the after archive: 60
+  `DOWNLOADING ASSET`, 60 `ASSET DOWNLOAD ERROR`, 60 pack-hash POSTs, 60
+  "readable body, unknown shape: not answered".
+* **The justification was already true BEFORE the flip.** The before
+  archive contains **32** `CC: [n] POST request` and **32** `POST complete
+  [Succeeded=True]` pairs. "The port is the network for this guest" was
+  established in the very run where the port still answered false, so it
+  cannot explain why the answer had to change.
+* **The frame counter collapsed and the commit did not own it.** 14,280
+  frames in 300 s before, **120** after, and `gfx-stats` never reaches frame
+  240. The commit attributed it to "the guest goes quiet during the
+  download", but the guest logged thousands of lines; what went quiet was the
+  port's own diagnostic stream. The presentation stopped. Whether the
+  60-request pack download is blocking the frame loop is **open**, and if the
+  stall is worse than the consent popup it replaced, the honest answer may
+  be to go back to false.
+
+Also: **the answer site is `jni_bridge.cpp:2061`**, verified - slot 118
+(`jniCallStaticBooleanMethodV`) answers by NAME and never consults the
+ManagedMethod table. A worker changed `rr3_Platform.cpp` first, measured
+that nothing moved, and moved it. Both sites now answer, which is a smell:
+the same answer is declared twice, in two mechanisms, and must be kept in
+agreement by hand.
+
+**A latent trap, confirmed by three independent instruments:** the guest
+binds the method as **`(I)Z`** (binary `0x12b6b5c` -> `.rodata 0x464b3e`;
+`Platform.java:1330 public static boolean isNetworkAvailable(int i)`), and
+the port registers **`(Z)Z`** (`rr3_Platform.cpp:356`). Harmless today,
+because the live bridge compares the NAME only - but `jni_compat/jni.cpp`'s
+`GetMethodIDGeneric` compares both exactly and **would miss**. The natural
+fix for "static booleans answer by name only" is to route slot 118 through
+the ManagedMethod table, and that would turn this into a hard lookup miss.
+
+#### 4. The atlas failures are a REGISTRY gap, and the fix is honest
+
+`ImageResManager::loadImageFromAtlas` (`0x10f98a4`, message at
+`ImageResManager.cpp:199`) prints the failure iff `0x10f9324` returns 0.
+That loader walks a list at `0x10f9614` and builds `entry->path + imageName`
+at `0x10f96c8` before calling `AtlasLoader::loadAtlas` (`0xbf7d40`, whose
+file open is `0xbf8c0c` -> `0xbf7280`). **The guest never requests an atlas
+file at all** - the complete set of distinct resolved paths in the whole run
+contains no `gui_assets/<res>/<feature>/...` entry; the only `gui_assets`
+activity is three `opendir` calls. The failure is entirely guest-side, before
+any file access.
+
+The registry is the asset list, and the served
+`files/apk/res/asset_list_gui_assets_core.txt` (365,312 B, 3,292 lines) has
+**zero** top-level `splash` and **zero** `loading_icon` entries - while the
+volumes ship both features at every resolution they carry. The files exist;
+the manifest does not describe them.
+
+**The honest fix is to complete the manifest** with the lines for the files
+the volumes already ship, each carrying that file's **real md5 and real
+size**, read from the file itself. Nothing is invented, and the data is real
+- this is the manifest being made to describe the shipped data, not the other
+way round.
+
+**A second, independent port-side defect.** `rewriteGuiResolutionPath()`
+carries `"files/.depot/gui_assets/2048x1536"` in its `kMissing` list. That
+is unjustified by the port's own rule ("a rewrite is justified when the
+volume does not ship the requested name") - `gui-hd.romfs` **does** ship
+`2048x1536` (1,692 manifest lines, ~2,045 atlases). And because
+`writeContentPath()` applies the rewrite **before** `contentDevice()`, every
+2048x1536 request is remapped to 960x640 and routed to `rr3gui1` - **the
+whole 1.66 GB `gui-hd.romfs` is unreachable.**
+
+A blanket 2048x1536 -> 960x640 rewrite was implemented and **measured to stop
+the guest from booting**: it costs the filesystem self-test bit 2
+(`0x1fff -> 0x1ffd`) and `main.cpp` gates the whole boot on
+`filesystemTest == 0x1fff`. It therefore ships as a **fallback** (the HD tree
+stays primary, the 960x640 copy answers when the HD tree misses), with the
+self-test asserting both halves.
+
+#### 5. More corrections to the record
+
+* **The gui-assets manifest is NOT 2048x1536-only.** Measured over its 3,292
+  lines: `480x320` 765, `960x640` 834, `2048x1536` 1,692 - so 51 % are
+  2048x1536, and the manifest **does** name the two resolutions the device
+  ranks first. S35 §3's "every one of them is under
+  `/gui_assets/2048x1536/`" is wrong, and the open question it raised
+  ("the manifest names only 2048x1536, the device wants 960x640") rests on
+  that error. What IS true is the narrower fact: **no top-level `splash` and
+  no top-level `loading_icon`**, at any resolution.
+* **The "11 -> 4 ENOENT" row in S34 §2 is wrong.** In the after archive
+  **all 60** asset-list requests are `rc=0`; there is no ENOENT at all.
+  `asset_list_updates.txt` is **served** (`rc=0`) - by the **stale card
+  tree**, which is still reachable and still feeding the guest.
+* **"33 of the 45" is 39 of 45.** Against all seven volumes under
+  `files/.depot/`, 39 of the update manifest's 45 entries are absent; 6 are
+  present.
+* **The ROMFS volumes DO carry a top-level `files/` directory.** A previous
+  briefing said the opposite. `contains("files/.depot/...")` is true and
+  `contains(".depot/...")` is false; the manifest's own sentinels depend on
+  the prefix. Note that `contains()` treats a path without a trailing slash
+  as a FILE lookup, so a directory probe needs the slash.
+* **The 2,824 figure for `files/.depot/gui/processed/` is unverified**;
+  `core.romfs` enumerates 2,386.
+* **The trace cap still hides data.** The 60 -> 400 raise in `b4a7cb3b` is
+  still a hard cap that returns **silently** - no counter, no cap notice -
+  and the after archive hits it again (400 lines, 37 distinct names seen).
+  The comment claiming the counter "still says so" is false.
+
+#### 6. The pack-hash requests, decoded
+
+60 requests, all with an empty URL, the path in the body:
+`payload[0..3]` is a u32 length and `payload[4..4+n)` is the path, **plain**
+(a positive control against the archived heads proved a first decoder, which
+assumed a 4-byte-group reversal, wrong). Five distinct paths, each 12x:
+`/MenuBannerData.xml`,
+`/assets_2048x1536/events/map/featured/weekly_events/lexus_is_f350_catalunya/sprites.android.atlas`,
+`/assets_480x320/common/sprites.android.atlas`,
+`/assets_960x640/events/map/featured/weekly_events/lexus_is_f350_catalunya/sprites.android.atlas`,
+`/vehicles/carrepairs.repairs`.
+No response body was invented; the requests still fail honestly.
+
+#### 7. What is open now
+
+1. **Which term of the MENU-ASSET gate `0x13833cc` fails** - never measured.
+2. **Who calls `0x1384b38`** (the routine that closes all three terms) and
+   under what condition - it has no direct BL callers.
+3. **Whether the menu-ASSET gate can be opened HONESTLY** - i.e. whether
+   there is a legitimate sequence of guest events that opens it, or whether
+   the guest must finish a rookie-championship flow that needs assets or a
+   server response we do not have.
+4. **What `0xE851E8` actually is**, and what it needs.
+5. **Whether the frame stall is a regression** that must be traded against
+   the 19 popup cycles the network answer removed.
+6. **The atlas registry**: does completing the manifest make the guest
+   request the atlases?
