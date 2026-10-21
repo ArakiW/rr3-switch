@@ -5287,3 +5287,142 @@ The sprite-atlas walk also went quiet: it used to open 756 atlases and now
 opens none, because the guest now follows the shipped manifest instead of
 the stale one, and the manifest's `gui_assets` folder is not the one the
 guest wants.
+
+### S35 - the network question, and four corrections to S34 (2026-10-21)
+
+#### 1. The platform's network answer was the stall
+
+`cc::AssetDownloadService::CheckNetworkAvailability` (`0xbee1ec`) is the
+guest's own gate, and it failed every time because the host answered
+`Platform.isNetworkAvailable` **false**:
+
+```
+0xbe5ee4  w8 = byte @ 0x1f985f0      ; "already raised once" - ONE-SHOT
+0xbe5ee8  cbnz w8 -> return
+0xbe5efc  x20 = cc::DeviceInfo*     ; global 0x1f94f28
+0xbe5f0c  w21 = 0x12b8f4c(devinfo, 1)   ; hasMobileConnection
+0xbe5f1c  w20 = 0x12b8f4c(devinfo, 8)   ; hasUnmeteredConnection
+0xbe5f34  w8  = byte @ [x8 + 0x50c]  ; "allow mobile download"
+0xbe5f64  engine->vfunc(0x100)(arg) -> nBytesToDownload
+0xbe5f7c  LOG "ShowNoWifiMessage"
+0xbe60b0  bl 0xbee3d4(this, nBytes, w21, w20) -> LOG "nBytesToDownload = %lli"
+0xbe6114  tbz w20,#0 -> 0xbe62a8     ; wifi?
+0xbe62a8  cbz w21 -> 0xbe6398         ; mobile AND allowed?
+0xbe6398  LOG "No connection available"   <-- the path we were on
+```
+
+The **answer site is `jni_bridge.cpp:2061`**, not `rr3_Platform.cpp`: JNI slot
+118 answers static booleans by NAME and never consults the ManagedMethod
+table. A worker changed the wrong place first, measured that the answer did
+not move, and moved it. The answer is now **true**, and for this guest that
+is defensible rather than a lie: the port terminates the guest's Cloudcell
+HTTP itself, and nothing else is reachable (`connect()` still refuses every
+non-loopback destination, so EA's CDN is exactly as unreachable as before).
+
+**Effect, archive `20261021-165010-eden-netanswer2`:**
+
+| | before | after |
+|---|---|---|
+| `CheckNetworkAvailability` | 548 | **0** |
+| "Network interface ... NOT available" | 137 | **0** |
+| `ShowNoWifiMessage` / `ShowConsentMessage` | 19 / 19 | **0 / 0** |
+| `openNetworkSettings` | 2 | **0** |
+| `nBytesToDownload` | 19 x 4,629,803 | **0** |
+| `sprites_` | 0 | **12** |
+| `gui/processed` | 15 | 23 |
+| `StartListDownload` / `AssetDownloadError` | 0 / 0 | 264 / **60** |
+| `Device Id` | 22 x 1001 | 26 x 1001 |
+| frames / draws | 14,280 / 0-0 | 120 / 0-0 |
+
+The frame drop is a run-length artefact: the harness ends a run when the
+guest has logged nothing for 30 s, and the guest goes quiet during the
+download. **And the consent was never the blocker in the first place** - the
+guest AUTO-GRANTS it when the pending download is under 100 MB
+(`0xbe57a4 cmp x22,#0x6400000` / `0xbe57ac b.lt`), which is why
+`m_downloadConsentState = 1` appeared 136 times even in the "stuck" runs.
+`m_downloadConsentState` is a **u32 at `this+0x114`**; `this+0x110` is a
+different byte - the "network available" flag, set to 1 in exactly one
+place, the success path of `CheckNetworkAvailability`.
+
+**What the flip does NOT fix.** The menu gate at `0x12aefc0..0x12af010` has
+**four** terms and **none** of them is the download, the consent or the
+network:
+
+```
+term 1  the menu-loader object at [x23]      must be non-NULL
+term 2  the cc::Cloudcell instance          must be non-NULL
+term 3  Cloudcell+0x4c1                     must be NON-ZERO
+term 4  the low bit of *(Cloudcell+0x280)   must be CLEAR
+```
+
+`Cloudcell+0x4c1` is set to 1 by the guest's own Cloudcell constructor at
+`0x1cbe218`. `Cloudcell::vfunc17` is `ldr x0,[x0,#0x280]; ret`, so
+**term 4 is literally "the low bit of `*(Cloudcell+0x280)`"** - a value
+nobody has ever read.
+
+#### 2. Four corrections to S34 (an audit of the audit)
+
+The instrument that produced S34's numbers had two traps, and a reviewer
+found them:
+
+* **`phase=fopen-other size=` is `::stat(resolution.primary)`** - so
+  `size=-1` means "the PRIMARY does not exist", **not** "the open failed";
+  and `size=N` does not mean the guest read N bytes.
+* **`phase=assetlist-req last_errno=2` is a LEFTOVER errno** from an earlier
+  failed candidate. **`rc=0` is the verdict.** `rc=0 last_errno=2` means
+  **served**.
+
+With those in mind:
+
+| S34 said | the truth |
+|---|---|
+| the guest now reads `files/apk/res/asset_list_base.txt` (278,073 B) | the guest never opened that file - it appears only in the trace's own positive control. The file it read is **`files/.depot/asset_list_base.txtCache.txt` at 4,212,795 B** (ROMFS) against the stale card copy at 779,974 B. The size IS the discriminator. |
+| "`/gui/processed/` requested 0 -> 15" | **15 before as well.** The real fingerprint is the flat requests: **338 -> 0**, and the 338 set is exactly the stale card manifest's vocabulary (set equality; intersection with the correct manifest 0). |
+| "opened it successfully (16,597 B)" | that was a **stat**, and it was identical in the before archive. `gui/processed` opens are **0** in every archive. |
+| "`asset_list_updates.txt`'s ENOENT is correct" | it is **not** an ENOENT: `rc=0`, and the 3,854 B it resolves to is the **stale card tree**'s copy. The stale tree is still reachable and still feeding the guest - the SD card is an independent THIRD candidate derived from the primary (`guest_filesystem.cpp:1405-1436`), not the fallback slot, so the reverse alias did not displace it. |
+| "`MainMenu` moved off zero" | the metric is a literal-string count: it was **2 before** (the stale flat names `gui/MainMenu.gui`, `gui/MainMenuPromotional.gui`) and **0 after**. The correct manifest's names are `/gui/processed/MainMenu.gui` (20 hits in the ROMFS manifest). **The metric was measuring the stale build.** |
+
+The two fixes themselves survive the audit: `compactSlashes()` is safe (no
+path in any volume or on the card has an empty segment; a trailing `//`
+keeps one slash; the compression cannot manufacture a traversal that
+`containsTraversal` would have missed, and that check runs on the compressed
+string), and the reverse alias is a net win (of the asset lists the guest
+resolves, **five moved from the stale build to the correct build** - sizes
+30,756->77,957, 41,634->49,847, 37,377->113,386, 4,826->6,230,
+10,808->11,232 - and no name lost reachability).
+
+#### 3. Where the guest is now
+
+* It reads the correct manifest and opens `/gui/processed/` assets.
+* It fails on the **atlas/image pipeline**: `Failed to load image from
+  atlas: 'splash/sky_gradient.png'` and 28 `loading_icon/frame_NN.png`
+  failures, **while requesting no `*.atlas` file at all** - it only LISTED
+  `rr3gui1:/files/.depot/gui_assets` and `rr3core:/files/apk/res/gui_assets`.
+* The shipped manifest `files/apk/res/asset_list_gui_assets_core.txt`
+  (365,312 B) has 3,292 lines and **every one is under
+  `/gui_assets/2048x1536/`** - no `loading_icon`, no `splash` - while the
+  guest's own resolution table says `Current res: 1280, 720` and lists
+  `960x640` and `480x320` but **no 2048x1536**. The port's
+  `rewriteGuiResolutionPath()` remaps `1280x720` (and 1280x800, 1920x1080,
+  1080p, 720p) onto `960x640` but has **no 2048x1536 -> 960x640 rule**.
+* The **pack download** now fails instead of waiting: 60
+  `AssetDownloadError` against
+  `https://connect-dev-ss.cloudcell.com:443//assetman/assetManDownloadPackHash.php`,
+  which the port received and did not answer. The path string is inside the
+  request body.
+
+#### 4. The open questions
+
+1. **Which of the four menu-gate terms is not satisfied?** Term 4
+   (`*(Cloudcell+0x280)`) has never been read. Measuring all four in one
+   line per sample is the cheapest decisive experiment left.
+2. **Why does the guest request no atlas at all?** The gui_assets manifest
+   names only `2048x1536`, the device wants `960x640`, and the guest's own
+   table has no 2048x1536 entry.
+3. **What does the pack-hash endpoint want?** The port has the requests;
+   it needs the answer shape, which is guest-side work.
+4. **Is the download popup input-modal?** It is built guest-side around
+   `0xbe6398` and re-raised every 15 s. If it swallows the front end's
+   input, then with the network answer now true the menu may become
+   reachable **without any further change** - which would make the
+   "no connection" popup, not the gate, the real blocker all along.
