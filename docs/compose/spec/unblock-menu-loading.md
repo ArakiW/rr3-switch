@@ -4950,3 +4950,173 @@ been in the spec for a dozen rounds.
 
 **The next round is aimed at gates 1 and 2, and at question 4**, because
 question 4 can invalidate the pivot entirely and is the cheapest to answer.
+
+### S33 - THE ACTUAL BLOCKER WAS A MISSING STATIC BOOLEAN, and the menu is a SEPARATE PATH (2026-10-21)
+
+S32 was right that the `/time` chain is a side quest, and wrong about which
+thing the pivot should have pointed at. This section records what the next
+round actually found, and the three places S32 has to be corrected.
+
+#### 1. The breakthrough: `GetInfo.IsInitialized` was answered FALSE, forever
+
+`jniCallStaticBooleanMethodV` (JNI slot 118) answers static booleans **only**
+from `platformBoolForMethod`; it never consults the ManagedMethod table, the
+way the instance path does. `IsInitialized` was not in that table, so the
+guest's `com/firemonkeys/cloudcellapi/util/GetInfo.IsInitialized()` got
+`FALSE` every time.
+
+Two independent instruments: the slot-118 body has no `managedMethodFor()`
+lookup at all, and the run shows **16,197** `GetStaticMethodID IsInitialized`
+lookups against **zero** `cc-dispatch-bool` lines naming `GetInfo`.
+
+`IsInitialized` is `true` in the Java - it is set unconditionally at the end
+of the advertising-id thread, with or without Play Services - so `true` is
+the faithful answer, not a convenient one.
+
+**Effect, archive `20261021-134632-eden-getinfobool` vs `20261021-121502-eden-mgrprobe4`:**
+
+| marker | before | after |
+|---|---|---|
+| **Invalid DeviceId** | 5 | **0** |
+| **Unable to send Sync** | 7 | **2** |
+| `cc-auth-req` | 0 | 2 (`matched-by-url`) |
+| `cc-auth-deliver` | 0 | 1 (`delivered (by=url)`) |
+| `GetEADeviceId` | `[]` | `[1000000001]` |
+| `UnpackData` assertions | 0 | **2980** |
+| frames | 16080 | **22** |
+
+Two more host-side defects were fixed in the same commit:
+
+* **The method name never matched.** The guest's JNI name literal is
+  `getEADeviceId` (lower-case `g`); the port matched `"GetEADeviceId"` with
+  a byte-exact, case-sensitive `rawEquals`, so the call fell through to the
+  empty-string catch-all. The guest's own log `NimbleManager::GetEADeviceId []`
+  (empty brackets) and the host's `phase=jni-obj ... method=getEADeviceId` are
+  two independent confirmations.
+* **`cloudcell_defer`'s error accounting** double-subtracted the drain batch
+  and reported `error=-3` for a successful drain of three.
+
+**And the frame collapse is a real defect, not a result.** The port answered
+a **1716-byte sync request** with the **78-byte authenticate-shaped** body
+(the URL fallback from `1b61022c`), the guest unpacked it as a sync response
+and asserted 2980 times in `BinaryBlob::UnpackData`. The guest is in a
+deeper Cloudcell state, not a shallower one, but the response shape has to
+be right before the frame count means anything again.
+
+#### 2. Three corrections to S32
+
+**(a) `Cloudcell+0x4b8` is `cc::ServerInfo+0x8`, not a device id.**
+`ServerInfo` is embedded at `Cloudcell+0x4b0` (ctor `0x1cbe58c` stores the
+vptr `0x1f63f48`), so `ServerInfo+0x8` and `Cloudcell+0x4b8` are the **same
+four bytes**. The only writer is `cc::ServerInfo::vfunc6` (`0x1cc1a34`),
+which unpacks a u32 list from the **"Global" config blob** during
+`cc::Cloudcell::Load` (`0x1cbee7c`, the assertion at `0x1cbf018` names `Load`
+in `Cloudcell.cpp`), called from the **Cloudcell constructor chain**
+(`0x1cbe0a0 bl 0x1cbe0bc` -> `0x1cbe188 bl 0x1cbee7c`) - i.e. **at init,
+before any login**. The blob is opened with the key **`"1"`** (not
+"Global"; "Global" is only the log label), and its layout is
+`u32 magic 0x870D`, `u32 version 0x11`, then a u32 stream whose **last u32
+is the value written to `ServerInfo+0x8`**. A missing or corrupt blob does
+**not** abort: the guest logs the assert and continues, so the field stays 0
+silently.
+
+**(b) `GetEADeviceId` is NimbleManager and is irrelevant.** The guest calls
+it at `0x12e0ce4` and logs `NimbleManager::GetEADeviceId [%s]` at `0x12e0d64`;
+it returns a `std::string` from the **telemetry** SDK. There is **no data
+flow** from it to `ServerInfo+0x8` anywhere in the image. The port's own
+comment ("an empty device id is the guest's definition of never connected to
+Cloudcell") was a stale guess.
+
+**(c) The social-media gate is `SocialMedia::vfunc27`, and it SKIPS NULL
+managers.** `GetSocialManager` is `0x1d064dc`, which is **vtable slot 12**
+(`0x1f66e58`), not slot 7 - slot 7 is the thunk `0x1d07e18` that forwards the
+constant 12 into it. But the sync manager's real gate is
+`cc::social::SocialMedia::vfunc27` (`0x1d066e4`), which walks the 14-entry
+manager array, **skips the NULL entries**, and returns false only if a
+**non-NULL** manager's `vfunc4()` returns false. Index 12 is
+`cc::GooglePlayManager` (ctor `0x1ca4fac`), one of the six that are built;
+the other eight stay NULL. So "GetSocialManager(12) is NULL" was never the
+story.
+
+Also: `AuthenticateCloudcellSync` has **three** external callers, not one
+(`0x1d00a54` tail-call, `0x1d0131c`, `0x1d0213c`), and `FederatedManager+0x20`
+starts at `LEGACY(0)` with **no local code** advancing it - the state comes
+from the server response, so the request has to go out before the state can
+move. That is the same deadlock the pivot found, one level down.
+
+#### 3. The menu gate, verified by hand
+
+S32's question 4 ("does the menu require a login?") is **still open** - it
+was asserted, not proved. What IS proved is the render-path gate at
+`0x12aefc4`-`0x12af010`, read out of the image directly:
+
+```
+0x12aefc4  cbz  x8, #0x12af014        ; term 1
+0x12aefcc  ldr  x8, [x8, #0x5d0]      ; GOT 0x1f6d5d0 -> .bss 0x1fc6e98 (the Cloudcell* slot)
+0x12aefd0  ldr  x0, [x8]              ; x0 = the Cloudcell instance
+0x12aefd4  cbz  x0, #0x12af014        ; term 2: Cloudcell != NULL
+0x12aefd8  ldrb w8, [x0, #0x4c1]      ; term 3: the availability byte
+0x12aefdc  cbz  w8, #0x12af014        ;        must be NON-ZERO
+0x12aefe0  ldr  x8, [x0]
+0x12aefe4  ldr  x8, [x8, #0x30]       ; Cloudcell vfunc6
+0x12aefe8  blr  x8
+0x12aefec  ldr  x8, [x0]
+0x12aef0   ldr  x8, [x8, #0x88]       ; Cloudcell vfunc17
+0x12aeff4  blr  x8
+0x12aeff8  tbnz w0, #0, #0x12af014    ; term 4: the low bit must be CLEAR
+0x12aeffc  ldr  x0, [x23]
+0x12af000  mov  w1, #2
+0x12af004  mov  w2, #0x60
+0x12af00c  ldr  x8, [x8, #0xa8]        ; vtable slot 21
+0x12af010  blr  x8                    ; the call
+```
+
+**And the thing at that call is NOT a menu loader.** The archive says
+`menu-loader slot21=0x21086081e8 (guest own=1, ours=0x807108d0)`; with that
+run's own bias (`0x2107183000`, from `mgrvptr=0x21090e7858` and
+`mgrvptrElf=0x1f64858`) the guest address is **`0x14851e8`** - and
+`0x14851e8` switches on `w2 = 0x60` and produces sizes like `0x1800` and
+`0x8ce0`. It is a **GL/render** function. The port's `menuLoaderStub` in
+`guest_view_probe.cpp` (which calls the XML loader with
+"ESportsMainMenu.xml") is built on the premise that S9 already retracted,
+and it is **dead code**: the guest keeps its own vtable.
+
+So "the guest reached the menu loader" was an artifact, and the inference
+"the menu path was entered while auth was still dead" does not hold.
+
+**The real menu asset load** is elsewhere: `ESportsMainMenu.xml` at `.rodata
+0x3b9b9a`, referenced from **one** instruction in the image,
+
+```
+0xd9c98c  adrp x1, #0x3b9000
+0xd9c990  add  x1, x1, #0xb9a      ; -> 0x3b9b9a 'ESportsMainMenu.xml'
+0xd9c994  bl  #0x10a2cac          ; the generic XML/GUI loader
+```
+
+inside **`0xd9c92c`** = **vfunc3** of `FrontEnd::MainMenuManager` (RTTI
+`N9FrontEnd215MainMenuManagerE`, typeinfo `0x1edd140`, vptr `0x1edd008`).
+**What gates that call is the open question**, and it is a different question
+from the Cloudcell one.
+
+#### 4. The next open questions
+
+1. **What gates `FrontEnd::MainMenuManager::vfunc3` (`0xd9c92c`)?** The
+   caller, the flags it reads, and the state machine.
+2. **What does the guest's own splash -> menu transition wait for?** The
+   `renderer+0x1f5a9` one-shot byte is never set by the guest (the port has
+   an A/B switch to force it, OFF); `engine+0xa`, `container+0xa` and
+   `container+0x20` are currently forced by hand.
+3. **Why does the guest issue ~3 GL calls per frame and never a draw?**
+   (`draws=0/0` for 16,200 frames.) That is the same gate in another form.
+4. **Can the port read the request body at all?** `body=0` for every request
+   means the port cannot tell an authenticate request from a sync request,
+   and it answered a 1716-byte sync request with a 78-byte authenticate
+   body. The guest's own JNI glue creates the array with slot 176
+   (`NewByteArray`) and fills it with slot 208 (`SetByteArrayRegion`), so the
+   handle should be one of ours - which leaves the **wrong JNI table** as
+   the prime suspect (jni.cpp's `jnienv_funcs` reads `count` at offset 8 of a
+   `FakeByteArray`, where the length is at offset 4).
+5. **What shape does a sync response have to have**, and where does the
+   device id sit in it? The guest now prints `CC: Device Id: 0` after the
+   response lands.
+6. **Does the menu require a successful login at all?** - still open.
