@@ -386,7 +386,19 @@ void cloudcell_pump(const char *site, bool always_log)
          * log, so they have to be sampled consistently. */
         g_drained_total += batch.size();
         depth_after = (unsigned)g_queue.size();
-        reentrant = g_enqueued_total - enqueued_before - batch.size();
+        /* Items enqueued DURING this drain, i.e. by a callback that extended the
+         * batch. enqueued_before was already sampled under the lock at the swap
+         * (line ~286), and the batch's own items were enqueued BEFORE that
+         * sample -- so they are already counted in it. Subtracting batch.size()
+         * again double-counts them and underflows: a run where nothing was
+         * enqueued during the drain reported error=18446744073709551613
+         * (0xFFFFFFFFFFFFFFFD, i.e. -3 for a batch of three) instead of 0.
+         * Measured in archive 20261021-121502-eden-mgrprobe4:
+         *   phase=cloudcell_pump: site=frame ... enqueued_total=3 entered_total=3
+         *     drained_total=3 error=18446744073709551613
+         * Every one of the three callbacks had run and returned, so the "error"
+         * was the arithmetic, not the drain. */
+        reentrant = g_enqueued_total - enqueued_before;
         enqueued_at = g_enqueued_total;
         entered_at = g_entered_total;
         drained_at = g_drained_total;

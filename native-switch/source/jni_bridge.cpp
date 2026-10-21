@@ -1872,24 +1872,88 @@ const char* platformStringForMethod(const char* name) {
     // Offline: no EA Tracking/Synergy component. Returning a non-null fake
     // made Java call methods on a sentinel and stall cloudcell init.
     if (rawEquals(name, "getComponent")) return nullptr;
-    // GetEADeviceId, 2026-10-21.
+    // GetEADeviceId / getEADeviceId, 2026-10-21 (rewritten 2026-10-21, second
+    // pass -- the first answer never reached the guest at all).
     //
-    // It answered "" and the guest logged
-    //     NimbleManager::GetEADeviceId []
-    //     CC: Invalid DeviceId! Have we connected to cloudcell yet?
-    // An empty device id is the guest's definition of "never connected to
-    // Cloudcell": the account manager's device-id field stays unset, the
-    // environment never becomes available, and the social-media availability
-    // byte at GooglePlayManager+0x148 is never written - which is what keeps
-    // the sync queue at 10765/10712 and the main menu unreachable.
+    // WHAT THE FIRST ANSWER GOT WRONG
+    // --------------------------------
+    // The first answer matched the name "GetEADeviceId". The guest's JNI method
+    // name is "getEADeviceId" -- lower-case g -- and rawEquals() above is
+    // byte-exact and case-SENSITIVE. So the matcher never fired and the
+    // function fell through to the catch-all `return "";` at the bottom.
     //
-    // The value is opaque to the guest, so a stable non-empty string is enough.
-    // It must be non-NULL and non-empty: a NULL return would make the guest
-    // call methods on a sentinel, which is the failure mode the getComponent
-    // line above documents. It must ALSO not look like a Java object - a plain
-    // string, like every other value this function returns.
-    if (rawEquals(name, "GetEADeviceId")) return "rr3-switch-device-000000000001";
-    if (rawEquals(name, "GetSynergyId")) return "";
+    // Two independent instruments, both in the 2026-10-21-121502-eden-mgrprobe4
+    // archive, show the value never arriving:
+    //
+    //   1. The guest's own log line, with the brackets EMPTY:
+    //        ordinal=779 NimbleManager::GetEADeviceId []
+    //      The format string is the guest's, at .rodata 0x453fa5:
+    //      "NimbleManager::GetEADeviceId [%s]".
+    //   2. The port's own per-call trace of the call it served:
+    //        phase=jni-obj ... method=getEADeviceId ret=jstring-fake
+    //      The NAME the port was handed is lower-case. The guest's JNI name
+    //      literal is at .rodata 0x423404 ("getEADeviceId").
+    //
+    // And the value WAS in the binary: the deployed NRO (built 2026-10-21
+    // 12:14:49, from the commit that added it) contains the literal
+    // "rr3-switch-device-000000000001" exactly once. A build that contains the
+    // value and still hands the guest an empty string is a NAME-MATCHING
+    // defect, not a build defect. That is why this file could look correct and
+    // still produce "[]".
+    //
+    // WHY THE VALUE IS NOW ALL DIGITS
+    // --------------------------------
+    // The old value started with 'r', so ANY integer parse of it -- atoi,
+    // strtol, std::stoi -- yields 0, and 0 is the guest's own "unset" value
+    // (com.ea.nimble.NimbleTrackingImplBase.java:511 and :514 treat the device
+    // id "0" as invalid). The value is therefore all decimal digits, so it
+    // survives both readings: as an opaque string it is non-empty and non-"0",
+    // and as a number it is non-zero.
+    //
+    // The shape is not invented. The guest prints its Cloudcell identity as an
+    // unsigned 32-bit decimal -- "CC: AUTH INFO [MemberId: %u]" (guest .rodata
+    // 0x3b7674) -- and the port's own fake authenticate response carries a
+    // uint32 member id (native-switch/source/jni_compat/classes/
+    // cc_cloudcell_auth.h). So a decimal string whose value fits in a u32 is
+    // the shape the guest's own code uses for its identity.
+    //
+    // STABILITY: the value is a compile-time constant, so it is the same on
+    // every run and on every card. The guest may persist it; a value that
+    // changed between runs would make a persisted copy look like a different
+    // device.
+    //
+    // WHAT THIS IS NOT
+    // ----------------
+    // This is the Nimble/Synergy TELEMETRY device id (com.ea.nimble), not the
+    // Cloudcell account device id. The u32 at cc::Cloudcell+0x4b8 is a
+    // different thing: a full-image scan of the guest's .text finds exactly two
+    // accesses to that field on a Cloudcell base -- the constructor zeroing it
+    // (0x1cbe580) and the one read that prints "CC: Invalid DeviceId!"
+    // (0x1cbf1c4) -- and no writer at all. The port's own note in
+    // cc_cloudcell_auth.h says the same thing from the other side: the device
+    // id is SERVER-ISSUED, and the fake authenticate response carries the
+    // member id (1u, the value the guest compares against its read-only
+    // constant of 1 at guest raw 0x600f30).
+    //
+    // So this answer is a genuine defect fix -- the value has never once been
+    // delivered -- but it is NOT the thing that fills Cloudcell+0x4b8. It is
+    // fixed here so that the next run can falsify that cleanly: with a
+    // delivered, non-empty, non-zero-parsing device id, a surviving "CC:
+    // Invalid DeviceId!" proves the device id is not the cause.
+    if (rawEquals(name, "getEADeviceId") || rawEquals(name, "GetEADeviceId")) {
+        return "1000000001";
+    }
+    // getSynergyId has the SAME defect and the SAME spelling: the guest asks
+    // for "getSynergyId" (guest .rodata 0x42340f) and the port matched
+    // "GetSynergyId", so the guest logged "NimbleManager::GetSynergyId []" with
+    // empty brackets too (ordinal 780). The Synergy anonymous id is the other
+    // half of the same server-issued pair (the EA device id and the anon uid),
+    // and the Java rejects "0" for it as well, so it gets the same numeric
+    // shape. It is a DIFFERENT value from the device id, because that is what
+    // the server sends: two fields, two ids.
+    if (rawEquals(name, "getSynergyId") || rawEquals(name, "GetSynergyId")) {
+        return "2000000002";
+    }
     return "";
 }
 
@@ -1939,6 +2003,67 @@ bool platformBoolForMethod(const char* name) {
     if (rawEquals(name, "hasCameraPermission")) return false;
     // extractRes is boolean in Platform.java; assets already live on sdmc.
     if (rawEquals(name, "extractRes")) return true;
+
+    // ---- com/firemonkeys/cloudcellapi/util/GetInfo ----
+    //
+    // WHY THIS FUNCTION AND NOT THE ManagedMethod table
+    // ---------------------------------------------------
+    // jniCallStaticBooleanMethodV (slot 118, jni_bridge.cpp) answers a STATIC
+    // boolean from platformBoolForMethod() alone. It does NOT consult the
+    // ManagedMethod table, so the static registrations in
+    // jni_compat/classes/cloudcell_compat.cpp are unreachable for a static
+    // call: a static boolean on this port is answered here or not at all.
+    //
+    // Two independent instruments:
+    //   1. Source: slot 118's body is "setGameState" plus
+    //      "return platformBoolForMethod(name) ? 1u : 0u" -- there is no
+    //      managedMethodFor() lookup anywhere in it, while the INSTANCE path
+    //      (jniCallBooleanMethodV) does have one and is what writes the
+    //      "phase=cc-dispatch-bool ... -> N" lines.
+    //   2. Runtime: archive 20261021-133715-eden-getinfo2, a full 300 s run,
+    //      has 16197 "GetStaticMethodID IsInitialized" lookups from the guest
+    //      and ZERO "cc-dispatch-bool" lines naming GetInfo. The instance path
+    //      would have logged every one of them.
+    //
+    // WHAT THE GUEST USES IT FOR
+    // --------------------------
+    // guest 0x1cc0d14 is cc::DeviceInfo::IsAdvertiserInitialized (its own
+    // assertion names it, DeviceInfo.cpp:587). It does FindClass(
+    // "com/firemonkeys/cloudcellapi/util/GetInfo"), GetStaticMethodID(
+    // "IsInitialized", "()Z") and uses the answer as "the advertiser is
+    // initialised". The guest asks it roughly 54 times a second.
+    //
+    // THE HONEST VALUE
+    // ----------------
+    // reverse/java/sources/com/firemonkeys/cloudcellapi/util/GetInfo.java:
+    //
+    //   public static boolean IsInitialized() { return ms_bInitialized; }
+    //   ...
+    //   for (int i = 0; i < 5; i++) { try { ...; break; } catch (...) { ... } }
+    //   GetInfo.ms_bInitialized = true;
+    //
+    // ms_bInitialized is set true at the END of the advertising-id thread,
+    // unconditionally -- whether or not the id could be fetched. On a device
+    // WITHOUT Google Play Services (i.e. this port) the real Java ends up with
+    // ms_bInitialized == true as well. TRUE is therefore what the genuine
+    // code produces here, not a convenience; FALSE is a permanent wait for
+    // an advertiser that can never exist.
+    //
+    // The other two are equally unambiguous:
+    //   GetIsChinaBuild()  -> GetPackageName().endsWith("_cn"); the port's
+    //                         package is "com.ea.games.r3_row", so FALSE.
+    //   GetIsRunningOnTv() -> UiModeManager.getCurrentModeType() == 4; a
+    //                         Switch is not an Android TV, so FALSE.
+    //
+    // GetVolume() is deliberately NOT answered here: its honest offline value
+    // is genuinely ambiguous (there is no Android AudioManager behind this
+    // port -- the audio path is the FMOD shim -- and 0 would mean "muted"
+    // while 7 would mean "a typical Android max", and neither is measured).
+    // It is looked up twice in a run, so the gap is harmless, and a guess
+    // here would be worse than the gap.
+    if (rawEquals(name, "IsInitialized")) return true;
+    if (rawEquals(name, "GetIsChinaBuild")) return false;
+    if (rawEquals(name, "GetIsRunningOnTv")) return false;
     return false;
 }
 
