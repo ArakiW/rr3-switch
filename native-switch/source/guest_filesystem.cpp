@@ -248,6 +248,53 @@ void cleanRelative(const char* input, char* output, size_t outputSize) {
     }
 }
 
+// Collapse interior repeated separators: "a//b" -> "a/b".
+//
+// WHY IT EXISTS (measured 2026-10-21, archive 20261021-151708-eden-syncfixlong):
+//
+//   guest_path = sdmc:/switch/rr3-native-rehost/.depot//asset_list_base.txtCache.txt
+//   primary    = rr3core:/files/.depot//asset_list_base.txtCache.txt
+//   fopen-other size=-1
+//
+// The volume DOES ship files/.depot/asset_list_base.txtCache.txt - it is in
+// core.romfs - but the doubled separator made the ROMFS lookup miss, so the
+// request fell through to the SD card, where a STALE copy of the manifest
+// cache sits. The guest then read the STALE manifest, asked for that build's
+// flat /gui/*.gui names, and the volumes ship /gui/processed/*.gui instead -
+// so every menu asset missed.
+//
+// The guest builds the doubled separator by concatenating a directory that
+// ends in "/" with a manifest entry that starts with "/". That is the guest's
+// doing and it is not a bug on its side: the filesystem layer is where a
+// doubled separator has to be tolerated. One slash is the whole difference.
+//
+// The trailing form is preserved: a path that ENDS in "//" keeps one slash,
+// so directory probes still enumerate.
+void compactSlashes(const char* input, char* output, size_t outputSize) {
+    if (output == nullptr || outputSize == 0) return;
+    if (input == nullptr) {
+        output[0] = '\0';
+        return;
+    }
+    size_t written = 0;
+    bool previousWasSlash = false;
+    for (const char* cursor = input; *cursor != '\0'; ++cursor) {
+        if (*cursor == '/') {
+            if (previousWasSlash) {
+                continue;
+            }
+            previousWasSlash = true;
+        } else {
+            previousWasSlash = false;
+        }
+        if (written + 1 >= outputSize) {
+            break;
+        }
+        output[written++] = *cursor;
+    }
+    output[written] = '\0';
+}
+
 const char* contentDevice(const char* relative) {
     constexpr const char* kVehiclePrefix = "files/.depot/vehicles/";
     // Bare "gui_assets" (no resolution) must go to the SD gui volume, not core.
@@ -546,6 +593,17 @@ bool mapAppRootToContent(const char* path, Resolution& resolution) {
     if (rest[0] == '\0') {
         return false;
     }
+    // Collapse interior "//" before anything is built out of this path. The
+    // guest concatenates a directory ending in "/" with a manifest entry
+    // starting with "/", so the raw path arrives with a doubled separator -
+    // and a doubled separator makes the ROMFS lookup MISS a file that the
+    // volume actually ships. See compactSlashes() for the measurement.
+    char restCompact[0x600]{};
+    compactSlashes(rest, restCompact, sizeof(restCompact));
+    rest = restCompact;
+    if (rest[0] == '\0') {
+        return false;
+    }
     if (startsWith(rest, "save/") || startsWith(rest, "cache/") ||
         startsWith(rest, "data/") || startsWith(rest, "proc/")) {
         return false;
@@ -706,6 +764,35 @@ bool mapAppRootToContent(const char* path, Resolution& resolution) {
             // only one, so no name that resolved before stops resolving.
             char alias[0x500]{};
             std::snprintf(alias, sizeof(alias), "files/.depot/%s", appResLeaf);
+            writeContentPath(resolution.fallback, sizeof(resolution.fallback),
+                             alias);
+        }
+        else if (startsWith(rest, ".depot/")) {
+            // THE REVERSE ALIAS, and it was missing.
+            //
+            // The volume ships TWO trees: files/.depot/ and files/apk/res/.
+            // The alias above covers an apk/res/ request that names a file the
+            // volume keeps under .depot/. This covers the other direction, and
+            // it is the direction the asset lists come from.
+            //
+            // MEASURED 2026-10-21, archive 20261021-154608-eden-slashfix: ten
+            // asset-list files the guest asks for under .depot/ exist in the
+            // volume ONLY under files/apk/res/:
+            //     asset_list_audio.txt            asset_list_vehicle_common.txt
+            //     asset_list_audio_base.txt       asset_list_vehicle_data.txt
+            //     asset_list_track_data_common.txt        asset_list_vehicle_shaders.txt
+            //     asset_list_track_laguna_seca_common.txt  asset_list_vehicle_wheels.txt
+            //     asset_list_track_laguna_seca_high.txt    asset_list_vector_images.txt
+            // All ten came back errno=2 (ENOENT) while their apk/res/ copies sat
+            // in core.romfs the whole time. The guest probes several roots and
+            // a missing probe is not free, so an unresolved asset list means an
+            // unresolved asset set - which is the 159 MB the AssetDownloadService
+            // then wanted to fetch.
+            //
+            // (asset_list_updates.txt is in NONE of the three packs, so its
+            // ENOENT is correct: the shipping game does not have it either.)
+            char alias[0x500]{};
+            std::snprintf(alias, sizeof(alias), "files/apk/res/%s", rest + 7);
             writeContentPath(resolution.fallback, sizeof(resolution.fallback),
                              alias);
         }
@@ -1075,6 +1162,13 @@ bool resolvePathImpl(const char* path, bool writing, Resolution& resolution) {
 
     if (const char* relative = afterPackageFiles(path)) {
         char contentRelative[0x500]{};
+        // The same doubled separator the app-root path can carry. The guest
+        // builds it by joining a directory that ends in "/" with an asset name
+        // that starts with "/", and a ROMFS lookup with "//" in it misses a
+        // file the volume ships. Compact before anything is built from it.
+        char relativeCompact[0x500]{};
+        compactSlashes(relative, relativeCompact, sizeof(relativeCompact));
+        relative = relativeCompact;
         // Android unpacks the depot under files/. Guest code sometimes asks
         // for files/gui/... or files/gui_assets/... without the .depot/ level.
         // The seven volumes store everything under files/.depot/.
