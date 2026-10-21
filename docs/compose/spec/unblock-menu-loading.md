@@ -4708,6 +4708,17 @@ cc::AndroidHttpRequestWorker
 
 #### 8. The request BODY is structurally unreadable, so the fake authenticate response has NEVER been delivered
 
+> **CORRECTION (2026-10-21, see S32).** The MECHANISM in this section is
+> **WRONG** and the conclusion drawn from it does not hold. The guest does
+> **not** hand us a raw guest pointer: it calls JNI slot 176 (`NewByteArray`)
+> and then slot 208 (`SetByteArrayRegion`) to copy the body out of guest
+> memory, so the handle **is** one of our `FakeByteArray` records and
+> `asByteArray()` accepts it. `body=0` on the `/time` request is simply
+> **correct**: that request is a **bodyless GET**. The real open question is
+> whether the *authenticate* request's body will be readable when it arrives,
+> and that request has never been seen at all. Everything below is kept as
+> the record of what was believed, and why.
+
 This is a confirmed latent blocker sitting **directly behind** the gate above,
 and it would have bitten the moment the gate opened.
 
@@ -4774,3 +4785,168 @@ next probe must (a) take the manager from `record+0xc0`, (b) read
 on EVERY 240-frame tick for the WHOLE run - the 4-sample caps are the
 single worst defect in the project right now - and (d) print the record's
 path with a purpose-built reader.
+
+### S32 - THE PIVOT: the /time chain is a SIDE QUEST, and the real blocker is upstream of HTTP (2026-10-21)
+
+This section supersedes S27-S31 as the working theory. It is written from
+three independent agents (runtime instrument, static call graph, adversarial
+review) plus a fourth that was asked only to attack the new story.
+
+**The headline: the Cloudcell `/time` response-complete event is NOT what
+stands between us and the main menu.** Fixing it would raise `cnt90` from 0
+to 5 and print one more line, and nothing else would move.
+
+#### 1. The free measurement that broke the story
+
+`cc::auth::FederatedManager::AuthenticateCloudcellSync` (`0x1d00364`) prints
+`"CC: AuthenticateCloudcellSync() - nCCMemberId=%d, m_eCurrentAuthenticateState=%s"`
+**at the top of the function, before any guard**. In every archive that line
+is **absent**:
+
+| line | srvbody2 | mgrprobe4 |
+|---|---|---|
+| `AuthenticateCloudcellSync` | **0** | **0** |
+| `AUTH_STATE` | 0 | 0 |
+| `AuthenticationCallback` | 0 | 0 |
+| `AUTH INFO` | 0 | 0 |
+| `Invalid DeviceId!` | 5 | 5 |
+| `Unable to send Sync` | 7 | 7 |
+
+⇒ **the authenticate function is never entered**, so the blocker is strictly
+**upstream of the HTTP transport**. No amount of `/time` tuning can move the
+menu. That function's gates are the auth state (`FederatedManager+0x20`), the
+social-login-in-progress flag (`+0x30`) and the MemberManager's member - it
+never reads the server-time state at all.
+
+#### 2. The new first two gates
+
+`cc::Cloudcell` is at `.bss 0x1fc6e98` (GOT `0x1f6d5d0`), sizeof `0x4d0`,
+vptr `0x1f63b58`, typeinfo `0x1f63d58` = `N2cc9CloudcellE`.
+
+| # | gate | address | symptom |
+|---|---|---|---|
+| 1 | **`Cloudcell+0x4b8`, the u32 device id, reads 0** | zeroed at `0x1cbe580`; setter `cc::ServerInfo::vfunc3` `0x1cc1ac0`; loader `vfunc6` `0x1cc1a34` | "CC: Invalid DeviceId! Have we connected to cloudcell yet?" (x5) |
+| 2 | **`cc::social::SocialMedia::GetSocialManager(12)` returns NULL** | SocialMedia at `Cloudcell+0x2f8` (vptr `0x1f66df8`); `GetSocialManager` = vfunc7 `0x1d064dc` | "CC: Unable to send Sync, Social Media not initialised." (x7) |
+
+`cc::Cloudcell::vfunc34` (`0x1cbf178`) prints "CC: App resumed" and, when
+`+0x4b8 == 0` (guard `cbnz w8` at `0x1cbf1c8`), the device-id complaint.
+`Cloudcell+0x4c1` is a "cloudcell ready" byte the **guest sets itself** at
+`0x1cbe218`, right before "CC: Initialization complete".
+
+#### 3. The instrument finally measures the right object (archive `20261021-121502-eden-mgrprobe4`)
+
+349 samples over the full 300 s (1 Hz host carrier + every 240 frames on the
+guest's own tick), with the 4-sample cap removed and the guest frame number
+carried in the line:
+
+```
+recOk=1 ownerOk=1 agree=1 mgr=0x210fc02600 mgrvptrElf=0x1f64858
+vec=0x21106daff0/0x21106daff8/1  rec=0x21105b8360  invec=1  hit=0
+tok=0x1 c8=1 c9=0 d0=0 d4=0 h100=0x21105b8440 b130=0x0 p160=0x21105b84a0 st170=0xc8
+mgr58=0x0 wk60=0x21105b86c0 recMgr=0x210fc02600
+pathLen=45 path=https://connect-dev-ss.cloudcell.com:443/time
+stmVptrElf=0x1f65b98 stmTok=0x1 stmTime=1792556121.528548
+```
+
+**What it settles:**
+
+* **Exactly ONE `cc::HttpRequestManager` instance** - and it is **heap
+  allocated** (`operator new(0x60)` at `0x1cbe2f4`), so a `.bss` scan finds
+  **zero** static instances. Its pointer is at `Cloudcell+0x218`. The runtime
+  vptr is `bias + 0x1f64858` because the loader rebases `R_AARCH64_RELATIVE`
+  by the bias - a `.bss` scan for the raw vaddr can never see it.
+* **The `/time` record IS in the manager's vector** (`invec=1`, vector count
+  1) on **every** sample. The old probe's `vecn=0 invec=0` was an artifact of
+  probing the wrong object; the question "is the record in the vector?" had
+  never actually been asked.
+* **The state never changes**: `c8=1`, handler installed, status 200, and
+  `c9=0`, `d0=0`, `d4=0` - bit-identical from the first sample to the last.
+* **Record identity, four independent ways**: the record's own path
+  (`https://connect-dev-ss.cloudcell.com:443/time`), the guest's own log
+  (`CC: [1] POST request [...]` - the `[1]` is the record's token), the
+  ServerTimeManager's token (`stmTok=0x1` == `tok=0x1`, its class confirmed
+  by vptr `0x1f65b98`), and the status `200` the port's own
+  `completeCallback` delivered.
+* **`record+0xd0` never fires** - the header-delivery witness written only at
+  `0x1ce2c6c`. So the guest's own post-delivery path is not running, which is
+  the same symptom as the missing Poll delivery.
+
+#### 4. Poll is called from exactly ONE place, on exactly this instance
+
+```
+cc::Cloudcell::vfunc36 (0x1cbf3d0)
+0x1cbf3f8  ldr  x0, [x0, #0x218]    ; Cloudcell->http_manager
+0x1cbf3fc  ldr  x8, [x0]           ; vptr
+0x1ce29b4 slot 0x78                ; cc::HttpRequestManager::Update
+0x1cbf404  blr  x8
+```
+reached per frame: `0x12aea7c -> 0x12b4448 -> 0x1405868 -> 0xcdb738 ->
+0x1cbf404`. `0x1ce29b4` appears in exactly **one** vtable slot in the image
+(`0x1f648d0` = vptr + 0x78); it is **virtual only**, with zero direct
+callers. The caller's own gates are `0xbea4e4` (`cmp w8,#0 ; b.le` - a
+counter), `0xcdb738` (`+0xd8` / `+0xd7` bytes) and `0x12b4448` (`+0xa` /
+`+0xb` bytes).
+
+**Naming:** `0x1ce29b4` is `cc::HttpRequestManager::Update`, per the guest's
+own assertion string at `0x394919` - not "Poll". Cosmetic, but the name has
+been in the spec for a dozen rounds.
+
+#### 5. Corrections to earlier sections
+
+* **S31 section 8's mechanism is wrong** (banner added there): the guest
+  creates the `byte[]` through JNI slot 176 (`NewByteArray`) and fills it
+  through slot 208 (`SetByteArrayRegion`) - so the handle **is** one of our
+  `FakeByteArray` records. `body=0` on `/time` is **correct**: that request
+  is a **bodyless GET**. The port's own `readGuestString()` mis-reads the
+  record's path because it assumes a `libc++ std::string` shape; the
+  dedicated reader (inline data at `+0x08`, size at `+0x18`, pointer at
+  `+0x20`) prints it correctly.
+* **"CC: Server time returned" is printed by `SetAveragedTimes`**
+  (`0x1cefb80`), **not** by the response handler. Its absence therefore
+  restates `cnt90 == 0` and is **not** independent evidence about the
+  response-complete event.
+* `SetAveragedTimes` copies **80 bytes (10 doubles)** from `this+0xd8`, not
+  120. The sample buffer is 120 bytes (5 x 24 stride, written at `0x1cefd8c`
+  with `madd x9, x8, #0x18`), but the copy length is `lsl x2, x8, #3` with
+  `x8 = 10`.
+* **The `/time` request is a bodyless GET**, not a POST with `body[0]==0x22`.
+  `CC_Sync.php` is the authenticate/sync endpoint.
+* **"MainMenu" is not a standalone token in the guest.** The only
+  NUL-terminated occurrences are RTTI tails (`18EAPlayDemoMainMenu`,
+  `19RaceMetricsMainMenu`, `28McLarenShadowProjectMainMenu`). The metric is
+  a substring grep, and its only realistic producer is the asset
+  `ESportsMainMenu.xml` (`0x3b9b9a`), loaded by `FrontEnd::MainMenuManager`
+  (vptr `0x1edd008`) at `0xd9c98c`. **Caveat:** our own probe loads that
+  asset by hand (`guest_view_probe.cpp` ~886), so the metric can be
+  confounded by the port's own synthetic load.
+* The probe's frame field is now **`gf=`**, not `frames=`: the Eden
+  instrument census takes the **last** `frames=(\d+)` match in the guest log
+  as the frame total (`tools\Test-OnEden.ps1:269`), so a probe line ending
+  in `frames=0` made the census report "frames 0" - a false "the guest
+  wedged on frame one" signal.
+
+#### 6. What is open now
+
+1. **Where does the device id come from?** The port answers the guest's
+   `GetEADeviceId` with the **string** `"rr3-switch-device-000000000001"`.
+   If the guest parses that as a number it gets **0**, because the string
+   starts with `r`. If the device id instead comes from the GameConfig
+   "Global" u32 list (`ServerInfo::vfunc6` `0x1cc1a34`) or from the
+   authenticate response, then faking it locally would be faking the wrong
+   thing - and the authenticate response would be **downstream** of a value
+   that is supposed to arrive with it.
+2. **Which platform is social-media index 12**, and what makes
+   `GetSocialManager(12)` non-NULL.
+3. **Who calls `FederatedManager::vfunc5` (`0x1d00a54`)** - the only
+   external caller of `AuthenticateCloudcellSync`, and therefore the
+   immediate upstream blocker.
+4. **Does the menu even require a successful login?** If it does not, the
+   pivot is aimed at the wrong target and the whole Cloudcell chain is a
+   red herring for the menu.
+5. `record+0xd4` still 0 with `worker+0x60` non-NULL and `manager+0x58` = 0
+   - the body-append path is not gated off, yet the count never moves.
+6. Why `record+0xd0` never fires although the port called the guest's
+   `headerCallback` and the guest logged `POST complete [Succeeded=True]`.
+
+**The next round is aimed at gates 1 and 2, and at question 4**, because
+question 4 can invalidate the pivot entirely and is the cheapest to answer.
