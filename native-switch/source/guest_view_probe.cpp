@@ -1313,6 +1313,11 @@ void pollDownloadPhaseGate();
 // is defined far below, next to the gate's own disassembly.
 void sampleMenuGateTerms(uint64_t frames, const char* carrier);
 
+// The MENU-ASSET gate probe. Same reason, and it is called from inside
+// sampleMenuGateTerms so that both carriers -- the guest's 240-frame tick and
+// the host sampler -- carry it.
+void sampleMenuAssetGateTerms(uint64_t frames, const char* carrier);
+
 void samplerWorker(void* opaque) {
     const Handle target = static_cast<Handle>(reinterpret_cast<uintptr_t>(opaque));
     uint64_t sinceFlush = 0;
@@ -4076,6 +4081,10 @@ void emitMenuGateSample(uint64_t frames, const char* carrier,
 // so once a second.
 void sampleMenuGateTerms(uint64_t frames, const char* carrier) {
     const uint64_t bias = static_cast<uint64_t>(resolveMainImageLoadBias());
+    // The MENU-ASSET gate, on the same carriers, sampled BEFORE the render
+    // gate's own change filter: the two gates are independent, and a filter
+    // that belongs to one of them must not silence the other.
+    sampleMenuAssetGateTerms(frames, carrier);
     const MenuGateSample s = sampleMenuGate(bias);
     if (carrier != nullptr && std::strcmp(carrier, "sampler") == 0) {
         struct Last {
@@ -4115,6 +4124,203 @@ void sampleMenuGateTerms(uint64_t frames, const char* carrier) {
         ++s_lines;
     }
     emitMenuGateSample(frames, carrier, s);
+}
+
+// ---------------------------------------------------------------------------
+// THE MENU-ASSET GATE: 0x13833cc, MEASURED.
+//
+// WHY A SECOND GATE. The gate measured above (0x12aefc0..0x12af010, the tail
+// of the render entry) is OPEN: all four of its terms are satisfied from the
+// moment the guest's own Cloudcell constructor finishes, and the guest calls
+// the menu loader every frame. So the render path is not the blocker, and
+// the menu-ASSET path is the one that has never been measured.
+//
+// THE GATE, DISASSEMBLED (guest 0x13833cc, a 68-byte function):
+//
+//   0x13833cc  stp  x29, x30, [sp, #-0x10]!
+//   0x13833d0  mov  x29, sp
+//   0x13833d4  ldrb w8, [x0, #8]      ; TERM 1: mgr+8   must be NON-ZERO
+//   0x13833d8  cbz  w8, #0x13833f8    ;   -> return 0
+//   0x13833dc  ldr  w8, [x0, #0xc]    ; TERM 2: mgr+0xc must be != 5
+//   0x13833e0  cmp  w8, #5
+//   0x13833e4  b.eq #0x13833f8        ;   -> return 0
+//   0x13833e8  bl   #0x10ab9a8        ; CGlobal + 0x478 (or 0 if CGlobal is null)
+//   0x13833ec  ldr  w8, [x0, #4]      ; TERM 3: CGlobal+0x47c must be != 20
+//   0x13833f0  cmp  w8, #0x14
+//   0x13833f4  b.ne #0x1383404        ;   -> return 1
+//   0x13833f8  mov  w0, wzr            ; return 0
+//   0x1383404  mov  w0, #1             ; return 1
+//
+// x0 IS THE MANAGER, and it arrives from the guest's own global chain:
+//
+//   0xdb8cb4  adrp x8, #0x1f6d000
+//   0xdb8cb8  ldr  x8, [x8, #0x840]   ; the .bss CELL 0x1f95cd8
+//   0xdb8cbc  ldr  x8, [x8]           ; the MANAGER object
+//   0xdb8cc0  mov  x0, x8
+//   0xdb8cc4  bl  #0x13833cc
+//
+// So the chain is the same TWO-LEVEL shape the render gate uses: the GOT slot
+// holds the .bss cell, and the cell holds the object.
+//
+// THE CGlobal CHAIN is the one 0x13833e8 calls into (guest 0x10ab9a8):
+//
+//   0x10ab9a8  adrp x8, #0x1f6d000
+//   0x10ab9ac  ldr  x8, [x8, #0x5d8]  ; the .bss CELL 0x1fb2688
+//   0x10ab9b0  ldr  x8, [x8]          ; the CGlobal object
+//   0x10ab9b4  add  x9, x8, #0x478
+//   0x10ab9b8  cmp  x8, #0
+//   0x10ab9bc  csel x0, xzr, x9, eq   ; CGlobal+0x478, or 0 when CGlobal is null
+//
+// and the gate then reads the word at +4 from that, i.e. CGlobal+0x47c.
+//
+// EVERY READ BELOW goes through menuGateReadWord/menuGateReadByte, which
+// check the guest's own 64-bit window AND ask svcQueryMemory for Perm_R on
+// the page. A read that cannot be satisfied is reported as UNKNOWN ('?'),
+// never as a value: "term 2 = 0" and "term 2 could not be read" must never
+// be the same observation.
+constexpr uint64_t kMenuAssetGateMgrGotElfVa = 0x1F6D840ULL;
+constexpr uint64_t kMenuAssetGateCGlobalGotElfVa = 0x1F6D5D8ULL;
+constexpr uint64_t kMenuAssetGateMgrByte8Off = 0x8ULL;
+constexpr uint64_t kMenuAssetGateMgrWord0cOff = 0xCULL;
+constexpr uint64_t kMenuAssetGateCGlobalWord47cOff = 0x47CULL;
+// The two values that SHUT the gate.
+constexpr uint32_t kMenuAssetGateMgrBlockedValue = 5U;
+constexpr uint32_t kMenuAssetGateCGlobalBlockedValue = 20U;
+
+struct MenuAssetGateSample {
+    bool mgrCellRead{};
+    bool mgrRead{};
+    bool byte8Read{};
+    bool word0cRead{};
+    bool cglobalCellRead{};
+    bool cglobalRead{};
+    bool word47cRead{};
+    uint64_t mgrCell{};
+    uint64_t mgr{};
+    uint64_t cglobalCell{};
+    uint64_t cglobal{};
+    uint8_t byte8{};
+    uint32_t word0c{};
+    uint32_t word47c{};
+};
+
+MenuAssetGateSample sampleMenuAssetGate(uint64_t bias) {
+    MenuAssetGateSample s{};
+    if (bias == 0) {
+        return s;
+    }
+    // The manager: GOT slot -> .bss cell -> the manager object.
+    s.mgrCellRead = menuGateReadWord(
+        bias, static_cast<uintptr_t>(bias + kMenuAssetGateMgrGotElfVa), &s.mgrCell);
+    if (s.mgrCellRead) {
+        s.mgrRead = menuGateReadWord(bias, static_cast<uintptr_t>(s.mgrCell), &s.mgr);
+    }
+    if (s.mgrRead && s.mgr != 0) {
+        uint8_t byte8Value = 0;
+        uint64_t word0cValue = 0;
+        s.byte8Read = menuGateReadByte(
+            bias, static_cast<uintptr_t>(s.mgr + kMenuAssetGateMgrByte8Off), &byte8Value);
+        s.word0cRead = menuGateReadWord(
+            bias, static_cast<uintptr_t>(s.mgr + kMenuAssetGateMgrWord0cOff), &word0cValue);
+        s.byte8 = byte8Value;
+        s.word0c = static_cast<uint32_t>(word0cValue);
+    }
+    // CGlobal: GOT slot -> .bss cell -> the CGlobal object.
+    s.cglobalCellRead = menuGateReadWord(
+        bias, static_cast<uintptr_t>(bias + kMenuAssetGateCGlobalGotElfVa), &s.cglobalCell);
+    if (s.cglobalCellRead) {
+        s.cglobalRead = menuGateReadWord(bias, static_cast<uintptr_t>(s.cglobalCell),
+                                         &s.cglobal);
+    }
+    if (s.cglobalRead && s.cglobal != 0) {
+        uint64_t word47cValue = 0;
+        s.word47cRead = menuGateReadWord(
+            bias, static_cast<uintptr_t>(s.cglobal + kMenuAssetGateCGlobalWord47cOff),
+            &word47cValue);
+        s.word47c = static_cast<uint32_t>(word47cValue);
+    }
+    return s;
+}
+
+// ONE LINE: the manager pointer, mgr+8, mgr+0xc, CGlobal+0x47c, and whether
+// the gate would return 1, with the guest's own frame number.
+void emitMenuAssetGateSample(uint64_t frames, const char* carrier,
+                             const MenuAssetGateSample& s) {
+    const bool t1Known = s.byte8Read;
+    const bool t2Known = s.word0cRead;
+    const bool t3Known = s.word47cRead;
+    const bool t1 = t1Known && s.byte8 != 0;
+    const bool t2 = t2Known && s.word0c != kMenuAssetGateMgrBlockedValue;
+    const bool t3 = t3Known && s.word47c != kMenuAssetGateCGlobalBlockedValue;
+    const bool allKnown = t1Known && t2Known && t3Known;
+    const bool allSatisfied = t1 && t2 && t3;
+    const char* gate = allKnown ? (allSatisfied ? "1" : "0") : "?";
+    unsigned mask = 0;
+    mask |= s.mgrCellRead ? 1u : 0u;
+    mask |= s.mgrRead ? 2u : 0u;
+    mask |= s.byte8Read ? 4u : 0u;
+    mask |= s.word0cRead ? 8u : 0u;
+    mask |= s.cglobalCellRead ? 16u : 0u;
+    mask |= s.cglobalRead ? 32u : 0u;
+    mask |= s.word47cRead ? 64u : 0u;
+    char line[512];
+    __builtin_snprintf(
+        line, sizeof(line),
+        "masset-gate: f=%llu via=%s mgr=%llx m8=%u m8ok=%c m0c=%u m0cok=%c"
+        " cg=%llx cg47c=%u cg47cok=%c gate=%s rd=0x%02x",
+        (unsigned long long)frames,
+        carrier != nullptr ? carrier : "?",
+        (unsigned long long)s.mgr, (unsigned)s.byte8, menuGateTerm(t1Known, t1),
+        (unsigned)s.word0c, menuGateTerm(t2Known, t2),
+        (unsigned long long)s.cglobal, (unsigned)s.word47c,
+        menuGateTerm(t3Known, t3), gate, mask);
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        line, 97, 0);
+}
+
+// The same change/heartbeat rule the render gate uses, so a run in which
+// nothing changes still says so once a second.
+void sampleMenuAssetGateTerms(uint64_t frames, const char* carrier) {
+    const uint64_t bias = static_cast<uint64_t>(resolveMainImageLoadBias());
+    const MenuAssetGateSample s = sampleMenuAssetGate(bias);
+    if (carrier != nullptr && std::strcmp(carrier, "sampler") == 0) {
+        struct Last {
+            bool valid{};
+            uint64_t mgr{};
+            uint32_t byte8{};
+            uint32_t word0c{};
+            uint64_t cglobal{};
+            uint32_t word47c{};
+            uint64_t tick{};
+        };
+        static Last s_last{};
+        static unsigned s_lines = 0;
+        constexpr unsigned kMaxLines = 200;
+        if (s_lines >= kMaxLines) {
+            return;
+        }
+        const uint64_t now = armGetSystemTick();
+        const uint64_t freq = armGetSystemTickFreq();
+        const uint64_t elapsedMs = (now - s_last.tick) * 1000ULL /
+                                   (freq != 0 ? freq : 1);
+        const bool heartbeatDue = s_last.valid && elapsedMs >= 1000ULL;
+        const bool changed =
+            !s_last.valid || s_last.mgr != s.mgr || s_last.byte8 != s.byte8 ||
+            s_last.word0c != s.word0c || s_last.cglobal != s.cglobal ||
+            s_last.word47c != s.word47c;
+        if (!changed && !heartbeatDue) {
+            return;
+        }
+        s_last.valid = true;
+        s_last.mgr = s.mgr;
+        s_last.byte8 = s.byte8;
+        s_last.word0c = s.word0c;
+        s_last.cglobal = s.cglobal;
+        s_last.word47c = s.word47c;
+        s_last.tick = now;
+        ++s_lines;
+    }
+    emitMenuAssetGateSample(frames, carrier, s);
 }
 
 // ---------------------------------------------------------------------------

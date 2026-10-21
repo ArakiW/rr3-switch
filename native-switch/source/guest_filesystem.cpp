@@ -3,15 +3,19 @@
 #include "rr3/bionic_misc_shims.hpp"
 #include "rr3/gfx_backend.hpp"
 #include "rr3/recovery_guard.hpp"
+#include "rr3/rr3_md5.hpp"
 #include "bionic_errno.hpp"
 
+#include <atomic>
 #include <cerrno>
 #include <cstdarg>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace rr3 {
@@ -1491,6 +1495,401 @@ void logAssetListRequest(const char* guestPath, const Resolution& resolution,
                         "assetlist-req", s_lines, 0, details);
 }
 
+// ---------------------------------------------------------------------------
+// THE COMPLETED GUI-ASSETS MANIFEST.
+//
+// WHY THIS EXISTS. The guest's atlas registry is built from the asset list.
+// The list the port serves, files/apk/res/asset_list_gui_assets_core.txt
+// (365,312 B, 3,292 lines), names NO "splash" file and NO "loading_icon"
+// file at ANY resolution -- measured, zero hits for either name in the whole
+// file -- so ImageResManager::loadImageFromAtlas (0x10f98a4) fails for
+// 'splash/sky_gradient.png' and for 'loading_icon/frame_01..13.png' WITHOUT
+// ever asking the filesystem for an atlas: the entry is simply not in the
+// registry.
+//
+// The volumes DO ship both features, at every resolution they carry. The
+// manifest is what is incomplete, not the data.
+//
+// WHAT THIS DOES. It completes THAT ONE manifest and serves the completed
+// copy:
+//
+//   * the shipped manifest is read from the volume, byte for byte;
+//   * every file under a top-level "splash/" or "loading_icon/" directory at
+//     every resolution the volumes ship is enumerated FROM THE VOLUMES
+//     (opendir/readdir on the mounted devices -- the same calls guestOpendir
+//     makes);
+//   * for each of those files the md5 and the size are computed FROM THE
+//     FILE'S OWN BYTES (rr3::md5File), so a line can never claim a digest
+//     the file does not have;
+//   * the lines are appended to the shipped manifest's text, and the result
+//     is written to the SD card, which the resolver then serves INSTEAD of
+//     the volume copy.
+//
+// The digest is not a constant in this file on purpose. The deployed volumes
+// are content-addressed (rr3-data-manifest.json carries a sha256 per
+// volume), and a digest computed at run time is a digest of the bytes that
+// are actually there -- for whichever copy the resolver would serve.
+//
+// WHAT IT DOES NOT DO. It does not edit a volume, it does not invent a
+// file, and it does not touch any other manifest. A file the volumes do not
+// ship produces NO line, and the count of those is in the log line below.
+// ---------------------------------------------------------------------------
+
+// The manifest the guest reads to build its atlas registry.
+constexpr const char* kGuiAssetsManifestLeaf = "asset_list_gui_assets_core.txt";
+// Where the completed copy is written. The cache root is already a writable
+// root (ensureWritableRoots), so this needs no new directory.
+constexpr const char* kCompletedManifestPath =
+    "sdmc:/switch/rr3-native-rehost/cache/asset_list_gui_assets_core.txt";
+constexpr const char* kCompletedManifestTempPath =
+    "sdmc:/switch/rr3-native-rehost/cache/asset_list_gui_assets_core.txt.tmp";
+// The two FEATURES the shipped manifest does not name at any resolution.
+constexpr const char* kManifestFeatures[] = {"splash", "loading_icon"};
+// The resolutions the volumes ship. The guest's own resolution table names
+// 960x640 first, then 480x320, then 1024x768 and 768x576 -- and the volumes
+// ship neither of the last two, so these three are the complete set.
+constexpr const char* kManifestResolutions[] = {"2048x1536", "960x640", "480x320"};
+
+struct ManifestAsset {
+    char logical[224];  // "/gui_assets/<resolution>/<relative path>"
+};
+constexpr unsigned kManifestMaxAssets = 256;
+
+bool manifestPathKnown(const ManifestAsset* assets, unsigned count, const char* logical) {
+    for (unsigned index = 0; index < count; ++index) {
+        if (std::strcmp(assets[index].logical, logical) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Recursively collect the files under one volume directory.
+//
+// The host's opendir/readdir, NOT the guest's: guestReaddir injects synthetic
+// entries for the bare gui_assets folder, and this walk must see only what the
+// volume really ships.
+void collectManifestAssets(const char* device, const char* volumeRelative,
+                           const char* logicalPrefix,
+                           ManifestAsset* assets, unsigned& count,
+                           unsigned& overflow) {
+    char directory[352];
+    std::snprintf(directory, sizeof(directory), "%s:/%s", device, volumeRelative);
+    DIR* handle = ::opendir(directory);
+    if (handle == nullptr) {
+        return;
+    }
+    for (;;) {
+        struct dirent* entry = ::readdir(handle);
+        if (entry == nullptr) {
+            break;
+        }
+        if (entry->d_name[0] == '.') {
+            continue;
+        }
+        char childRelative[352];
+        std::snprintf(childRelative, sizeof(childRelative), "%s/%s",
+                      volumeRelative, entry->d_name);
+        char childDevice[384];
+        std::snprintf(childDevice, sizeof(childDevice), "%s:/%s", device, childRelative);
+        struct stat info{};
+        if (::stat(childDevice, &info) != 0) {
+            continue;
+        }
+        if (S_ISDIR(info.st_mode)) {
+            char childLogical[256];
+            std::snprintf(childLogical, sizeof(childLogical), "%s%s/",
+                          logicalPrefix, entry->d_name);
+            collectManifestAssets(device, childRelative, childLogical,
+                                  assets, count, overflow);
+            continue;
+        }
+        if (count >= kManifestMaxAssets) {
+            ++overflow;
+            continue;
+        }
+        char logical[256];
+        std::snprintf(logical, sizeof(logical), "%s%s", logicalPrefix, entry->d_name);
+        if (manifestPathKnown(assets, count, logical)) {
+            continue;
+        }
+        std::snprintf(assets[count].logical, sizeof(assets[count].logical), "%s", logical);
+        ++count;
+    }
+    ::closedir(handle);
+}
+
+// EVERY place the port can serve a logical manifest path from, in the order
+// the resolver would try them.
+//
+// A manifest line has to describe bytes the port can actually hand the
+// guest, and the port has FOUR ways to serve a gui_assets path:
+//
+//   1. the .depot copy in the gui volume for that resolution
+//   2. the 960x640 copy -- the hd->sd FALLBACK, 2048x1536 only
+//   3. the apk/res copy in the core volume -- the .depot -> apk/res ALIAS
+//   4. the 960x640 .depot copy, for a 2048x1536 path
+//
+// MEASURED 2026-10-21, archive 20261021-183146-eden-massetgate-manifest: a
+// two-candidate form that mirrored the resolver's own order resolved only the
+// 480x320 paths (18 of 58) and called the other 40 absent -- and every one of
+// those 40 IS present in the volumes, so that count was a statement about the
+// candidate list and not about the data.
+//
+// THE FIRST VERSION OF THIS FUNCTION HAD THE OFF-BY-ONE THAT CAUSED IT: it
+// compared the resolution SEGMENT LENGTH against 8 for "2048x1536" and 6 for
+// "960x640". Both are wrong -- "2048x1536" is NINE characters and "960x640"
+// is SEVEN -- so only "480x320" (seven) ever matched. The length is now
+// never used to identify the resolution: the segment is copied out and
+// compared as a STRING.
+void manifestCandidates(const char* logical, char out[4][384], unsigned& countOut) {
+    static const char kPrefix[] = "/gui_assets/";
+    countOut = 0;
+    if (logical == nullptr) {
+        return;
+    }
+    if (std::strncmp(logical, kPrefix, sizeof(kPrefix) - 1) != 0) {
+        return;
+    }
+    const char* resolution = logical + sizeof(kPrefix) - 1;
+    const char* slash = std::strchr(resolution, '/');
+    if (slash == nullptr || slash[1] == '\0') {
+        return;
+    }
+    const size_t resolutionLength = static_cast<size_t>(slash - resolution);
+    char resolutionName[16];
+    if (resolutionLength >= sizeof(resolutionName)) {
+        return;
+    }
+    std::memcpy(resolutionName, resolution, resolutionLength);
+    resolutionName[resolutionLength] = '\0';
+    const char* relative = slash + 1;
+    if (std::strcmp(resolutionName, "2048x1536") == 0) {
+        std::snprintf(out[0], sizeof(out[0]),
+                      "rr3gui0:/files/.depot/gui_assets/2048x1536/%s", relative);
+        std::snprintf(out[1], sizeof(out[1]),
+                      "rr3core:/files/apk/res/gui_assets/2048x1536/%s", relative);
+        std::snprintf(out[2], sizeof(out[2]),
+                      "rr3gui1:/files/.depot/gui_assets/960x640/%s", relative);
+        countOut = 3;
+    } else if (std::strcmp(resolutionName, "960x640") == 0) {
+        std::snprintf(out[0], sizeof(out[0]),
+                      "rr3gui1:/files/.depot/gui_assets/960x640/%s", relative);
+        std::snprintf(out[1], sizeof(out[1]),
+                      "rr3core:/files/apk/res/gui_assets/960x640/%s", relative);
+        countOut = 2;
+    } else if (std::strcmp(resolutionName, "480x320") == 0) {
+        std::snprintf(out[0], sizeof(out[0]),
+                      "rr3gui1:/files/.depot/gui_assets/480x320/%s", relative);
+        std::snprintf(out[1], sizeof(out[1]),
+                      "rr3core:/files/apk/res/gui_assets/480x320/%s", relative);
+        countOut = 2;
+    }
+}
+
+// True once the completed manifest has been written and can be served.
+bool gCompletedManifestReady = false;
+
+const char* completedManifestPath() {
+    return gCompletedManifestReady ? kCompletedManifestPath : nullptr;
+}
+
+// Build the completed manifest and write it to the card. Returns true when
+// the completed file exists and can be served.
+bool buildCompletedGuiAssetsManifest() {
+    const uint64_t startTick = armGetSystemTick();
+    const uint64_t tickFreq = armGetSystemTickFreq();
+    // 1. THE SHIPPED MANIFEST, byte for byte.
+    static const char* const kShipped[] = {
+        "rr3core:/files/apk/res/asset_list_gui_assets_core.txt",
+        "rr3core:/files/.depot/asset_list_gui_assets_core.txt",
+    };
+    char* shipped = nullptr;
+    size_t shippedLength = 0;
+    for (const char* candidate : kShipped) {
+        std::FILE* file = std::fopen(candidate, "rb");
+        if (file == nullptr) {
+            continue;
+        }
+        if (std::fseek(file, 0, SEEK_END) != 0) {
+            std::fclose(file);
+            continue;
+        }
+        const long size = std::ftell(file);
+        if (size <= 0 || std::fseek(file, 0, SEEK_SET) != 0) {
+            std::fclose(file);
+            continue;
+        }
+        char* text = static_cast<char*>(std::malloc(static_cast<size_t>(size) + 1));
+        if (text == nullptr) {
+            std::fclose(file);
+            break;
+        }
+        const size_t got = std::fread(text, 1, static_cast<size_t>(size), file);
+        std::fclose(file);
+        if (got != static_cast<size_t>(size)) {
+            std::free(text);
+            continue;
+        }
+        text[got] = '\0';
+        shipped = text;
+        shippedLength = got;
+        break;
+    }
+    if (shipped == nullptr) {
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "manifest-build", 0, 0,
+                            "FAILED reason=no-shipped-manifest");
+        return false;
+    }
+    // 2. THE FILES the shipped manifest does not name.
+    ManifestAsset assets[kManifestMaxAssets]{};
+    unsigned count = 0;
+    unsigned overflow = 0;
+    for (const char* resolution : kManifestResolutions) {
+        const char* device =
+            (std::strcmp(resolution, "2048x1536") == 0) ? "rr3gui0" : "rr3gui1";
+        for (const char* feature : kManifestFeatures) {
+            char logical[256];
+            std::snprintf(logical, sizeof(logical), "/gui_assets/%s/%s/",
+                          resolution, feature);
+            char depotRelative[256];
+            std::snprintf(depotRelative, sizeof(depotRelative),
+                          "files/.depot/gui_assets/%s/%s", resolution, feature);
+            collectManifestAssets(device, depotRelative, logical, assets, count, overflow);
+            char coreRelative[256];
+            std::snprintf(coreRelative, sizeof(coreRelative),
+                          "files/apk/res/gui_assets/%s/%s", resolution, feature);
+            collectManifestAssets("rr3core", coreRelative, logical, assets, count, overflow);
+        }
+    }
+    // 3. THE LINES. Each one carries the md5 and the size of the file the
+    //    port serves at that path, computed from the file's own bytes.
+    const size_t capacity = shippedLength + static_cast<size_t>(count) * 320u + 64u;
+    char* text = static_cast<char*>(std::malloc(capacity));
+    if (text == nullptr) {
+        std::free(shipped);
+        return false;
+    }
+    std::memcpy(text, shipped, shippedLength);
+    size_t used = shippedLength;
+    std::free(shipped);
+    // The shipped file's LAST line is TRUNCATED mid-digest -- it ends
+    // ".../store/packs/sprites_0.ptc.pvr.z\tcdbcb25a9b102c81d7b5daf6d4c",
+    // 28 hex characters instead of 32 and no size at all -- so a newline has
+    // to go in before anything is appended, or the first appended line would
+    // be glued onto that fragment and the manifest would name a file that
+    // does not exist.
+    if (used > 0 && text[used - 1] != '\n') {
+        text[used++] = '\n';
+    }
+    unsigned emitted = 0;
+    unsigned absent = 0;
+    unsigned logged = 0;
+    for (unsigned index = 0; index < count; ++index) {
+        char candidates[4][384];
+        unsigned candidateCount = 0;
+        manifestCandidates(assets[index].logical, candidates, candidateCount);
+        char digest[33];
+        unsigned long long size = 0;
+        bool found = false;
+        const char* source = nullptr;
+        for (unsigned candidate = 0; candidate < candidateCount; ++candidate) {
+            struct stat info{};
+            if (::stat(candidates[candidate], &info) != 0) {
+                continue;
+            }
+            if (!md5File(candidates[candidate], digest, &size)) {
+                continue;
+            }
+            found = true;
+            source = candidates[candidate];
+            break;
+        }
+        if (!found) {
+            // The file is genuinely not reachable from any of the places the
+            // port could serve it. No line is invented for it; the count goes
+            // into the log line instead.
+            ++absent;
+            if (logged < 80) {
+                ++logged;
+                char diag[640];
+                std::snprintf(diag, sizeof(diag),
+                              "path=%s candidates=%u ABSENT", assets[index].logical,
+                              candidateCount);
+                appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                    "manifest-asset", logged, 0, diag);
+            }
+            continue;
+        }
+        const int written = std::snprintf(text + used, capacity - used,
+                                          "%s\t%s\t%llu\t%llu\n",
+                                          assets[index].logical, digest, size, size);
+        if (written <= 0 || static_cast<size_t>(written) >= capacity - used) {
+            break;
+        }
+        used += static_cast<size_t>(written);
+        ++emitted;
+        if (logged < 80) {
+            ++logged;
+            char diag[640];
+            std::snprintf(diag, sizeof(diag),
+                          "path=%s md5=%s size=%llu from=%s",
+                          assets[index].logical, digest, size, source);
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                "manifest-asset", logged, 0, diag);
+        }
+    }
+    // 4. WRITE IT, through a temporary name, so a reader never sees a
+    //    half-written manifest.
+    //
+    //    THE TARGET IS REMOVED FIRST. libnx's fsdev rename does NOT overwrite
+    //    an existing file: MEASURED 2026-10-21, archive
+    //    20261021-184611-eden-massetgate-manifest3 -- the build produced
+    //    371,191 bytes, the temporary file held them, and the target still
+    //    held the PREVIOUS run's 367,109 bytes, because the rename failed
+    //    against a file that was already there. The manifest the guest then
+    //    read was the previous run's, which is the worst possible outcome: a
+    //    stale completion that looks like a fresh one.
+    std::FILE* output = std::fopen(kCompletedManifestTempPath, "wb");
+    bool written = false;
+    int writeErrno = 0;
+    if (output != nullptr) {
+        const size_t bytes = std::fwrite(text, 1, used, output);
+        const bool flushed = (bytes == used);
+        const int closeResult = std::fclose(output);
+        writeErrno = errno;
+        written = flushed && (closeResult == 0);
+        if (written) {
+            std::remove(kCompletedManifestPath);
+            written = std::rename(kCompletedManifestTempPath, kCompletedManifestPath) == 0;
+            if (!written) {
+                writeErrno = errno;
+            }
+        }
+    }
+    else {
+        writeErrno = errno;
+    }
+    std::free(text);
+    char diag[512];
+    const uint64_t elapsedMs = (armGetSystemTick() - startTick) * 1000ULL /
+                               (tickFreq != 0 ? tickFreq : 1);
+    std::snprintf(diag, sizeof(diag),
+                  "files=%u emitted=%u absent=%u overflow=%u shipped=%zu out=%zu ms=%llu written=%d errno=%d path=%s",
+                  count, emitted, absent, overflow, shippedLength, used,
+                  (unsigned long long)elapsedMs, written ? 1 : 0, writeErrno,
+                  kCompletedManifestPath);
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "manifest-build", 0, 0, diag);
+    return written;
+}
+
+bool isGuiAssetsManifestPath(const char* guestPath) {
+    return guestPath != nullptr &&
+           std::strcmp(pathBasename(guestPath), kGuiAssetsManifestLeaf) == 0;
+}
+
 template <typename Callback>
 int withReadFallback(const Resolution& resolution, const char* guestPath,
                      Callback callback, const char** servedOut = nullptr) {
@@ -1534,6 +1933,53 @@ int withReadFallback(const Resolution& resolution, const char* guestPath,
     const char* const candidates[2] = {resolution.primary, resolution.fallback};
     int result = -1;
     int firstError = ENOENT;
+    // THE COMPLETED GUI-ASSETS MANIFEST, SERVED INSTEAD OF THE VOLUME COPY.
+    //
+    // One file, one leaf name. The completed copy is the shipped manifest
+    // plus the lines for the features the shipped manifest does not name, and
+    // it has to be the copy the guest sees: the appended lines are PAST THE
+    // END of the shipped text, so a stat that still said 365,312 would cut
+    // them off and the guest would rebuild the same incomplete registry.
+    //
+    // The candidates below are still tried, in order, if the completed copy
+    // is not there -- so a card that cannot be written costs the completion
+    // and nothing else.
+    if (isGuiAssetsManifestPath(guestPath)) {
+        const char* completed = completedManifestPath();
+        if (completed == nullptr) {
+            char diag[320];
+            std::snprintf(diag, sizeof(diag),
+                          "guest=%.200s completed=NONE (the build did not finish)",
+                          guestPath != nullptr ? guestPath : "-");
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                "manifest-serve", 0, 0, diag);
+        }
+        if (completed != nullptr) {
+            ++attempts;
+            const int rc = attempt(completed);
+            // The serve attempt is logged EVERY time, because "the completed
+            // manifest was built and the guest still read the shipped one" is
+            // only distinguishable from "the completed manifest was never
+            // offered" with this line on record.
+            {
+                char diag[640];
+                std::snprintf(diag, sizeof(diag),
+                              "guest=%.200s completed=%.200s rc=%d errno=%d",
+                              guestPath != nullptr ? guestPath : "-", completed, rc, errno);
+                appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                    "manifest-serve", 0, 0, diag);
+            }
+            if (rc == 0) {
+                if (servedOut != nullptr) {
+                    *servedOut = completed;
+                }
+                if (assetList) {
+                    logAssetListRequest(guestPath, resolution, false, 0, lastErrno);
+                }
+                return 0;
+            }
+        }
+    }
     for (int i = 0; i < 2; ++i) {
         const char* candidate = candidates[i];
         if (candidate == nullptr || candidate[0] == '\0') {
@@ -1820,6 +2266,18 @@ ExternalDataStatus mountExternalData() {
     // Volumes are mounted, so the resolver can now be exercised for real.
     // One bounded line, once per process. Loose mode returns above and skips it.
     logApkResReachabilityOnce();
+    // THE COMPLETED GUI-ASSETS MANIFEST, built now because the volumes that
+    // describe it are mounted and the card is writable.
+    //
+    // It is built HERE, once, on the boot thread, and not at the first
+    // request: the build reads ~26 MB out of the volumes and hashes it, and
+    // doing that inside a guest request would stall whichever guest thread
+    // happened to ask for the manifest -- and would need a lock to keep two
+    // of them from doing it at once.
+    //
+    // A failure here costs the completion and nothing else: the shipped
+    // manifest is still served, and the log line says why.
+    gCompletedManifestReady = buildCompletedGuiAssetsManifest();
     return gStatus;
 }
 

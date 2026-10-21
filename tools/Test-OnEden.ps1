@@ -253,6 +253,8 @@ if (Test-Path $guestLog -PathType Leaf) {
                      'phase=render-call-pre', 'phase=render-call-post',
                      'phase=mmap-file-ok', 'phase=mmap-file-fail',
                      'phase=stat-layout',
+                     'phase=menu-gate:', 'phase=masset-gate:',
+                     'phase=manifest-build', 'phase=manifest-asset',
                      'phase=guest-thread ', 'phase=guest-thread-start ')) {
         $probes["guest:$p"] = ([regex]::Matches($guestText, [regex]::Escape($p))).Count
     }
