@@ -373,6 +373,72 @@ bool rewriteGuiResolutionPath(const char* relative, char* out, size_t outSize) {
         "files/.depot/gui_assets/1920x1080",
         "files/.depot/gui_assets/1080p",
         "files/.depot/gui_assets/720p",
+        // "files/.depot/gui_assets/2048x1536" IS DELIBERATELY NOT IN THIS LIST.
+        //
+        // 2026-10-21. It was here for one round and the round MEASURED it to
+        // be wrong, twice over.
+        //
+        // WHAT THE VOLUMES SHIP, with tools/verify_rr3_data_volumes.py's
+        // RomFS.contains(path), on the deployed data set
+        // (E:\Eden\user\sdmc\switch\rr3-native-rehost\data):
+        //
+        //   gui-hd.romfs  files/.depot/gui_assets/2048x1536/loading_icon/
+        //                   sprites.android.atlas            HIT  3,429 B
+        //                 files/.depot/gui_assets/2048x1536/common/
+        //                   sprites.android.atlas            HIT
+        //                 files/.depot/gui_assets/2048x1536/splash/
+        //                   sprites.android.atlas            HIT    257 B
+        //                 files/.depot/gui_assets/960x640/... MISS (0 entries)
+        //                 files/.depot/gui_assets/480x320/... MISS (0 entries)
+        //
+        //   gui-sd.romfs  files/.depot/gui_assets/960x640/loading_icon/
+        //                   sprites.android.atlas            HIT  3,432 B
+        //                 files/.depot/gui_assets/960x640/common/
+        //                   sprites.android.atlas            HIT
+        //                 files/.depot/gui_assets/960x640/splash/
+        //                   sprites.android.atlas            HIT    257 B
+        //                 files/.depot/gui_assets/2048x1536/... MISS (0 entries)
+        //                 files/.depot/gui_assets/480x320/... 2 entries only
+        //                   (events/, splash/)
+        //
+        // Both trees ship the SAME 53 sub-folders, so 2048x1536 is not a
+        // different asset set -- it is the same set at another resolution --
+        // and the 2048x1536 tree IS shipped. This file's own rule, written
+        // above, is "a rewrite is justified when the volume does not ship the
+        // requested name, never merely because the SD card does not have it",
+        // and the volume DOES ship 2048x1536.
+        //
+        // MEASURED, and this is the part that decides it: with the rewrite in
+        // place the port's own filesystem self-test loses a bit
+        // (fsTest 0x1fff -> 0x1ffd, archive 20261021-174619-eden-menugate-terms),
+        // because the self-test asserts that a gui_assets/2048x1536 request
+        // resolves into rr3gui0 (the HD volume). And main.cpp GATES THE GUEST
+        // BOOT ON THAT MASK:
+        //
+        //   else if (!dashboard.externalData.ready ||
+        //            dashboard.filesystemTest != 0x1fff) {
+        //       dashboardNotice = "...Guest 启动已阻止。";
+        //   }
+        //
+        // so the rewrite does not merely cost a test bit: it stops the guest
+        // from starting at all. The measured run that carried the rewrite
+        // never reached onViewRenderJNI (no "view-probe-enter", no
+        // "gfx-stats", 1,002 log lines instead of 24,751) and the census
+        // spent the whole run with one thread and no guest progress.
+        //
+        // It is also the wrong bytes: the manifest the guest reads,
+        // files/apk/res/asset_list_gui_assets_core.txt, names 3,292 files
+        // that are ALL under /gui_assets/2048x1536/ and carries an md5 and a
+        // size for each -- and the 2048x1536 and 960x640 copies of the same
+        // atlas are NOT the same file (3,429 B vs 3,432 B).
+        //
+        // WHAT REPLACES IT: the 2048x1536 -> 960x640 rule is implemented as a
+        // FALLBACK, in mapAppRootToContent() below, not as a rewrite. The
+        // request is still answered from the 2048x1536 tree when the volume
+        // has it -- the bytes the manifest describes -- and from the 960x640
+        // tree when it does not. That is the same rule ("a 2048x1536 request
+        // may be answered from 960x640") without giving up the tree that
+        // matches the manifest.
     };
     for (const char* miss : kMissing) {
         const size_t n = std::strlen(miss);
@@ -783,8 +849,31 @@ bool mapAppRootToContent(const char* path, Resolution& resolution) {
     }
     const bool ok = writeContentPath(resolution.primary, sizeof(resolution.primary),
                                      effectiveRelative);
+    // THE 2048x1536 -> 960x640 RULE, AS A FALLBACK AND NOT AS A REWRITE.
+    //
+    // It is decided here, once, and applied below: the request for a
+    // 2048x1536 gui_assets path may be answered from the 960x640 tree when
+    // the 2048x1536 tree does not have the file.
+    //
+    // The guest's manifest -- files/apk/res/asset_list_gui_assets_core.txt,
+    // 3,292 entries, every one of them under /gui_assets/2048x1536/ -- names
+    // the 2048x1536 tree, with an md5 and a size per file, and the HD volume
+    // (rr3gui0) ships exactly that tree. The SD volume (rr3gui1) ships the
+    // 960x640 copy of the same 53 sub-folders. Both halves are measured with
+    // RomFS.contains(path) on the deployed volumes; see the long note on
+    // rewriteGuiResolutionPath() for the table.
+    //
+    // WHY NOT A REWRITE: a rewrite sends EVERY 2048x1536 request to 960x640,
+    // which (a) gives up the tree whose bytes the manifest's md5s describe --
+    // the two copies of one atlas are 3,429 B and 3,432 B, so they are not
+    // the same file -- and (b) costs the port a self-test bit, and main.cpp
+    // gates the whole guest boot on that mask being exactly 0x1fff. Measured
+    // in archive 20261021-174619-eden-menugate-terms: with the rewrite in
+    // place fsTest was 0x1ffd and the guest never started.
+    const bool hdToSdFallback =
+        startsWith(effectiveRelative, "files/.depot/gui_assets/2048x1536");
     if (ok) {
-        if (appResLeaf != nullptr) {
+        if (appResLeaf != nullptr && !hdToSdFallback) {
             // The legacy .depot target becomes the second candidate, not the
             // only one, so no name that resolved before stops resolving.
             char alias[0x500]{};
@@ -792,7 +881,7 @@ bool mapAppRootToContent(const char* path, Resolution& resolution) {
             writeContentPath(resolution.fallback, sizeof(resolution.fallback),
                              alias);
         }
-        else if (startsWith(rest, ".depot/")) {
+        else if (startsWith(rest, ".depot/") && !hdToSdFallback) {
             // THE REVERSE ALIAS, and it was missing.
             //
             // The volume ships TWO trees: files/.depot/ and files/apk/res/.
@@ -818,6 +907,20 @@ bool mapAppRootToContent(const char* path, Resolution& resolution) {
             // ENOENT is correct: the shipping game does not have it either.)
             char alias[0x500]{};
             std::snprintf(alias, sizeof(alias), "files/apk/res/%s", rest + 7);
+            writeContentPath(resolution.fallback, sizeof(resolution.fallback),
+                             alias);
+        }
+        // THE 2048x1536 -> 960x640 FALLBACK ITSELF.
+        //
+        // It comes AFTER the alias chain and only fills the fallback slot if
+        // that slot is still empty, so it never displaces the apk/res alias
+        // (which resolves names that exist only under files/apk/res/).
+        if (hdToSdFallback) {
+            char alias[0x500]{};
+            const char* const kHd = "files/.depot/gui_assets/2048x1536";
+            const char* const kSd = "files/.depot/gui_assets/960x640";
+            std::snprintf(alias, sizeof(alias), "%s%s", kSd,
+                          effectiveRelative + std::strlen(kHd));
             writeContentPath(resolution.fallback, sizeof(resolution.fallback),
                              alias);
         }
@@ -1274,7 +1377,30 @@ bool resolvePathImpl(const char* path, bool writing, Resolution& resolution) {
         }
         resolution.readOnly = true;
         resolution.mapped = true;
-        return writeContentPath(resolution.primary, sizeof(resolution.primary), contentRelative);
+        if (!writeContentPath(resolution.primary, sizeof(resolution.primary),
+                              contentRelative)) {
+            return false;
+        }
+        // THE 2048x1536 -> 960x640 FALLBACK, for the RELATIVE form of the
+        // request. mapAppRootToContent() has the same rule for the app-root
+        // form; this is the same rule on the other path into the resolver,
+        // and the guest uses BOTH ("sdmc:/.../rr3-native-rehost/gui_assets/..."
+        // and the bare "files/.depot/gui_assets/...").
+        //
+        // The primary stays the 2048x1536 tree on the HD volume -- the bytes
+        // the manifest's md5s describe -- and the 960x640 copy on the SD volume
+        // answers when the HD tree does not have the file. See the long note
+        // in mapAppRootToContent() and in rewriteGuiResolutionPath().
+        if (startsWith(contentRelative, "files/.depot/gui_assets/2048x1536")) {
+            char alias[0x500]{};
+            const char* const kHd = "files/.depot/gui_assets/2048x1536";
+            const char* const kSd = "files/.depot/gui_assets/960x640";
+            std::snprintf(alias, sizeof(alias), "%s%s", kSd,
+                          contentRelative + std::strlen(kHd));
+            writeContentPath(resolution.fallback, sizeof(resolution.fallback),
+                             alias);
+        }
+        return true;
     }
     if (isCacheRelative(relative)) {
         resolution.mapped = true;
@@ -1367,7 +1493,7 @@ void logAssetListRequest(const char* guestPath, const Resolution& resolution,
 
 template <typename Callback>
 int withReadFallback(const Resolution& resolution, const char* guestPath,
-                     Callback callback) {
+                     Callback callback, const char** servedOut = nullptr) {
     const bool probe = resolution.primary != nullptr &&
                        std::strstr(resolution.primary, kProbeSubtree) != nullptr;
     // The asset-list requests are traced here because this is the only place
@@ -1375,6 +1501,18 @@ int withReadFallback(const Resolution& resolution, const char* guestPath,
     // left behind. The guest path is passed in because the resolver is the
     // only place that knows what the guest asked for.
     const bool assetList = isAssetListPath(guestPath);
+    // WHICH CANDIDATE ANSWERED. Until now nothing said so: the resolver
+    // builds up to three candidates (the volume primary, the volume alias
+    // and the SD card), and the caller only ever saw the RESULT. "size=-1"
+    // on an fopen line is the stat of the PRIMARY, so it said "the primary
+    // does not exist" and NOT "the open failed" -- and it said nothing at
+    // all about which tree actually served the bytes.
+    //
+    // The pointer is into the Resolution (or into the local card path), and
+    // the caller reads it before the Resolution goes out of scope.
+    if (servedOut != nullptr) {
+        *servedOut = nullptr;
+    }
     // Counts the attempts this one logical lookup makes, so the trace can say
     // "3 candidates, last errno=2" instead of leaving the reader to infer it.
     unsigned attempts = 0;
@@ -1403,6 +1541,9 @@ int withReadFallback(const Resolution& resolution, const char* guestPath,
         }
         result = attempt(candidate);
         if (result == 0) {
+            if (servedOut != nullptr) {
+                *servedOut = candidate;
+            }
             if (assetList) {
                 logAssetListRequest(guestPath, resolution, false, 0, lastErrno);
             }
@@ -1460,6 +1601,9 @@ int withReadFallback(const Resolution& resolution, const char* guestPath,
                 result = callback(card);
                 lastErrno = errno;
                 if (result == 0) {
+                    if (servedOut != nullptr) {
+                        *servedOut = card;
+                    }
                     if (assetList) {
                         logAssetListRequest(guestPath, resolution, false, 0,
                                             lastErrno);
@@ -1729,7 +1873,16 @@ uint64_t guestFilesystemSelfTest() {
         std::strcmp(value.primary, "rr3core:/files/.depot/langs.utf8") == 0) bits |= 1;
     value = {};
     if (resolvePath("files/.depot/gui_assets/2048x1536/test", false, value) &&
-        startsWith(value.primary, "rr3gui0:/")) bits |= 2;
+        startsWith(value.primary, "rr3gui0:/") &&
+        // AND the 2048x1536 -> 960x640 FALLBACK is installed. Both halves of
+        // the rule are asserted here, so the boot gate (main.cpp: the guest
+        // does not start unless filesystemTest == 0x1fff) fails if either
+        // half breaks. Before this, the rule was a REWRITE, which cost this
+        // very bit -- fsTest 0x1ffd -- and stopped the guest from starting
+        // at all (archive 20261021-174619-eden-menugate-terms).
+        startsWith(value.fallback, "rr3gui1:/files/.depot/gui_assets/960x640/")) {
+        bits |= 2;
+    }
     value = {};
     if (resolvePath("files/.depot/gui_assets/960x640/test", false, value) &&
         startsWith(value.primary, "rr3gui1:/")) bits |= 4;
@@ -1827,8 +1980,15 @@ std::FILE* guestFopen(const char* path, const char* mode) {
         return nullptr;
     }
     std::FILE* file = nullptr;
+    // WHICH CANDIDATE ANSWERED. The resolver builds up to three of them
+    // (the volume primary, the volume alias, the SD card) and the caller
+    // used to see only the RESULT, so a line could not say which tree served
+    // the bytes. The pointer is into the Resolution, which outlives the
+    // call.
+    const char* served = nullptr;
     if (writing) {
         file = std::fopen(resolution.primary, mode);
+        served = (file != nullptr) ? resolution.primary : nullptr;
         if (isAssetListPath(path)) {
             // The write path does not go through withReadFallback, so the
             // write is traced here instead.
@@ -1842,7 +2002,7 @@ std::FILE* guestFopen(const char* path, const char* mode) {
         withReadFallback(resolution, path, [&file, mode](const char* candidate) {
             file = std::fopen(candidate, mode);
             return file == nullptr ? -1 : 0;
-        });
+        }, &served);
     }
     if (file == nullptr && path != nullptr && path[0] != '\0') {
         appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
@@ -1867,13 +2027,26 @@ std::FILE* guestFopen(const char* path, const char* mode) {
         // cap silently truncated the sequence long before the interesting open.
         // A cap that hides the answer is worse than a big log -- the guest log
         // budget is 4000 lines and the whole file is well under it.
+        // THE SIZE OF THE FILE THAT WAS ACTUALLY OPENED, AND WHICH ONE IT WAS.
+        //
+        // The old line stat'ed resolution.primary, so "size=-1" meant "the
+        // PRIMARY does not exist" -- NOT "the open failed" -- and "size=N"
+        // said nothing about how many bytes the guest read. The primary is
+        // only the FIRST of up to three candidates, so the number was about
+        // the wrong file whenever an alias or the card answered.
+        //
+        // "size=" is now the on-disk size of the SERVED candidate. It is
+        // still not a byte count the guest read -- the guest may read less,
+        // and this probe never sees the read -- and the field name says
+        // "size" of a file, not of a transfer.
         struct stat opened{};
         const long long openedSize =
-            ::stat(resolution.primary, &opened) == 0
+            (served != nullptr && ::stat(served, &opened) == 0)
                 ? static_cast<long long>(opened.st_size) : -1LL;
-        char odiag[288];
-        __builtin_snprintf(odiag, sizeof(odiag), "size=%lld primary=%s",
+        char odiag[512];
+        __builtin_snprintf(odiag, sizeof(odiag), "size=%lld served=%s primary=%s",
                            openedSize,
+                           served != nullptr ? served : "-",
                            resolution.primary[0] != '\0' ? resolution.primary : "-");
         if (assetLike && s_assetOpens < 1200) {
             ++s_assetOpens;

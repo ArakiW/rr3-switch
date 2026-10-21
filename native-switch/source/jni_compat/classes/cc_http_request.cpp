@@ -448,6 +448,119 @@ static bool authLogBudget(void)
     return true;
 }
 
+/*
+ * THE ASSET-PATH REQUEST -- the pack-hash endpoint.
+ *
+ * MEASURED, archive 20261021-165010-eden-netanswer2: the port received 60
+ * requests whose URL is EMPTY ("cc-http-init ... url=(none)") and whose body
+ * is a BinaryBlob box of mode 1 (zlib). The guest's own log says what they
+ * are: every one of them is
+ *
+ *   CC: [8] POST request [https://connect-dev-ss.cloudcell.com:443//assetman/
+ *         assetManDownloadPackHash.php]
+ *
+ * and every one of them ends in the guest logging
+ *
+ *   CC: ASSET DOWNLOAD ERROR! ... [MSG: Download failed - incomplete
+ *      Download.] , url: https://.../assetManDownloadPackHash.php, httpCode : 0
+ *   ******** CC_AssetManager_Class::AssetDownloadError() : Download attempt
+ *          1 of 4 from Cloudcell has failed!  Asset (/MenuBannerData.xml)
+ *
+ * So the path the request is ABOUT is inside the body, and the port has to
+ * read it out of there. The URL is not the discriminator: the port never
+ * sees it.
+ *
+ * THE LAYOUT, measured from the payload heads in that archive's
+ * "cc-req-class" lines (those are the UNBOXED payload, in hex words):
+ *
+ *   bodyLen=205  payloadLen=241  head=[00000013 6e654d2f 6e614275 4472656e
+ *                                     2e617461 206c6d78 ...]
+ *   bodyLen=184  payloadLen=280  head=[00000061 7373612f 5f737465 38343032
+ *                                     33353178 76652f36 73746e65 70616d2f ...]
+ *   bodyLen=328  payloadLen=624  head=[0000002c 7373612f 5f737465 78303834
+ *                                     2f303233 6d6d6f63 732f6e6f ...]
+ *   bodyLen=1487 payloadLen=2569 head=[0000005f 7373612f 5f737465 78303639
+ *                                     2f303436 6e657665 6d2f7374 ...]
+ *   bodyLen=134  payloadLen=145  head=[0000001c 6865762f 656c6369 61632f73
+ *                                     70657272 73726961 7065722e 73726961 ...]
+ *
+ *   word 0   the path's length in bytes
+ *   word 1+  the path, FOUR BYTES AT A TIME WITH EACH GROUP REVERSED
+ *
+ * THE RULE, checked against the guest's own asset names (the
+ * AssetDownloadError lines name them, and they are the only ground truth
+ * there is):
+ *
+ *   bodyLen=205  len=19  payload[4..22] = "/MenuBannerData.xml"
+ *   bodyLen=184  len=97  payload[4.. ]  = "/assets_2048x1536/events/map/..."
+ *   bodyLen=328  len=44  payload[4.. ]  = "/assets_480x320/common/sprites..."
+ *   bodyLen=1487 len=95  payload[4.. ]  = "/assets_960x640/events/map/f..."
+ *   bodyLen=134  len=28  payload[4.. ]  = "/vehicles/carrepairs.repairs"
+ *
+ * i.e. THE PATH IS PLAIN. The first four characters of the path region are
+ * "/ass" for four of the five cases and "/veh" for the fifth, and the
+ * length word is followed by exactly the path.
+ *
+ * ONE TRAP, and it is the one this decoder was first written wrong on: the
+ * port's own log prints the payload head as little-endian u32 WORDS
+ * ("%08x" of a word built from four bytes), so the WORD "6e654d2f" is the
+ * BYTES 2f 4d 65 6e = "/Men". Reading the word's hex digits as ASCII
+ * instead of un-swapping the bytes produces a path that looks scrambled and
+ * is not: it suggests a four-byte-group reversal that the format does not
+ * have. The decoder below reads the bytes.
+ *
+ * WHAT THIS DOES NOT DO. It does not answer the request. The port does not
+ * know what the pack-hash endpoint's response looks like, and an invented
+ * body would be a false success: the guest would take it for a server answer
+ * and the run would say something it did not do. So the port LOGS the
+ * request -- the body, the parsed path, and the fact that no answer shape is
+ * known -- and the request still fails, honestly.
+ */
+
+/* Decode the asset path out of a request body.
+ *
+ * Returns true when a path was found and written to `path` (NUL terminated).
+ * `payload` receives the unboxed payload so the caller can log it.
+ */
+static bool decodeAssetRequestPath(const uint8_t *body, size_t bodyLen,
+                                    std::vector<uint8_t> &payload,
+                                    char *path, size_t pathSize)
+{
+    if (path == nullptr || pathSize == 0) {
+        return false;
+    }
+    path[0] = '\0';
+    if (!cccloud::unboxBlob(body, bodyLen, payload) || payload.size() < 8u) {
+        return false;
+    }
+    uint32_t length = 0;
+    memcpy(&length, payload.data(), sizeof(length));
+    if (length == 0u || length > 4096u) {
+        return false;
+    }
+    /* The path region starts at payload[4], after the length word, and the
+     * path is plain. */
+    const size_t region = 4u;
+    if (payload.size() < region + length) {
+        return false;
+    }
+    for (uint32_t i = 0; i < length; ++i) {
+        const char c = static_cast<char>(payload[region + i]);
+        if (c < 0x20 || c > 0x7e) {
+            path[0] = '\0';
+            return false;
+        }
+        path[i] = c;
+    }
+    path[length] = '\0';
+    /* A path the guest would have asked for starts with '/'. */
+    if (path[0] != '/') {
+        path[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
 static void http_ctor(JNIEnv *, jobject self, jclass)
 {
     /* NewObject callocs and never runs a constructor (jni/jni.cpp:216), so the
@@ -610,6 +723,70 @@ static void http_init(JNIEnv *env, jobject self, jstring /*userAgent*/,
                            req->urlLen > 0u ? req->url : "(none)");
         rr3::guestViewWideLog("cc-http-init", (unsigned long long)req->bodyLen,
                               0, details);
+    }
+
+    /*
+     * THE ASSET-PATH REQUEST (the pack-hash endpoint).
+     *
+     * The port received 60 of these in archive 20261021-165010-eden-netanswer2
+     * and answered none, so the guest logged 60 "AssetDownloadError" lines
+     * with no way to say what had been asked for. The path is inside the
+     * body -- the URL the port sees is EMPTY -- so it is decoded here and
+     * logged with the body, together with the fact that no answer shape is
+     * known yet.
+     *
+     * NOTHING IS INVENTED. There is no response for this endpoint in the
+     * port, because the port does not know what the real one looks like, and
+     * a made-up body would be a false success: the guest would take it for a
+     * server answer and the run would claim something that did not happen.
+     * The request still fails, and it fails honestly.
+     *
+     * The cap is 64 lines, and the measured run makes 60, so a normal run is
+     * traced in full. The counter is a COUNTER, not a cap on the truth: the
+     * "n=" field says how many arrived.
+     */
+    {
+        static unsigned s_assetReqLines = 0;
+        static unsigned s_assetReqTotal = 0;
+        ++s_assetReqTotal;
+        std::vector<uint8_t> payload;
+        char path[512];
+        if (decodeAssetRequestPath(req->body, req->bodyLen, payload, path,
+                                   sizeof(path))) {
+            if (s_assetReqLines < 64u) {
+                ++s_assetReqLines;
+                /* The body head, the payload head, and the path. */
+                char bodyHead[80];
+                const size_t bodyHeadLen = (req->bodyLen < 16u) ? req->bodyLen : 16u;
+                for (size_t i = 0; i < bodyHeadLen; ++i) {
+                    __builtin_snprintf(bodyHead + (i * 2), 3u, "%02x", req->body[i]);
+                }
+                bodyHead[bodyHeadLen * 2u] = '\0';
+                char payloadHead[96];
+                const size_t payloadHeadLen = (payload.size() < 24u) ? payload.size() : 24u;
+                for (size_t i = 0; i < payloadHeadLen; ++i) {
+                    __builtin_snprintf(payloadHead + (i * 2), 3u, "%02x", payload[i]);
+                }
+                payloadHead[payloadHeadLen * 2u] = '\0';
+                char details[1024];
+                __builtin_snprintf(
+                    details, sizeof(details),
+                    "n=%u bodyLen=%u payloadLen=%u url=%s bodyHead=%s"
+                    " payloadHead=%s path=%s answered=0 reason=no-known-answer-shape",
+                    s_assetReqTotal, (unsigned)req->bodyLen,
+                    (unsigned)payload.size(),
+                    req->urlLen > 0u ? req->url : "(none)",
+                    bodyHead, payloadHead, path);
+                rr3::guestViewWideLog("cc-asset-req",
+                                      (unsigned long long)req->bodyLen,
+                                      (unsigned long long)s_assetReqTotal, details);
+                if (authLogBudget()) {
+                    trace("cc-asset-req: bodyLen=%zu payloadLen=%zu path=%s"
+                          " (NOT answered: no known answer shape)",
+                          (unsigned)req->bodyLen, (unsigned)payload.size(), path);
+                }
+            }
+        }
     }
 
     /* Start the cc::HttpRequestManager census, and tell it which

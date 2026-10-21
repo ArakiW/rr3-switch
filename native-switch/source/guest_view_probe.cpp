@@ -984,6 +984,15 @@ enum SamplerPhase : uint32_t {
 };
 static std::atomic<uint32_t> g_samplerPhase{kSamplerPhasePreLoop};
 
+// The guest's frame counter, published so the host sampler thread can label
+// its samples with the frame the guest was on. The guest's frame loop stops
+// around frame 120, so a probe that only lived there would have one sample
+// and no time series.
+//
+// DEFINED HERE, next to the sampler state, because the sampler thread is
+// ABOVE the menu-gate probe and needs it.
+std::atomic<uint64_t> g_guestFrameNumber{0};
+
 struct SamplerImageRange {
     uint64_t base;
     uint64_t bytes;
@@ -1300,6 +1309,10 @@ std::atomic<bool> g_samplerWakeReported{false};
 // its only caller and it runs BEFORE the definition.
 void pollDownloadPhaseGate();
 
+// The menu-gate probe. Same reason: the sampler thread below calls it and it
+// is defined far below, next to the gate's own disassembly.
+void sampleMenuGateTerms(uint64_t frames, const char* carrier);
+
 void samplerWorker(void* opaque) {
     const Handle target = static_cast<Handle>(reinterpret_cast<uintptr_t>(opaque));
     uint64_t sinceFlush = 0;
@@ -1394,6 +1407,16 @@ void samplerWorker(void* opaque) {
         // svcQueryMemory readability check), so a concurrent guest cannot
         // turn it into a fault.
         pollDownloadPhaseGate();
+        // The menu gate, all four terms, on the same carrier.
+        //
+        // The frame loop is the wrong place for this ALONE: it stops around
+        // frame 120, so a probe that lives only there samples once, at frame
+        // 0, before the guest's Cloudcell exists. This thread keeps ticking
+        // after the frame loop is gone, so the four terms are observed over
+        // TIME -- and each sample carries the guest's own frame number, so
+        // the reader can still say which part of the run it describes.
+        sampleMenuGateTerms(g_guestFrameNumber.load(std::memory_order_relaxed),
+                            "sampler");
         const Result pauseResult =
             svcSetThreadActivity(target, ThreadActivity_Paused);
         if (R_FAILED(pauseResult)) {
@@ -3770,6 +3793,331 @@ void pollDownloadPhaseGate() {
 }
 
 // ---------------------------------------------------------------------------
+// THE MENU GATE: ALL FOUR TERMS, ONE LINE, GUARDED READS.
+//
+// WHY THIS EXISTS. The "cc-cell-poll" line further up is the only thing that
+// has ever reported the menu gate, and it reports ONCE per run: it lives
+// under `if ((frames % 240) == 0)` inside the render frame loop, and the
+// guest's frame loop stops around frame 120 (gfx-stats frames=120 in archive
+// 20261021-165010-eden-netanswer2), so the only sample it ever takes is the
+// frame-0 one -- BEFORE the guest's own Cloudcell constructor has run
+// (0x1cbe028 -> 0x1cbe218 is what sets Cloudcell+0x4c1 to 1). A reading taken
+// before the thing it measures exists is not a measurement of the gate.
+//
+// It also reads with NO guard at all ("NO RANGE CHECK AT RUNTIME, ON
+// ANYTHING"), which is a second and independent defect: an unguarded
+// dereference of a pointer the guest owns is the one thing that can take the
+// whole run down.
+//
+// THE GATE, DISASSEMBLED (guest 0x12aea7c, the body onViewRenderJNI
+// tail-calls; the export is at 0x12b3614):
+//
+//   0x12aefb4  adrp x23, #0x1f6d000
+//   0x12aefb8  ldr  x23, [x23, #0xf50]   ; x23 = *(GOT 0x1f6df50)
+//   0x12aefc0  ldr  x8, [x23]             ; TERM 1: the menu-loader object
+//   0x12aefc4  cbz  x8, #0x12af014        ;        must be NON-NULL
+//   0x12aefc8  adrp x8, #0x1f6d000
+//   0x12aeccc  ldr  x8, [x8, #0x5d0]      ; x8 = *(GOT 0x1f6d5d0)
+//   0x12aefd0  ldr  x0, [x8]              ; x0 = the Cloudcell object
+//   0x12aefd4  cbz  x0, #0x12af014        ; TERM 2: must be NON-NULL
+//   0x12aefd8  ldrb w8, [x0, #0x4c1]      ; TERM 3: Cloudcell+0x4c1 NON-ZERO
+//   0x12aefdc  cbz  w8, #0x12af014
+//   0x12aefe0  ldr  x8, [x0] ; ldr x8, [x8, #0x30] ; blr x8   ; vtable slot 6
+//   0x12aeff0  ldr  x8, [x0] ; ldr x8, [x8, #0x88] ; blr x8   ; vtable slot 17
+//   0x12aeff8  tbnz w0, #0, #0x12af014    ; TERM 4: low bit of slot 17 CLEAR
+//   0x12aeffc  ldr  x0, [x23] ; mov w1, #2 ; mov w2, #0x60
+//   0x12af008  ldr  x8, [x0] ; ldr x8, [x8, #0xa8] ; blr x8 ; vtable slot 21
+//
+// TERM 4 IS NOT A BOOL METHOD. The Cloudcell object's vtable ADDRESS POINT is
+// 0x1f63b58: the constructor at 0x1cbe290 stores `*(GOT 0x1f7dfd8) + 0x10` at
+// offset 0, and GOT 0x1f7dfd8 is an R_AARCH64_RELATIVE relocation whose
+// addend is 0x1f63b48. Slot 17 is therefore the word at 0x1f63b58 + 0x88 =
+// 0x1f63be0, which relocates to 0x1cbfad4:
+//
+//   0x1cbfad4  ldr x0, [x0, #0x280] ; ret
+//
+// so slot 17 returns the POINTER at Cloudcell+0x280 and the gate tests that
+// pointer's LOW BIT. The fourth term is literally "the low bit of
+// *(Cloudcell+0x280) is 0". The host can read that word directly instead of
+// calling guest code across a thread boundary.
+//
+// x23 IS NOT A RENDER-TARGET FIELD. It is the global cell at .bss 0x1fb5bf8
+// (GOT 0x1f6df50 -> .bss 0x1fb5bf8, R_AARCH64_RELATIVE), and [x23] is the
+// menu-loader object stored in it. The render target's own fields -- the
+// activity, the container and the renderer that readGuestActivitySnapshot()
+// resolves -- are NOT what this gate reads.
+//
+// THE ADDRESSES. bias is the loader's own (resolveMainImageLoadBias), so
+// bias + <ELF vaddr> is the SAME runtime address the guest's own code
+// reaches. MEASURED, archive 20261021-165010-eden-netanswer2:
+//   cc-got-diag : GOT slot low32 0x092f05d0 = bias+0x1f6d5d0, and it holds
+//                 the .bss cell whose low32 is 0x09349e98 = bias+0x1fc6e98
+//   ml-got-diag : GOT slot low32 0x092f0f50 = bias+0x1f6df50, and it holds
+//                 the .bss cell whose low32 is 0x09338bf8 = bias+0x1fb5bf8
+// So the two chains below are the guest's own two chains, and the objects
+// they end at are heap objects, not image addresses.
+constexpr uint64_t kMenuGateLoaderGotElfVa = 0x1F6DF50ULL;
+constexpr uint64_t kMenuGateCloudGotElfVa  = 0x1F6D5D0ULL;
+// The Cloudcell object's own fields the gate reads.
+constexpr uint64_t kMenuGateCloudWord280Off = 0x280ULL;
+constexpr uint64_t kMenuGateCloudFlag4c1Off = 0x4C1ULL;
+// The menu-loader's vtable slot 21 -- the call the gate makes when it opens.
+constexpr uint64_t kMenuGateLoaderSlot21Off = 0xA8ULL;
+// The guest's own 64-bit window, as a radius around the image bias: the
+// guest's mappings sit either side of the image and the host's own code and
+// heap do not. It is the SAME window cc_http_request.cpp's guestReadable()
+// uses, so the project has one definition of "inside the guest".
+constexpr uint64_t kGuestWindowRadius = 0x1000000000ULL;
+
+// Is this guest page mapped and readable RIGHT NOW?
+//
+// TWO CHECKS, BOTH REQUIRED:
+//   (1) the address is inside the guest's own 64-bit window, and
+//   (2) svcQueryMemory says the page is mapped with read permission.
+//
+// (1) alone is not enough under Eden: the kernel is asked about the HOST's
+// mapping of the address and Eden's emulated guest MMU has its own idea of
+// what is mapped, so a host address that happens to be readable can still be
+// unmapped as far as the guest is concerned. (2) alone is not enough either:
+// the host's heap is perfectly readable and is not the guest's.
+//
+// The page query is cached one page deep, for the reason the Cloudcell probe
+// gives: this runs on a host thread and every syscall it spends is a syscall
+// the guest's frame loop does not get. The cache is invalidated when the
+// window (and therefore the bias) changes.
+bool menuGatePageReadable(uint64_t bias, uintptr_t address) {
+    static uint64_t s_cachedBias = 0;
+    static uintptr_t s_cachedPage = 0;
+    static bool s_cachedReadable = false;
+    static bool s_cachedValid = false;
+    if (bias == 0 || address == 0) {
+        return false;
+    }
+    const uintptr_t page = address & ~static_cast<uintptr_t>(0xFFF);
+    if (s_cachedValid && page == s_cachedPage && bias == s_cachedBias) {
+        return s_cachedReadable;
+    }
+    bool readable = false;
+    const uintptr_t lo = static_cast<uintptr_t>(bias - kGuestWindowRadius);
+    const uintptr_t hi = static_cast<uintptr_t>(bias + kGuestWindowRadius);
+    if (address >= lo && address < hi) {
+        MemoryInfo info{};
+        u32 pageInfo = 0;
+        if (!R_FAILED(svcQueryMemory(&info, &pageInfo, static_cast<u64>(address)))) {
+            readable = (info.perm & Perm_R) != 0;
+        }
+    }
+    s_cachedBias = bias;
+    s_cachedPage = page;
+    s_cachedReadable = readable;
+    s_cachedValid = true;
+    return readable;
+}
+
+bool menuGateReadWord(uint64_t bias, uintptr_t address, uint64_t* out) {
+    if (out == nullptr || address == 0 || (address & 7u) != 0u) {
+        return false;
+    }
+    if (!menuGatePageReadable(bias, address)) {
+        return false;
+    }
+    *out = *reinterpret_cast<const volatile uint64_t*>(address);
+    return true;
+}
+
+bool menuGateReadByte(uint64_t bias, uintptr_t address, uint8_t* out) {
+    if (out == nullptr || address == 0) {
+        return false;
+    }
+    if (!menuGatePageReadable(bias, address)) {
+        return false;
+    }
+    *out = *reinterpret_cast<const volatile uint8_t*>(address);
+    return true;
+}
+
+// One reading of the gate. Every field carries its own "was it readable"
+// flag, so a refused read is reported as UNKNOWN and never as a value: a
+// "term 2 = 0" that really means "term 2 could not be read" is exactly the
+// confusion this probe exists to remove.
+struct MenuGateSample {
+    bool loaderCellRead{};
+    bool loaderRead{};
+    bool loaderVptrRead{};
+    bool cloudCellRead{};
+    bool cloudRead{};
+    bool flagRead{};
+    bool word280Read{};
+    uint64_t loaderCell{};
+    uint64_t loader{};
+    uint64_t loaderVptr{};
+    uint64_t loaderSlot21{};
+    uint64_t cloudCell{};
+    uint64_t cloud{};
+    uint8_t  cloudFlag4c1{};
+    uint64_t cloudWord280{};
+};
+
+// The guest's frame counter is published in g_guestFrameNumber, next to the
+// sampler state, because the sampler thread is above this probe.
+
+MenuGateSample sampleMenuGate(uint64_t bias) {
+    MenuGateSample s{};
+    if (bias == 0) {
+        return s;
+    }
+    // TERM 1's chain: the GOT slot holds the .bss CELL, and the cell holds
+    // the menu-loader object. Two levels, exactly as the gate does it.
+    s.loaderCellRead = menuGateReadWord(
+        bias, static_cast<uintptr_t>(bias + kMenuGateLoaderGotElfVa), &s.loaderCell);
+    if (s.loaderCellRead) {
+        s.loaderRead = menuGateReadWord(bias, static_cast<uintptr_t>(s.loaderCell),
+                                        &s.loader);
+    }
+    if (s.loaderRead) {
+        s.loaderVptrRead = menuGateReadWord(
+            bias, static_cast<uintptr_t>(s.loader), &s.loaderVptr);
+    }
+    if (s.loaderVptrRead) {
+        menuGateReadWord(
+            bias, static_cast<uintptr_t>(s.loaderVptr + kMenuGateLoaderSlot21Off),
+            &s.loaderSlot21);
+    }
+    // TERM 2's chain: the same shape, the Cloudcell cell and the object.
+    s.cloudCellRead = menuGateReadWord(
+        bias, static_cast<uintptr_t>(bias + kMenuGateCloudGotElfVa), &s.cloudCell);
+    if (s.cloudCellRead) {
+        s.cloudRead = menuGateReadWord(bias, static_cast<uintptr_t>(s.cloudCell),
+                                       &s.cloud);
+    }
+    if (s.cloudRead) {
+        s.flagRead = menuGateReadByte(
+            bias, static_cast<uintptr_t>(s.cloud + kMenuGateCloudFlag4c1Off),
+            &s.cloudFlag4c1);
+        s.word280Read = menuGateReadWord(
+            bias, static_cast<uintptr_t>(s.cloud + kMenuGateCloudWord280Off),
+            &s.cloudWord280);
+    }
+    return s;
+}
+
+// '1' the term is satisfied, '0' it is not, '?' it could not be read.
+char menuGateTerm(bool known, bool satisfied) {
+    if (!known) {
+        return '?';
+    }
+    return satisfied ? '1' : '0';
+}
+
+// THE ONE LINE. All four terms, the two object pointers, the menu-loader's
+// vtable address point, and the readability mask that says which of the
+// reads behind the numbers actually happened.
+void emitMenuGateSample(uint64_t frames, const char* carrier,
+                         const MenuGateSample& s) {
+    const bool t1Known = s.loaderRead;
+    const bool t2Known = s.cloudRead;
+    const bool t3Known = s.flagRead;
+    const bool t4Known = s.word280Read;
+    const bool t1 = t1Known && s.loader != 0;
+    const bool t2 = t2Known && s.cloud != 0;
+    const bool t3 = t3Known && s.cloudFlag4c1 != 0;
+    const bool t4 = t4Known && (s.cloudWord280 & 1ULL) == 0ULL;
+    const bool allKnown = t1Known && t2Known && t3Known && t4Known;
+    const bool allSatisfied = t1 && t2 && t3 && t4;
+    const char* gate = allKnown ? (allSatisfied ? "1" : "0") : "?";
+    // The vtable's address point, as an ELF vaddr when it is inside the
+    // image, so it can be compared with the disassembly.
+    const uint64_t bias = static_cast<uint64_t>(resolveMainImageLoadBias());
+    char vtabElfText[32] = "-";
+    const char* vtabElf = vtabElfText;
+    if (s.loaderVptrRead && s.loaderVptr >= bias &&
+        s.loaderVptr - bias < 0x4000000ULL) {
+        __builtin_snprintf(vtabElfText, sizeof(vtabElfText), "rr3+0x%llx",
+                           (unsigned long long)(s.loaderVptr - bias));
+    }
+    unsigned mask = 0;
+    mask |= s.loaderCellRead ? 1u : 0u;
+    mask |= s.loaderRead ? 2u : 0u;
+    mask |= s.loaderVptrRead ? 4u : 0u;
+    mask |= s.cloudCellRead ? 8u : 0u;
+    mask |= s.cloudRead ? 16u : 0u;
+    mask |= s.flagRead ? 32u : 0u;
+    mask |= s.word280Read ? 64u : 0u;
+    char line[640];
+    __builtin_snprintf(
+        line, sizeof(line),
+        "menu-gate: f=%llu via=%s t1=%llx t1ok=%c t2=%llx t2ok=%c"
+        " t3=4c1=%u t3ok=%c t4=280=%llx t4bit=%u t4ok=%c gate=%s"
+        " mlvtab=%llx mlvtabElf=%s mls21=%llx rd=0x%02x",
+        (unsigned long long)frames,
+        carrier != nullptr ? carrier : "?",
+        (unsigned long long)s.loader, menuGateTerm(t1Known, t1),
+        (unsigned long long)s.cloud, menuGateTerm(t2Known, t2),
+        (unsigned)s.cloudFlag4c1, menuGateTerm(t3Known, t3),
+        (unsigned long long)s.cloudWord280,
+        (unsigned)(s.cloudWord280 & 1ULL), menuGateTerm(t4Known, t4), gate,
+        (unsigned long long)s.loaderVptr, vtabElf,
+        (unsigned long long)s.loaderSlot21, mask);
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        line, 96, 0);
+}
+
+// The guest's own 240-frame tick, plus a host-thread carrier.
+//
+// The frame-loop call is the one the project already has: `(frames % 240) ==
+// 0`. It is ALSO the only one that can fire at all in a run whose frame loop
+// stops around frame 120 -- it samples exactly once, at frame 0 -- so it
+// cannot answer "which of the four terms is not satisfied" on its own. The
+// host sampler thread (samplerWorker) keeps ticking after the frame loop is
+// gone, and it is the carrier that turns this into a time series.
+//
+// The sampler emits on a CHANGE and on a 1 s heartbeat, the same rule the
+// Cloudcell gate probe uses, so a run in which nothing changes still says
+// so once a second.
+void sampleMenuGateTerms(uint64_t frames, const char* carrier) {
+    const uint64_t bias = static_cast<uint64_t>(resolveMainImageLoadBias());
+    const MenuGateSample s = sampleMenuGate(bias);
+    if (carrier != nullptr && std::strcmp(carrier, "sampler") == 0) {
+        struct Last {
+            bool valid{};
+            uint64_t loader{};
+            uint64_t loaderVptr{};
+            uint64_t cloud{};
+            uint32_t flag4c1{};
+            uint64_t word280{};
+            uint64_t tick{};
+        };
+        static Last s_last{};
+        static unsigned s_lines = 0;
+        constexpr unsigned kMaxLines = 200;
+        if (s_lines >= kMaxLines) {
+            return;
+        }
+        const uint64_t now = armGetSystemTick();
+        const uint64_t freq = armGetSystemTickFreq();
+        const uint64_t elapsedMs = (now - s_last.tick) * 1000ULL /
+                                   (freq != 0 ? freq : 1);
+        const bool heartbeatDue = s_last.valid && elapsedMs >= 1000ULL;
+        const bool changed =
+            !s_last.valid || s_last.loader != s.loader ||
+            s_last.loaderVptr != s.loaderVptr || s_last.cloud != s.cloud ||
+            s_last.flag4c1 != s.cloudFlag4c1 || s_last.word280 != s.cloudWord280;
+        if (!changed && !heartbeatDue) {
+            return;
+        }
+        s_last.valid = true;
+        s_last.loader = s.loader;
+        s_last.loaderVptr = s.loaderVptr;
+        s_last.cloud = s.cloud;
+        s_last.flag4c1 = s.cloudFlag4c1;
+        s_last.word280 = s.cloudWord280;
+        s_last.tick = now;
+        ++s_lines;
+    }
+    emitMenuGateSample(frames, carrier, s);
+}
+
+// ---------------------------------------------------------------------------
 // DIAGNOSTIC (STEP 1): force the guest's server-variable feature bits.
 // ---------------------------------------------------------------------------
 //
@@ -4030,6 +4378,10 @@ void* frameLoopDriver(void* opaque) {
     g_samplerPhase.store(kSamplerPhaseFrameLoopHost, std::memory_order_relaxed);
     runSamplerSelfTest();
     while (probe.frameLoopActive) {
+        // Publish the guest's own frame counter for the host sampler thread,
+        // which labels its menu-gate samples with it. The frame loop is the
+        // only place that knows it.
+        g_guestFrameNumber.store(frames, std::memory_order_relaxed);
         // Placed BEFORE padUpdate, and that placement is the measurement.
         // Archive 20261004-060230-wedge3 (guard widened to frames < 3) produced
         // loop-top / after-pad-pump / after-cloudcell-pump exactly once each --
@@ -4294,6 +4646,14 @@ void* frameLoopDriver(void* opaque) {
             // The cc::HttpRequestManager census, one compact line per
             // 240-frame tick, anchored to the guest's frame counter.
             rr3HttpManagerFrameTick(frames);
+            // THE MENU GATE, all four terms, on the guest's own 240-frame
+            // tick. This is the sample the guest's frame number anchors, and
+            // it is also the ONE place the guest's own frame counter is the
+            // right label: the host sampler thread carries the same probe
+            // with the LAST frame number it saw, because the frame loop
+            // stops around frame 120 and this tick then never comes round
+            // again.
+            sampleMenuGateTerms(frames, "frame");
         }
         // The download-phase gate probe is NOT called here any more. It used
         // to be, under `if ((frames % 240) == 0)`, and the frame loop dies
