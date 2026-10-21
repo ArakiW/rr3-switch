@@ -863,12 +863,20 @@ static unsigned describeMap(uintptr_t container, char *out, size_t cap)
 }
 
 /*
- * The ServerTimeManager's vtable, measured in archive
- * 20261021-072801-eden-srvtime5 (the probe read the manager's own vptr).
- * It is a fast selector: the manager is the object whose FIRST WORD is this
- * address, so the hunt needs one read per candidate instead of four.
+ * The ServerTimeManager's vtable pointer, read out of the guest image's
+ * .data.rel.ro (the vtable base is 0x1f65b88: [0] = offset-to-top,
+ * [1] = the typeinfo, [2] = vfunc0, so the vptr an object carries is the
+ * address of the FIRST function slot = 0x1f65b98).
+ *
+ * THE OLD CONSTANT WAS WRONG BY 0x200 (eight slots): it was 0x1f65bb98,
+ * which is the slot of vfunc4 (cc::ServerTimeManager::Update, guest raw
+ * 0x1ceedcc), not the vtable pointer. The vtable-selector arm of
+ * reportManagerCandidate therefore NEVER matched, and every manager sample
+ * in every archive was found by the +0x78 shape fallback instead. The
+ * fallback works, so the bug was invisible - but the selector is the cheap
+ * path (one read per candidate) and it should work.
  */
-static const uintptr_t kManagerVtableElf = 0x1f65bb98ull;
+static const uintptr_t kManagerVtableElf = 0x1f65b98ull;
 
 /*
  * The ServerTimeManager's address, remembered once the hunt finds it. The
@@ -877,6 +885,13 @@ static const uintptr_t kManagerVtableElf = 0x1f65bb98ull;
  * cost the run thousands of frames: 16200 -> 8280).
  */
 static uintptr_t g_managerAddr = 0;
+
+/*
+ * The cc::AndroidHttpRequestWorker the port is serving. Remembered so the
+ * late sample can read the request record (the worker's +0x08) without
+ * hunting for it again.
+ */
+static uintptr_t g_workerAddr = 0;
 
 /*
  * The ServerTimeManager's shape, read out of the guest's own code:
@@ -989,6 +1004,140 @@ static void reportManagerCandidate(uintptr_t p, const char *phase)
 }
 
 /*
+ * THE GATE ON THE HANDLER, read straight out of the guest's request record.
+ *
+ * The guest's cc::HttpRequestManager holds its active requests in a vector at
+ * this+0x38 (begin) / this+0x40 (end); each element is a 0x30-byte
+ * cc::ActiveRequest_Struct.  Read out of the guest image:
+ *
+ *   +0x00  u64   the request token (the ServerTimeManager's this+0x70)
+ *   +0x88  u64   the "completion" delegate (void(bool*)) - the worker calls it
+ *   +0x90  u64   its holder
+ *   +0xc8  u8    THE RESPONSE-COMPLETE FLAG
+ *   +0xc9  u8    "the completion delegate was already delivered"
+ *   +0xd4  u32   the pending body byte count
+ *   +0xd8  ptr   the pending body buffer
+ *   +0x100 u64   THE HANDLER DELEGATE  (void(char const*, u32, u64))
+ *   +0x130 u64   the body delegate     (void(char const*, u32, u64))
+ *   +0x160 u64   THE PARSER DELEGATE  (void(unordered_map&, u64))
+ *   +0x170 u32   the HTTP status code
+ *   +0x178 ...   the response header map
+ *
+ * cc::HttpRequestManager::OnRequestComplete (guest raw 0x1ce2da0 - the
+ * function that prints "CC: [%lu] %s complete [Succeeded=%s]") sets +0xc8 to
+ * 1, and cc::HttpRequestManager::Poll (0x1ce29b4) invokes the +0x100
+ * delegate ONLY when +0xc8 != 0 and +0xc9 == 0.  So:
+ *
+ *   +0xc8 == 0   the guest never marked the response complete
+ *   +0xc8 == 1, +0xc9 == 0, +0x100 == 0   the handler delegate was never
+ *                                         installed
+ *   +0xc8 == 1, +0xc9 == 0, +0x100 != 0   the handler IS installed and
+ *                                         waiting, and the only thing left is
+ *                                         that Poll has not run
+ *
+ * The manager pointer comes from the guest's own request record: the
+ * cc::AndroidHttpRequestWorker's +0x08 IS the cc::ActiveRequest_Struct it is
+ * serving (cc::AndroidHttpRequestWorker::CompletionCallback at guest raw
+ * 0x1ce4c60 does "ldr x9,[x0,#8]" and then "str w8,[x9,#0x170]" - the status
+ * into the record), and the port already holds the worker pointer: it is the
+ * jlong the guest handed init() and hands back to every callback.
+ *
+ * (The first version of this probe went after the Cloudcell's +0x10 and
+ * found the TIME SERVICE there, not the HTTP request manager - the manager
+ * comes out of cloudcell->vtable[4](), which a probe must not call. The
+ * worker is the right handle and it costs one fewer hop.)
+ */
+static void describeActiveRequests(uintptr_t worker)
+{
+    /* Bounded: the record's fields live in one or two pages, but each read
+     * that crosses a page boundary costs the guest a syscall, and the probe
+     * runs on the thread the guest called JNI from. Four samples is a time
+     * series; sixty-seven is a cost. */
+    static unsigned s_samples = 0u;
+    if (s_samples >= 4u) {
+        return;
+    }
+    ++s_samples;
+    if (worker == 0) {
+        return;
+    }
+    uint64_t rec = 0;
+    if (!readU64(worker + 0x08u, &rec) || rec == 0) {
+        return;
+    }
+    const uintptr_t r = static_cast<uintptr_t>(rec);
+    uint64_t tok = 0, c8 = 0, d4 = 0, d100 = 0, d130 = 0, d160 = 0, status = 0;
+    readU64(r + 0x00u, &tok);
+    readU64(r + 0xc8u, &c8);
+    readU64(r + 0xd4u, &d4);
+    readU64(r + 0x100u, &d100);
+    readU64(r + 0x130u, &d130);
+    readU64(r + 0x160u, &d160);
+    readU64(r + 0x170u, &status);
+
+    /*
+     * Is the record still in the HTTP request manager's active-request
+     * vector?
+     *
+     * The manager is a global: the guest's cc::HttpRequestManager pointer
+     * lives in .bss at 0x1f97818 (GOT 0x1f6dac8 -> that address), and
+     * cc::HttpRequestManager::Poll (0x1ce29b4) walks its vector at
+     * this+0x38 (begin) / this+0x40 (end) - a vector of POINTERS, 8 bytes
+     * per element ("ldr x21,[x8,x9,lsl #3]"), not of 0x30-byte records.
+     *
+     * A record that is not in the vector is one the poll can never see, and
+     * a record that IS in it with +0xc8 set and +0xc9 clear is one the
+     * poll has not delivered yet. Those are different blockers and the
+     * probe has to tell them apart.
+     */
+    const uintptr_t bias = rr3::resolveMainImageLoadBias();
+    uint64_t mgr = 0, begin = 0, end = 0;
+    uint64_t mgrvptr = 0;
+    uint64_t vecn = 0;
+    bool found = false;
+    if (bias != 0 &&
+        readU64(bias + 0x1f97818ull, &mgr) && mgr != 0) {
+        /* The object's own vptr, so the log says WHICH class the global
+         * holds. cc::HttpRequestManager's vtable base is 0x1f64848, so its
+         * vfunc0 slot - the address an instance's vptr points at - is
+         * 0x1f64858. If the vptr does not match, the global is some other
+         * object and its +0x38/+0x40 are not an active-request vector. */
+        readU64(static_cast<uintptr_t>(mgr), &mgrvptr);
+        if (readU64(static_cast<uintptr_t>(mgr) + 0x38u, &begin) &&
+            readU64(static_cast<uintptr_t>(mgr) + 0x40u, &end) &&
+            end > begin) {
+            vecn = (end - begin) / 8u;
+            for (uint64_t i = 0; i < vecn && i < 32u; ++i) {
+                uint64_t e = 0;
+                if (readU64(static_cast<uintptr_t>(begin) + i * 8u, &e) && e == rec) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    char line[512];
+    __builtin_snprintf(line, sizeof(line),
+                       "worker=0x%llx rec=0x%llx token=0x%llx c8=%llu c9=%llu "
+                       "d4=%llu handler100=0x%llx body130=0x%llx "
+                       "parser160=0x%llx status=0x%llx | mgr=0x%llx "
+                       "mgrvptr=0x%llx vecn=%llu invec=%d",
+                       (unsigned long long)worker, (unsigned long long)rec,
+                       (unsigned long long)tok,
+                       (unsigned long long)(c8 & 0xffu),
+                       (unsigned long long)((c8 >> 8) & 0xffu),
+                       (unsigned long long)(d4 & 0xffffffffu),
+                       (unsigned long long)d100, (unsigned long long)d130,
+                       (unsigned long long)d160,
+                       (unsigned long long)(status & 0xffffffffu),
+                       (unsigned long long)mgr, (unsigned long long)mgrvptr,
+                       (unsigned long long)vecn, found ? 1 : 0);
+    rr3::guestViewWideLog("cc-probe-req", (unsigned long long)rec,
+                          (unsigned long long)d100, line);
+}
+
+/*
  * Hunt for the manager among the objects the record and the worker point at,
  * one level down. Bounded: at most 96 direct candidates and 256 second-level
  * ones, every read gated on svcQueryMemory.
@@ -1093,6 +1242,10 @@ static void probeWorker(uintptr_t worker, const char *phase)
     rr3::guestViewWideLog("cc-probe", (unsigned long long)worker,
                           (unsigned long long)vt3, details);
 
+    /* Remember the worker: the late sample reads the request record out of
+     * it (the worker's +0x08 IS the cc::ActiveRequest_Struct). */
+    g_workerAddr = worker;
+
     /* The objects the record and the worker point at, so a run says which
      * pointer leads to the ServerTimeManager and what its fields say. */
     huntServerTime(worker, (base != 0) ? static_cast<uintptr_t>(base) : worker, phase);
@@ -1118,12 +1271,19 @@ static void probeWorker(uintptr_t worker, const char *phase)
  */
 extern "C" bool rr3ServerTimeManagerProbe(const char *phase)
 {
-    if (ccprobe::g_managerAddr == 0) {
-        return false;
+    bool took = false;
+    if (ccprobe::g_managerAddr != 0) {
+        ccprobe::reportManagerCandidate(ccprobe::g_managerAddr,
+                                        phase != nullptr ? phase : "late");
+        took = true;
     }
-    ccprobe::reportManagerCandidate(ccprobe::g_managerAddr,
-                                    phase != nullptr ? phase : "late");
-    return true;
+    /* The gate on the handler: is the request record still there, has the
+     * guest marked the response complete, and is the handler delegate
+     * installed?  This is the read that says which of those three is
+     * missing.  It does not need the manager, so it runs even when the
+     * manager hunt has not landed yet. */
+    ccprobe::describeActiveRequests(ccprobe::g_workerAddr);
+    return took;
 }
 
 /*
@@ -1210,6 +1370,33 @@ static bool deliverServerTime(JNIEnv *env, CCHttpRequest *req)
     return true;
 }
 
+/*
+ * The /time answer.
+ *
+ * THE DELIVERY ORDER IS NOT THE BLOCKER - MEASURED 2026-10-21, archive
+ * 20261021-100155-eden-srvinline.
+ *
+ * The hypothesis was: the guest's cc::HttpRequestManager::QueueRequest
+ * (0x1ce1a84) pushes the request record into the manager's vector
+ * (this+0x38..+0x40) only AFTER post() returns, and the guest's only poll
+ * of the manager is the one inside cc::Cloudcell::Cloudcell (0xcd1014) -
+ * a CONSTRUCTOR, so it runs once, at construction, before any answer can
+ * exist.  Answering /time INLINE, inside post(), would therefore leave a
+ * record that is already complete when the vector push happens.
+ *
+ * Answering /time inline was implemented and measured.  It changed
+ * NOTHING: the record is still not in the manager's vector (cc-probe-req:
+ * vecn=0, invec=0), c8 is still 1, c9 is still 0, "CC: Server time
+ * returned" is still absent, and the guest still issues exactly one /time
+ * request.  The same reading also shows the manager the port can see (the
+ * guest's .bss global 0x1f97818) has an EMPTY vector, so the request is
+ * registered in a DIFFERENT cc::HttpRequestManager instance - and the
+ * poll that would deliver the handler never walks that one.
+ *
+ * The deferred delivery stays, because that is what the real Java
+ * HttpThread does (it answers on its own thread) and because the inline
+ * arm bought nothing.
+ */
 static void http_post(JNIEnv *env, jobject self)
 {
     CCHttpRequest *req = (CCHttpRequest *)self;

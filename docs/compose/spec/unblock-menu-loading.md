@@ -4040,3 +4040,231 @@ looks at it.
 
 
 
+
+
+## [S9] The server-time handler: what the two binds are, and what the guest is actually waiting for (2026-10-21)
+
+The open question in [S8] was "why the bind calls the parser and not the
+handler". It is answered, and the answer is not about the bind.
+
+### 1. The class is `cc::ServerTimeManager`, and there are TWO binds, not one
+
+The guest's class is `cc::ServerTimeManager` (typeinfo at guest raw
+`0x1f65d18`, name `N2cc17ServerTimeManagerE`; vtable base `0x1f65b88`,
+`[1]` = typeinfo, `[2]` = vfunc0, so the vptr an instance carries is
+`0x1f65b98`). The source file is named in the guest's own assert strings:
+`E:\dev\builds\r3_update_a\source\src\Cloudcell\CloudcellApi\ServerTimeManager.cpp`.
+
+Both functions are reached from ONE place, `cc::ServerTimeManager::TimeCallback(char const*, unsigned long)` at guest raw `0x1cef068`, which builds two delegates and hands them to one call:
+
+```
+0x1cef1e4  adrp x8, #0x1f7e000
+0x1cef1ec  ldr  x8, [x8, #0x3e0]     ; GOT -> 0x1f65d80 (the __bind ops table)
+0x1cef1f0  ldr  x9, [x9, #0x3e8]     ; GOT -> 0x1cef2f8  <-- THE HANDLER
+0x1cef204  ldr  x9, [x9, #0x3f0]     ; GOT -> 0x1cef8a4  <-- THE PARSER
+0x1cef220  ldr  x9, [x9, #0x3f8]     ; GOT -> 0x1f65e18 (the other ops table)
+0x1cef224  stur x8, [x29, #-0x80]    ; closure A: {vtable, 0x1cef2f8, 0, this}
+0x1cef228  stur q1, [x24, #0x68]     ; closure A's fn word
+0x1cef22c  stp  x19, x20, [x29, #-0x68]
+0x1cef234  str  x8, [sp, #0xc0]      ; closure B: {vtable, 0x1cef8a4, 0, this}
+0x1cef238  stur q0, [x24, #8]
+0x1cef23c  stp  x19, x21, [sp, #0xd8]
+0x1cef244  sub  x2, x29, #0x80       ; closure A  -> the HANDLER
+0x1cef248  sub  x3, x29, #0xb0
+0x1cef24c  add  x4, sp, #0xc0        ; closure B  -> the PARSER
+0x1cef250  ldr  x8, [x8, #0x18]       ; vtable slot 3
+0x1cef254  blr  x8                    ; one call, two delegates
+0x1cef258  str  x0, [x19, #0x70]     ; the request token
+```
+
+The two delegates differ in their TYPE, and that is what lands them in
+different places:
+
+| | closure A | closure B |
+|---|---|---|
+| target | `0x1cef2f8` (the handler) | `0x1cef8a4` (the parser) |
+| `std::function` type | `void(char const*, u32, u64)` | `void(unordered_map<string,pair<const string,string>>&, u64)` |
+| bound member | `cc::ServerTimeManager::(char const*, u32, u64)` | `cc::ServerTimeManager::(unordered_map&, u64)` |
+| its invoke | `0x1cf0760` (3 args) | `0x1cf0824` (1 arg, in x2) |
+| ops table | `0x1f65d80` | `0x1f65e18` |
+
+The typeinfo names say so in the guest's own symbols: `__bind<cc::ServerTimeManager::(char const*, unsigned int, unsigned long)(...)>` and `__bind<cc::ServerTimeManager::(unordered_map<...>&)(...)>`.
+
+### 2. They land in different slots of the request record, and are invoked by different events
+
+`cc::HttpRequestManager::QueueRequest` (guest raw `0x1ce1a84`; the guest's
+own assert names it) builds a 0x1b0-byte `cc::ActiveRequest_Struct` with
+`0x1ce13a4` and then registers it:
+
+```
+0x1ce1ae4  bl   0x1ce13a4             ; build the record; its ctor calls post()
+0x1ce1af4  ldp  x9, x8, [x19, #0x40]
+0x1ce1b00  str  x20, [x9], #8         ; PUSH the record pointer
+0x1ce1b04  str  x9,  [x19, #0x40]    ; the vector END  (begin at +0x38)
+```
+
+`0x1ce13a4` puts the three delegates into the record:
+
+| record slot | what it is | who invokes it |
+|---|---|---|
+| `+0x90` | the completion delegate `void(bool*)` | `cc::AndroidHttpRequestWorker::CompletionCallback` (`0x1ce4c60`) |
+| `+0xe0` | inline storage for a 32-byte delegate | (the copy target) |
+| `+0x100` | **the HANDLER delegate** (`0x1ce2af4`-`0x1ce2b10`) | `cc::HttpRequestManager::Poll` (`0x1ce29b4`) |
+| `+0x130` | the body delegate | the same poll, gated on `+0xd4 != 0` |
+| `+0x140` | inline storage | (the copy target) |
+| `+0x160` | **the PARSER delegate** (`0x1ce2c68`-`0x1ce2c8c`) | the same poll, with `(&record+0x178, &status)` |
+| `+0xc8` | the RESPONSE-COMPLETE flag | set by `cc::HttpRequestManager::OnRequestComplete` (`0x1ce2da0`) |
+| `+0xc9` | "the completion delegate was delivered" | set by the poll, just before it delivers |
+| `+0x170` | the HTTP status | the worker's completion callback |
+
+**So the two binds are separated by the EVENT, not by the bind:**
+
+* the PARSER fires on the HEADERS event (it is handed the response header
+  map at `record+0x178`), which is why it ran;
+* the HANDLER fires on the RESPONSE-COMPLETE event, and the poll gates it
+  on `record+0xc8 != 0 && record+0xc9 == 0`.
+
+### 3. The probe now reads the gate, and it says the answer is ACCEPTED
+
+`cc-probe-req` (new, in `native-switch/source/jni_compat/classes/cc_http_request.cpp`)
+reads the request record out of the worker (`worker+0x08` IS the
+`cc::ActiveRequest_Struct`; the worker's `CompletionCallback` does
+`ldr x9,[x0,#8]` and `str w8,[x9,#0x170]`). Archive
+`20261021-100742-eden-srvhandler`:
+
+```
+worker=0x21106b2020 rec=0x21101150c0 token=0x1 c8=1 c9=0 d4=0
+handler100=0x21101151a0 body130=0x0 parser160=0x2110115200 status=0xc8
+```
+
+Read line by line:
+
+* `status=0xc8` - the port's 200 landed in the record.
+* `c8=1` - the guest's `OnRequestComplete` ran and marked the response complete.
+* `handler100=0x21101151a0 = rec+0xe0` - **the handler delegate IS installed**
+  (the manager copied the caller's inline delegate into `record+0xe0` and
+  pointed `record+0x100` at it).
+* `parser160=0x2110115200 = rec+0x140` - the parser delegate is installed.
+* `token=0x1` - the record's token equals the manager's `this+0x70` (`0x1`),
+  so the handler's own token check would PASS.
+* `c9=0` - **the handler delegate was never delivered.**
+* `body130=0x0` - the body delegate slot is empty, as it should be: the
+  manager's out-parameter was never filled, so the ServerTimeManager's
+  handler is the `+0x100` delegate and the parser the `+0x160` one.
+
+**The port's `/time` answer is accepted. There is nothing wrong with it.**
+
+The handler's own preconditions (all measured from the binary at
+`0x1cef2f8`) would also have passed: `this+0x88 > 0` (the parser stored
+`1792541772.348445`), `|now - this+0x80| < 5 s` and
+`|now - this+0x78| < 5 s` (the request and the parse are 0.15 s apart in
+the archive), and the token matches.
+
+**A READING THAT WAS WRONG, AND IS RETRACTED HERE.** The same probe line
+also reported `mgr=... vecn=0 invec=0`, which reads as "the record is not
+in the manager's active-request vector". That is about the WRONG OBJECT:
+the pointer was read from the guest's .bss global `0x1f97818`, and that
+global holds a **GluRevSDKWrapper** (its vptr is ELF `0x1e4b948`, the
+`GluRevSDKWrapper` vtable at `0x1e4b940`), not the
+`cc::HttpRequestManager`. Its `+0x38`/`+0x40` are not an active-request
+vector, so `vecn=0` says nothing. The probe now also prints the vptr so
+this cannot be mistaken again.
+
+### 4. The averaging is real, and it is why the guest never asks again
+
+`cc::ServerTimeManager::SetAveragedTimes` (guest raw `0x1cefb80`) copies
+**0x78 = 120 bytes = 5 samples of 24 bytes** out of `this+0xd8`, sorts them
+and computes the mean and the variance; it asserts (ServerTimeManager.cpp
+line 218) when `this+0x90 <= 0 && this+0x140 == 0 && this+0x148 < 0`.
+`this+0x90` is the sample counter, and the handler compares it with five:
+
+```
+0x1cef3a0  ldr  w8, [x19, #0x90]
+0x1cef3a8  cmp  w8, #5
+0x1cef3ac  b.lo #0x1cef460            ; fewer than 5 samples -> schedule a timer
+0x1cef460  ...                        ; a 5000 ms timer (mov w2, #0x1388)
+                                       ; carrying the lambda TimeCallback::$_0
+0x1cef494  blr x8                     ; the timer service's vfunc7
+```
+
+**The guest wants FIVE `/time` samples, five seconds apart, before it
+publishes an averaged server time.** That is why `this+0xd8` is a five
+element array and why the handler schedules a five second re-request.
+
+And the re-request is gated on having a sample at all:
+
+```
+0x1ceef1c  ldr  w8, [x19, #0x90]
+0x1ceef20  cbz  w8, #0x1ceef48        ; NO samples -> do not ask again
+0x1ceef24  mov  x0, x19
+0x1ceef2c  bl   0x1cef068             ; TimeCallback -> a new /time request
+```
+
+**So the deadlock is closed on itself:** the handler never runs, so the
+sample counter stays 0, so the guest never asks again. The archive shows
+exactly that - `cc-http-init = 1`, one `/time` request in the whole run,
+`this+0x98 = 1`, `this+0x90 = 0`, `this+0x60 = 1` (still "in flight") and
+`this+0x88` still holding the server time that was never consumed.
+
+### 5. The delivery order is NOT the blocker (measured, and reverted)
+
+The obvious candidate was the order. `cc::HttpRequestManager::QueueRequest`
+(`0x1ce1a84`) builds the record, calls `post()` (which is where the port
+answers), and ONLY THEN pushes the record pointer into the vector at
+`this+0x38..+0x40`:
+
+```
+0x1ce1ae4  bl  0x1ce13a4        ; build the record; its ctor calls post()
+0x1ce1af4  ldp x9, x8, [x19,#0x40]
+0x1ce1b00  str x20, [x9], #8    ; PUSH the record
+0x1ce1b04  str x9,  [x19,#0x40]
+```
+
+and the guest's only poll of the request manager is the one inside
+`cc::Cloudcell::Cloudcell` (`0xcd1014` - a CONSTRUCTOR: it lays out a
+0x5d0-byte object and initialises `+0x10 .. +0xd5`), at `0xcd1db0` - ONCE,
+at construction, before any answer can exist. So answering `/time` INLINE,
+inside `post()`, was implemented and measured.
+
+**It changed nothing.** Archive `20261021-100155-eden-srvinline`, answered
+inline:
+
+```
+worker=0x210ffbd3c0 rec=0x210fcec0c0 token=0x1 c8=1 c9=0 d4=0
+handler100=0x210fcec1a0 body130=0x0 parser160=0x210fcec200 status=0xc8
+| mgr=0x2102f514a0 vecn=0 invec=0
+```
+
+Identical to the deferred run, down to the vector being empty, and
+"CC: Server time returned" is still absent. **The inline arm was
+REVERTED**; the deferred delivery stays, because that is what the real
+Java HttpThread does (it answers on its own thread) and because the inline
+arm bought nothing.
+
+**What the same reading settles is WHERE THE MISSING CALL IS.**
+`cc::HttpRequestManager::Poll` (`0x1ce29b4`) is **vfunc15** of the
+`cc::HttpRequestManager` (vtable base `0x1f64848`, so `&vfunc0` is
+`0x1f64858` and vfunc15 is `0x1f648d0`). A caller therefore has to do
+`ldr xN,[xM]; ldr xN,[xN,#0x78]; blr xN` **on a manager instance**. Every
+such call site in the guest image that could be found is on the OTHER
+object in the same .bss neighbourhood - the **GluRevSDKWrapper** global at
+`0x1f97818` (`0xce0ee4`, `0xcdf7b8`, `0xce4d6c`) - and that object's
+vfunc15 is `0xb3b518`, not the poll.
+
+**So the last link is: who calls `cc::HttpRequestManager::vfunc15` on the
+manager instance that holds the `/time` record, and why is that call not
+reached in this run?** It is guest-side code. The port cannot change it
+with a different `/time` response - the response is already accepted, the
+handler delegate is armed, the token matches, and the guest's own retry is
+already gated on the sample counter that only the handler can advance.
+
+### 6. A bug in the probe itself, found on the way
+
+The probe's vtable selector was wrong by 0x200 (eight slots): it compared
+the manager's vptr against `0x1f65bb98`, which is the slot of vfunc4
+(`cc::ServerTimeManager::Update`, `0x1ceedcc`) and not the vtable pointer
+`0x1f65b98`. The selector therefore never matched, and every manager
+sample in every archive was found by the `+0x78` shape fallback instead.
+The fallback works, so the bug was invisible; the constant is now
+`0x1f65b98` and the selector does what it says.
+
