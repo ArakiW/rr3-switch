@@ -5459,10 +5459,21 @@ The old instrument could not see it: the existing `cc-cell-poll` lives under
 `if ((frames % 240) == 0)` inside the frame loop, and the loop stops at
 frame ~120-209, so it sampled **once, at f=0**, before the Cloudcell existed.
 
-**The menu loader's own slot 21 resolves to ELF `0xE851E8`.** The
-`0x14851E8` (`mt::RenderGL`) figure carried in S33/S35 belongs to a
-**different object's** slot 21 - the same "pointed at the wrong object" error
-class that has now appeared three times in this project.
+**And the slot-21 target is NOT a menu loader at all.** The render-path gate
+ends in `ldr x8,[x0]; ldr x8,[x8,#0xa8]; blr x8` - `vtable[21]` of
+`mt::RenderGL` (vtable address point `0x1ed6fa0`, typeinfo `0x1ed7518` =
+`10mtRenderGL`; the same slot of `mt::RenderGLPP` and `mt::RenderGLPPES`
+holds the same function). `0x14851E8` switches on `w2` and emits render-pass
+descriptors (`0x1800`/`0x8ce0`/...); it is a **GL-version assert guard**.
+The project already retracted this in `[S9] ("0x12af010 is an ASSERT, not a
+menu loader")`, then re-asserted it in S36 - **so it is retracted again, and
+the whole "render-path menu gate" line of reasoning is withdrawn.**
+
+*(A transcription error crept in: S36 first wrote the slot-21 target as
+`0xE851E8`. That address does not exist in the image - it is mid-function
+inside a text-layout routine, and it appears in no relocation. The correct
+address is `0x14851E8`, which is also what S33's own measurement
+`slot21 = 0x21086081e8 - bias 0x2107183000` gives.)*
 
 #### 2. There are TWO menu gates, and the journal conflated them
 
@@ -5623,3 +5634,146 @@ No response body was invented; the requests still fail honestly.
    the 19 popup cycles the network answer removed.
 6. **The atlas registry**: does completing the manifest make the guest
    request the atlases?
+
+### S37 - the real blocker is an EMPTY resolution list, and the menu gate was never the gate (2026-10-21)
+
+Three independent agents, and the conclusion is now a chain rather than a
+guess.
+
+#### 1. The menu-asset gate `0x13833cc` is OPEN by default
+
+The gate's three terms are on `cc::RookieChampionship::RookieChampionshipManager`
+and on `CGlobal+0x47c`. **The constructor `0x1382a74` writes `mgr+8 = 1`
+(`0x1382ae0`) and `mgr+0xc = 0` (`0x1382adc`)**, and `CGlobal+0x47c` lives in
+`.bss` with an initial value of 0. So at cold start **all three terms are
+satisfied and the gate returns 1**.
+
+`mgr+0xc` is the serialized property **`m_CurrentState`** (the deserializer
+at `0x1383420` reads the property name at `0x43afe7` and writes it back
+through a vtable setter). The state means: **4 = career / "Motorsports"**
+(set by `0x1385898`, which also writes `Progression -> Tutorial Name =
+Motorsports` and `Is_Rookie = Yes`), **5 = Rookie Championship** (set by
+`0x1384b38`, which writes `Tutorial Name = Rookie Championship`). The gate
+closes only when the guest has **really finished** the Rookie Championship -
+`0x1385fc8` sets 5 only after its two event lists and `0x9b50b4` all
+complete.
+
+**So the gate is a consequence, not a cause, and nothing needs to be faked.**
+
+Two corrections to the previous round's account of it:
+
+* **`0x1384b38` DOES have direct BL callers** - `0xa78434` (fn `0xa7841c`, a
+  slot in the **function-pointer table** at `.data.rel.ro 0x1e78b80`, which
+  sits next to `FrontEnd::MainMenuCheatScreen`'s vtable - i.e. cheat/menu
+  action callbacks) and `0xcce2a8` (fn `0xccdef4`, the rookie-completion
+  handler).
+* **"146 per-event flags cleared" is wrong in both direction and count.**
+  `0x152c1c8(idx, flag)` is `flag ? ORR(set) : BIC(clear)`; `0x1384b38` passes
+  `flag = 1`, so it **SETS** bits, and the loop covers 0..145 skipping bits
+  {0, 62, 63} - **143 bits set**, in the heap bitset at `CGlobal+0x488`.
+
+**And the runtime says the manager is never built at all**: the probe found
+the object pointer at `.bss 0x1f95cd8` to be **0 in 40 of 40 samples**
+(frames 0..432). So the gate cannot even be evaluated - and the guest's own
+call site `0xdacf38 ldr x0,[x0,#0x4c0]` would hand a NULL to a gate whose
+first instruction is `ldrb w8,[x0,#8]`, i.e. it would fault. **The guest
+never reaches the menu-asset path at all.** The construction is conditional
+inside `fn 0x10b0ca8` (preconditions `0x13dd2f0`, `0x10b07f4`, `0xc78120`,
+`0xa02f88`; bail at `0x10b11b8`).
+
+#### 2. The real blocker: the GUI resolution list is EMPTY
+
+The 69 `Failed to load image from atlas` failures are **one** defect, not 69.
+`cc::ImageResManager` builds its list of `gui_assets/<W>x<H>/` folders by
+**enumerating `<content-root>/gui_assets` with `opendir`/`readdir`, keeping
+only `d_type == DT_DIR`**, parsing each name with **`sscanf(name, "%ux%u",
+&w, &h)`** and keeping the candidate only if the call **returns 2**.
+
+* The port's readdir trace shows the guest was handed `480x320`, `960x640`
+  (plus the injected `2048x1536`, `1280x720`) with `d_type = DT_DIR` - **so
+  the enumeration worked and `d_type` is right.**
+* The guest prints `Res base: 1280x720` and then `Res order:` with **ZERO
+  entry lines**, in all four recent archives.
+* The only gate before a candidate is dropped is `cmp w0,#2` on the
+  **`sscanf`** return - and the port binds `sscanf` to the **host newlib**
+  (`symbol_resolver.cpp:1473`).
+
+⇒ **The next experiment is one line: have the port call its own
+`sscanf("480x320", "%ux%u", &w, &h)` and log the return value.** If it is
+not 2, that is the whole bug and the fix is a `sscanf` shim.
+
+The other two loss points, if `sscanf` returns 2: the registrar's vector
+post-processing (`0x12c0fac`-`0x12c0ff8`, whose comparator is passed as
+`&sp+0x10` at `0x12c0fb0` - **an uninitialised stack slot**, which would make
+the sort undefined), and the per-candidate thresholds (`0x10f8ec8` compares
+`w` against `w20` and `h` against `w21`, which must be the device metrics,
+1280x720).
+
+**The volumes are not the problem:** `960x640/splash/sprites.android.atlas`
+(257 B) + `sprites_0.rgb.pvr.z` (317 B) and
+`960x640/loading_icon/sprites.android.atlas` (3,432 B) +
+`sprites_0.rgb.pvr.z` (9,087 B) are **complete in both reachable volumes**. A
+non-empty list should satisfy all 69 failures without touching the volumes.
+
+#### 3. Completing the manifest was honest and NEUTRAL
+
+The port now builds `cache/asset_list_gui_assets_core.txt` by walking the
+volumes' `gui_assets/<res>/{splash,loading_icon}` trees and appending **58**
+lines with each file's **real md5 and real size computed from the file's own
+bytes** (a new RFC-1321 MD5 unit, `rr3_md5.cpp`, checked against the seven
+official vectors and against Python `hashlib` on 27 sizes). The guest now
+reads the **completed 371,191 B** manifest instead of the 365,312 B original.
+
+**And it changed nothing**: `Failed to load image from atlas` 69 -> 69, atlas
+file requests 0 -> 0. **The atlas list is not the asset registry** - it is the
+directory scan above. The manifest feeds the *download* path, not the atlas
+path. The asset-registry hypothesis is refuted.
+
+Two corrections that came out of that work:
+
+* **ROMFS data offsets are RELATIVE to the data section (base `0x200`), not
+  absolute.** Reading them absolutely reads the tail of the *previous* file -
+  and on a text manifest that produces **plausible-looking but wrong** text.
+* The `gui-hd` `2048x1536/loading_icon/` tree ships the atlas but **not** its
+  texture, while `core.romfs`'s `apk/res/` copy of the same path ships
+  **both** and the atlas is byte-identical (same md5 `190120e8...`). That is
+  a **packaging omission in `gui-hd.romfs`**, not a dedup. The port's
+  manifest builder already sources the missing texture from `core.romfs`.
+
+#### 4. The frame stall: not the harness, not a block - per-frame work
+
+`gfx-stats` reaches 14,280 frames in 300 s with the network answer false and
+120/240/360 with it true. It is **not** the harness's 30 s no-log rule (that
+rule never fired in the baseline, and it is itself shorter than the reaper's
+50 s slice, so it mis-kills healthy runs - `...-manifest2` / `...-manifest3`
+were killed at ~140 s). It is **not** a block: no `frame-loop-exit` line, the
+frame counter still advances, and the guest is measured doing real work
+(`spinning=no`, `idle_ms` in the thousands). **The network answer let the
+guest past the "no network" gate into the asset-download phase, and the guest
+now does 60 assets x 4 attempts of download accounting PER FRAME** - the
+per-frame log went from 3.7 lines to 30-42, and the frame time from ~21 ms to
+~2.5 s.
+
+Is that trade worth it? **Split answer: the frame rate is worse, the progress
+is better, and the menu is unreachable either way.** With `false`: 19 popup
+cycles, 548 `CheckNetworkAvailability`, and the asset phase **never starts**
+(`StartListDownload` 0, `sprites_` 0, `gui/processed` 15). With `true`: 586
+-> 0 popups, the asset phase starts, `gui/processed` 15 -> 23, `sprites_`
+0 -> 13 -> 102 - and the frame rate collapses to 0.4-1.2 fps. The frame
+collapse is a **separate defect** (the per-frame download accounting) and
+should be fixed as one, not by reverting the answer.
+
+#### 5. What is open now
+
+1. **Does the host newlib's `sscanf("%ux%u")` return 2?** One line, and it
+   may be the entire blocker.
+2. If it does: the sort's comparator argument at `0x12c0fb0`, and the
+   thresholds `w20`/`w21` at `0x10f8ec8`.
+3. **Which precondition of `fn 0x10b0ca8` fails**, so the
+   `RookieChampionshipManager` is never constructed.
+4. **The "show the main menu" routine** `0xa781c8` -> `0x1385898` ->
+   `0x14a7d5c` -> `0xdac364` -> `b 0xdac6d4` (it pushes the main-menu
+   screen) - who calls it and what gates it.
+5. **The per-frame download accounting** that cost 100x the frame time.
+6. The pack-hash endpoint's response shape (the five paths are now decoded
+   and logged; nothing has been invented).
