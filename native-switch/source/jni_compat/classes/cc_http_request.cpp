@@ -1,7 +1,11 @@
 #include <stdio.h>
 #include <new>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
+#include <deque>
+#include <mutex>
+#include <utility>
 #include <vector>
 
 #include <switch.h>
@@ -16,7 +20,9 @@
 #include "cc_http_headers.h"
 #include "cloudcell_defer.h"
 #include "cloudcell_natives.h"
+#include "rr3/guest_filesystem.hpp"
 #include "rr3/guest_view_trace.hpp"
+#include "rr3/rr3_md5.hpp"
 
 /*
  * com.firemonkeys.cloudcellapi.HttpRequest - the load-bar blocker.
@@ -561,6 +567,287 @@ static bool decodeAssetRequestPath(const uint8_t *body, size_t bodyLen,
     return true;
 }
 
+/* ------------------------------------------------------------------ *
+ * THE ASSET-SERVER ENDPOINT -- assetManDownloadPackHash.php
+ * ------------------------------------------------------------------ */
+
+/*
+ * WHAT THE GUEST WANTS BACK, AND WHY THE ANSWER IS NOT BOXED.
+ *
+ * The request is a Cloudcell BinaryBlob box, and cccloud::unboxBlob() takes
+ * it apart; the PAYLOAD is the interesting part. It is a sequence of
+ * triples, one per pending asset, in the guest's map order:
+ *
+ *     [u32 pathLen][path bytes]
+ *     [u32 md5Len ][md5 hex, 32 characters]
+ *     [u32 id     ]
+ *
+ * The guest's own reader of the answer is cc::AssetManager::
+ * ProcessAssetServerData (guest raw 0x1cdbf08), and it reads the answer as a
+ * sequence of blocks:
+ *
+ *     [u32 A][u32 B][B bytes]
+ *
+ * where A is the asset's id (the same u32 the request carried) and B is the
+ * byte count. The first word of the block is compared against the pending
+ * asset's id at 0x1cdc060, and the bytes are written to "<path>.ast" (the
+ * ".ast" suffix is at guest raw 0x601e81, used at 0x1cdbbb0, 0x1cdc42c and
+ * 0x1cdca10). After the write the guest MD5s what it received
+ * (0x1cb60f4 is MD5 -- the 0x67452301/0xefcdab89/0x98badcfe/0x10325476
+ * initial state) and compares it word by word with the manifest md5
+ * (0x1cdcb90..0x1cdcbe4).
+ *
+ * BOXED OR RAW -- the answer is RAW, and the reason is the port's own
+ * delivery contract:
+ *
+ *   1. The port hands the guest the authenticate and sync answers THROUGH
+ *      dataCallback, and it hands them over BOXED (buildAuthResponse boxes
+ *      twice: zlib inside XOR). The guest's sync reader unboxes them ITSELF
+ *      (0x1d01380 and 0x1d0138c are two UnboxData calls on the body the
+ *      callback delivered). So the Cloudcell HTTP transport passes the body
+ *      through VERBATIM: it does not unbox for the consumer.
+ *   2. The asset consumer does not unbox either. Neither
+ *      CallbackAssetServerData (0x1cd96fc) nor ProcessAssetServerData
+ *      (0x1cdbf08) calls UnboxData (0x1cbd8f0) -- the complete list of
+ *      UnboxData call sites in the image has none in that range.
+ *
+ * A transport that unboxed and a consumer that unboxes cannot both be true,
+ * and the measurement says the transport does not. So the body the asset
+ * callback receives is the RAW HTTP body, and the raw body has to BE the
+ * block sequence. The answer this port sends is therefore the block
+ * sequence, unboxed.
+ *
+ * WHAT IS SERVED. The bytes are the bytes of a REAL local file: the port
+ * never invents a body. A path with no local file is NOT answered -- it is
+ * reported, and the guest takes its own error path for it.
+ */
+
+/* One asset the guest asked for. */
+struct AssetRequest {
+    char     path[256];
+    char     md5[64];
+    uint32_t id;
+};
+
+/* A response that has been built and is waiting to be delivered. */
+struct PendingAssetResponse {
+    const CCHttpRequest*     request = nullptr;
+    uint64_t                 callback = 0;
+    std::vector<uint8_t>     body;
+};
+
+static uint32_t readU32le(const uint8_t *data, size_t size, size_t off)
+{
+    if (data == nullptr || off + 4u > size) {
+        return 0u;
+    }
+    return (uint32_t)data[off] |
+           ((uint32_t)data[off + 1u] << 8) |
+           ((uint32_t)data[off + 2u] << 16) |
+           ((uint32_t)data[off + 3u] << 24);
+}
+
+static void appendU32le(std::vector<uint8_t> &out, uint32_t value)
+{
+    out.push_back((uint8_t)(value & 0xffu));
+    out.push_back((uint8_t)((value >> 8) & 0xffu));
+    out.push_back((uint8_t)((value >> 16) & 0xffu));
+    out.push_back((uint8_t)((value >> 24) & 0xffu));
+}
+
+/*
+ * Parse the asset request payload into (path, md5, id) triples.
+ *
+ * The payload is walked from the front. A FOUR BYTE HEADER is tolerated:
+ * if the first word is not a path length the walk is retried one word in,
+ * so a payload that starts with a count is still read.
+ */
+static bool parseAssetRequests(const std::vector<uint8_t> &payload,
+                               std::vector<AssetRequest> &out,
+                               size_t &baseOut)
+{
+    for (size_t base = 0; base <= 4u; base += 4u) {
+        std::vector<AssetRequest> parsed;
+        size_t off = base;
+        while (off + 4u <= payload.size()) {
+            const uint32_t pathLen = readU32le(payload.data(), payload.size(), off);
+            if (pathLen == 0u || pathLen >= sizeof(AssetRequest::path)) {
+                break;
+            }
+            if (off + 4u + pathLen > payload.size()) {
+                break;
+            }
+            char path[sizeof(AssetRequest::path)];
+            bool printable = true;
+            for (uint32_t i = 0; i < pathLen; ++i) {
+                const char c = (char)payload[off + 4u + i];
+                if (c < 0x20 || c > 0x7e) {
+                    printable = false;
+                    break;
+                }
+                path[i] = c;
+            }
+            path[pathLen] = '\0';
+            if (!printable) {
+                break;
+            }
+            off += 4u + pathLen;
+
+            if (off + 4u > payload.size()) {
+                break;
+            }
+            const uint32_t md5Len = readU32le(payload.data(), payload.size(), off);
+            off += 4u;
+            if (md5Len == 0u || md5Len >= sizeof(AssetRequest::md5)) {
+                break;
+            }
+            if (off + md5Len > payload.size()) {
+                break;
+            }
+            char md5[sizeof(AssetRequest::md5)];
+            bool md5Printable = true;
+            for (uint32_t i = 0; i < md5Len; ++i) {
+                const char c = (char)payload[off + i];
+                if (c < 0x20 || c > 0x7e) {
+                    md5Printable = false;
+                    break;
+                }
+                md5[i] = c;
+            }
+            md5[md5Len] = '\0';
+            off += md5Len;
+            if (!md5Printable) {
+                break;
+            }
+
+            if (off + 4u > payload.size()) {
+                break;
+            }
+            const uint32_t id = readU32le(payload.data(), payload.size(), off);
+            off += 4u;
+
+            AssetRequest entry;
+            memcpy(entry.path, path, pathLen + 1u);
+            memcpy(entry.md5, md5, md5Len + 1u);
+            entry.id = id;
+            parsed.push_back(entry);
+        }
+        if (!parsed.empty()) {
+            out.swap(parsed);
+            baseOut = base;
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * The local files that can back a requested path, in the order they are
+ * tried.
+ *
+ * 1. The guest's OWN depot on the card, under the same relative name: the
+ *    game's installed copy of the asset. ".depot" + the server path.
+ * 2. The volume tree with the same relative name: "files/.depot" + path.
+ * 3. The gui_assets tree, for the server's "/assets_<res>/" spelling: the
+ *    volumes ship "files/.depot/gui_assets/<res>/...".
+ */
+static unsigned assetCandidates(const char *path, char out[4][384])
+{
+    unsigned count = 0;
+    if (path == nullptr) {
+        return 0u;
+    }
+    __builtin_snprintf(out[count], sizeof(out[count]), ".depot%s", path);
+    ++count;
+    __builtin_snprintf(out[count], sizeof(out[count]), "files/.depot%s", path);
+    ++count;
+    if (strncmp(path, "/assets_", 8) == 0) {
+        const char *rest = strchr(path + 8, '/');
+        if (rest != nullptr) {
+            char resolution[32];
+            const size_t n = (size_t)(rest - (path + 8));
+            if (n < sizeof(resolution)) {
+                memcpy(resolution, path + 8, n);
+                resolution[n] = '\0';
+                __builtin_snprintf(out[count], sizeof(out[count]),
+                                   "files/.depot/gui_assets/%s%s", resolution, rest);
+                ++count;
+            }
+        }
+    }
+    return count;
+}
+
+/* Read a local file through the port's own filesystem and MD5 it. */
+static bool readLocalAsset(const char *guestPath, std::vector<uint8_t> &out,
+                           char digest[33], unsigned long long &sizeOut)
+{
+    out.clear();
+    sizeOut = 0u;
+    digest[0] = '\0';
+    std::FILE *file = rr3::guestFopen(guestPath, "rb");
+    if (file == nullptr) {
+        return false;
+    }
+    if (std::fseek(file, 0, SEEK_END) != 0) {
+        std::fclose(file);
+        return false;
+    }
+    const long size = std::ftell(file);
+    if (size < 0 || std::fseek(file, 0, SEEK_SET) != 0) {
+        std::fclose(file);
+        return false;
+    }
+    out.resize((size_t)size);
+    const size_t got = (size > 0) ? std::fread(out.data(), 1, (size_t)size, file)
+                                  : 0u;
+    std::fclose(file);
+    if (got != (size_t)size) {
+        out.clear();
+        return false;
+    }
+    sizeOut = (unsigned long long)size;
+    rr3::Md5 md5;
+    md5.begin();
+    if (size > 0) {
+        md5.update(out.data(), out.size());
+    }
+    md5.finish(digest);
+    return true;
+}
+
+/* The response bodies waiting to be delivered, and the lock that guards
+ * them. The body is built in init() (where the request is read) and
+ * delivered in post() (where the guest's own Java thread would have
+ * answered), so it has to survive the gap between the two calls. */
+static std::mutex g_assetResponsesMutex;
+static std::deque<PendingAssetResponse> g_assetResponses;
+
+static void queueAssetResponse(const CCHttpRequest *request, uint64_t callback,
+                               std::vector<uint8_t> &body)
+{
+    PendingAssetResponse pending;
+    pending.request  = request;
+    pending.callback = callback;
+    pending.body     = body;
+    std::lock_guard<std::mutex> lock(g_assetResponsesMutex);
+    g_assetResponses.push_back(pending);
+}
+
+static bool takeAssetResponse(const CCHttpRequest *request, uint64_t callback,
+                              std::vector<uint8_t> &body)
+{
+    std::lock_guard<std::mutex> lock(g_assetResponsesMutex);
+    for (auto it = g_assetResponses.begin(); it != g_assetResponses.end(); ++it) {
+        if (it->request == request && it->callback == callback) {
+            body = it->body;
+            g_assetResponses.erase(it);
+            return true;
+        }
+    }
+    return false;
+}
+
 static void http_ctor(JNIEnv *, jobject self, jclass)
 {
     /* NewObject callocs and never runs a constructor (jni/jni.cpp:216), so the
@@ -731,15 +1018,11 @@ static void http_init(JNIEnv *env, jobject self, jstring /*userAgent*/,
      * The port received 60 of these in archive 20261021-165010-eden-netanswer2
      * and answered none, so the guest logged 60 "AssetDownloadError" lines
      * with no way to say what had been asked for. The path is inside the
-     * body -- the URL the port sees is EMPTY -- so it is decoded here and
-     * logged with the body, together with the fact that no answer shape is
-     * known yet.
+     * body -- the URL the port sees is EMPTY -- so it is decoded here.
      *
-     * NOTHING IS INVENTED. There is no response for this endpoint in the
-     * port, because the port does not know what the real one looks like, and
-     * a made-up body would be a false success: the guest would take it for a
-     * server answer and the run would claim something that did not happen.
-     * The request still fails, and it fails honestly.
+     * The request is now ANSWERED, with the real bytes of real local files:
+     * see the block comment on the asset endpoint above for the answer's
+     * shape and for why the answer is not boxed.
      *
      * The cap is 64 lines, and the measured run makes 60, so a normal run is
      * traced in full. The counter is a COUNTER, not a cap on the truth: the
@@ -751,40 +1034,163 @@ static void http_init(JNIEnv *env, jobject self, jstring /*userAgent*/,
         ++s_assetReqTotal;
         std::vector<uint8_t> payload;
         char path[512];
-        if (decodeAssetRequestPath(req->body, req->bodyLen, payload, path,
-                                   sizeof(path))) {
-            if (s_assetReqLines < 64u) {
+        const bool assetShaped =
+            decodeAssetRequestPath(req->body, req->bodyLen, payload, path,
+                                   sizeof(path));
+        if (assetShaped) {
+            /* The full request: the triples, one per pending asset. */
+            std::vector<AssetRequest> entries;
+            size_t base = 0;
+            const bool parsed = parseAssetRequests(payload, entries, base);
+
+            std::vector<uint8_t> body;
+            unsigned served = 0;
+            unsigned missing = 0;
+            for (size_t i = 0; parsed && i < entries.size(); ++i) {
+                const AssetRequest &entry = entries[i];
+
+                /* Which local file backs this path. The md5 the guest
+                 * asked for is the tie breaker: a candidate whose md5
+                 * matches is the file the guest wants, whatever else is
+                 * lying around under a similar name. */
+                char candidates[4][384];
+                const unsigned candidateCount =
+                    assetCandidates(entry.path, candidates);
+                const char *chosen = nullptr;
+                char chosenMd5[33] = {0};
+                unsigned long long chosenSize = 0;
+                std::vector<uint8_t> chosenBytes;
+                for (unsigned c = 0; c < candidateCount; ++c) {
+                    std::vector<uint8_t> bytes;
+                    char digest[33];
+                    unsigned long long size = 0;
+                    if (!readLocalAsset(candidates[c], bytes, digest, size)) {
+                        continue;
+                    }
+                    /* The FIRST candidate that exists is the fallback; a
+                     * candidate whose md5 matches the one the guest asked
+                     * for REPLACES it. Both are the same move: the bytes
+                     * travel with the choice.
+                     *
+                     * ONE MOVE, NOT TWO. The first version of this ran the
+                     * move twice -- once for "first candidate that exists"
+                     * and once for "the md5 matches" -- and the second move
+                     * took the bytes OUT of the buffer that was about to be
+                     * appended: the block went out with size 0 and the guest
+                     * answered "not found on server or download failed."
+                     * (measured, archive 20261021-223727-eden-assetdl3: the
+                     * assets whose md5 MATCHED were the ones that failed,
+                     * and the ones whose md5 differed -- the bytes kept by
+                     * the first branch -- arrived.) */
+                    const bool isMatch = (strcasecmp(digest, entry.md5) == 0);
+                    if (chosen == nullptr || isMatch) {
+                        chosen = candidates[c];
+                        chosenBytes = std::move(bytes);
+                        chosenSize = size;
+                        memcpy(chosenMd5, digest, sizeof(chosenMd5));
+                    }
+                    if (isMatch) {
+                        break;
+                    }
+                }
+
+                if (chosen == nullptr) {
+                    /* NO LOCAL FILE. Nothing is invented for it: the
+                     * guest takes its own error path for this asset. */
+                    ++missing;
+                    if (s_assetReqLines < 64u) {
+                        ++s_assetReqLines;
+                        char details[640];
+                        __builtin_snprintf(
+                            details, sizeof(details),
+                            "n=%u id=%u path=%s md5=%s candidates=%u"
+                            " answered=0 reason=no-known-answer-shape"
+                            " detail=no-local-file",
+                            s_assetReqTotal, entry.id, entry.path, entry.md5,
+                            candidateCount);
+                        rr3::guestViewWideLog("cc-asset-req",
+                                              (unsigned long long)entry.id,
+                                              (unsigned long long)s_assetReqTotal,
+                                              details);
+                    }
+                    continue;
+                }
+
+                /* The block the guest's reader expects:
+                 *     [u32 id][u32 size][the bytes] */
+                appendU32le(body, entry.id);
+                appendU32le(body, (uint32_t)chosenBytes.size());
+                body.insert(body.end(), chosenBytes.begin(), chosenBytes.end());
+                ++served;
+
+                if (s_assetReqLines < 64u) {
+                    ++s_assetReqLines;
+                    const bool md5Matches =
+                        (strcasecmp(chosenMd5, entry.md5) == 0);
+                    char details[1200];
+                    __builtin_snprintf(
+                        details, sizeof(details),
+                        "n=%u id=%u path=%.250s want_md5=%.40s src=%.380s"
+                        " size=%llu src_md5=%.32s answered=1 md5_match=%d",
+                        s_assetReqTotal, entry.id, entry.path, entry.md5,
+                        chosen, chosenSize, chosenMd5, md5Matches ? 1 : 0);
+                    rr3::guestViewWideLog("cc-asset-req",
+                                          (unsigned long long)entry.id,
+                                          (unsigned long long)s_assetReqTotal,
+                                          details);
+                    if (authLogBudget()) {
+                        trace("cc-asset-req: id=%u path=%s -> %s (%llu B)"
+                              " md5 %s (want %s)",
+                              entry.id, entry.path, chosen, chosenSize,
+                              chosenMd5, entry.md5);
+                    }
+                }
+            }
+
+            if (served > 0u) {
+                queueAssetResponse(req, (uint64_t)req->callback, body);
+                if (s_assetReqLines < 64u) {
+                    ++s_assetReqLines;
+                    char details[320];
+                    __builtin_snprintf(
+                        details, sizeof(details),
+                        "n=%u assets=%u served=%u missing=%u bytes=%u"
+                        " answered=1 reason=real-local-bytes",
+                        s_assetReqTotal, (unsigned)entries.size(), served,
+                        missing, (unsigned)body.size());
+                    rr3::guestViewWideLog("cc-asset-req",
+                                          (unsigned long long)body.size(),
+                                          (unsigned long long)s_assetReqTotal,
+                                          details);
+                }
+            } else if (parsed) {
+                if (s_assetReqLines < 64u) {
+                    ++s_assetReqLines;
+                    char details[320];
+                    __builtin_snprintf(
+                        details, sizeof(details),
+                        "n=%u assets=%u served=0 missing=%u"
+                        " answered=0 reason=no-known-answer-shape"
+                        " detail=no-local-file",
+                        s_assetReqTotal, (unsigned)entries.size(), missing);
+                    rr3::guestViewWideLog("cc-asset-req", 0,
+                                          (unsigned long long)s_assetReqTotal,
+                                          details);
+                }
+            } else if (s_assetReqLines < 64u) {
                 ++s_assetReqLines;
-                /* The body head, the payload head, and the path. */
-                char bodyHead[80];
-                const size_t bodyHeadLen = (req->bodyLen < 16u) ? req->bodyLen : 16u;
-                for (size_t i = 0; i < bodyHeadLen; ++i) {
-                    __builtin_snprintf(bodyHead + (i * 2), 3u, "%02x", req->body[i]);
-                }
-                bodyHead[bodyHeadLen * 2u] = '\0';
-                char payloadHead[96];
-                const size_t payloadHeadLen = (payload.size() < 24u) ? payload.size() : 24u;
-                for (size_t i = 0; i < payloadHeadLen; ++i) {
-                    __builtin_snprintf(payloadHead + (i * 2), 3u, "%02x", payload[i]);
-                }
-                payloadHead[payloadHeadLen * 2u] = '\0';
                 char details[1024];
                 __builtin_snprintf(
                     details, sizeof(details),
-                    "n=%u bodyLen=%u payloadLen=%u url=%s bodyHead=%s"
-                    " payloadHead=%s path=%s answered=0 reason=no-known-answer-shape",
+                    "n=%u bodyLen=%u payloadLen=%u url=%.200s path=%.500s"
+                    " answered=0 reason=no-known-answer-shape"
+                    " detail=payload-not-asset-shaped",
                     s_assetReqTotal, (unsigned)req->bodyLen,
                     (unsigned)payload.size(),
-                    req->urlLen > 0u ? req->url : "(none)",
-                    bodyHead, payloadHead, path);
+                    req->urlLen > 0u ? req->url : "(none)", path);
                 rr3::guestViewWideLog("cc-asset-req",
                                       (unsigned long long)req->bodyLen,
                                       (unsigned long long)s_assetReqTotal, details);
-                if (authLogBudget()) {
-                    trace("cc-asset-req: bodyLen=%zu payloadLen=%zu path=%s"
-                          " (NOT answered: no known answer shape)",
-                          (unsigned)req->bodyLen, (unsigned)payload.size(), path);
-                }
             }
         }
     }
@@ -968,6 +1374,64 @@ static bool deliverSyncResponse(JNIEnv *env, CCHttpRequest *req,
     }
     rr3::guestViewWideLog("cc-sync-sent", memberId, (unsigned long long)body.size(),
                            "sync response delivered to the guest");
+    return true;
+}
+
+/*
+ * THE ASSET-SERVER RESPONSE.
+ *
+ * The body was built in init() (that is where the request is read) and is
+ * delivered here, on the port's deferred thread, the way the guest's own
+ * HttpThread would have delivered it: the data first, then the completion.
+ *
+ * The body is the RAW block sequence -- [u32 id][u32 size][bytes] per asset
+ * -- and it is NOT boxed. The reason is in the block comment on the asset
+ * endpoint above: the Cloudcell transport hands the body to the consumer
+ * verbatim (the sync answer proves it -- the port delivers a double-boxed
+ * body and the guest's sync reader unboxes it itself), and the asset
+ * consumer never unboxes, so the raw body has to be the block sequence.
+ */
+static bool deliverAssetResponse(JNIEnv *env, CCHttpRequest *req)
+{
+    static CCHttpDataFn data_callback = cloudcell_native<CCHttpDataFn>(
+        kCCHttpDataCallback);
+    static CCHttpCompleteFn complete_callback = cloudcell_native<CCHttpCompleteFn>(
+        kCCHttpCompleteCallback);
+
+    std::vector<uint8_t> body;
+    if (!takeAssetResponse(req, (uint64_t)req->callback, body) ||
+        body.empty()) {
+        return false;
+    }
+    if (data_callback == nullptr || complete_callback == nullptr) {
+        warning("HttpRequest: success natives missing (data=%p complete=%p); "
+                "asset request %p stays pending\n",
+                (void *)data_callback, (void *)complete_callback, (void *)req);
+        rr3::guestViewWideLog("cc-asset-deliver", 0,
+                               (unsigned long long)body.size(),
+                               "FAILED (natives missing)");
+        return false;
+    }
+
+    jbyteArray array = env->NewByteArray((jsize)body.size());
+    if (array == nullptr) {
+        warning("HttpRequest: could not allocate the asset response array\n");
+        rr3::guestViewWideLog("cc-asset-deliver", 0,
+                               (unsigned long long)body.size(),
+                               "FAILED (no byte array)");
+        return false;
+    }
+    env->SetByteArrayRegion(array, 0, (jsize)body.size(),
+                             (const jbyte *)body.data());
+
+    data_callback(env, (jobject)req, req->callback, array, (jint)body.size());
+    complete_callback(env, (jobject)req, req->callback, 200);
+
+    if (authLogBudget()) {
+        trace("cc-asset-sent: bytes=%zu status=200", (unsigned)body.size());
+    }
+    rr3::guestViewWideLog("cc-asset-deliver", 1, (unsigned long long)body.size(),
+                           "asset response delivered to the guest");
     return true;
 }
 
@@ -2927,6 +3391,18 @@ static void http_post(JNIEnv *env, jobject self)
             }
         } else if (authLogBudget()) {
             trace("cc-http-req: not the /time request url=%s", req->url);
+        }
+
+        /* THE ASSET-SERVER REQUEST (assetManDownloadPackHash.php).
+         *
+         * The URL the port sees for this one is EMPTY, so the body is the
+         * only discriminator, and the body was read in init(): if a
+         * response was built there, this is that request.
+         *
+         * The answer is the raw block sequence, not a Cloudcell box -- see
+         * the block comment on the asset endpoint for the evidence. */
+        if (deliverAssetResponse(env, req)) {
+            return;
         }
 
         /* The request the guest posted.
