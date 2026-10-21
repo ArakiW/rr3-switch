@@ -1997,7 +1997,68 @@ bool platformBoolForMethod(const char* name) {
     // Empty Java collections: HashMap.keySet().iterator() must terminate.
     if (rawEquals(name, "hasNext")) return false;
     if (rawEquals(name, "isEmpty")) return true;
-    if (rawEquals(name, "isNetworkAvailable")) return false;
+    // THE NETWORK ANSWER, and it is TRUE.
+    //
+    // This table, not rr3_Platform.cpp's platform_is_network_available, is what
+    // answers the guest: slot 118 (jniCallStaticBooleanMethodV) returns
+    // platformBoolForMethod(name) and never consults the ManagedMethod table,
+    // so a static boolean is answered here or not at all (the note further
+    // down says the same thing about GetInfo.IsInitialized).  The managed
+    // registration in jni_compat/classes/rr3_Platform.cpp is therefore
+    // unreachable for this call, and the two must be kept in agreement.
+    //
+    // WHY TRUE, when the Switch has no radio and the port refuses every
+    // non-loopback connect():
+    //
+    // Because this process IS the network for this guest.  The guest's own
+    // HTTP requests are answered here, at the JNI layer, out of the local
+    // data volumes -- measured, archive 20261021-155728-eden-aliasfix:
+    //
+    //   CC: [2] POST request [https://connect-dev-ss.cloudcell.com:443/CC_Sync.php]
+    //   CC: [2] POST complete [Succeeded=True]
+    //   CC: Device Id: 1001
+    //
+    // so "is there a network" has to mean "will my requests be answered", and
+    // for this port the answer is yes.
+    //
+    // WHAT FALSE COST, measured over 19 identical cycles in that same 300 s
+    // run:
+    //
+    //   AssetDownloadService::ShowNoWifiMessage
+    //   nBytesToDownload = 4629803
+    //   AssetDownloadService:: ShowConsentMessage - No connection available
+    //   AssetDownloadService::ConsentToDownload
+    //   CheckNetworkAvailability::Network interface Network is NOT available
+    //   CheckNetworkAvailability::hasMobileConnection = 0
+    //   CheckNetworkAvailability::hasUnmeteredConnection = 0
+    //   CheckNetworkAvailability::m_downloadConsentState = 1
+    //
+    // The consent flag was ALREADY 1 -- the guest asked, the port's alert
+    // answer was accepted ("ConsentToDownload"), the consent state was set --
+    // so consent was never the blocker.  The only thing between the guest and
+    // its asset set was this answer, and the no-wifi alert was delivered on
+    // the FRAME path (cloudcell_pump site=alert-inline, then
+    // openNetworkSettings) 19 times in 300 s.
+    //
+    // WHAT THE GUEST DOES WITH TRUE (its own string table):
+    //
+    //   CC_AssetManager_Class::StartListDownload()
+    //   CC_AssetManager_Class::AssetDownloadError() : Downloading from CDN has
+    //       failed! Reverting to Cloudcell server. Asset (%s) %s
+    //   CC_AssetManager_Class::AssetDownloadError() : Downloading from CDN has
+    //       failed! NO Cloudcell Fallback server. Asset (%s) %s
+    //   /assetman/assetManDownloadPackHash.php     (the Cloudcell fallback)
+    //   firemonkeys.akamaized.net                  (the CDN)
+    //   GetAssetsDownloadPath / ProcessAssetServerData
+    //
+    // The CDN is NOT reachable -- the connect() policy is frozen by the
+    // session gate -- so the reachable endpoint is the Cloudcell one, and
+    // this port answers Cloudcell requests.  A request this port cannot
+    // answer is NOT answered: cc_http_request.cpp logs "readable body,
+    // unknown shape: not answered" rather than guessing.  TRUE therefore
+    // means "the guest's requests are answered by this process", NOT "the
+    // internet is reachable" and NOT "the asset download succeeded".
+    if (rawEquals(name, "isNetworkAvailable")) return true;
     if (rawEquals(name, "isMobileDataAvailable")) return false;
     if (rawEquals(name, "isNetworkSettingsShown")) return false;
     if (rawEquals(name, "hasCameraPermission")) return false;

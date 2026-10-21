@@ -152,15 +152,69 @@ static void platform_show_message(JNIEnv *env, jclass clazz, jstring title, jstr
 }
 
 /*
- * Network state. All three answer "offline", which is the truth on this
- * console and is also what keeps CC_Helpers::IsConnectedToInternet from
- * starting work that cannot finish.
+ * Network state.
+ *
+ * WARNING: this managed registration is NOT what answers the guest.  Slot 118
+ * (jniCallStaticBooleanMethodV) returns platformBoolForMethod(name) and never
+ * consults the ManagedMethod table, so a static boolean is answered by
+ * jni_bridge.cpp's name table or not at all.  The answer for
+ * "isNetworkAvailable" therefore lives in jni_bridge.cpp, and THIS function
+ * is kept in agreement with it rather than being the source of truth.
+ *
+ * isNetworkAvailable() answers TRUE, and the reason is not "the Switch has
+ * Wi-Fi" -- it has none, and the port refuses every non-loopback connect()
+ * (symbol_resolver.cpp, destinationIsLoopback).  It answers TRUE because the
+ * port IS the network for this guest: the guest's own HTTP requests are
+ * answered by this process, at the JNI layer, out of the local data
+ * volumes.  Measured, archive 20261021-155728-eden-aliasfix:
+ *
+ *   CC: [2] POST request [https://connect-dev-ss.cloudcell.com:443/CC_Sync.php]
+ *   CC: [2] POST complete [Succeeded=True]
+ *
+ * so the Cloudcell exchange is served locally and succeeds.  Answering FALSE
+ * told the guest "you have no network", and the guest acted on it:
+ *
+ *   AssetDownloadService::ShowNoWifiMessage
+ *   nBytesToDownload = 4629803
+ *   AssetDownloadService:: ShowConsentMessage - No connection available
+ *   AssetDownloadService::ConsentToDownload
+ *   CheckNetworkAvailability::Network interface Network is NOT available
+ *   CheckNetworkAvailability::m_downloadConsentState = 1
+ *
+ * 19 identical cycles in 300 s, with the no-wifi alert delivered on the FRAME
+ * path (cloudcell_pump site=alert-inline, then openNetworkSettings).  The
+ * consent flag is ALREADY 1 -- the guest asked, the port's alert answer was
+ * accepted ("ConsentToDownload"), and the consent state is set -- so consent
+ * was never the blocker.  The only thing between the guest and its asset set
+ * was this answer.
+ *
+ * WHAT THE GUEST DOES WITH TRUE, from the guest's own string table:
+ *
+ *   CC_AssetManager_Class::StartListDownload()
+ *   CC_AssetManager_Class::AssetDownloadError() : Downloading from CDN has
+ *       failed! Reverting to Cloudcell server. Asset (%s) %s
+ *   CC_AssetManager_Class::AssetDownloadError() : Downloading from CDN has
+ *       failed! NO Cloudcell Fallback server. Asset (%s) %s
+ *   /assetman/assetManDownloadPackHash.php        (the Cloudcell fallback)
+ *   firemonkeys.akamaized.net                     (the CDN)
+ *   GetAssetsDownloadPath / ProcessAssetServerData
+ *
+ * So TRUE makes the guest ask for the asset pack.  The CDN is NOT reachable
+ * (the connect() policy is frozen), so the reachable endpoint is the
+ * Cloudcell one -- and this port answers Cloudcell requests itself, logging
+ * every URL it is handed.  A request the port cannot answer is NOT answered:
+ * cc_http_request.cpp says "readable body, unknown shape: not answered"
+ * rather than guessing.  That is the honest outcome, and it is recorded.
+ *
+ * isMobileDataAvailable() stays FALSE: the guest uses it to decide whether a
+ * cellular connection may be used for a download, and this port has no
+ * cellular radio to report.
  *
  * isNetworkSettingsShown() must stay false: Java sets that flag in
  * openNetworkSettings() and clears it when the settings activity returns, and
  * the engine polls it to decide whether it is still waiting for the user.
  */
-static jboolean platform_is_network_available(JNIEnv *, jclass, jboolean) { return JNI_FALSE; }
+static jboolean platform_is_network_available(JNIEnv *, jclass, jboolean) { return JNI_TRUE; }
 static jboolean platform_is_mobile_data_available(JNIEnv *, jclass) { return JNI_FALSE; }
 static jboolean platform_is_network_settings_shown(JNIEnv *, jclass) { return JNI_FALSE; }
 static void platform_open_network_settings(JNIEnv *, jclass) {}

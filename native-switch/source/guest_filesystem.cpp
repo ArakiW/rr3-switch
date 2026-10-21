@@ -345,6 +345,31 @@ bool rewriteGuiResolutionPath(const char* relative, char* out, size_t outSize) {
     static const char* kMissing[] = {
         "files/.depot/gui_assets/1280x720",
         "files/.depot/gui_assets/1280x800",
+        // 2026-10-21. The guest's OWN resolution table, read out of its own
+        // log in archive 20261021-155728-eden-aliasfix:
+        //
+        //   Res order:
+        //   share) Current res: 1280, 720
+        //   original [2] (960.000000, 640.000000) - 1.500000
+        //   original [0] (480.000000, 320.000000) - 1.500000
+        //   original [3] (1024.000000, 768.000000) - 1.333333
+        //   original [1] (768.000000, 576.000000) - 1.333333
+        //
+        // so the engine knows FOUR GUI resolutions and shares atlases between
+        // them: 960x640 first, 480x320 second, then 1024x768 and 768x576.
+        // The volumes ship 480x320, 960x640 and 2048x1536 -- they ship
+        // NEITHER 1024x768 NOR 768x576, so the guest's third and fourth
+        // choices both miss, and the fallback chain the guest printed is
+        // exactly what ends in a miss.
+        //
+        // The rule this file already encodes -- "a rewrite is justified when
+        // the volume does not ship the requested name, never merely because
+        // the SD card does not have it" -- applies to both of them, and both
+        // land on 960x640, which is the resolution the guest itself ranks
+        // first and which the SD gui volume really ships (1,928
+        // sprites.android.atlas files, measured).
+        "files/.depot/gui_assets/1024x768",
+        "files/.depot/gui_assets/768x576",
         "files/.depot/gui_assets/1920x1080",
         "files/.depot/gui_assets/1080p",
         "files/.depot/gui_assets/720p",
@@ -1044,7 +1069,20 @@ void logWatchedOpen(const char* guestPath, const Resolution& resolution, int fd)
 // candidates the host tried (primary and fallback), the errno of the LAST
 // attempt, and whether the request was a read or a write.
 constexpr const char* kAssetListMarker = "asset_list";
-constexpr unsigned kAssetListLines = 60;
+// 2026-10-21. The cap was 60 and it was HIT in the archive
+// 20261021-155728-eden-aliasfix: the trace stopped at
+// asset_list_quest_flashback_assets.txt, which is the 18th of the 35 names
+// the guest queues.  The remaining 17 requests, and any request for the
+// "asset_list_updates.info" sidecar the guest's own code builds (guest
+// 0x996e50), were therefore NOT on record -- and "the guest never asked" and
+// "the trace stopped" were the same observation.
+//
+// 400 is sized against the measured traffic: the guest makes 4 requests per
+// manifest (2 stat + 2 fopen) for 35 manifests, i.e. ~140 lines, plus the
+// positive control and the cache.  The counter is a cap, not a filter: a run
+// that exceeds it still says so in the counter rather than reading like a
+// complete census.
+constexpr unsigned kAssetListLines = 400;
 
 bool isAssetListPath(const char* path) {
     return path != nullptr && std::strstr(path, kAssetListMarker) != nullptr;

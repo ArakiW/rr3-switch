@@ -278,7 +278,7 @@ blr x8                    // 菜单加载调用
 |------|--------|------|
 | getComponent | dummy object | |
 | isDataAvailable | true | false 会导致 hideSplash 不被调用 |
-| isNetworkAvailable | false | |
+| isNetworkAvailable | true | 2026-10-21 改：本进程自己应答 guest 的 HTTP（Cloudcell），对 guest 而言"网络可达"；CDN 仍被 connect() 策略拒绝，答复不落地时端口会明说"not answered" |
 | getCloudcellEnvironment | "switch" | |
 | hideSplash/showSplash | no-op + 日志 | |
 | loadTextureFromMemory | PNG 解码 + 占位符 | |
