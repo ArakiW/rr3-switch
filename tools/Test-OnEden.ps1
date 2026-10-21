@@ -159,6 +159,28 @@ if (Test-Path $edenLog -PathType Leaf) {
 $deadline = (Get-Date).AddSeconds($Seconds)
 $lastSize = -1
 $stableTicks = 0
+# How long the guest-view log has been growing still, in seconds.
+$lastGrowthElapsed = 0
+# The no-log rule. WHY 12 TICKS AND NOT 3.
+#
+# The guest-view log's growth is the only liveness signal this harness has,
+# and it is NOT a heartbeat. The reaper writes one line per 1 s slice, but
+# only while its condvar wait TIMES OUT -- every detached guest thread wakes
+# the reaper instead (pthread_bridge.cpp:5536-5549, `waitedNanos` resets to
+# 0 on a wake), so a guest that churns threads goes quiet for long stretches
+# while it is very much alive. The measured consequence in the archives:
+# 20261021-184122-...-manifest2, 20261021-184611-...-manifest3 and
+# 20261021-185316-...-manifest4 were ALL ended by the old 3-tick (30 s) rule
+# at ~120 s, with Eden's CPU time still climbing linearly (13.9 s -> 155.5 s
+# over 110 s in manifest2) and the guest log flat from t=80 s onward.
+#
+# 12 ticks = 120 s, comfortably longer than the longest observed quiet
+# window, and it still ends a genuinely wedged guest instead of running it
+# to the wall clock.
+$stableTickLimit = 12
+$tickSeconds = 10
+# Why the run ended, recorded in the archive so a short run explains itself.
+$exitReason = 'wall-clock deadline reached'
 # The host CPU series is the spin-vs-deadlock discriminator. An in-guest
 # watchdog thread cannot do this job on Eden (a thread created through the
 # guest pthread bridge never gets scheduled out of svcSleepThread there, so it
@@ -167,10 +189,11 @@ $stableTicks = 0
 $cpuSeries = [System.Collections.Generic.List[object]]::new()
 try {
     while ((Get-Date) -lt $deadline) {
-        Start-Sleep -Seconds 10
+        Start-Sleep -Seconds $tickSeconds
         $live = Get-Process -Id $process.Id -ErrorAction SilentlyContinue
         if (-not $live) {
             Write-Host 'eden    : exited on its own'
+            $exitReason = 'eden exited on its own'
             break
         }
         $size = if (Test-Path $guestLog) { (Get-Item $guestLog).Length } else { 0 }
@@ -184,9 +207,21 @@ try {
         Write-Host ("t={0,4}s cpu={1,7:N1}s log={2,6}B  {3}" -f $elapsed, $live.CPU, $size, $stampLine)
         if ($size -eq $lastSize -and $size -gt 0) {
             $stableTicks++
-            if ($stableTicks -ge 3) { Write-Host '        : log stable for 30s, guest has stopped making progress'; break }
+            if ($stableTicks -ge $stableTickLimit) {
+                # Say how long the log was ACTUALLY stable, not a hard-coded
+                # number. A reader comparing archives needs the real quiet
+                # window, and the old fixed "30s" text could not distinguish
+                # "quiet for exactly the threshold" from "quiet for 10 minutes
+                # with the rule firing late".
+                $stableFor = $elapsed - $lastGrowthElapsed
+                $exitReason = "guest log stable for ${stableFor}s (no growth since t=${lastGrowthElapsed}s)"
+                Write-Host ("        : log stable for {0}s (no growth since t={1}s, {2} ticks of {3}s), guest has stopped making progress" -f `
+                    $stableFor, $lastGrowthElapsed, $stableTicks, $tickSeconds)
+                break
+            }
         } else {
             $stableTicks = 0
+            $lastGrowthElapsed = $elapsed
         }
         $lastSize = $size
     }
@@ -195,6 +230,13 @@ finally {
     Get-Process -Id $process.Id -ErrorAction SilentlyContinue | Stop-Process -Force
     Start-Sleep -Seconds 2
 }
+# Wall-clock length of the run, measured from the emulator's own start time
+# to the moment the harness stopped it. Recorded in the archive because the
+# single most important fact about a run -- how long it lasted -- was
+# previously only recoverable by subtracting timestamps in the CPU series.
+$runEnd = Get-Date
+$runSeconds = [int]((New-TimeSpan -Start $process.StartTime -End $runEnd).TotalSeconds)
+$finalLogBytes = if (Test-Path $guestLog) { (Get-Item $guestLog).Length } else { 0 }
 
 # --- 4. capture --------------------------------------------------------------
 $archive = Join-Path $archiveRoot $label
@@ -213,6 +255,23 @@ if ($EmulatorName -ne 'eden') {
 }
 if (Test-Path $edenLog -PathType Leaf) {
     Copy-Item -LiteralPath $edenLog -Destination (Join-Path $archive 'eden_log.txt.tail') -Force
+}
+# Eden's emulator log is a CAPPED file, not a per-run file. Measured on every
+# recent archive: eden_log.txt stops growing at ~105,830,000 bytes (100.93
+# MiB), the last line is COMPLETE rather than truncated, and its timestamps
+# stop at t=37-45 s of a run that lasts 60-300 s. Eden's writer simply stops
+# once the file passes the cap. The archived copy therefore holds only the
+# FIRST ~40 s of the run, and every count taken from it -- "Unmapped Read64"
+# above all -- is a count over that window, not over the run. The
+# edenLogFirstTs/edenLogLastTs fields in the census and in run-summary.txt
+# exist so that a reader can see the window instead of having to discover it.
+#
+# eden_log.txt.old.txt is NOT the earlier part of this run: Eden creates and
+# truncates it at startup (measured: 0 bytes, lastWrite == the run's start
+# time), so it is archived for completeness and explicitly labelled as such.
+$edenLogOld = "$edenLog.old.txt"
+if (Test-Path $edenLogOld -PathType Leaf) {
+    Copy-Item -LiteralPath $edenLogOld -Destination (Join-Path $archive 'eden_log.txt.old.txt') -Force
 }
 
 # --- 4b. instrument census -----------------------------------------------------
@@ -233,8 +292,27 @@ if (Test-Path $edenLog -PathType Leaf) {
 $summary = [ordered]@{
     label        = $label
     seconds      = $Seconds
+    runSeconds   = $runSeconds
+    runTicks     = $cpuSeries.Count
+    exitReason   = $exitReason
+    guestLogBytes = $finalLogBytes
     guestLogLines = 0
     edenLogLines  = 0
+    # Initialised to a real value so that an archive always SHOWS the number
+    # rather than a blank: "0 TrackDesc::load failures" is evidence, and a
+    # missing key is not. Every one of these is overwritten below when the
+    # corresponding line is present in the log.
+    lastGuestLogOrdinal = 0
+    guestLogAnyLines = 0
+    gfxStatsLines   = 0
+    gfxFrames       = 0
+    gfxCalls        = 0
+    gfxDraws        = '0/0'
+    trackDescFailures = 0
+    trackDescLastNames = ''
+    edenLogFirstTs  = '-'
+    edenLogLastTs   = '-'
+    edenLogOldLines = 0
 }
 $probes = [ordered]@{}
 if (Test-Path $guestLog -PathType Leaf) {
@@ -274,6 +352,44 @@ if (Test-Path $guestLog -PathType Leaf) {
         $summary.framesFirst = [int]$allFrames[0].Groups[1].Value
         $summary.framesMatches = $allFrames.Count
     }
+    # The LAST guest-log-any ordinal: how many times the guest called its own
+    # logging function by the time the run ended. This is the run's "how far
+    # did the guest get" counter that does not depend on the render loop, and
+    # it is what tells a short run apart from a long one at a glance -- the
+    # guest-log ordinal keeps climbing through the quiet stretches that make
+    # the guest-view log look dead.
+    $allOrdinals = [regex]::Matches($guestText, 'phase=guest-log-any ordinal=(\d+)')
+    if ($allOrdinals.Count -gt 0) {
+        $summary.lastGuestLogOrdinal = [int]$allOrdinals[$allOrdinals.Count - 1].Groups[1].Value
+        $summary.guestLogAnyLines = $allOrdinals.Count
+    }
+    # The LAST gfx-stats line carries the frame counter, the GL call counter
+    # and the draw counter. Recorded here so a reader does not have to grep a
+    # 40 MB log to learn how many frames the run rendered.
+    $gfxLines = [regex]::Matches($guestText, 'phase=gfx-stats[^\r\n]*')
+    if ($gfxLines.Count -gt 0) {
+        $gfxLast = $gfxLines[$gfxLines.Count - 1].Value
+        $summary.gfxStatsLines = $gfxLines.Count
+        $m = [regex]::Match($gfxLast, 'frames=(\d+)')
+        if ($m.Success) { $summary.gfxFrames = [int]$m.Groups[1].Value }
+        $m = [regex]::Match($gfxLast, 'calls=(\d+)')
+        if ($m.Success) { $summary.gfxCalls = [int]$m.Groups[1].Value }
+        $m = [regex]::Match($gfxLast, 'draws=(\d+)/(\d+)')
+        if ($m.Success) { $summary.gfxDraws = "$($m.Groups[1].Value)/$($m.Groups[2].Value)" }
+    }
+    # The guest's own "TrackDesc::load unable to load track desc file: '<name>'"
+    # lines. Counted and the names kept, because the names the guest asks for
+    # are the evidence for the corrupt track-name table. MEASURED on archive
+    # 20261021-185316-eden-massetgate-manifest4: 163 of 163 distinct names
+    # the guest asked for are the name the volume ships with its FIRST 16
+    # BYTES REMOVED (e.g. it asked for "Tracks/data/-154.bin.nct" where the
+    # volume ships "monza-jnr-sunset-154.bin.nct"). The names are therefore a
+    # TAIL of the real name, not a name with a stray prefix.
+    $trackDesc = [regex]::Matches($guestText, "TrackDesc::load unable to load track desc file: '([^']*)'")
+    if ($trackDesc.Count -gt 0) {
+        $summary.trackDescFailures = $trackDesc.Count
+        $summary.trackDescLastNames = (($trackDesc | ForEach-Object { $_.Groups[1].Value } | Select-Object -Last 10) -join ' ')
+    }
 }
 if (Test-Path (Join-Path $archive 'eden_log.txt.tail') -PathType Leaf) {
     $edenText = [IO.File]::ReadAllText((Join-Path $archive 'eden_log.txt.tail'))
@@ -282,9 +398,23 @@ if (Test-Path (Join-Path $archive 'eden_log.txt.tail') -PathType Leaf) {
                      'alert-pump: pre-lock', 'alert-pump: wait-result',
                      'alert-pump: reached-drain', 'alert-pump: wake-wakeup',
                      'cloudcell-pump: queue-lock', 'Unmapped Read',
-                     'Unmapped Write')) {
+                     'Unmapped Write', 'Unmapped Read64')) {
         $probes["eden:$p"] = ([regex]::Matches($edenText, [regex]::Escape($p))).Count
     }
+    # The Eden log's own timestamp span. Eden's log file is capped, so for a
+    # run longer than the cap the archived copy covers only the FIRST part of
+    # the run and every count taken from it is a count over that window, not
+    # over the run. Recording the span makes that visible in the archive
+    # instead of leaving it to be discovered.
+    $ts = [regex]::Matches($edenText, '(?m)^\[\s*(\d+\.\d+)\]')
+    if ($ts.Count -gt 0) {
+        $summary.edenLogFirstTs = $ts[0].Groups[1].Value
+        $summary.edenLogLastTs = $ts[$ts.Count - 1].Groups[1].Value
+    }
+}
+if (Test-Path (Join-Path $archive 'eden_log.txt.old.txt') -PathType Leaf) {
+    $summary.edenLogOldLines = ([regex]::Matches(
+        [IO.File]::ReadAllText((Join-Path $archive 'eden_log.txt.old.txt')), "`n")).Count
 }
 $summaryPath = Join-Path $archive 'instrument-census.txt'
 @(
@@ -299,6 +429,34 @@ $summaryPath = Join-Path $archive 'instrument-census.txt'
 ) | Set-Content -LiteralPath $summaryPath -Encoding ascii
 Write-Host ("census  : instrument-census.txt  (frames={0} guestLines={1} edenLines={2})" -f `
     $summary.frames, $summary.guestLogLines, $summary.edenLogLines)
+
+# --- 4c. run summary ----------------------------------------------------------
+# A short run must be obvious from the archive ITSELF, without somebody
+# subtracting timestamps in the CPU series or interpreting a counter. This
+# file answers "how long did this run last and why did it end" in one read.
+$runSummaryPath = Join-Path $archive 'run-summary.txt'
+@(
+    "run summary: $label"
+    ("generated : {0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+    ''
+    ('label          {0}' -f $label)
+    ('emulator       {0}' -f $EmulatorName)
+    ('nro            {0} bytes  sha256={1}' -f $built.Length, (Get-FileHash -LiteralPath $deployedNro -Algorithm SHA256).Hash)
+    ('nro mtime      {0}' -f $built.LastWriteTime)
+    ''
+    ('wall clock     {0} s   (requested {1} s, {2} ticks of {3} s)' -f $runSeconds, $Seconds, $cpuSeries.Count, $tickSeconds)
+    ('ended because  {0}' -f $exitReason)
+    ('guest log      {0} bytes, {1} lines' -f $finalLogBytes, $summary.guestLogLines)
+    ('last guest-log ordinal  {0}   ({1} guest-log-any lines)' -f $summary.lastGuestLogOrdinal, $summary.guestLogAnyLines)
+    ('frames         {0}' -f $summary.frames)
+    ('gfx-stats      {0} lines; frames={1} calls={2} draws={3}' -f `
+        $summary.gfxStatsLines, $summary.gfxFrames, $summary.gfxCalls, $summary.gfxDraws)
+    ('TrackDesc::load failures  {0}' -f $summary.trackDescFailures)
+    ('eden log       {0} lines, spans t={1}..{2} s of emulator time (capped file: a count taken from it is a count over that window, not over the run)' -f `
+        $summary.edenLogLines, $summary.edenLogFirstTs, $summary.edenLogLastTs)
+    ('eden log old   {0} lines (Eden''s startup-created file; it is NOT the earlier part of this run)' -f $summary.edenLogOldLines)
+) | Set-Content -LiteralPath $runSummaryPath -Encoding ascii
+Write-Host ("summary : run-summary.txt  (wall={0}s end={1})" -f $runSeconds, $exitReason)
 
 # The null graphics backend (RR3_GFX) dumps every GLSL source and every binary
 # shader blob it is handed to sdmc:/switch/. They are the only way to answer
