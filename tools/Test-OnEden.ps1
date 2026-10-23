@@ -391,6 +391,13 @@ $summary = [ordered]@{
     msAssetListsAdded   = 0   # "Assets are added"
     msTwosquare         = 0   # "gui/processed/main_menu/main_menu_twosquare.gui" in the PORT trace
     msMainMenuLayouts   = 0   # "gui/processed/main_menu/" in the PORT trace
+    # The pixel readback: the most honest "is there anything on screen"
+    # instrument, because it measures pixels rather than a string.
+    pixelReadbackLines  = 0
+    pixelReadbackFrame  = 0
+    pixelsLit           = 0
+    pixelsTotal         = 0
+    pixelBins           = ''
     msEventMapScreen    = 0   # "EventMapScreen"
     msMainMenuLiteral   = 0   # "MainMenu"    (WEAK -- see the note above)
     msAstFilesOnCard    = 0   # *.ast on the card: the physical proof the .ast round trip works
@@ -464,6 +471,37 @@ if (Test-Path $guestLog -PathType Leaf) {
         if ($m.Success) { $summary.gfxCalls = [int]$m.Groups[1].Value }
         $m = [regex]::Match($gfxLast, 'draws=(\d+)/(\d+)')
         if ($m.Success) { $summary.gfxDraws = "$($m.Groups[1].Value)/$($m.Groups[2].Value)" }
+    }
+    # THE LAST PIXEL READBACK: how much of the 1280x720 back buffer is lit.
+    #
+    # This is the most honest "is there anything on screen" instrument the
+    # project has, because it measures the pixels rather than a string. It
+    # is what finally settled the front end: archive
+    # 20261024-010947-eden-shot2 reads
+    #   LATE frame=3000 full 1280x720 lit=921600 of 921600
+    #   px0=7f8a46ff quads[r_bins=226703,285945,125911,283041]
+    #   pts=[818c48 7f8080 03438b 182c43 0c0d0f]
+    # i.e. EVERY pixel lit, four populated red bins, five probe points of
+    # five different colours -- a real image, not a flat fill. A source
+    # comment in guest_view_trace.cpp still claims the opposite ("lit=0 of
+    # 921600 ... the guest really has nothing drawn"); that comment
+    # describes an archive from before the fixes and is stale.
+    #
+    # A run with lit=0 and one with lit=921600 look nothing alike on
+    # screen, and no string counter can tell them apart.
+    $rbLines = [regex]::Matches($guestText, 'phase=view-pixel-readback[^\r\n]*')
+    if ($rbLines.Count -gt 0) {
+        $rbLast = $rbLines[$rbLines.Count - 1].Value
+        $summary.pixelReadbackLines = $rbLines.Count
+        $m = [regex]::Match($rbLast, 'lit=(\d+) of (\d+)')
+        if ($m.Success) {
+            $summary.pixelsLit = $m.Groups[1].Value
+            $summary.pixelsTotal = $m.Groups[2].Value
+        }
+        $m = [regex]::Match($rbLast, 'r_bins=(\d+),(\d+),(\d+),(\d+)')
+        if ($m.Success) { $summary.pixelBins = ($m.Groups[1].Value + ',' + $m.Groups[2].Value + ',' + $m.Groups[3].Value + ',' + $m.Groups[4].Value) }
+        $m = [regex]::Match($rbLast, 'frame=(\d+)')
+        if ($m.Success) { $summary.pixelReadbackFrame = [int]$m.Groups[1].Value }
     }
     # The guest's own "TrackDesc::load unable to load track desc file: '<name>'"
     # lines. Counted and the names kept, because the names the guest asks for
@@ -605,6 +643,8 @@ $runSummaryPath = Join-Path $archive 'run-summary.txt'
         $summary.gfxStatsLines, $summary.gfxFrames, $summary.gfxCalls, $summary.gfxDraws)
     ('TrackDesc::load failures  {0}' -f $summary.trackDescFailures)
     ('frame PNGs      {0}   (the pictures of what the guest drew; see frames/)' -f $summary.framePngs)
+    ('pixels lit      {0} of {1}   (the last 1280x720 back-buffer readback; r_bins={2}; frame={3})' -f `
+        $summary.pixelsLit, $summary.pixelsTotal, $summary.pixelBins, $summary.pixelReadbackFrame)
     ('eden log       {0} lines, spans t={1}..{2} s of emulator time (capped file: a count taken from it is a count over that window, not over the run)' -f `
         $summary.edenLogLines, $summary.edenLogFirstTs, $summary.edenLogLastTs)
     ('eden log old   {0} lines (Eden''s startup-created file; it is NOT the earlier part of this run)' -f $summary.edenLogOldLines)
