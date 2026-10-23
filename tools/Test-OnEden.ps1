@@ -389,7 +389,8 @@ $summary = [ordered]@{
     msDownloadFailed    = 0   # "Download failed - incomplete Download."
     msStat22            = 0   # "unknown error stat(22)"
     msAssetListsAdded   = 0   # "Assets are added"
-    msTwosquare         = 0   # "twosquare"   (the front-end XML the guest opens)
+    msTwosquare         = 0   # "gui/processed/main_menu/main_menu_twosquare.gui" in the PORT trace
+    msMainMenuLayouts   = 0   # "gui/processed/main_menu/" in the PORT trace
     msEventMapScreen    = 0   # "EventMapScreen"
     msMainMenuLiteral   = 0   # "MainMenu"    (WEAK -- see the note above)
     msAstFilesOnCard    = 0   # *.ast on the card: the physical proof the .ast round trip works
@@ -499,7 +500,25 @@ if (Test-Path $guestLog -PathType Leaf) {
     $summary.msDownloadFailed  = [regex]::Matches($guestText, 'Download failed - incomplete Download').Count
     $summary.msStat22          = [regex]::Matches($guestText, 'stat\(22\)').Count
     $summary.msAssetListsAdded = [regex]::Matches($guestText, 'Assets are added').Count
-    $summary.msTwosquare       = [regex]::Matches($guestText, 'twosquare').Count
+    # THE FRONT-END METRIC. The old one counted the literal "twosquare" in
+    # the GUEST'S OWN log, and it could never be non-zero: the guest does
+    # not write layout names into its log. Layout names appear in the PORT's
+    # trace (map-app / stat-layout), because that is where the port is the
+    # one that sees them.
+    #
+    # Measured 2026-10-24: forty-plus runs reported "front-end layout
+    # opened 0" while the screen was plainly up. The framebuffer capture
+    # from archive 20261024-010947-eden-shot2 shows the front end rendered
+    # -- a 3D track scene, the status bar, the main menu's white panel --
+    # with main_menu_career_page.gui and main_menu_race_now.gui both loaded,
+    # while the guest's own log had never once said "twosquare". The metric
+    # was not measuring the menu; it was measuring a string the guest does
+    # not emit. It now counts the PORT's trace of the layout being opened,
+    # which is the event that means anything.
+    $summary.msTwosquare = [regex]::Matches(
+        $guestText, 'gui/processed/main_menu/main_menu_twosquare\.gui').Count
+    $summary.msMainMenuLayouts = [regex]::Matches(
+        $guestText, 'gui/processed/main_menu/').Count
     $summary.msEventMapScreen  = [regex]::Matches($guestText, 'EventMapScreen').Count
     $summary.msMainMenuLiteral = [regex]::Matches($guestText, 'MainMenu').Count
     # The last front-end gate line and the last loading-state line, verbatim.
@@ -599,7 +618,8 @@ $runSummaryPath = Join-Path $archive 'run-summary.txt'
     ('  stat(22)                 {0}   (want 0)' -f $summary.msStat22)
     ('  asset lists added        {0}' -f $summary.msAssetListsAdded)
     ('  .ast files on the card   {0}   (want > 0 when assets were downloaded)' -f $summary.msAstFilesOnCard)
-    ('  front-end layout opened  {0}   ("twosquare" -- want > 0 for the menu)' -f $summary.msTwosquare)
+    ('  front-end layout opened  {0}   ("gui/processed/main_menu/main_menu_twosquare.gui" in the PORT trace -- want > 0 for the main menu panel)' -f $summary.msTwosquare)
+    ('  main menu layouts open   {0}   (gui/processed/main_menu/ -- want > 0 once the front end is up)' -f $summary.msMainMenuLayouts)
     ('  EventMapScreen           {0}   (want > 0 for the menu)' -f $summary.msEventMapScreen)
     ('  "MainMenu" literal       {0}   (WEAK instrument, see the note in this script)' -f $summary.msMainMenuLiteral)
     ''
