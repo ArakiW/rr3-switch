@@ -65,6 +65,7 @@
 #include "jni_compat/classes/cc_http_headers.h"
 #include "jni_compat/classes/cloudcell_defer.h"
 #include "jni_compat/classes/cloudcell_natives.h"
+#include "jni_compat/classes/glyph_vector.h"
 
 // The Java side of the one class the guest binds natives for
 // (csdk/glucentralservices/eventbus/ServerEventBus). The header carries the
@@ -587,13 +588,26 @@ size_t g_jniFieldCount = 0;
 
 struct JniStringHandle {
     uint32_t magic;
-    char value[128];
+    char value[512];
 };
 
 constexpr uint32_t kJniStringMagic = 0x52523353; // RR3S
-constexpr size_t kMaxJniStrings = 64;
+// The guest builds one Java String per text it renders -- 23,411 of them in
+// the run of archive 20261024-010947-eden-shot2 -- and it hands each one to
+// GlyphVector and then deletes it again straight away. The table used to hold
+// 64 strings of 128 bytes each, so the 65th distinct string onwards came back
+// as the shared sentinel with an EMPTY value, and every paragraph arrived
+// with no text at all.
+//
+// The value is 512 bytes because the game's own strings are longer than 128
+// (the longest NewStringUTF payload in the run was 190 characters), and the
+// table is a RING because the port's DeleteLocalRef is a no-op: nothing ever
+// frees a slot, so the oldest one has to be recycled. The guest deletes the
+// string it just used, so a slot that is 1024 creations old is long dead.
+constexpr size_t kMaxJniStrings = 1024;
 JniStringHandle g_fakeStringObject{kJniStringMagic, {0}};
 JniStringHandle g_jniStrings[kMaxJniStrings]{};
+size_t g_jniStringCursor = 0;
 
 struct JniMethodRecord {
     uint32_t magic;
@@ -1411,17 +1425,87 @@ struct FakeFont {
     uint32_t magic;        // 'FNTO'
     uint32_t initialised;  // 1 once init() has answered true
     uintptr_t bmpData;     // FakeByteArray handle, 0 before the first loadBitmap
+    // The real Font.init arguments. The Java class's getSize(),
+    // getTypeface() and getWidthScale() read exactly these, and
+    // GlyphVector.initWithParagraph() asks the Font for them, so they have
+    // to survive the call that set them.
+    float size;
+    float widthScale;
+    uint32_t bold;
+    uint32_t italic;
+    char path[96];
 };
 
 constexpr uint32_t kFakeFontMagic = 0x4F544E46;  // FNTO
-FakeFont g_fakeFont{kFakeFontMagic, 0, 0};
+
+// The guest creates one Font per (face, style, size) and hands the SAME Font
+// to every GlyphVector that uses it: archive 20261024-010947-eden-shot2 shows
+// 149 FindClass("com/firemint/realracing/Font") calls and 149 Font.init
+// calls in one run. One global Font therefore sized every paragraph from
+// whichever Font happened to be created last, so the Font objects get a
+// table of their own.
+//
+// It is deliberately NOT the fake-object pool: the guest holds a Font for the
+// whole run and hands it back on every initWithParagraph, while the pool
+// recycles a slot every 512 objects.
+constexpr size_t kMaxFakeFonts = 512;
+FakeFont g_fakeFonts[kMaxFakeFonts]{};
+size_t g_fakeFontCount = 0;
+
+FakeFont* allocateFakeFont() {
+    size_t index = g_fakeFontCount;
+    if (index >= kMaxFakeFonts) {
+        // The table is full. Reuse the first slot rather than refusing: a
+        // stale Font costs the wrong text size, not a crash.
+        index = 0;
+    } else {
+        ++g_fakeFontCount;
+    }
+    FakeFont& font = g_fakeFonts[index];
+    font.magic = kFakeFontMagic;
+    font.initialised = 0;
+    font.bmpData = 0;
+    font.size = kFontSizeX100 / 100.0f;
+    font.widthScale = 1.0f;
+    font.bold = 0;
+    font.italic = 0;
+    font.path[0] = '\0';
+    return &font;
+}
 
 FakeFont* asFontObject(uintptr_t handle) {
     if (handle == 0) {
         return nullptr;
     }
-    FakeFont* font = reinterpret_cast<FakeFont*>(handle);
-    return (font == &g_fakeFont && font->magic == kFakeFontMagic) ? font : nullptr;
+    const size_t limit = g_fakeFontCount < kMaxFakeFonts ? g_fakeFontCount
+                                                          : kMaxFakeFonts;
+    for (size_t index = 0; index < limit; ++index) {
+        FakeFont* font = &g_fakeFonts[index];
+        if (reinterpret_cast<uintptr_t>(font) == handle &&
+            font->magic == kFakeFontMagic) {
+            return font;
+        }
+    }
+    return nullptr;
+}
+
+// The Font parameters GlyphVector needs. See glyph_vector.cpp.
+void fontRequestFor(uintptr_t fontHandle, float* sizePx, float* widthScale,
+                    bool* bold, char* path, size_t pathCapacity) {
+    if (sizePx != nullptr) *sizePx = kFontSizeX100 / 100.0f;
+    if (widthScale != nullptr) *widthScale = 1.0f;
+    if (bold != nullptr) *bold = false;
+    if (path != nullptr && pathCapacity > 0) path[0] = '\0';
+    FakeFont* font = asFontObject(fontHandle);
+    if (font == nullptr) {
+        return;
+    }
+    if (sizePx != nullptr) *sizePx = font->size;
+    if (widthScale != nullptr) *widthScale = font->widthScale;
+    if (bold != nullptr) *bold = font->bold != 0;
+    if (path != nullptr && pathCapacity > 0) {
+        rawCopy(path, pathCapacity, font->path);
+    }
 }
 
 // The byte[] behind bmpData. Allocated through the existing NewByteArray slot
@@ -1485,17 +1569,27 @@ bool g_fontLoggedGlyph = false;
 bool g_fontLoggedBitmap = false;
 bool g_fontLoggedSummary = false;
 
-void fontNoteInit() {
-    if (g_fontLoggedInit) {
+// The real size and style of every Font the guest asks for. The synthetic
+// 48 px was all the port had before, and it is the number the paragraph text
+// would have been laid out with, so it has to be visible when it is wrong.
+void fontNoteInit(const FakeFont* font) {
+    static unsigned s_initLines = 0;
+    if (s_initLines >= 32) {
         return;
     }
+    ++s_initLines;
     g_fontLoggedInit = true;
-    char details[192];
+    char details[224];
     __builtin_snprintf(details, sizeof(details),
-                       "init -> true size=%d.%02d ascent=%.0f descent=%.0f "
-                       "height=%.0f (unitsPerEm=2048, scale=48/2048)",
-                       kFontSizeX100 / 100, kFontSizeX100 % 100, kFontAscent,
-                       kFontDescent, kFontHeight);
+                       "init -> true size=%.2f widthScale=%.2f bold=%u "
+                       "italic=%u path=%s (was synthetic %.2f px)",
+                       font != nullptr ? font->size : 0.f,
+                       font != nullptr ? font->widthScale : 0.f,
+                       font != nullptr ? font->bold : 0u,
+                       font != nullptr ? font->italic : 0u,
+                       (font != nullptr && font->path[0] != '\0') ? font->path
+                                                                : "(none)",
+                       kFontSizeX100 / 100.0);
     rawLog("[jni] Font ");
     rawLog(details);
     rawLog("\n");
@@ -1567,9 +1661,24 @@ uintptr_t makeJniString(const char* value) {
             return handle;
         }
     }
-    registerHostHandle(reinterpret_cast<uintptr_t>(&g_fakeStringObject),
-                       "makeJniString/sentinel");
-    return reinterpret_cast<uintptr_t>(&g_fakeStringObject);
+    // Every slot is taken. Nothing frees a slot -- the port's DeleteLocalRef
+    // is a no-op -- so the oldest one is recycled. The guest deletes the
+    // string it has just used, so a slot that is kMaxJniStrings creations old
+    // is long dead.
+    const size_t index = g_jniStringCursor;
+    g_jniStringCursor = (g_jniStringCursor + 1) % kMaxJniStrings;
+    rawCopy(g_jniStrings[index].value, sizeof(g_jniStrings[index].value), value);
+    const uintptr_t handle = reinterpret_cast<uintptr_t>(&g_jniStrings[index]);
+    registerHostHandle(handle, "makeJniString/ring");
+    if (perCallLogAllow("jni-string-ring")) {
+        char details[96];
+        __builtin_snprintf(details, sizeof(details),
+                           "string table recycled slot=%u len=%u",
+                           (unsigned)index, (unsigned)rawStrlen(value));
+        guestViewWideLog("jni-string-ring", static_cast<unsigned long long>(index),
+                         0, details);
+    }
+    return handle;
 }
 
 const char* jniStringValue(uintptr_t string) {
@@ -2328,6 +2437,12 @@ int32_t jniGetIntField(uintptr_t /*env*/, uintptr_t object, uintptr_t fieldId) {
     if (font != nullptr) {
         return fontIntField(font, jniFieldName(fieldId));
     }
+    // GlyphVector: the guest reads texId, texWidth, texHeight and numLines
+    // back out of the object it just initialised.
+    int32_t glyphValue = 0;
+    if (glyphvector::readIntField(object, jniFieldName(fieldId), &glyphValue)) {
+        return glyphValue;
+    }
     const FakeTextureInfo* info =
         reinterpret_cast<const FakeTextureInfo*>(object);
     if (info->magic == kTextureInfoMagic) {
@@ -2351,6 +2466,13 @@ int32_t jniGetIntField(uintptr_t /*env*/, uintptr_t object, uintptr_t fieldId) {
 float jniGetFloatField(uintptr_t /*env*/, uintptr_t object, uintptr_t fieldId) {
     FakeFont* font = asFontObject(object);
     if (font == nullptr) {
+        // GlyphVector: offsetX, offsetY, boundsW, boundsH, pixelBoundsW and
+        // pixelBoundsH are the six float fields the guest reads back after
+        // initWithParagraph.
+        float glyphValue = 0.f;
+        if (glyphvector::readFloatField(object, jniFieldName(fieldId), &glyphValue)) {
+            return glyphValue;
+        }
         return 0.f;
     }
     return fontFloatField(font, jniFieldName(fieldId));
@@ -2373,6 +2495,52 @@ uintptr_t jniNewStringUTF(uintptr_t /*env*/, const char* bytes) {
     rawLog(bytes);
     rawLog("\n");
     return makeJniString(bytes);
+}
+
+// Slot 163 is the guest's OWN string slot.
+//
+// MEASURED 2026-10-24 from libRealRacing3.so: the guest builds the Java
+// String for a paragraph with a call through JNIEnv slot 163 -- guest
+// 0x12a77b4 is "ldr x8, [x8, #0x518]" (0x518 / 8 = 163) followed by "blr x8",
+// with x0 = the JNIEnv and x1 = the UTF-8 buffer the text was copied into.
+// 129 call sites in the guest load that slot; the GlyphVector path is one of
+// them.
+//
+// The port's table answered slot 163 with the default stub, which returns
+// null. So the guest's jstring handle came back as 0, the port's
+// jniStringValue(0) answered the empty string, and EVERY paragraph arrived
+// with no text at all: the class resolved, the layout ran, and the panel was
+// still blank. That is the part of the blank text that had nothing to do with
+// GlyphVector.
+//
+// The port's NewStringUTF lives at slot 167, which the guest also uses (429
+// call sites), so both slots are the guest's string slot and both are wired.
+//
+// THE GUARD: an argument that is one of this port's own jstring handles is
+// not a C string. Reading it as one would be a wild pointer read, so such an
+// argument is answered with the stub's null instead.
+uintptr_t jniNewStringUTFSlot163(uintptr_t env, const char* bytes) {
+    if (bytes == nullptr) {
+        return 0;
+    }
+    const uintptr_t value = reinterpret_cast<uintptr_t>(bytes);
+    const uintptr_t tableLow =
+        reinterpret_cast<uintptr_t>(&g_jniStrings[0]);
+    const uintptr_t tableHigh =
+        reinterpret_cast<uintptr_t>(&g_jniStrings[kMaxJniStrings]);
+    if (value == reinterpret_cast<uintptr_t>(&g_fakeStringObject) ||
+        (value >= tableLow && value < tableHigh)) {
+        return 0;
+    }
+    const uintptr_t handle = makeJniString(bytes);
+    if (perCallLogAllow("jni-utf163")) {
+        char details[192];
+        __builtin_snprintf(details, sizeof(details), "slot=163 len=%u text=%s",
+                           (unsigned)rawStrlen(bytes), bytes);
+        guestViewWideLog("jni-utf163", 0, handle, details);
+    }
+    (void)env;
+    return handle;
 }
 
 uintptr_t jniGetStringUTFLength(uintptr_t /*env*/, uintptr_t string) {
@@ -2437,12 +2605,18 @@ uintptr_t jniNewObjectV(uintptr_t /*env*/, uintptr_t clazz,
     // Everything else keeps the shared sentinel unless objid=1.
     const uintptr_t fontClass = fontClassHandle();
     if (fontClass != 0 && clazz == fontClass) {
-        g_fakeFont.initialised = 0;
-        g_fakeFont.bmpData = 0;  // re-made on demand, pool may have recycled
-        return reinterpret_cast<uintptr_t>(&g_fakeFont);
+        // A Font per NewObjectV, so every (face, style, size) keeps its own
+        // parameters. The guest creates 149 of them and hands each one to the
+        // GlyphVector that uses it; one shared Font sized every paragraph from
+        // whichever Font was created last.
+        return reinterpret_cast<uintptr_t>(allocateFakeFont());
     }
     if (::rr3::gfxObjectIdentity()) {
-        return newFakeObject(clazz);
+        const uintptr_t instance = newFakeObject(clazz);
+        // GlyphVector carries its ten Java-visible fields in the pool slot,
+        // so the slot has to be stamped before the guest reads them back.
+        glyphvector::onNewObject(clazz, instance);
+        return instance;
     }
     registerHostHandle(reinterpret_cast<uintptr_t>(&g_fakeObjectObject),
                        "jniNewObjectV/shared-sentinel");
@@ -2773,9 +2947,87 @@ const ManagedMethod* managedMethodByNameAlone(const char* name,
 // and a shared flag would stamp one thread's entry site onto another's line.
 thread_local const char* t_jniVoidEntry = "62";
 
+// Unpacks the guest's own variadic block. Defined further down, next to the
+// block's layout; the boolean slot needs it too, because the guest's boolean
+// helper (guest 0x10e8f2c) builds the same block.
+static constexpr size_t kMaxGuestVarArgs = 16;
+
+static size_t decodeGuestVarArgs(const void* block, const char* signature,
+                                 jvalue* out, size_t maxOut);
+
+// Font.init(String path, boolean bold, boolean italic, float size, float
+// widthScale) -- the only place the typeface and the text size come from.
+//
+// The port used to answer a synthetic 48 px for every Font object. That is
+// harmless for the Font's own synthetic metrics, but GlyphVector reads
+// getSize()/getWidthScale()/getTypeface() off the Font it is handed, so a
+// synthetic size would lay every paragraph out at the wrong size.
+void captureFontInit(FakeFont* font, const jvalue* argv, size_t argc, void* args,
+                     bool guestBlock) {
+    if (font == nullptr) {
+        return;
+    }
+    if (argv != nullptr && argc >= 5) {
+        font->size = argv[3].f;
+        font->widthScale = argv[4].f;
+        font->bold = argv[1].z != 0 ? 1u : 0u;
+        font->italic = argv[2].z != 0 ? 1u : 0u;
+        const char* path =
+            jniStringValue(reinterpret_cast<uintptr_t>(argv[0].l));
+        if (path != nullptr) {
+            rawCopy(font->path, sizeof(font->path), path);
+        }
+        return;
+    }
+    if (!guestBlock && args != nullptr) {
+        // Slot 37 carries a real va_list. A float argument arrives promoted
+        // to double, and a boolean promoted to int.
+        va_list ap;
+        va_copy(ap, *static_cast<va_list*>(args));
+        const jstring pathArg = va_arg(ap, jstring);
+        const jint boldArg = va_arg(ap, jint);
+        const jint italicArg = va_arg(ap, jint);
+        const double sizeArg = va_arg(ap, double);
+        const double widthArg = va_arg(ap, double);
+        va_end(ap);
+        font->size = static_cast<float>(sizeArg);
+        font->widthScale = static_cast<float>(widthArg);
+        font->bold = boldArg != 0 ? 1u : 0u;
+        font->italic = italicArg != 0 ? 1u : 0u;
+        const char* path =
+            jniStringValue(reinterpret_cast<uintptr_t>(pathArg));
+        if (path != nullptr) {
+            rawCopy(font->path, sizeof(font->path), path);
+        }
+    }
+}
+
 int32_t jniCallBooleanMethodV(uintptr_t env, uintptr_t object,
                               uintptr_t methodId, void* args) {
     const char* name = jniMethodName(methodId);
+    // The guest's boolean helper (guest 0x10e8f2c) calls JNIEnv::
+    // CallBooleanMethodV -- table slot 38 -- whose fourth argument is the
+    // GUEST's own va_list block: the same 32-byte block the void slot
+    // carries. Slot 37 (CallBooleanMethod, the non-V form) really does carry
+    // a va_list*.
+    //
+    // t_jniVoidEntry tells the two apart: the non-V wrapper sets it to "37",
+    // and slot 38 leaves it at the default "62". The old code read the "62"
+    // case as a jvalue ARRAY, which handed the dispatcher the block's own
+    // header words instead of the arguments -- and GlyphVector's
+    // renderToTexture(int texId, int w, int h, float scale) is a boolean
+    // method, so all four of its arguments arrived as garbage.
+    const bool guestBlock = rawEquals(t_jniVoidEntry, "62");
+    jvalue argv[kMaxGuestVarArgs];
+    __builtin_memset(argv, 0, sizeof(argv));
+    size_t argc = 0;
+    if (args != nullptr && guestBlock) {
+        const JniMethodRecord* argRec = findJniMethod(methodId);
+        const char* argSig =
+            argRec != nullptr && argRec->signature[0] != '\0' ? argRec->signature
+                                                              : nullptr;
+        argc = decodeGuestVarArgs(args, argSig, argv, kMaxGuestVarArgs);
+    }
     // The response-header map: "hasNext" on the iterator the port handed
     // out. The name table below answers hasNext with false, which would end
     // the guest's header walk before the first entry.
@@ -2805,8 +3057,14 @@ int32_t jniCallBooleanMethodV(uintptr_t env, uintptr_t object,
     FakeFont* font = asFontObject(object);
     if (font != nullptr && fontBoolMethod(name)) {
         if (rawEquals(name, "init")) {
+            // The Java's init(String path, boolean bold, boolean italic,
+            // float size, float widthScale) is where the typeface and the
+            // text size come from. GlyphVector.initWithParagraph() asks the
+            // Font it is handed for exactly these, so the real arguments
+            // have to be captured instead of the synthetic 48 px.
+            captureFontInit(font, argv, argc, args, guestBlock);
             font->initialised = 1;
-            fontNoteInit();
+            fontNoteInit(font);
         }
         else if (rawEquals(name, "loadGlyph")) {
             fontNoteGlyph();
@@ -2858,7 +3116,8 @@ int32_t jniCallBooleanMethodV(uintptr_t env, uintptr_t object,
         if (cls != nullptr) {
             const Class* clazz = managedClassFor(cls);
             method = managedMethodFor(clazz, name);
-        } else {
+        }
+        if (method == nullptr) {
             method = managedMethodByNameAlone(name, &guessClass);
         }
         if (method != nullptr && !method->takes_class) {
@@ -2879,12 +3138,13 @@ int32_t jniCallBooleanMethodV(uintptr_t env, uintptr_t object,
             } else {
                 using Fn = jboolean (*)(JNIEnv*, jobject, jvalue*);
                 jboolean result = 0;
-                if (rawEquals(t_jniVoidEntry, "62") && args != nullptr) {
+                if (guestBlock && args != nullptr) {
+                    // The guest's own variadic block, already unpacked above.
                     result = reinterpret_cast<Fn>(method->addr_array)(
                         reinterpret_cast<JNIEnv*>(env),
                         reinterpret_cast<jobject>(object),
-                        static_cast<jvalue*>(args));
-                } else {
+                        argv);
+                } else if (args != nullptr) {
                     using VFn = jboolean (*)(JNIEnv*, jobject, va_list);
                     va_list forwarded;
                     va_copy(forwarded, *static_cast<va_list*>(args));
@@ -2917,11 +3177,16 @@ int32_t jniCallBooleanMethod(uintptr_t env, uintptr_t object,
     va_list arguments;
     va_start(arguments, methodId);
     // Same entry-site marker as the void slot: slot 37 passes a va_list* and
-    // slot 38 passes a jvalue array, and the boolean dispatch below has to
-    // know which one it is holding.
+    // slot 38 passes the guest's own variadic block, and the boolean dispatch
+    // below has to know which one it is holding.
+    //
+    // Restored on the way out, like the void slot does: the marker is
+    // thread_local state that a nested call on this thread could otherwise
+    // inherit, and the boolean dispatch now branches on it.
     const char* previousEntry = t_jniVoidEntry;
     t_jniVoidEntry = "37";
     int32_t result = jniCallBooleanMethodV(env, object, methodId, &arguments);
+    t_jniVoidEntry = previousEntry;
     va_end(arguments);
     return result;
 }
@@ -3847,7 +4112,7 @@ const char* hostHandleOwner(uintptr_t address) {
         {g_jniStrings, sizeof(g_jniStrings)},
         {g_fakeClasses, sizeof(g_fakeClasses)},
         {g_jniMethods, sizeof(g_jniMethods)},
-        {&g_fakeFont, sizeof(g_fakeFont)},
+        {g_fakeFonts, sizeof(g_fakeFonts)},
         {&g_fakeObjectObject, 1},
     };
     for (const Range& range : ranges) {
@@ -3881,8 +4146,8 @@ const char* hostHandleOwner(uintptr_t address) {
         if (range.base == static_cast<const void*>(g_jniMethods)) {
             return "g_jniMethods/RR3M";
         }
-        if (range.base == static_cast<const void*>(&g_fakeFont)) {
-            return "g_fakeFont/FNTO";
+        if (range.base == static_cast<const void*>(g_fakeFonts)) {
+            return "g_fakeFonts/FNTO";
         }
         return "host range, unattributed";
     }
@@ -4039,7 +4304,9 @@ const ManagedMethod* managedMethodByNameAlone(const char* name,
 // whose .rela.dyn addend is 0x1ce6e2c - a guest CODE address, the
 // continuation the guest's own LoginCompleteCallback trampoline at 0x1ce7318
 // tail-branches to.
-static constexpr size_t kMaxGuestVarArgs = 16;
+//
+// kMaxGuestVarArgs is declared next to the boolean slot's forward
+// declaration, because that slot needs the same unpacker.
 
 // Unpacks the guest's variadic block into a jvalue array, using the guest's
 // own JNI signature for the layout. Returns how many arguments were written.
@@ -4114,7 +4381,26 @@ static size_t decodeGuestVarArgs(const void* block, const char* signature,
             }
             ++gpIndex;
         }
-        out[written].l = reinterpret_cast<jobject>(static_cast<uintptr_t>(raw));
+        if (type == 'F') {
+            // A float argument is PROMOTED to double in a variadic call, and
+            // the guest does the promotion explicitly (guest 0x12a77dc:
+            // "fcvt d0, s0"). The block therefore holds a double, and the
+            // array-form dispatcher reads a jvalue.f -- which would be the
+            // LOW HALF of the double's bit pattern. Narrow it here.
+            //
+            // GlyphVector.initWithParagraph(Font, String, float, float, int,
+            // int) is the call this exists for: its two float arguments are
+            // the wrap width and the height limit.
+            double promoted = 0.0;
+            __builtin_memcpy(&promoted, &raw, sizeof(promoted));
+            out[written].f = static_cast<jfloat>(promoted);
+        } else if (type == 'D') {
+            double promoted = 0.0;
+            __builtin_memcpy(&promoted, &raw, sizeof(promoted));
+            out[written].d = promoted;
+        } else {
+            out[written].l = reinterpret_cast<jobject>(static_cast<uintptr_t>(raw));
+        }
         ++written;
     }
     return written;
@@ -4291,12 +4577,27 @@ void jniCallVoidMethodV(uintptr_t env, uintptr_t object,
             //
             // Only a name present in EXACTLY ONE registered class qualifies;
             // managedMethodByNameAlone returns null for an ambiguous one.
+            //
+            // The class comes from the guest's own method id. It used to come
+            // from cloudcellClass(), which only knows the Cloudcell classes,
+            // so every other class was reported as "class=(none)" even when
+            // the guest had resolved it -- com/firemint/realracing/GlyphVector
+            // included, which is why the probe said "no class, no unique
+            // name" for a class the guest had named 23,411 times.
+            const JniMethodRecord* dispatchRec = findJniMethod(methodId);
+            const char* dispatchClass =
+                dispatchRec != nullptr ? className(dispatchRec->clazz) : nullptr;
             const char* guessClass = nullptr;
             const ManagedMethod* byNameOnly = nullptr;
-            const Class* clazz = ccClass != nullptr ? managedClassFor(ccClass) : nullptr;
+            const Class* clazz =
+                dispatchClass != nullptr ? managedClassFor(dispatchClass) : nullptr;
             const ManagedMethod* method =
                 clazz != nullptr ? managedMethodFor(clazz, name) : nullptr;
-            if (method == nullptr && clazz == nullptr) {
+            if (method == nullptr) {
+                // The name-only fallback stays: a class the port has not
+                // registered can still carry a method another class
+                // declares, and that is how the Cloudcell facades were
+                // reached before the class was known.
                 byNameOnly = managedMethodByNameAlone(name, &guessClass);
                 method = byNameOnly;
             }
@@ -4309,8 +4610,8 @@ void jniCallVoidMethodV(uintptr_t env, uintptr_t object,
             __builtin_snprintf(dd, sizeof(dd),
                                "level=%d class=%s method=%s -> %s static=%d obj=%p",
                                dispatchLevel,
-                               ccClass != nullptr
-                                   ? ccClass
+                               dispatchClass != nullptr
+                                   ? dispatchClass
                                    : (guessClass != nullptr ? guessClass : "(none)"),
                                name, verdict,
                                method != nullptr ? (method->is_static_method ? 1 : 0) : -1,
@@ -4698,6 +4999,7 @@ void ensureInitialized() {
     g_jniTable[102] = reinterpret_cast<void*>(&jniGetFloatField);     // GetFloatField
     g_jniTable[144] = reinterpret_cast<void*>(&jniGetFieldID);        // GetStaticFieldID
     g_jniTable[167] = reinterpret_cast<void*>(&jniNewStringUTF);      // NewStringUTF
+g_jniTable[163] = reinterpret_cast<void*>(&jniNewStringUTFSlot163); // NewStringUTF (the guest's own slot)
     g_jniTable[168] = reinterpret_cast<void*>(&jniGetStringUTFLength); // GetStringUTFLength
     g_jniTable[169] = reinterpret_cast<void*>(&jniGetStringUTFChars); // GetStringUTFChars
     g_jniTable[170] = reinterpret_cast<void*>(&jniNoop);              // ReleaseStringUTFChars
@@ -4741,6 +5043,40 @@ void ensureInitialized() {
 }
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// Exported to the GlyphVector facade
+// ---------------------------------------------------------------------------
+//
+// jni_compat/classes/glyph_vector.cpp is a separate translation unit and
+// cannot see this file's anonymous namespace. These three forwarders are the
+// whole of what it needs from the bridge: the name behind a class handle, the
+// text behind a jstring, and the Font's captured parameters.
+//
+// The class handle is needed because the port hands out one fake-object pool
+// slot per NewObjectV, and the slot's facade has to know it is a GlyphVector
+// before the guest reads the ten fields back out of it.
+//
+// The jstring text is needed because GlyphVector's init and initWithParagraph
+// both take a Java String, and on this port there is no ART runtime to hold
+// it: the port's own jstring table is the only copy.
+//
+// The Font parameters are needed because GlyphVector.initWithParagraph() asks
+// the Font it is handed for its typeface, its size and its width scale, and
+// those only exist in Font.init's arguments.
+
+const char* glyphClassName(uintptr_t handle) {
+    return className(handle);
+}
+
+const char* glyphStringText(uintptr_t string) {
+    return jniStringValue(string);
+}
+
+void glyphFontRequest(uintptr_t fontHandle, float* sizePx, float* widthScale,
+                      bool* bold, char* path, size_t pathCapacity) {
+    fontRequestFor(fontHandle, sizePx, widthScale, bold, path, pathCapacity);
+}
 
 // The FakeByteArray record, exported for the Cloudcell HTTP shim.
 //
