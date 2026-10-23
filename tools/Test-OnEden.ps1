@@ -96,6 +96,13 @@ foreach ($marker in $markers) {
     }
 }
 
+# The framebuffer PNGs the port writes into the app directory. They are the
+# only instrument that shows WHAT the guest drew, so they are archived like
+# the logs are -- and they are cleared first, because a stale capture from a
+# previous run would be indistinguishable from a current one.
+Get-ChildItem -LiteralPath $appDir -Filter 'frame-*.png' -File -ErrorAction SilentlyContinue |
+    ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+
 # --- 2. deploy ---------------------------------------------------------------
 if (-not $NoDeploy) {
     if (-not (Test-Path $buildNro -PathType Leaf)) {
@@ -242,10 +249,52 @@ $finalLogBytes = if (Test-Path $guestLog) { (Get-Item $guestLog).Length } else {
 $archive = Join-Path $archiveRoot $label
 New-Item -ItemType Directory -Force -Path $archive | Out-Null
 $cpuSeries | Export-Csv -NoTypeInformation -Path (Join-Path $archive 'eden-cpu-series.csv')
+
+# HOW MUCH ROOM IS LEFT ON THE CARD. Eden runs a VIRTUAL SD card: a FAT32
+# filesystem of FIXED capacity over the loose sdmc directory. The host disk
+# having 120 GB free says nothing about it, and the symptom is an errno 12
+# (ENOSPC) deep inside a file write -- which reads like a port bug and is
+# not one. Measured 2026-10-24: a stale SECOND copy of the seven romfs
+# volumes (9.63 GB, left behind by an older deploy layout, referenced by
+# nothing) filled the volume, the guest's asset downloads started failing
+# with ENOSPC, and Eden exited on its own at 42 s and 55 s. Deleting the
+# duplicate freed the space.
+#
+# So the card's usage is measured and archived, every run, whether or not
+# anything went wrong.
+$cardFiles = @(Get-ChildItem -LiteralPath $sdmcSwitch -Recurse -File -ErrorAction SilentlyContinue)
+$cardBytes = ($cardFiles | Measure-Object -Property Length -Sum).Sum
+if ($null -eq $cardBytes) { $cardBytes = 0 }
+$staleVolBytes = 0
+$staleVolDir = Join-Path $appDir 'rr3-native-rehost'
+if (Test-Path -LiteralPath $staleVolDir -PathType Container) {
+    $staleVolBytes = ((Get-ChildItem -LiteralPath $staleVolDir -Filter '*.romfs' -File -ErrorAction SilentlyContinue |
+        Measure-Object -Property Length -Sum).Sum)
+    if ($null -eq $staleVolBytes) { $staleVolBytes = 0 }
+}
+Write-Host ("card     : {0} files, {1:N0} bytes on the SD card{2}" -f `
+    $cardFiles.Count, $cardBytes, `
+    $(if ($staleVolBytes -gt 0) { " -- WARNING: {0:N0} bytes of STALE duplicate romfs in {1}" -f $staleVolBytes, $staleVolDir } else { '' }))
+
 foreach ($marker in $markers) {
     if (Test-Path $marker -PathType Leaf) {
         Copy-Item -LiteralPath $marker -Destination (Join-Path $archive (Split-Path $marker -Leaf)) -Force
     }
+}
+
+# The framebuffer captures. They go into the archive under frames/ so that a
+# reader can SEE what the guest drew instead of reading a colour triple.
+# The count is recorded in the summary below, because "the archive has no
+# pictures" and "the port wrote no pictures" are different failures.
+$frameDir = Join-Path $archive 'frames'
+$framePngs = @(Get-ChildItem -LiteralPath $appDir -Filter 'frame-*.png' -File -ErrorAction SilentlyContinue |
+    Sort-Object Name)
+if ($framePngs.Count -gt 0) {
+    New-Item -ItemType Directory -Force -Path $frameDir | Out-Null
+    foreach ($png in $framePngs) {
+        Copy-Item -LiteralPath $png.FullName -Destination (Join-Path $frameDir $png.Name) -Force
+    }
+    Write-Host ("frames  : {0} PNG(s) captured -> {1}" -f $framePngs.Count, $frameDir)
 }
 $edenLog = Join-Path $edenRoot 'user\log\eden_log.txt'
 if ($EmulatorName -ne 'eden') {
@@ -308,6 +357,17 @@ $summary = [ordered]@{
     gfxFrames       = 0
     gfxCalls        = 0
     gfxDraws        = '0/0'
+    # How many framebuffer PNGs the run produced. Zero means the port wrote no
+    # pictures, which is a DIFFERENT failure from "the pictures are in the
+    # archive but show the wrong thing" -- so the number is recorded even
+    # when it is zero.
+    framePngs       = 0
+    # The SD card's usage. Eden's virtual SD is a FIXED-capacity FAT32 over
+    # the loose sdmc directory, so the host disk's free space is not the
+    # number that matters -- this one is.
+    cardBytes       = 0
+    cardFiles       = 0
+    staleVolBytes   = 0
     trackDescFailures = 0
     trackDescLastNames = ''
     edenLogFirstTs  = '-'
@@ -489,6 +549,7 @@ if (Test-Path (Join-Path $archive 'eden_log.txt.old.txt') -PathType Leaf) {
         [IO.File]::ReadAllText((Join-Path $archive 'eden_log.txt.old.txt')), "`n")).Count
 }
 $summaryPath = Join-Path $archive 'instrument-census.txt'
+$summary.framePngs = $framePngs.Count
 @(
     "# instrument census for $label"
     ("# {0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
@@ -524,6 +585,7 @@ $runSummaryPath = Join-Path $archive 'run-summary.txt'
     ('gfx-stats      {0} lines; frames={1} calls={2} draws={3}' -f `
         $summary.gfxStatsLines, $summary.gfxFrames, $summary.gfxCalls, $summary.gfxDraws)
     ('TrackDesc::load failures  {0}' -f $summary.trackDescFailures)
+    ('frame PNGs      {0}   (the pictures of what the guest drew; see frames/)' -f $summary.framePngs)
     ('eden log       {0} lines, spans t={1}..{2} s of emulator time (capped file: a count taken from it is a count over that window, not over the run)' -f `
         $summary.edenLogLines, $summary.edenLogFirstTs, $summary.edenLogLastTs)
     ('eden log old   {0} lines (Eden''s startup-created file; it is NOT the earlier part of this run)' -f $summary.edenLogOldLines)

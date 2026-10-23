@@ -19,6 +19,11 @@
 #include "rr3/recovery_guard.hpp"
 #include "rr3/tls_probe.hpp"
 
+// The PNG writer, for the framebuffer capture. It lives next to the other
+// guest-view instruments so that "what the guest drew" is a picture and not
+// a colour triple.
+#include "rr3_png_write.hpp"
+
 // The deferred-callback pump (jni_compat/classes/cloudcell_defer.cpp). It is
 // called on the thread that runs the guest's per-frame callbacks, bracketing
 // each one, because on Android the replies these stubs owe the engine arrive
@@ -8323,13 +8328,72 @@ void* frameLoopDriver(void* opaque) {
                 pts, pts + 9, pts + 18, pts + 27, pts + 36, glGetError());
             appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                                 "view-pixel-readback", 249, 0, diag);
+
+            // THE PICTURE. The numbers above say the back buffer is not
+            // black; they cannot say what is ON it, and "is the main menu
+            // open" is not a question a colour triple can answer. So write
+            // the frame out as a PNG.
+            //
+            // glReadPixels hands back rows BOTTOM-UP and PNG stores them
+            // top-down, so the image is flipped here instead of being saved
+            // upside down.
+            //
+            // The file name carries the frame number, because the question
+            // is not "what does one frame look like" but "does the picture
+            // change once the front end is up".
+            {
+                static unsigned char row[1280 * 4];
+                for (int y = 0; y < 720 / 2; ++y) {
+                    unsigned char* top = px + static_cast<size_t>(y) * 1280 * 4;
+                    unsigned char* bot = px + static_cast<size_t>(719 - y) * 1280 * 4;
+                    std::memcpy(row, top, sizeof(row));
+                    std::memcpy(top, bot, sizeof(row));
+                    std::memcpy(bot, row, sizeof(row));
+                }
+                char path[128];
+                std::snprintf(path, sizeof(path),
+                    "sdmc:/switch/rr3-native-rehost/frame-%06u.png", frame);
+                const bool wrote = rr3::writePngRgba(path, 1280, 720, px);
+                char pdiag[192];
+                std::snprintf(pdiag, sizeof(pdiag),
+                    "frame=%u png=%s path=%s", frame,
+                    wrote ? "ok" : "FAILED", path);
+                appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                    "view-frame-png", 249, 0, pdiag);
+            }
         };
 
+        // Capture the framebuffer SEVERAL times across the run, not once.
+        // The question is not "what does one frame look like" but "does the
+        // picture change once the front end is up", and a single late sample
+        // cannot answer that -- it is the same mistake the EARLY sample made
+        // (frame 30, half a second after boot, before anything was drawn).
+        //
+        // The schedule is DENSE EARLY and sparse later, and that is measured,
+        // not guessed: in the lockstep3 archive the front-end probe reads
+        // f=136 at t=159 s, and the render loop only reaches f=22560 much
+        // later, so the front end is on screen while the frame counter is
+        // still tiny. A schedule that started at frame 3000 would have
+        // missed exactly the moment worth seeing -- and a run that dies at
+        // 60 s (Eden does that) would have produced no picture at all.
+        //
+        // The first capture keeps the old "LATE" label so that archives
+        // before and after this change can be compared on the same label.
         if (!gfxNullActive()) {
-            static unsigned s_lateReadbackDone = 0;
-            if (s_lateReadbackDone == 0 && frames >= 3000) {
-                s_lateReadbackDone = 1;
-                readbackAndLog("LATE", frames);
+            static const unsigned kSchedule[] = {
+                30u, 120u, 300u, 600u, 1000u, 3000u, 7000u, 11000u, 15000u,
+                19000u, 23000u
+            };
+            static unsigned s_index = 0;
+            if (s_index < (sizeof(kSchedule) / sizeof(kSchedule[0])) &&
+                frames >= kSchedule[s_index]) {
+                const unsigned at = kSchedule[s_index];
+                ++s_index;
+                // The frame-3000 capture keeps the old "LATE" label so that
+                // archives before and after this change can be compared on
+                // the same label; frame 30 keeps "EARLY" for the same reason.
+                readbackAndLog(at == 3000 ? "LATE" : (at == 30 ? "EARLY" : "CAP"),
+                               frames);
             }
         }
 
