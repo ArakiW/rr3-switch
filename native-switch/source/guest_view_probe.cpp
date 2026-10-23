@@ -4449,6 +4449,9 @@ struct FeGateSample {
     ProbeValue frontEndUp{};
     ProbeValue mgrState{};
     ProbeValue scrState{};
+    ProbeValue scrVptr{};
+    ProbeValue regKey0{};
+    ProbeValue regKey1{};
     bool gMatch{false};
     bool mgrCellMatch{false};
     const char* gForm{"none"};
@@ -4513,11 +4516,29 @@ FeGateSample sampleFeGate(uintptr_t bias) {
             static_cast<uintptr_t>(bias + kFeGateFrontEndUpCellElfVa), 1);
         s.scrState = probeReadGuest(bias,
             static_cast<uintptr_t>(s.screenMgr.value + kFeGateState5d0Off), 4);
+        // WHOSE SCREEN MANAGER IS IT, AND WHAT IS IN THE REGISTRY?
+        //
+        // GATE B calls Find("EventMapScreen") on the object at G+0x17f8. If
+        // that object is NOT the MainMenuManager (vtable 0x1edd008), the
+        // registry it searches is a different tree and the gate can never
+        // pass. And the key bytes of the tree's first node say WHICH name
+        // was actually registered.
+        s.scrVptr = probeReadGuest(bias,
+            static_cast<uintptr_t>(s.screenMgr.value), 8);
+        if (s.regRoot.ok && s.regRoot.value != 0) {
+            s.regKey0 = probeReadGuest(bias,
+                static_cast<uintptr_t>(s.regRoot.value + 0x20), 8);
+            s.regKey1 = probeReadGuest(bias,
+                static_cast<uintptr_t>(s.regRoot.value + 0x28), 8);
+        }
     } else {
         const char* why = s.screenMgr.ok ? "null" : s.screenMgr.reason;
         s.regRoot.reason = why;
         s.evInst.reason = why;
         s.scrState.reason = why;
+        s.scrVptr.reason = why;
+        s.regKey0.reason = why;
+        s.regKey1.reason = why;
     }
 
     // The RookieChampionshipManager. The CELL is read directly, because that
@@ -4564,6 +4585,9 @@ FeGateSample sampleFeGate(uintptr_t bias) {
     if (s.frontEndUp.ok) { ++s.readable; }
     if (s.mgrState.ok) { ++s.readable; }
     if (s.scrState.ok) { ++s.readable; }
+    if (s.scrVptr.ok) { ++s.readable; }
+    if (s.regKey0.ok) { ++s.readable; }
+    if (s.regKey1.ok) { ++s.readable; }
     return s;
 }
 
@@ -4613,6 +4637,9 @@ void emitFeGateSample(uint64_t frames, const char* carrier,
     char feUpText[16];
     char mgrStText[24];
     char scrStText[24];
+    char scrVptrText[32];
+    char regKeyText[64];
+    char regKeyText2[64];
     char controlText[16];
     char predText[16];
 
@@ -4635,6 +4662,7 @@ void emitFeGateSample(uint64_t frames, const char* carrier,
         " screenmgr=%s screenmgr_ok=%c screen_find=not-probed"
         " regroot=%s regrootok=%c evinst=%s evinstok=%c feup=%s feupok=%c"
         " mgrst=%s mgrstok=%c scrst=%s scrstok=%c"
+        " scrvptr=%s scrvptrok=%c regkey0=%s regkey0ok=%c regkey1=%s regkey1ok=%c"
         " pred13833cc=%s pred13833cc_src=derived readable=%u/%u ctrl=%s",
         (unsigned long long)frames,
         (unsigned long long)elapsedMs,
@@ -4666,6 +4694,12 @@ void emitFeGateSample(uint64_t frames, const char* carrier,
         s.mgrState.ok ? '1' : '0',
         probeText(s.scrState, scrStText, sizeof(scrStText), false),
         s.scrState.ok ? '1' : '0',
+        probeText(s.scrVptr, scrVptrText, sizeof(scrVptrText), true),
+        s.scrVptr.ok ? '1' : '0',
+        probeText(s.regKey0, regKeyText, sizeof(regKeyText), true),
+        s.regKey0.ok ? '1' : '0',
+        probeText(s.regKey1, regKeyText2, sizeof(regKeyText2), true),
+        s.regKey1.ok ? '1' : '0',
         feGateDerivedPredicate(s, predText, sizeof(predText)),
         s.readable, s.total,
         probeControlVerdict(resolveMainImageLoadBias(), controlText,
