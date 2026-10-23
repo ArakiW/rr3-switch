@@ -282,6 +282,32 @@ foreach ($marker in $markers) {
     }
 }
 
+# THE GUEST LOG MUST BE ACCOUNTED FOR, NOT JUST COUNTED.
+#
+# "guest log 54178341 bytes, 0 lines" is what archive
+# 20261024-040807-eden-touch3 reported, and it was a lie of omission: the
+# 54 MB file could not be COPIED (Eden still held it open), so the archive
+# contained no log at all and every count derived from it was zero. A
+# reader would have concluded "the guest logged nothing for 600 seconds",
+# which is a completely different fact from "the log could not be read".
+#
+# So the copy is verified, and the summary says WHICH state it is in:
+#   archived   the log is in the archive and the counters come from it
+#   missing    the log was not copied; every count below is void
+#   empty      the log was copied and is genuinely empty
+$guestLogArchived = 'missing'
+$guestLogBytes = 0
+$guestLogLines = 0
+$archivedGuestLog = Join-Path $archive (Split-Path $guestLog -Leaf)
+if (Test-Path $archivedGuestLog -PathType Leaf) {
+    $guestLogArchived = 'archived'
+    $guestLogBytes = (Get-Item $archivedGuestLog).Length
+    $guestLogLines = ([regex]::Matches([IO.File]::ReadAllText($archivedGuestLog), "`n")).Count
+    if ($guestLogBytes -eq 0) { $guestLogArchived = 'empty' }
+} else {
+    Write-Host ("warn    : the guest log could NOT be copied into the archive ({0} bytes were on the card). Every count derived from it is void." -f $finalLogBytes)
+}
+
 # The framebuffer captures. They go into the archive under frames/ so that a
 # reader can SEE what the guest drew instead of reading a colour triple.
 # The count is recorded in the summary below, because "the archive has no
@@ -344,8 +370,13 @@ $summary = [ordered]@{
     runSeconds   = $runSeconds
     runTicks     = $cpuSeries.Count
     exitReason   = $exitReason
-    guestLogBytes = $finalLogBytes
+    guestLogBytes = $guestLogBytes
     guestLogLines = 0
+    # WHICH state the log is in: archived / empty / missing. A count taken
+    # from a log that could not be read is void, and the summary has to say
+    # so instead of printing a confident zero.
+    guestLogArchived = $guestLogArchived
+    guestLogOnCardBytes = $finalLogBytes
     edenLogLines  = 0
     # Initialised to a real value so that an archive always SHOWS the number
     # rather than a blank: "0 TrackDesc::load failures" is evidence, and a
@@ -409,9 +440,15 @@ $summary = [ordered]@{
     loadStateLast       = '(none)'
 }
 $probes = [ordered]@{}
-if (Test-Path $guestLog -PathType Leaf) {
-    $guestText = [IO.File]::ReadAllText($guestLog)
-    $summary.guestLogLines = ([regex]::Matches($guestText, "`n")).Count
+# The counters come from the ARCHIVED COPY, not from the live file on the
+# card. The live file can be locked by a running emulator (the copy then
+# fails and the archive has no log at all -- archive
+# 20261024-040807-eden-touch3) and it can still be growing. The archived
+# copy is a verified, stable snapshot, and the summary records whether it
+# exists.
+if ($guestLogArchived -eq 'archived') {
+    $guestText = [IO.File]::ReadAllText($archivedGuestLog)
+    $summary.guestLogLines = $guestLogLines
     # The trailing space on the last two is load-bearing, not decoration:
     # "phase=guest-thread" is a substring of "phase=guest-thread-start", so the
     # bare name would add the two counts together and the creation line -- the
@@ -636,7 +673,8 @@ $runSummaryPath = Join-Path $archive 'run-summary.txt'
     ''
     ('wall clock     {0} s   (requested {1} s, {2} ticks of {3} s)' -f $runSeconds, $Seconds, $cpuSeries.Count, $tickSeconds)
     ('ended because  {0}' -f $exitReason)
-    ('guest log      {0} bytes, {1} lines' -f $finalLogBytes, $summary.guestLogLines)
+    ('guest log      {0} bytes, {1} lines   (archived={2}; on the card at the end: {3} bytes)' -f `
+        $summary.guestLogBytes, $summary.guestLogLines, $summary.guestLogArchived, $summary.guestLogOnCardBytes)
     ('last guest-log ordinal  {0}   ({1} guest-log-any lines)' -f $summary.lastGuestLogOrdinal, $summary.guestLogAnyLines)
     ('frames         {0}' -f $summary.frames)
     ('gfx-stats      {0} lines; frames={1} calls={2} draws={3}' -f `
