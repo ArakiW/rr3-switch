@@ -4145,26 +4145,39 @@ constexpr char kFeGateControlText[] = "EventMapScreen";
 // 'ok' when the control was read back EXACTLY, 'fail' when it was read and
 // did not match (which invalidates every other value on the line), and
 // 'unread' when it could not be read at all.
-const char* probeControlVerdict(uintptr_t bias, char* buffer, size_t capacity) {
-    if (bias == 0) {
+//
+// The COMPARISON with the expectation as an argument, so that the failure
+// path can be EXERCISED rather than only asserted: a control that cannot
+// fail would report "ok" for a probe that is reading garbage. The
+// expected text is a parameter here, and the caller below is the one that
+// knows where the real control lives.
+const char* probeControlVerdictExpect(uintptr_t bias, uintptr_t address,
+                                       const char* expect, size_t expectLen,
+                                       char* buffer, size_t capacity) {
+    if (bias == 0 || expect == nullptr || expectLen == 0) {
         __builtin_snprintf(buffer, capacity, "unread");
         return buffer;
     }
-    const uintptr_t base = static_cast<uintptr_t>(bias + kFeGateControlElfVa);
-    for (size_t index = 0; index < sizeof(kFeGateControlText); ++index) {
-        const ProbeValue byte = probeReadGuest(bias, base + index, 1);
+    for (size_t index = 0; index < expectLen; ++index) {
+        const ProbeValue byte = probeReadGuest(bias, address + index, 1);
         if (!byte.ok) {
             __builtin_snprintf(buffer, capacity, "unread");
             return buffer;
         }
         if (byte.value != static_cast<uint64_t>(
-                             static_cast<uint8_t>(kFeGateControlText[index]))) {
+                             static_cast<uint8_t>(expect[index]))) {
             __builtin_snprintf(buffer, capacity, "fail");
             return buffer;
         }
     }
     __builtin_snprintf(buffer, capacity, "ok");
     return buffer;
+}
+
+const char* probeControlVerdict(uintptr_t bias, char* buffer, size_t capacity) {
+    return probeControlVerdictExpect(
+        bias, static_cast<uintptr_t>(bias + kFeGateControlElfVa),
+        kFeGateControlText, sizeof(kFeGateControlText), buffer, capacity);
 }
 
 // The menu-gate's two reads used to live here: menuGateReadWord() and
@@ -4708,6 +4721,1247 @@ void emitFeGateSample(uint64_t frames, const char* carrier,
                         line, 98, 0);
 }
 
+// ---------------------------------------------------------------------------
+// THE STATE CARRIER: the object the front end's state machine hangs on.
+//
+// CORRECTION, and it is the whole point of this section.
+//
+// WHAT WAS WRONG. This section used to say that 9GuiScreen is a GLOBAL
+// SINGLETON whose pointer lives in the .bss cell 0x1fc6e98, and the probe
+// read its "+0x5d0" from there. That cell holds a cc::Cloudcell, not a
+// screen, so the readings were a networking helper's fields wearing a
+// screen's names. Three independent facts from the file on disk:
+//
+//   1. the cell's object has the vtable at 0x1f63b58 (measured at runtime);
+//   2. that vtable's typeinfo slot (0x1f63b50) has an R_AARCH64_RELATIVE
+//      relocation with addend 0x1f63d58 -- the typeinfo object;
+//   3. that typeinfo's __name slot (0x1f63d60) relocates to 0x601a34, and
+//      0x601a34 holds the string "N2cc9CloudcellE".
+//
+// And the guest's own code agrees: the state setter 0xe3bd64 does
+//
+//   0xe3bdac  adrp x8,#0x1f6d000
+//   0xe3bdb0  ldr  x8,[x8,#0x5d0]   ; GOT 0x1f6d5d0 -> .bss 0x1fc6e98
+//   0xe3bdb4  ldr  x0,[x8]          ; the Cloudcell
+//   0xe3bdb8  ldr  x8,[x0]
+//   0xe3bdbc  ldr  x8,[x8,#0x90]    ; Cloudcell vtable slot 18
+//   0xe3bdc0  blr  x8
+//
+// i.e. the cell is the Cloudcell singleton and the state machine merely
+// NOTIFIES it. The probe now reports it under the name "cloud*" and keeps
+// the reading, because the log is evidence.
+//
+// WHAT IS RIGHT. The manager the front end uses is *(G+0x17f8), and its
+// RTTI is N9FrontEnd215MainMenuManagerE (vtable 0x1edd008, typeinfo
+// 0x1edd140): a MainMenuManager, whose bases are FrontEnd2::Manager,
+// GuiEventListener and cc::IEventListener -- NOT a GuiScreen. So the
+// "+0x5d0" the fe-gate line reads on the manager is the MANAGER's own
+// field and says nothing about the state machine.
+//
+// The state machine belongs to the object the manager OWNS at manager+0x420:
+//
+//   0x14c0238  mov  w0,#0x5e0 ; bl operator_new
+//   0x14c0244  bl  0xe1d374            ; the constructor
+//   0x14c024c  str  x20,[x19,#0x420]   ; -> manager+0x420
+//
+// The constructor installs the vtable at 0x1e78928 (GOT 0x1f72098 holds
+// 0x1e78918 and the ctor adds 0x10), whose typeinfo slot 0x1e78920
+// relocates to 0x1e79f58, whose __name is "N9FrontEnd219MainMenuCheatScreenE".
+// That vtable is the ONLY one in the image that carries the state machine:
+// slot 21 is 0xe3b5e8 (reads [this+0x5d0] and, at 3, calls the fill) and
+// slot 22 is 0xe3bd64 (the 1 -> 2 -> 3 setter). The probe therefore reads
+// the state from *(manager+0x420) and says which class that object is, BY
+// NAME, through the image's own RTTI.
+//
+// THE STATE FIELD, +0x5d0, and the whole state machine (disassembled):
+//
+//   0xe1d58c  str wzr,[x19,#0x5d0]    ; the constructor 0xe1d374 sets 0
+//   0xe3bd64  (a vtable slot)         ; 1 -> 2 and 2 -> 3, and nothing else
+//   0xe3b184  (a vtable slot)         ; 0 -> 1
+//   0xe3b618  ldr w8,[x0,#0x5d0] ; cmp w8,#3 ; b.ne
+//   0xe3b628  bl 0xe27304              ; so ONLY state 3 reaches the fill
+//   0xe27828  bl 0xe1d8bc              ; ... which fills the action table
+//   0xe278fc  mov w8,#4
+//   0xe27910  str w8,[x19,#0x5d0]      ; and only then does the state become 4
+//
+// The fill (0xe27828) and the state-4 store (0xe27910) are in the SAME
+// function and write the SAME object (x19), and the fill comes FIRST. So
+// "state == 4" is exactly "the action table was filled", and the only way
+// to reach state 3 is to run the 1->2->3 setter twice.
+//
+// THE ACTION TABLE. 317 entries of {fn, ctx}, 0x10 bytes each, at 0x1e78b70
+// (.data.rel.ro). Every one of the 317 `fn` words carries an
+// R_AARCH64_RELATIVE relocation and not one `ctx` word carries any, so this
+// is a 16-byte-stride {code pointer, zero} table and NOT a vtable: a vtable
+// would relocate every 8-byte word. The three entries this probe reports
+// are the front end's own tail-callers:
+//
+//   entry  0  fn = 0xa685c4    b 0xa679a0        (the front-end entry)
+//   entry 17  fn = 0xa67468    b 0xa679a0
+//   entry 45  fn = 0xa67fcc    strb 1,[GOT 0x1f6e580 -> 0x1f9d461]
+//                                b 0xa679a0
+//
+// The "front end was entered" byte at 0x1f9d461 is reached only through
+// GOT 0x1f6e580 (the only relocation in the image with that addend), and
+// 0xa67fcc writes through it immediately before it tail-calls the front-end
+// entry. So entry 45 is the action that enters the front end.
+//
+// THE EVENT MAP SCREEN IS NOT THE CARRIER EITHER. The manager's embedded
+// EventMapScreen lives at manager+0x2850, and the word stored there is the
+// object's V PTR -- the object itself is the address, not the value. The
+// proof is the register call:
+//
+//   0x14bfcd4  mov  w8,#0x2850
+//   0x14bfcdc  add  x1,x19,x8        ; x1 = manager+0x2850 (the INSTANCE)
+//   0x14bfce0  add  x2,x2,#0xc66     ; "EventMapScreen"
+//   0x14bfce8  bl   0x14a6158        ; Register(name, instance)
+//
+// and the value at manager+0x2850 is 0x1e6c558, which is a vtable ADDRESS
+// POINT: its typeinfo slot at 0x1e6c550 relocates to 0x1e6c850, whose
+// __name is "N9FrontEnd214EventMapScreenE". EventMapScreen derives from
+// 9GuiScreen (single base, at offset 0), so it IS a screen -- but its
+// vtable does not carry the state machine, so it is not the carrier.
+//
+// THE TABLE AT +0x470 IS NOT A {fn,ctx} ARRAY. This is where the brief and
+// the disassembly disagree, and the disassembly wins:
+//
+//   0xe1d9a0  ldr x23,[x19,#0x470]     ; the vector's END pointer
+//   0xe1d9a4  ldr x8,[x19,#0x478]      ; the vector's CAPACITY pointer
+//   0xe1d9ac  cmp x23,x8 ; b.hs       ; end >= cap -> grow
+//   0xe1da94  str x9,[x19,#0x470]      ; end = end + 0x80, one element
+//
+// so +0x470 is an END pointer into a vector of 0x80-BYTE elements (the
+// action index is at element+0x60 and the localized name at element+0x68),
+// not a pointer to a 0x10-byte-stride {fn,ctx} array. The probe therefore
+// reports the runtime pointer, a runtime element count DERIVED from the
+// pointers, and the count of non-zero fn words in the IMAGE table -- and it
+// labels which is which, because "the count" of two different tables are
+// two different claims.
+//
+// THE NAME TABLE. 317 entries of 0x18 bytes at 0x1f9d6d8 (.bss): the
+// localized action names. The entry is NOT a libc++ std::string; it is the
+// game's own {size byte, inline characters, heap pointer}. From the
+// initializer at 0xe19634 (entry 0 is "Debug Race Selector: ", 21
+// characters, size byte 0x2a = 21 << 1) and the destructor at 0xe19578
+// (`tbz w9,#0` skips the entry, otherwise `ldur x0,[x8,#-8]` frees the
+// pointer at entry+0x10):
+//
+//   size byte, low bit CLEAR -> SHORT: length = byte >> 1, characters
+//                               inline at entry+1
+//   size byte, low bit SET   -> LONG : length = u64 at entry+8, characters
+//                               behind the heap pointer at entry+0x10
+//
+// The brief had the two branches the other way round. The destructor is
+// unambiguous: the low bit SET is the one that frees a pointer at +0x10.
+// ---------------------------------------------------------------------------
+
+// Every address below is an ELF VADDR. The runtime address is always
+// bias + vaddr, and bias comes from resolveMainImageLoadBias(), never from
+// a constant.
+constexpr uint64_t kGuiScreenCellElfVa   = 0x1FC6E98ULL;
+constexpr uint64_t kGuiScreenGotElfVa    = 0x1F6D5D0ULL;
+constexpr uint64_t kGuiScreenState5d0Off = 0x5D0ULL;
+constexpr uint64_t kGuiScreenFlag4c1Off  = 0x4C1ULL;
+constexpr uint64_t kGuiScreenVecEndOff   = 0x470ULL;
+constexpr uint64_t kGuiScreenVecCapOff   = 0x478ULL;
+constexpr uint64_t kGuiScreenVecBeginOff = 0x480ULL;
+// The runtime vector's element: 0x80 bytes, with the action index at +0x60
+// and the localized name at +0x68 (0xe1da78 and 0xe1da88).
+constexpr uint64_t kGuiScreenElemSize   = 0x80ULL;
+constexpr uint64_t kGuiScreenElemFnOff  = 0x10ULL;
+constexpr uint64_t kGuiScreenElemIdxOff = 0x60ULL;
+constexpr uint64_t kGuiScreenActionTabElfVa = 0x1E78B70ULL;
+constexpr uint64_t kGuiScreenActionStride  = 0x10ULL;
+constexpr uint64_t kGuiScreenActionCount   = 317ULL;
+constexpr uint64_t kGuiScreenNameTabElfVa   = 0x1F9D6D8ULL;
+constexpr uint64_t kGuiScreenNameStride     = 0x18ULL;
+constexpr uint64_t kGuiScreenFeUpCellElfVa  = 0x1F9D461ULL;
+constexpr uint64_t kGuiScreenThunk0ElfVa    = 0xA685C4ULL;
+constexpr uint64_t kGuiScreenThunk17ElfVa   = 0xA67468ULL;
+constexpr uint64_t kGuiScreenThunk45ElfVa   = 0xA67FCCULL;
+// THE STATE CARRIER: the object the manager OWNS at manager+0x420.
+//
+//   0x14c0238  mov  w0,#0x5e0 ; bl operator_new
+//   0x14c0240  mov  x20,x0
+//   0x14c0244  bl  0xe1d374            ; the constructor
+//   0x14c024c  str  x20,[x19,#0x420]   ; -> manager+0x420
+//
+// The constructor installs the vtable at 0x1e78928 (GOT 0x1f72098 holds
+// 0x1e78918 and the ctor adds 0x10), and THAT vtable is the only one in the
+// image that carries the state machine: slot 21 is 0xe3b5e8 (reads
+// [this+0x5d0] and, at 3, calls the fill) and slot 22 is 0xe3bd64 (the
+// 1 -> 2 -> 3 setter).
+constexpr uint64_t kGuiScreenStateObjOff    = 0x420ULL;
+constexpr uint64_t kGuiScreenStateVtabElfVa = 0x1E78928ULL;
+// THE RTTI CONTROL: a vtable whose class name is known from the FILE, so
+// the resolver can be shown to work (and to fail) at runtime. The
+// EventMapScreen vtable at 0x1e6c558 has typeinfo 0x1e6c850, whose __name
+// slot relocates to 0x4d2d9a, which holds the string below.
+constexpr uint64_t kGuiScreenRttiCtlVtabElfVa = 0x1E6C558ULL;
+constexpr char kGuiScreenRttiCtlClass[] = "N9FrontEnd214EventMapScreenE";
+// THE LONGEST NAME THE PROBE WILL PRINT. The name table's long form holds a
+// u64 length, and the length is what the escape expansion multiplies by
+// four, so the buffer is sized for the worst case and the length is capped
+// to keep the line bounded.
+constexpr unsigned kGuiScreenNameMaxChars = 63U;
+constexpr unsigned kGuiScreenNameBufChars  = 256U;
+// THE TWO CANDIDATE VTABLE ADDRESS POINTS, both reported, neither assumed.
+//
+//   0x1e78920: the typeinfo slot of the group whose address point is
+//              0x1e78928.
+//   0x1e78928: what the constructor 0xe1d374 actually installs (GOT
+//              0x1f72098 holds 0x1e78918 and the ctor adds 0x10). Its
+//              typeinfo slot (0x1e78920) relocates to 0x1e79f58, whose
+//              __name is "N9FrontEnd219MainMenuCheatScreenE" -- so it is
+//              NOT a 9GuiScreen vtable, and slot 21 of it (0xe3b5e8) and
+//              slot 22 of it (0xe3bd64) are the state machine.
+//
+// The line reports the CLOUD object's vtable pointer's ELF vaddr AND which
+// of the two it equals, so a reader can tell "the vtable is somewhere else"
+// apart from "the object is not a screen at all". The answer for the
+// cc::Cloudcell is the third one: neither.
+constexpr uint64_t kGuiScreenVtabSlotElfVa = 0x1E78920ULL;
+constexpr uint64_t kGuiScreenVtabCtorElfVa = 0x1E78928ULL;
+// The inline characters of a SHORT name live in entry+1..entry+0x15, with
+// the NUL at entry+0x16, so 21 is the most a short name can be.
+constexpr unsigned kGuiScreenShortInlineMax = 21U;
+// The image table scan is a 5 KB walk (317 x 16 bytes). It is refreshed
+// every 32nd sample and the line says how old the number is, so it can
+// never be mistaken for a per-sample reading.
+constexpr unsigned kGuiScreenScanEvery = 32U;
+
+// ---------------------------------------------------------------------------
+// THE RTTI RESOLVER: a vptr -> the class name, read out of the guest image.
+//
+// A vptr points at a vtable ADDRESS POINT. The typeinfo pointer sits at
+// (vptr - 8), the typeinfo's __name pointer sits at (typeinfo + 8) for every
+// Itanium ABI flavour (__class_type_info, __si_class_type_info and
+// __vmi_class_type_info all put __name second), and the name itself is a
+// NUL-terminated mangled string in .rodata.
+//
+// The pointers inside the image are RELOCATED when the guest is loaded, so at
+// runtime a typeinfo slot holds loadBias + <vaddr>. An unrelocated image
+// would hold the bare vaddr instead, and BOTH forms are accepted: the
+// second one is not a guess, it is the same reasoning probeResolveCell()
+// already uses for the .bss cells, and a pointer that is neither form is
+// refused rather than dereferenced.
+//
+// The image's last addressable byte is .bss + 0x32b79 = 0x1fc7a99, so a
+// pointer that lands inside [0, 0x2000000) and outside the loaded window is
+// an unrelocated vaddr; anything else is refused.
+// ---------------------------------------------------------------------------
+constexpr uint64_t kProbeImageVaddrMax = 0x2000000ULL;
+
+bool probePointerToElfVa(uintptr_t bias, uint64_t value, uint64_t* outVa) {
+    if (bias == 0 || value == 0 || outVa == nullptr) {
+        return false;
+    }
+    const uint64_t base = static_cast<uint64_t>(bias);
+    if (value >= base && value - base < kProbeImageVaddrMax) {
+        *outVa = value - base;
+        return true;
+    }
+    if (value < kProbeImageVaddrMax) {
+        *outVa = value;
+        return true;
+    }
+    return false;
+}
+
+// The class name of the object whose vptr is `vptr`, or the reason there is
+// none. `why` ALWAYS gets a string, so the log can say what went wrong
+// instead of printing an empty name that looks like a real answer.
+bool probeRttiClassName(uintptr_t bias, uint64_t vptr, char* out, size_t capacity,
+                         const char** why) {
+    if (out != nullptr && capacity > 0) {
+        out[0] = '\0';
+    }
+    if (why != nullptr) {
+        *why = "none";
+    }
+    if (bias == 0) {
+        if (why != nullptr) { *why = "no-bias"; }
+        return false;
+    }
+    if (vptr == 0) {
+        if (why != nullptr) { *why = "null-vptr"; }
+        return false;
+    }
+    uint64_t vptrVa = 0;
+    if (!probePointerToElfVa(bias, vptr, &vptrVa)) {
+        if (why != nullptr) { *why = "vptr-outside"; }
+        return false;
+    }
+    if (vptrVa < 8ULL) {
+        if (why != nullptr) { *why = "vptr-low"; }
+        return false;
+    }
+    const ProbeValue tiSlot =
+        probeReadGuest(bias, static_cast<uintptr_t>(bias + vptrVa - 8ULL), 8);
+    if (!tiSlot.ok) {
+        if (why != nullptr) { *why = tiSlot.reason; }
+        return false;
+    }
+    uint64_t tiVa = 0;
+    if (!probePointerToElfVa(bias, tiSlot.value, &tiVa)) {
+        if (why != nullptr) { *why = "typeinfo-outside"; }
+        return false;
+    }
+    const ProbeValue nameSlot =
+        probeReadGuest(bias, static_cast<uintptr_t>(bias + tiVa + 8ULL), 8);
+    if (!nameSlot.ok) {
+        if (why != nullptr) { *why = nameSlot.reason; }
+        return false;
+    }
+    uint64_t nameVa = 0;
+    if (!probePointerToElfVa(bias, nameSlot.value, &nameVa)) {
+        if (why != nullptr) { *why = "name-outside"; }
+        return false;
+    }
+    size_t written = 0;
+    for (unsigned index = 0; index < 160U; ++index) {
+        const ProbeValue ch =
+            probeReadGuest(bias, static_cast<uintptr_t>(bias + nameVa + index), 1);
+        if (!ch.ok) {
+            if (why != nullptr) { *why = ch.reason; }
+            return false;
+        }
+        const uint8_t c = static_cast<uint8_t>(ch.value);
+        if (c == 0) {
+            if (out != nullptr && capacity > 0) {
+                out[written < capacity ? written : capacity - 1U] = '\0';
+            }
+            if (written == 0) {
+                if (why != nullptr) { *why = "empty"; }
+                return false;
+            }
+            return true;
+        }
+        // A MANGLED NAME IS PRINTABLE ASCII. Anything else means the chain
+        // resolved to something that is not a typeinfo name, and saying so
+        // is better than printing bytes that nobody can read.
+        if (c < 0x20u || c >= 0x7Fu) {
+            if (why != nullptr) { *why = "not-printable"; }
+            return false;
+        }
+        if (out != nullptr && written + 1U < capacity) {
+            out[written] = static_cast<char>(c);
+        }
+        ++written;
+    }
+    if (why != nullptr) { *why = "unterminated"; }
+    return false;
+}
+
+// THE RTTI RESOLVER'S POSITIVE CONTROL.
+//
+// A resolver that cannot fail is not a resolver. The image contains a
+// vtable whose class name is known from the FILE: the EventMapScreen
+// vtable at 0x1e6c558, whose typeinfo is 0x1e6c850 and whose name string
+// is "N9FrontEnd214EventMapScreenE". Running the resolver on that address
+// proves, AT RUNTIME, that (a) the RTTI layout assumption holds, (b) the
+// loader applied the RELATIVE relocations the chain depends on, and (c) the
+// string is where the file says it is.
+//
+// It CAN fail: if the loader did not relocate, the chain ends in
+// "typeinfo-outside" and the control says "fail" -- which invalidates every
+// class name on the line, exactly like the read control does.
+const char* probeRttiSelfTest(uintptr_t bias, char* buffer, size_t capacity) {
+    if (bias == 0) {
+        __builtin_snprintf(buffer, capacity, "unread");
+        return buffer;
+    }
+    static uintptr_t s_bias = 0;
+    static char s_verdict[16] = "unread";
+    if (s_bias != bias) {
+        s_bias = bias;
+        char name[128];
+        const char* why = "none";
+        if (probeRttiClassName(bias,
+                               static_cast<uint64_t>(bias +
+                                   kGuiScreenRttiCtlVtabElfVa),
+                               name, sizeof(name), &why)) {
+            __builtin_snprintf(s_verdict, sizeof(s_verdict), "%s",
+                std::strcmp(name, kGuiScreenRttiCtlClass) == 0 ? "ok"
+                                                              : "mismatch");
+        } else {
+            __builtin_snprintf(s_verdict, sizeof(s_verdict), "fail");
+        }
+    }
+    __builtin_snprintf(buffer, capacity, "%s", s_verdict);
+    return buffer;
+}
+
+struct GuiScreenSample {
+    // ---- THE CLOUDCELL: the object the OLD probe called "guiptr". It is
+    // a cc::Cloudcell, and it is kept here (RENAMED) because the log is
+    // evidence: the line has to show WHY the old reading was wrong.
+    ProbeValue cloudGotSlot{};
+    ProbeValue cloudGotCell{};
+    ProbeValue cloudPtr{};
+    ProbeValue cloudVptr{};
+    ProbeValue cloudState{};
+    ProbeValue cloud4c1{};
+    ProbeValue cloudVecEnd{};
+    ProbeValue cloudVecCap{};
+    ProbeValue cloudVecBegin{};
+    char cloudClass[128]{};
+    const char* cloudClassSrc{"none"};
+    // ---- THE MANAGER: *(G+0x17f8), a FrontEnd2::MainMenuManager.
+    ProbeValue gameGotSlot{};
+    ProbeValue gameCell{};
+    ProbeValue game{};
+    ProbeValue mgr{};
+    // ---- THE EVENT MAP SCREEN: the manager's embedded member at +0x2850.
+    // The word stored there is its V PTR, not the object itself.
+    ProbeValue evVptr{};
+    char evClass[128]{};
+    const char* evClassSrc{"none"};
+    // ---- THE STATE CARRIER: the object the manager owns at +0x420.
+    ProbeValue stateObj{};
+    ProbeValue stateVptr{};
+    char stateClass[128]{};
+    const char* stateClassSrc{"none"};
+    ProbeValue state5d0{};
+    ProbeValue state4c1{};
+    ProbeValue stateVecEnd{};
+    ProbeValue stateVecCap{};
+    ProbeValue stateVecBegin{};
+    unsigned stateRtn{0};
+    const char* stateRtnSrc{"n/a"};
+    bool stateRtnLastMatch{false};
+    bool stateVptrIsCarrier{false};
+    // ---- THE IMAGE ACTION TABLE (317 entries of 0x10 at 0x1e78b70).
+    ProbeValue act0{};
+    ProbeValue act17{};
+    ProbeValue act45{};
+    unsigned actNonZero{0};
+    unsigned actAge{0};
+    // ---- THE NAME OF ACTION 45, out of the runtime name table.
+    ProbeValue nameByte{};
+    ProbeValue nameLen{};
+    bool nameOk{false};
+    unsigned nameLenValue{0};
+    char name[kGuiScreenNameBufChars]{};
+    const char* nameSrc{"none"};
+    const char* nameLenSrc{"none"};
+    // ---- MISC.
+    ProbeValue feup{};
+    bool gotMatch{false};
+    bool vptrIsSlot{false};
+    bool vptrIsCtor{false};
+    const char* gotForm{"none"};
+    unsigned readable{0};
+    unsigned total{26};
+};
+
+// THE NAME, printable-safe and bounded.
+//
+// A name that could not be read is NOT an empty name: nameOk carries the
+// difference, and `src` carries the reason. Every character is a separate
+// checked read, because a heap string can be unmapped while the guest
+// rewrites it.
+void guiScreenReadName(uintptr_t bias, uintptr_t entry, char* out,
+                        size_t outCapacity, GuiScreenSample* s) {
+    s->nameOk = false;
+    s->nameLenValue = 0;
+    s->nameSrc = "none";
+    s->nameLenSrc = "none";
+    out[0] = '\0';
+    const ProbeValue flag = probeReadGuest(bias, entry, 1);
+    if (!flag.ok) {
+        s->nameSrc = flag.reason;
+        return;
+    }
+    const uint8_t byte = static_cast<uint8_t>(flag.value);
+    uintptr_t chars = 0;
+    unsigned length = 0;
+    if ((byte & 1u) != 0u) {
+        // LONG: the length is a u64 at entry+8 and the characters are
+        // behind the heap pointer at entry+0x10.
+        s->nameSrc = "long";
+        const ProbeValue len = probeReadGuest(bias, entry + 8, 8);
+        const ProbeValue ptr = probeReadGuest(bias, entry + 0x10, 8);
+        if (!len.ok) {
+            s->nameSrc = len.reason;
+            return;
+        }
+        if (!ptr.ok) {
+            s->nameSrc = ptr.reason;
+            return;
+        }
+        if (ptr.value == 0) {
+            s->nameSrc = "null";
+            return;
+        }
+        s->nameLen = len;
+        s->nameLenSrc = "read";
+        s->nameLenValue = len.value > kGuiScreenNameMaxChars
+                              ? kGuiScreenNameMaxChars
+                              : static_cast<unsigned>(len.value);
+        if (len.value > kGuiScreenNameMaxChars) {
+            // The length is reported CAPPED, and it says so, because a
+            // truncated name that does not say it is truncated is a lie.
+            s->nameLenSrc = "capped";
+        }
+        chars = static_cast<uintptr_t>(ptr.value);
+        length = s->nameLenValue;
+    } else {
+        // SHORT: the length is the size byte shifted right by one, and the
+        // characters are INLINE at entry+1. The length is DERIVED from the
+        // byte that was read, which is why nameLenSrc says so.
+        s->nameSrc = "short";
+        length = static_cast<unsigned>(byte >> 1);
+        if (length > kGuiScreenShortInlineMax) {
+            s->nameSrc = "badlen";
+            return;
+        }
+        s->nameLenSrc = "inline-derived";
+        s->nameLenValue = length;
+        chars = entry + 1;
+    }
+    // The READ loop covers the string's own length, not the output buffer:
+    // an escaped byte takes four output characters, so capping the READ by
+    // the buffer size would silently cut the tail off the name.
+    unsigned written = 0;
+    for (unsigned index = 0; index < length; ++index) {
+        const ProbeValue ch = probeReadGuest(bias, chars + index, 1);
+        if (!ch.ok) {
+            out[written] = '\0';
+            s->nameSrc = ch.reason;
+            return;
+        }
+        const uint8_t c = static_cast<uint8_t>(ch.value);
+        if (c == 0) {
+            break;
+        }
+        if (c >= 0x20u && c < 0x7Fu) {
+            if (written + 1U < outCapacity) {
+                out[written++] = static_cast<char>(c);
+            }
+        } else {
+            // ESCAPE, do not swallow. A byte outside 0x20..0x7e is printed
+            // as \xNN, so the log stays readable AND the byte is still
+            // visible. Printing '.' instead would have thrown the
+            // information away, and a name is exactly the kind of thing
+            // that has to survive into the log intact.
+            if (written + 4U < outCapacity) {
+                out[written++] = '\\';
+                out[written++] = 'x';
+                out[written++] = "0123456789abcdef"[(c >> 4) & 0x0Fu];
+                out[written++] = "0123456789abcdef"[c & 0x0Fu];
+            }
+        }
+    }
+    out[written] = '\0';
+    s->nameOk = true;
+}
+
+// The same reader, for a caller that does not want a sample object. The
+// action-name dump needs one name at a time and keeps its own bookkeeping,
+// and duplicating the long/short rules here would be a second copy of the
+// one thing that must not drift.
+bool guiScreenReadNameAt(uintptr_t bias, uintptr_t entry, char* out,
+                         size_t outCapacity, unsigned* outLength,
+                         const char** outSrc) {
+    GuiScreenSample tmp{};
+    guiScreenReadName(bias, entry, out, outCapacity, &tmp);
+    if (outLength != nullptr) {
+        *outLength = tmp.nameLenValue;
+    }
+    if (outSrc != nullptr) {
+        *outSrc = tmp.nameSrc;
+    }
+    return tmp.nameOk;
+}
+
+// ONE READING OF THE CHAIN. Every field carries its own "was it
+// readable" flag, so a refused read is reported as UNKNOWN and never as a
+// value: "the state is 0" and "the state could not be read" are different
+// observations and this line keeps them apart.
+//
+// THE CHAIN, and it is the chain the guest itself walks:
+//
+//   .bss 0x1fc6e98  -> the cc::Cloudcell           (the OLD "guiptr")
+//   G               -> the game global
+//   G+0x17f8        -> the FrontEnd2::MainMenuManager
+//   manager+0x2850  -> the EventMapScreen's V PTR
+//   manager+0x420   -> the state carrier's POINTER
+GuiScreenSample sampleGuiScreen(uintptr_t bias) {
+    GuiScreenSample s{};
+    if (bias == 0) {
+        // No image base. Every address below would be a bare ELF vaddr, and
+        // reading one is how a probe turns a measurement into a crash, so
+        // the line says WHY there is nothing instead of printing zeros.
+        s.cloudGotSlot.reason = "no-bias";
+        s.cloudGotCell.reason = "no-bias";
+        s.cloudPtr.reason = "no-bias";
+        s.cloudVptr.reason = "no-bias";
+        s.cloudState.reason = "no-bias";
+        s.cloud4c1.reason = "no-bias";
+        s.cloudVecEnd.reason = "no-bias";
+        s.cloudVecCap.reason = "no-bias";
+        s.cloudVecBegin.reason = "no-bias";
+        s.cloudClassSrc = "no-bias";
+        s.gameGotSlot.reason = "no-bias";
+        s.gameCell.reason = "no-bias";
+        s.game.reason = "no-bias";
+        s.mgr.reason = "no-bias";
+        s.evVptr.reason = "no-bias";
+        s.evClassSrc = "no-bias";
+        s.stateObj.reason = "no-bias";
+        s.stateVptr.reason = "no-bias";
+        s.stateClassSrc = "no-bias";
+        s.state5d0.reason = "no-bias";
+        s.state4c1.reason = "no-bias";
+        s.stateVecEnd.reason = "no-bias";
+        s.stateVecCap.reason = "no-bias";
+        s.stateVecBegin.reason = "no-bias";
+        s.stateRtnSrc = "no-bias";
+        s.feup.reason = "no-bias";
+        s.act0.reason = "no-bias";
+        s.act17.reason = "no-bias";
+        s.act45.reason = "no-bias";
+        s.nameByte.reason = "no-bias";
+        s.nameLen.reason = "no-bias";
+        s.nameSrc = "no-bias";
+        s.nameLenSrc = "no-bias";
+        return s;
+    }
+    // THE SINGLETON, through both routes the guest itself has, so the two
+    // can be checked against each other instead of one being taken on
+    // faith.
+    // ---- THE CLOUDCELL, through both routes the guest itself has, so the
+    // two can be checked against each other instead of one being taken on
+    // faith. This is the object the OLD probe called the GuiScreen.
+    s.cloudGotSlot = probeReadGuest(bias,
+        static_cast<uintptr_t>(bias + kGuiScreenGotElfVa), 8);
+    const ProbeCell gotCell = probeResolveCell(bias, s.cloudGotSlot.value,
+                                                kGuiScreenCellElfVa);
+    s.gotForm = gotCell.form;
+    s.cloudGotCell = probeReadGuest(bias, gotCell.address, 8);
+    s.cloudPtr = probeReadGuest(bias,
+        static_cast<uintptr_t>(bias + kGuiScreenCellElfVa), 8);
+    s.gotMatch = s.cloudPtr.ok && s.cloudGotCell.ok &&
+                 s.cloudPtr.value == s.cloudGotCell.value;
+
+    const uint64_t cloud = s.cloudPtr.ok ? s.cloudPtr.value : 0;
+    if (s.cloudPtr.ok && cloud != 0) {
+        s.cloudVptr = probeReadGuest(bias, static_cast<uintptr_t>(cloud), 8);
+        s.cloudState = probeReadGuest(bias,
+            static_cast<uintptr_t>(cloud + kGuiScreenState5d0Off), 4);
+        s.cloud4c1 = probeReadGuest(bias,
+            static_cast<uintptr_t>(cloud + kGuiScreenFlag4c1Off), 1);
+        s.cloudVecEnd = probeReadGuest(bias,
+            static_cast<uintptr_t>(cloud + kGuiScreenVecEndOff), 8);
+        s.cloudVecCap = probeReadGuest(bias,
+            static_cast<uintptr_t>(cloud + kGuiScreenVecCapOff), 8);
+        s.cloudVecBegin = probeReadGuest(bias,
+            static_cast<uintptr_t>(cloud + kGuiScreenVecBeginOff), 8);
+        // The class name, so the log says WHY this object was rejected
+        // instead of leaving the reader to guess.
+        probeRttiClassName(bias, s.cloudVptr.ok ? s.cloudVptr.value : 0,
+                           s.cloudClass, sizeof(s.cloudClass),
+                           &s.cloudClassSrc);
+    } else {
+        // The dependent fields report WHY they have no value: the reason
+        // the pointer itself could not be read, or "null" when it was read
+        // and was zero.
+        const char* why = s.cloudPtr.ok ? "null" : s.cloudPtr.reason;
+        s.cloudVptr.reason = why;
+        s.cloudState.reason = why;
+        s.cloud4c1.reason = why;
+        s.cloudVecEnd.reason = why;
+        s.cloudVecCap.reason = why;
+        s.cloudVecBegin.reason = why;
+        s.cloudClassSrc = why;
+    }
+    if (s.cloudVptr.ok) {
+        const uint64_t wantSlot =
+            static_cast<uint64_t>(bias) + kGuiScreenVtabSlotElfVa;
+        const uint64_t wantCtor =
+            static_cast<uint64_t>(bias) + kGuiScreenVtabCtorElfVa;
+        s.vptrIsSlot = s.cloudVptr.value == wantSlot;
+        s.vptrIsCtor = s.cloudVptr.value == wantCtor;
+    }
+    // ---- THE MANAGER: G, then *(G+0x17f8). The front-end entry walks
+    // exactly this chain (0xa679ac / 0xa679b4 / 0xa679dc).
+    s.gameGotSlot = probeReadGuest(bias,
+        static_cast<uintptr_t>(bias + kFeGateGameGotElfVa), 8);
+    const ProbeCell gameCell = probeResolveCell(bias, s.gameGotSlot.value,
+                                                 kFeGateGameCellElfVa);
+    s.gameCell = probeReadGuest(bias, gameCell.address, 8);
+    s.game = s.gameCell;
+    if (s.game.ok && s.game.value != 0) {
+        s.mgr = probeReadGuest(bias,
+            static_cast<uintptr_t>(s.game.value + kFeGateScreenMgrOff), 8);
+    } else {
+        s.mgr.reason = s.game.ok ? "null" : s.game.reason;
+    }
+    // ---- THE EVENT MAP SCREEN (the manager's embedded member) and THE
+    // STATE CARRIER (the object the manager owns).
+    if (s.mgr.ok && s.mgr.value != 0) {
+        s.evVptr = probeReadGuest(bias,
+            static_cast<uintptr_t>(s.mgr.value + kFeGateEventMapInstOff), 8);
+        s.stateObj = probeReadGuest(bias,
+            static_cast<uintptr_t>(s.mgr.value + kGuiScreenStateObjOff), 8);
+    } else {
+        const char* why = s.mgr.ok ? "null" : s.mgr.reason;
+        s.evVptr.reason = why;
+        s.stateObj.reason = why;
+    }
+    if (s.evVptr.ok) {
+        probeRttiClassName(bias, s.evVptr.value, s.evClass, sizeof(s.evClass),
+                           &s.evClassSrc);
+    } else {
+        s.evClassSrc = s.evVptr.reason;
+    }
+    // ---- THE STATE CARRIER's own fields: +0x5d0 is the lifecycle state
+    // (0 -> 1 -> 2 -> 3 -> 4), +0x4c1 is a precondition byte and +0x470 is
+    // the END pointer of the vector the action names live in.
+    if (s.stateObj.ok && s.stateObj.value != 0) {
+        const uint64_t state = s.stateObj.value;
+        s.stateVptr = probeReadGuest(bias, static_cast<uintptr_t>(state), 8);
+        s.state5d0 = probeReadGuest(bias,
+            static_cast<uintptr_t>(state + kGuiScreenState5d0Off), 4);
+        s.state4c1 = probeReadGuest(bias,
+            static_cast<uintptr_t>(state + kGuiScreenFlag4c1Off), 1);
+        s.stateVecEnd = probeReadGuest(bias,
+            static_cast<uintptr_t>(state + kGuiScreenVecEndOff), 8);
+        s.stateVecCap = probeReadGuest(bias,
+            static_cast<uintptr_t>(state + kGuiScreenVecCapOff), 8);
+        s.stateVecBegin = probeReadGuest(bias,
+            static_cast<uintptr_t>(state + kGuiScreenVecBeginOff), 8);
+        probeRttiClassName(bias, s.stateVptr.ok ? s.stateVptr.value : 0,
+                           s.stateClass, sizeof(s.stateClass),
+                           &s.stateClassSrc);
+        s.stateVptrIsCarrier =
+            s.stateVptr.ok &&
+            s.stateVptr.value ==
+                static_cast<uint64_t>(bias) + kGuiScreenStateVtabElfVa;
+    } else {
+        const char* why = s.stateObj.ok ? "null" : s.stateObj.reason;
+        s.stateVptr.reason = why;
+        s.state5d0.reason = why;
+        s.state4c1.reason = why;
+        s.stateVecEnd.reason = why;
+        s.stateVecCap.reason = why;
+        s.stateVecBegin.reason = why;
+        s.stateClassSrc = why;
+    }
+    // THE "FRONT END WAS ENTERED" BYTE. The same cell the fe-gate line
+    // reads, read here too so this line stands on its own.
+    s.feup = probeReadGuest(bias,
+        static_cast<uintptr_t>(bias + kGuiScreenFeUpCellElfVa), 1);
+    // THE IMAGE ACTION TABLE, entries 0, 17 and 45. These are the front
+    // end's own tail-callers, so comparing them with the expected thunks
+    // is a check on the IMAGE MAPPING and the relocations, not a guess.
+    s.act45 = probeReadGuest(bias, static_cast<uintptr_t>(
+        bias + kGuiScreenActionTabElfVa + 45ULL * kGuiScreenActionStride), 8);
+    s.act17 = probeReadGuest(bias, static_cast<uintptr_t>(
+        bias + kGuiScreenActionTabElfVa + 17ULL * kGuiScreenActionStride), 8);
+    s.act0 = probeReadGuest(bias, static_cast<uintptr_t>(
+        bias + kGuiScreenActionTabElfVa), 8);
+
+    // THE RUNTIME VECTOR: the count is DERIVED from the pointers, not
+    // scanned. The fill advances the end pointer by exactly one 0x80-byte
+    // element per action (0xe1da94), so the count is (end - begin) / 0x80,
+    // and it is reported only when that division is exact and lands in
+    // range. Walking 317 heap elements instead would cost a page query
+    // per element, and this probe runs 13 times a second.
+    if (s.stateVecEnd.ok && s.stateVecBegin.ok && s.stateVecEnd.value != 0 &&
+        s.stateVecBegin.value != 0) {
+        if (s.stateVecEnd.value > s.stateVecBegin.value) {
+            const uint64_t span = s.stateVecEnd.value - s.stateVecBegin.value;
+            if (span % kGuiScreenElemSize != 0ULL) {
+                s.stateRtnSrc = "noalign";
+            } else {
+                const uint64_t count = span / kGuiScreenElemSize;
+                if (count < 1ULL || count > kGuiScreenActionCount) {
+                    s.stateRtnSrc = "range";
+                } else {
+                    s.stateRtn = static_cast<unsigned>(count);
+                    s.stateRtnSrc = "derived";
+                    // CROSS-CHECK the LAST element: its index field must
+                    // be count-1 and its fn must be the image table's entry
+                    // count-1. If that holds, the 0x80-byte layout is
+                    // confirmed at runtime and not just in the disassembly.
+                    const uintptr_t last =
+                        static_cast<uintptr_t>(s.stateVecEnd.value) -
+                        kGuiScreenElemSize;
+                    const ProbeValue idx = probeReadGuest(bias,
+                        last + kGuiScreenElemIdxOff, 4);
+                    const ProbeValue fn = probeReadGuest(bias,
+                        last + kGuiScreenElemFnOff, 8);
+                    const ProbeValue want = probeReadGuest(bias,
+                        static_cast<uintptr_t>(bias + kGuiScreenActionTabElfVa +
+                            (count - 1ULL) * kGuiScreenActionStride), 8);
+                    s.stateRtnLastMatch = idx.ok && fn.ok && want.ok &&
+                        idx.value + 1ULL == count && fn.value == want.value;
+                }
+            }
+        } else {
+            s.stateRtnSrc = "badspan";
+        }
+    } else {
+        s.stateRtnSrc = s.stateVecEnd.ok ? "null" : s.stateVecEnd.reason;
+    }
+
+    // THE NAME OF ACTION 45, from the runtime name table.
+    const uintptr_t nameEntry = static_cast<uintptr_t>(
+        bias + kGuiScreenNameTabElfVa + 45ULL * kGuiScreenNameStride);
+    s.nameByte = probeReadGuest(bias, nameEntry, 1);
+    guiScreenReadName(bias, nameEntry, s.name, sizeof(s.name), &s);
+
+    // THE IMAGE TABLE SCAN, RATE LIMITED. The table is in the image, so
+    // its words are constant for a given bias: the count of non-zero fn
+    // words is 317 when the loader applied the relocations and 0 when it
+    // did not, and an unrelocated image is exactly the failure that would
+    // otherwise be misread as "the table is empty". It does not need to be
+    // redone 13 times a second.
+    static unsigned s_scanTick = 0;
+    static unsigned s_scanCount = 0;
+    static unsigned s_scanAt = 0;
+    static uintptr_t s_scanBias = 0;
+    ++s_scanTick;
+    if (s_scanBias != bias || (s_scanTick % kGuiScreenScanEvery) == 0U) {
+        s_scanBias = bias;
+        s_scanCount = 0;
+        for (uint64_t index = 0; index < kGuiScreenActionCount; ++index) {
+            const ProbeValue fn = probeReadGuest(bias, static_cast<uintptr_t>(
+                bias + kGuiScreenActionTabElfVa +
+                index * kGuiScreenActionStride), 8);
+            if (fn.ok && fn.value != 0) {
+                ++s_scanCount;
+            }
+        }
+        s_scanAt = s_scanTick;
+    }
+    s.actNonZero = s_scanCount;
+    s.actAge = s_scanTick - s_scanAt;
+
+    s.readable = 0;
+    if (s.cloudGotSlot.ok) { ++s.readable; }
+    if (s.cloudGotCell.ok) { ++s.readable; }
+    if (s.cloudPtr.ok) { ++s.readable; }
+    if (s.cloudVptr.ok) { ++s.readable; }
+    if (s.cloudState.ok) { ++s.readable; }
+    if (s.cloud4c1.ok) { ++s.readable; }
+    if (s.cloudVecEnd.ok) { ++s.readable; }
+    if (s.cloudVecCap.ok) { ++s.readable; }
+    if (s.cloudVecBegin.ok) { ++s.readable; }
+    if (s.gameGotSlot.ok) { ++s.readable; }
+    if (s.gameCell.ok) { ++s.readable; }
+    if (s.mgr.ok) { ++s.readable; }
+    if (s.evVptr.ok) { ++s.readable; }
+    if (s.stateObj.ok) { ++s.readable; }
+    if (s.stateVptr.ok) { ++s.readable; }
+    if (s.state5d0.ok) { ++s.readable; }
+    if (s.state4c1.ok) { ++s.readable; }
+    if (s.stateVecEnd.ok) { ++s.readable; }
+    if (s.stateVecCap.ok) { ++s.readable; }
+    if (s.stateVecBegin.ok) { ++s.readable; }
+    if (s.feup.ok) { ++s.readable; }
+    if (s.act0.ok) { ++s.readable; }
+    if (s.act17.ok) { ++s.readable; }
+    if (s.act45.ok) { ++s.readable; }
+    if (s.nameByte.ok) { ++s.readable; }
+    return s;
+}
+
+// THE CONTROL'S FAILURE PATH, EXERCISED ONCE.
+//
+// probeControlVerdict() gates every line this file writes, so a control
+// that could not fail would make the gate worthless: it would report "ok"
+// for a probe that is reading garbage. This self-test runs the SAME
+// comparison against a KNOWN-WRONG READ: the control text lives at
+// bias+0x3fcc66, so bias+0x3fcc67 holds "ventMapScreen", and asking for
+// "EventMapScreen" THERE must come out "fail". If it comes out "ok" the
+// comparison is not comparing, and every verdict this file prints is
+// worthless -- so the line says which of the two happened.
+//
+// The verdict is computed once per bias (the image cannot move while it is
+// mapped) and costs 14 byte reads.
+const char* guiScreenControlSelfTest(uintptr_t bias, char* buffer,
+                                      size_t capacity) {
+    if (bias == 0) {
+        __builtin_snprintf(buffer, capacity, "unread");
+        return buffer;
+    }
+    static uintptr_t s_bias = 0;
+    static char s_verdict[16] = "unread";
+    if (s_bias != bias) {
+        s_bias = bias;
+        char raw[16];
+        probeControlVerdictExpect(bias,
+            static_cast<uintptr_t>(bias + kFeGateControlElfVa + 1ULL),
+            kFeGateControlText, sizeof(kFeGateControlText),
+            raw, sizeof(raw));
+        if (std::strcmp(raw, "fail") == 0) {
+            __builtin_snprintf(s_verdict, sizeof(s_verdict), "fail-detected");
+        } else if (std::strcmp(raw, "ok") == 0) {
+            // The control said "ok" for a read that CANNOT be right. The
+            // control is broken and every other number on the line is
+            // unfalsifiable.
+            __builtin_snprintf(s_verdict, sizeof(s_verdict), "not-failed");
+        } else {
+            __builtin_snprintf(s_verdict, sizeof(s_verdict), "%s", raw);
+        }
+    }
+    __builtin_snprintf(buffer, capacity, "%s", s_verdict);
+    return buffer;
+}
+
+// ONE LINE, and every field on it carries its own ok flag.
+//
+// THE FIELD NAMES ARE THE POINT OF THIS LINE. The old one called the
+// cc::Cloudcell at .bss 0x1fc6e98 "guiptr", and a reader had no way to know
+// that. So:
+//   cloud*  -> the .bss 0x1fc6e98 object, a cc::Cloudcell (KEPT: evidence)
+//   mgr     -> the FrontEnd2::MainMenuManager
+//   ev*     -> the EventMapScreen embedded in the manager at +0x2850
+//   gui*    -> the state carrier the manager owns at +0x420
+//   act*    -> the IMAGE action table at 0x1e78b70 (not an object's field)
+void emitGuiScreenSample(uint64_t frames, const char* carrier,
+                          const GuiScreenSample& s, uint64_t elapsedMs) {
+    const uint64_t bias = static_cast<uint64_t>(resolveMainImageLoadBias());
+    char cloudCellText[32];
+    char cloudText[32];
+    char cloudVptrText[32];
+    char cloudVptrElfText[32];
+    char cloudStateText[24];
+    char cloudFlagText[16];
+    char cloudEndText[32];
+    char cloudCapText[32];
+    char cloudBeginText[32];
+    char mgrText[32];
+    char evVptrText[32];
+    char stateObjText[32];
+    char stateVptrText[32];
+    char stateVptrElfText[32];
+    char stateText[24];
+    char flagText[16];
+    char endText[32];
+    char capText[32];
+    char beginText[32];
+    char feUpText[16];
+    char act0Text[32];
+    char act17Text[32];
+    char act45Text[32];
+    char controlText[16];
+    char selfTestText[16];
+    char rttiSelfText[16];
+
+    // The vtable pointers as ELF vaddrs, so they can be compared with the
+    // disassembly without the reader having to subtract the bias.
+    __builtin_snprintf(cloudVptrElfText, sizeof(cloudVptrElfText), "-");
+    if (s.cloudVptr.ok && bias != 0 && s.cloudVptr.value >= bias &&
+        s.cloudVptr.value - bias < 0x4000000ULL) {
+        __builtin_snprintf(cloudVptrElfText, sizeof(cloudVptrElfText),
+            "rr3+0x%llx",
+            (unsigned long long)(s.cloudVptr.value - bias));
+    }
+    __builtin_snprintf(stateVptrElfText, sizeof(stateVptrElfText), "-");
+    if (s.stateVptr.ok && bias != 0 && s.stateVptr.value >= bias &&
+        s.stateVptr.value - bias < 0x4000000ULL) {
+        __builtin_snprintf(stateVptrElfText, sizeof(stateVptrElfText),
+            "rr3+0x%llx",
+            (unsigned long long)(s.stateVptr.value - bias));
+    }
+    const uint64_t want45 =
+        static_cast<uint64_t>(bias) + kGuiScreenThunk45ElfVa;
+    const uint64_t want17 =
+        static_cast<uint64_t>(bias) + kGuiScreenThunk17ElfVa;
+    const uint64_t want0 =
+        static_cast<uint64_t>(bias) + kGuiScreenThunk0ElfVa;
+
+    // The buffer is sized for the WHOLE line: the format alone is over a
+    // thousand characters and the name field alone can carry 63, so a buffer
+    // that only fits the format would truncate the tail -- and the tail is
+    // where the control verdicts live.
+    char line[4096];
+    __builtin_snprintf(
+        line, sizeof(line),
+        "guiscreen: f=%llu t=%llu via=%s"
+        " cloudptr=%s cloudptr_ok=%c cloudsrc=bss:0x1fc6e98"
+        " cloudgot=%s cloudgot_ok=%c cloudgot_form=%s cloudgot_match=%c"
+        " cloudvptr=%s cloudvptr_ok=%c cloudvptr_elf=%s"
+        " cloudvptr_is_1e78920=%c cloudvptr_is_1e78928=%c"
+        " cloudclass=%s cloudclass_src=%s"
+        " cloudstate=%s cloudstate_ok=%c cloud4c1=%s cloud4c1_ok=%c"
+        " cloudreg=%s cloudreg_ok=%c cloudregc=%s cloudregb=%s"
+        " mgr=%s mgr_ok=%c"
+        " evobj=mgr+0x2850 evvptr=%s evvptr_ok=%c evclass=%s evclass_src=%s"
+        " guiobj=%s guiobj_ok=%c guisrc=mgr+0x420"
+        " guivptr=%s guivptr_ok=%c guivptr_elf=%s guivptr_is_1e78928=%c"
+        " guiclass=%s guiclass_src=%s"
+        " guistate=%s guistate_ok=%c gui4c1=%s gui4c1_ok=%c"
+        " guivec=%s guivec_ok=%c guivecc=%s guivecb=%s"
+        " guirtn=%u guirtn_src=%s guirtlast_match=%c"
+        " actn=%u actn_src=image:0x1e78b70 actn_age=%u"
+        " act45=%s act45_ok=%c act45_is_a67fcc=%c"
+        " act17=%s act17_ok=%c act17_is_a67468=%c"
+        " act0=%s act0_ok=%c act0_is_a685c4=%c"
+        " name45=\"%s\" name45_ok=%c name45_src=%s name45_len=%u"
+        " name45_len_src=%s"
+        " feup=%s feup_ok=%c readable=%u/%u ctrl=%s ctrl_selftest=%s"
+        " rtti_selftest=%s",
+        (unsigned long long)frames,
+        (unsigned long long)elapsedMs,
+        carrier != nullptr ? carrier : "unknown",
+        probeText(s.cloudPtr, cloudText, sizeof(cloudText), true),
+        s.cloudPtr.ok ? '1' : '0',
+        probeText(s.cloudGotCell, cloudCellText, sizeof(cloudCellText), true),
+        s.cloudGotCell.ok ? '1' : '0',
+        s.gotForm,
+        s.gotMatch ? '1' : '0',
+        probeText(s.cloudVptr, cloudVptrText, sizeof(cloudVptrText), true),
+        s.cloudVptr.ok ? '1' : '0',
+        cloudVptrElfText,
+        s.vptrIsSlot ? '1' : '0',
+        s.vptrIsCtor ? '1' : '0',
+        s.cloudClass,
+        s.cloudClassSrc,
+        probeText(s.cloudState, cloudStateText, sizeof(cloudStateText), false),
+        s.cloudState.ok ? '1' : '0',
+        probeText(s.cloud4c1, cloudFlagText, sizeof(cloudFlagText), false),
+        s.cloud4c1.ok ? '1' : '0',
+        probeText(s.cloudVecEnd, cloudEndText, sizeof(cloudEndText), true),
+        s.cloudVecEnd.ok ? '1' : '0',
+        probeText(s.cloudVecCap, cloudCapText, sizeof(cloudCapText), true),
+        probeText(s.cloudVecBegin, cloudBeginText, sizeof(cloudBeginText), true),
+        probeText(s.mgr, mgrText, sizeof(mgrText), true),
+        s.mgr.ok ? '1' : '0',
+        probeText(s.evVptr, evVptrText, sizeof(evVptrText), true),
+        s.evVptr.ok ? '1' : '0',
+        s.evClass,
+        s.evClassSrc,
+        probeText(s.stateObj, stateObjText, sizeof(stateObjText), true),
+        s.stateObj.ok ? '1' : '0',
+        probeText(s.stateVptr, stateVptrText, sizeof(stateVptrText), true),
+        s.stateVptr.ok ? '1' : '0',
+        stateVptrElfText,
+        s.stateVptrIsCarrier ? '1' : '0',
+        s.stateClass,
+        s.stateClassSrc,
+        probeText(s.state5d0, stateText, sizeof(stateText), false),
+        s.state5d0.ok ? '1' : '0',
+        probeText(s.state4c1, flagText, sizeof(flagText), false),
+        s.state4c1.ok ? '1' : '0',
+        probeText(s.stateVecEnd, endText, sizeof(endText), true),
+        s.stateVecEnd.ok ? '1' : '0',
+        probeText(s.stateVecCap, capText, sizeof(capText), true),
+        probeText(s.stateVecBegin, beginText, sizeof(beginText), true),
+        s.stateRtn, s.stateRtnSrc,
+        s.stateRtnLastMatch ? '1' : '0',
+        s.actNonZero, s.actAge,
+        probeText(s.act45, act45Text, sizeof(act45Text), true),
+        s.act45.ok ? '1' : '0',
+        (s.act45.ok && s.act45.value == want45) ? '1' : '0',
+        probeText(s.act17, act17Text, sizeof(act17Text), true),
+        s.act17.ok ? '1' : '0',
+        (s.act17.ok && s.act17.value == want17) ? '1' : '0',
+        probeText(s.act0, act0Text, sizeof(act0Text), true),
+        s.act0.ok ? '1' : '0',
+        (s.act0.ok && s.act0.value == want0) ? '1' : '0',
+        s.name,
+        s.nameOk ? '1' : '0',
+        s.nameSrc,
+        s.nameLenValue,
+        s.nameLenSrc,
+        probeText(s.feup, feUpText, sizeof(feUpText), false),
+        s.feup.ok ? '1' : '0',
+        s.readable, s.total,
+        probeControlVerdict(resolveMainImageLoadBias(), controlText,
+                             sizeof(controlText)),
+        guiScreenControlSelfTest(resolveMainImageLoadBias(), selfTestText,
+                                  sizeof(selfTestText)),
+        probeRttiSelfTest(resolveMainImageLoadBias(), rttiSelfText,
+                          sizeof(rttiSelfText)));
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        line, 101, 0);
+}
+
+// The GuiScreen probe's own carrier: a CHANGE or a 1 s heartbeat, the same
+// rule the other probes use, so a run in which nothing changes still says
+// so once a second.
+//
+// The change test compares the READ FLAGS as well as the values: a field
+// that went from "unreadable" to "readable, and the value happens to be 0"
+// compares EQUAL on the value alone, and that is exactly the transition a
+// reader is waiting for.
+//
+// The action-name dump lives below, next to the other emitters, and is
+// declared here because the sampler calls it.
+void emitActionNameDump(uintptr_t bias);
+
+void sampleGuiScreenTerms(uint64_t frames, const char* carrier) {
+    const uintptr_t bias = resolveMainImageLoadBias();
+    const GuiScreenSample s = sampleGuiScreen(bias);
+    // THE 317 NAMES, once per run. It is called from here rather than from
+    // the sampler proper because it must not be able to run on EVERY tick:
+    // the function itself refuses to do it twice for the same image load.
+    emitActionNameDump(bias);
+    if (carrier != nullptr && std::strcmp(carrier, "sampler") == 0) {
+        struct Last {
+            bool valid{};
+            GuiScreenSample sample{};
+            uint64_t tick{};
+        };
+        static Last s_last{};
+        static unsigned s_lines = 0;
+        static uint64_t s_firstTick = 0;
+        constexpr unsigned kMaxLines = 200;
+        if (s_lines >= kMaxLines) {
+            return;
+        }
+        const uint64_t now = armGetSystemTick();
+        const uint64_t freq = armGetSystemTickFreq();
+        const uint64_t elapsedMs = (now - s_last.tick) * 1000ULL /
+                                   (freq != 0 ? freq : 1);
+        const bool heartbeatDue = s_last.valid && elapsedMs >= 1000ULL;
+        const GuiScreenSample& p = s_last.sample;
+        const bool changed =
+            !s_last.valid ||
+            p.cloudPtr.ok != s.cloudPtr.ok ||
+            p.cloudPtr.value != s.cloudPtr.value ||
+            p.cloudVptr.ok != s.cloudVptr.ok ||
+            p.cloudVptr.value != s.cloudVptr.value ||
+            p.cloudState.ok != s.cloudState.ok ||
+            p.cloudState.value != s.cloudState.value ||
+            p.cloud4c1.ok != s.cloud4c1.ok || p.cloud4c1.value != s.cloud4c1.value ||
+            p.mgr.ok != s.mgr.ok || p.mgr.value != s.mgr.value ||
+            p.evVptr.ok != s.evVptr.ok || p.evVptr.value != s.evVptr.value ||
+            p.stateObj.ok != s.stateObj.ok ||
+            p.stateObj.value != s.stateObj.value ||
+            p.stateVptr.ok != s.stateVptr.ok ||
+            p.stateVptr.value != s.stateVptr.value ||
+            p.state5d0.ok != s.state5d0.ok ||
+            p.state5d0.value != s.state5d0.value ||
+            p.state4c1.ok != s.state4c1.ok ||
+            p.state4c1.value != s.state4c1.value ||
+            p.stateVecEnd.ok != s.stateVecEnd.ok ||
+            p.stateVecEnd.value != s.stateVecEnd.value ||
+            p.feup.ok != s.feup.ok || p.feup.value != s.feup.value ||
+            p.act45.ok != s.act45.ok || p.act45.value != s.act45.value ||
+            p.nameOk != s.nameOk || s.name[0] != p.name[0] ||
+            p.stateRtn != s.stateRtn;
+        if (!changed && !heartbeatDue) {
+            return;
+        }
+        s_last.valid = true;
+        s_last.sample = s;
+        s_last.tick = now;
+        if (s_firstTick == 0) {
+            s_firstTick = now;
+        }
+        ++s_lines;
+        emitGuiScreenSample(frames, carrier, s,
+                            (now - s_firstTick) * 1000ULL /
+                                (freq != 0 ? freq : 1));
+        return;
+    }
+    emitGuiScreenSample(frames, carrier, s, 0);
+}
+
+// ---------------------------------------------------------------------------
+// THE WHOLE NAME TABLE: all 317 action names, ONCE per run.
+//
+// THE TABLE. 317 entries of 0x18 bytes at 0x1f9d6d8, in .bss, so it exists
+// only once the guest has built it -- there is nothing in the file to read.
+// The fill 0xe1d8bc walks it with the same stride and the same count:
+//
+//   0xe1d8f4  adrp x21,#0x1f9d000 ; add x21,x21,#0x6d8
+//   0xe1d934  add  x21,x21,#0x18
+//   0xe1d938  cmp  x25,#0x13d          ; 0x13d = 317
+//
+// WHY IT IS RATE LIMITED. The dump is the only expensive thing this probe
+// does: 317 entries, each a flag byte plus a character-by-character read of
+// the name, and the long names live on the heap, so every one of those
+// characters can miss the probe's eight-entry page cache and cost a kernel
+// page query. It is therefore emitted ONCE per image load, with a small
+// number of retries in case the first attempt landed before the guest had
+// initialised the table.
+//
+// WHY A NAME PER LINE. The log is read with grep, and one name per line is
+// the shape that greps best: "phase=action-name ... idx=45 name=...". The
+// names are escaped (a byte outside 0x20..0x7e is printed as \xNN) so a
+// name can never inject a control character into the log.
+// ---------------------------------------------------------------------------
+constexpr unsigned kActionNameDumpAttempts = 4U;
+constexpr unsigned kActionNameDumpEvery = 256U;
+
+void emitActionNameDump(uintptr_t bias) {
+    if (bias == 0) {
+        return;
+    }
+    static uintptr_t s_bias = 0;
+    static unsigned s_attempts = 0;
+    static unsigned s_tick = 0;
+    static bool s_done = false;
+    if (s_bias != bias) {
+        s_bias = bias;
+        s_attempts = 0;
+        s_tick = 0;
+        s_done = false;
+    }
+    if (s_done || s_attempts >= kActionNameDumpAttempts) {
+        return;
+    }
+    ++s_tick;
+    if (s_attempts > 0U && (s_tick % kActionNameDumpEvery) != 0U) {
+        return;
+    }
+    // The table must be THERE before it is dumped: an all-empty dump would
+    // read exactly like "the table holds 317 empty names".
+    const uintptr_t entry0 = static_cast<uintptr_t>(
+        bias + kGuiScreenNameTabElfVa);
+    const ProbeValue flag = probeReadGuest(bias, entry0, 1);
+    if (!flag.ok) {
+        return;
+    }
+    const uint8_t byte = static_cast<uint8_t>(flag.value);
+    if ((byte & 1u) != 0u) {
+        // LONG: the characters are behind a heap pointer at entry+0x10.
+        const ProbeValue ptr = probeReadGuest(bias, entry0 + 0x10, 8);
+        if (!ptr.ok || ptr.value == 0) {
+            return;
+        }
+    } else if ((byte >> 1) == 0u) {
+        // SHORT and empty: the table has not been built yet.
+        return;
+    }
+    ++s_attempts;
+    char name[kGuiScreenNameBufChars];
+    char details[kGuiScreenNameBufChars + 96U];
+    unsigned named = 0;
+    for (uint64_t index = 0; index < kGuiScreenActionCount; ++index) {
+        const uintptr_t entry = static_cast<uintptr_t>(
+            bias + kGuiScreenNameTabElfVa + index * kGuiScreenNameStride);
+        unsigned length = 0;
+        const char* src = "none";
+        const bool ok = guiScreenReadNameAt(bias, entry, name, sizeof(name),
+                                            &length, &src);
+        if (ok && length > 0U) {
+            ++named;
+        }
+        __builtin_snprintf(details, sizeof(details),
+            "idx=%llu len=%u src=%s ok=%c name=\"%s\"",
+            (unsigned long long)index, length,
+            src != nullptr ? src : "none", ok ? '1' : '0', name);
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "action-name", index, 0, details);
+    }
+    __builtin_snprintf(details, sizeof(details),
+        "entries=%llu named=%u src=bss:0x1f9d6d8 stride=0x18 attempt=%u",
+        (unsigned long long)kGuiScreenActionCount, named, s_attempts);
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "action-names", kGuiScreenActionCount, 0, details);
+    if (named > 0U) {
+        s_done = true;
+    }
+}
+
 // The front-end gate's own carrier: a CHANGE or a 1 s heartbeat, the same
 // rule the other probes use, so a run in which nothing changes still says
 // so once a second.
@@ -5013,6 +6267,13 @@ void sampleMenuGateTerms(uint64_t frames, const char* carrier) {
     // probe owns its own filter, so one probe's silence can never hide
     // another's change.
     sampleFeGateTerms(frames, carrier);
+    // THE GUISCREEN SINGLETON, on the same carriers and with the same
+    // change-or-heartbeat rule. It is the probe that reads the front end's
+    // OWN lifecycle field (the 9GuiScreen singleton's +0x5d0), where the
+    // fe-gate line above reads two other classes' fields at the same
+    // offset -- which is why neither of them could say anything about the
+    // front end.
+    sampleGuiScreenTerms(frames, carrier);
     sampleLoadStateTerms(frames, carrier);
     const MenuGateSample s = sampleMenuGate(bias);
     if (carrier != nullptr && std::strcmp(carrier, "sampler") == 0) {

@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <new>
+#include <stdarg.h>
 #include <string.h>
 #include <strings.h>
 #include <time.h>
@@ -13,6 +14,7 @@
 #include "../../eap_port/platform_adapter.h"
 #include "../../eap_port/so_util_adapter.h"
 #include "../../eap_port/trace_adapter.h"
+#include "../../rr3_asset_candidates.hpp"
 #include "../../../include/rr3/jni_bridge.hpp"
 #include "../jni.h"
 #include "../jni_internals.h"
@@ -622,7 +624,37 @@ static bool decodeAssetRequestPath(const uint8_t *body, size_t bodyLen,
  * reported, and the guest takes its own error path for it.
  */
 
-/* One asset the guest asked for. */
+/*
+ * ONE ASSET THE GUEST ASKED FOR.
+ *
+ * THE DIGEST FIELD: THERE IS EXACTLY ONE, AND IT IS ALWAYS POPULATED.
+ *
+ * The wire format of an asset request is a list of triples:
+ *
+ *     [u32 pathLen][path][u32 md5Len][md5][u32 id]
+ *
+ * ONE digest field, and the parser above REFUSES an entry whose digest
+ * length is zero -- it breaks out of the walk, so an entry with no digest
+ * could never reach the endpoint at all.
+ *
+ * WHICH SETTLES THE "md5=" AGAINST "want_md5=" QUESTION. The port's own log
+ * used the label "md5=" on the line it printed for a MISS and "want_md5="
+ * on the line it printed for a HIT -- two names for the SAME parsed field,
+ * and the difference in the logs read like "the guest sent a digest for one
+ * asset and none for the other". It did not: the guest sent a digest for
+ * every asset, and the field it sent is the one in the triples above.
+ *
+ * What the digest WAS for the assets that failed is the other half of the
+ * story: the guest asked for e198be78... (the 2048x1536 weekly-event atlas),
+ * which is the digest the SERVER's own list publishes -- the port's manifest
+ * rewrite kept the server's value because it could not resolve a local file
+ * to compute one from ("kept=SERVER size=- source=none" in
+ * native-switch/source/guest_filesystem.cpp). So the guest did its lookup
+ * and had a digest; the digest described a file the port does not have.
+ *
+ * The log now uses ONE label, "want_md5=", on both lines, and says
+ * "digest_field=wire" so the field cannot be mistaken for two.
+ */
 struct AssetRequest {
     char     path[256];
     char     md5[64];
@@ -753,6 +785,10 @@ static bool parseAssetRequests(const std::vector<uint8_t> &payload,
  *
  * AND THE REVERSE ALIAS, FOR THE GUEST'S OWN SPELLING.
  *
+ * RULES 5 AND 6 -- the guest's own download cache and the nearest lower
+ * resolution -- ARE DESCRIBED AT THE END OF THIS BLOCK, WITH THE MEASUREMENT
+ * THAT PUT THEM THERE.
+ *
  * MEASURED 2026-10-22, archive 20261022-031343-eden-gfsalias-r1 and
  * 20261022-032739-eden-gfsalias2-r1: the last 12 "didn't match its MD5"
  * failures were ONE asset -- /gui_assets/960x640/common/sprites.android.atlas
@@ -793,107 +829,203 @@ static bool parseAssetRequests(const std::vector<uint8_t> &payload,
  * digest matches): the card's assets_<res> copy goes LAST, because it is the
  * stale revision -- see the note at its insertion point.
  *
- * THE LIST MUST STAY IN LOCKSTEP with the manifest-rewrite resolver in
- * native-switch/source/guest_filesystem.cpp (assetCandidates() there). The
- * digest written into the list is the digest of the bytes this endpoint
- * sends; two copies of the list in two files can only ever agree by accident.
+ * THE LIST IS NOW IN ONE PLACE, AND IT IS A HEADER.
+ *
+ * The list and the SELECTION RULE both live in
+ * native-switch/source/rr3_asset_candidates.hpp, and this endpoint and the
+ * manifest rewriters in native-switch/source/guest_filesystem.cpp both call
+ * rr3::asset::buildCandidates() and rr3::asset::selectCandidate(). There is
+ * no second copy of the rules left to drift.
+ *
+ * THE DIGEST WRITTEN INTO A MANIFEST IS THE DIGEST OF THE BYTES THIS
+ * ENDPOINT SENDS: the manifest side picks its candidate with the shared rule
+ * and publishes THAT candidate's digest, the guest then asks for that
+ * digest, and the endpoint's answer is the candidate whose digest is the
+ * published one. Two copies of the list in two files could only ever agree
+ * by accident; there is one copy, and the agreement is by construction.
+ *
+ * ---------------------------------------------------------------------------
+ * MEASURED 2026-10-23: THE TWO WAYS THIS LIST MISSED A FILE THE PORT HAS.
+ * ---------------------------------------------------------------------------
+ *
+ * The guest asked for FOUR assets and got nothing for three of them:
+ *
+ *   /assets_2048x1536/events/map/featured/weekly_events/
+ *       lexus_is_f350_catalunya/sprites.android.atlas    md5 e198be78...
+ *   /assets_2048x1536/.../lexus_is_f350_catalunya/
+ *       sprites_0.rgb.pvr.z                               md5 a19c19a4...
+ *   /assets_480x320/.../lexus_is_f350_catalunya/
+ *       sprites_0.rgb.pvr.z                               md5 d367c6f1...
+ *
+ * and the endpoint logged "candidates=3 answered=0 detail=no-local-file" for
+ * each. Two DIFFERENT causes, and the log could not tell them apart:
+ *
+ * 1. THE GUEST'S OWN DOWNLOAD CACHE. The guest writes every asset it
+ *    downloads to "<asset path>.ast" on the card and reads the bytes back
+ *    from there (the ".ast" rule in native-switch/source/guest_filesystem.cpp:
+ *    1683-1713). The card holds exactly ONE such file:
+ *
+ *      .depot/assets_480x320/events/map/featured/weekly_events/
+ *          lexus_is_f350_catalunya/sprites_0.rgb.pvr.z.ast
+ *      65,102 B   md5 d367c6f1b923e6551f2692bfa58b05bd
+ *
+ *    and that digest IS the digest the server's own list publishes for
+ *    "/assets_480x320/.../sprites_0.rgb.pvr.z" (the shipped
+ *    files/.depot/asset_list_updates.txt on the card, line for line:
+ *    "d367c6f1b923e6551f2692bfa58b05bd  65102  65102"). So the bytes were
+ *    on the card, under the name the guest writes them under, and the
+ *    candidate list never produced that name: it only ever tried the path
+ *    the guest ASKED for. THAT is why the 480x320 texture was a miss.
+ *
+ * 2. THE RESOLUTION. The 2048x1536 pair has no copy ANYWHERE -- not on the
+ *    card, not in the seven volumes, not in the three data packs, not in the
+ *    APK. What exists is the 960x640 and the 480x320 copy of the same event.
+ *    The list tried one resolution and stopped.
+ *
+ * So the list grows by TWO rules, both of them general:
+ *
+ *   5. the guest's own download cache, "<path>.ast", for BOTH spellings;
+ *   6. the nearest LOWER resolution, which is the direction the port's
+ *      runtime path space already falls back in (the "2048x1536 -> 960x640
+ *      RULE, AS A FALLBACK AND NOT AS A REWRITE" in
+ *      native-switch/source/guest_filesystem.cpp:1474-1496).
+ *
+ * AND THE TWO RULES HAVE DIFFERENT RIGHTS. Rule 5 is the guest's own copy of
+ * ONE asset, so it is only the answer when its digest IS the digest the
+ * guest asked for -- a leftover of an older revision is not the asset, and
+ * answering with it would be a false success. Rule 6 is a DIFFERENT
+ * resolution of the same asset, so it answers as the fallback, with the
+ * mismatch reported: the digest the manifest publishes for the requested
+ * path has to be the digest of the bytes sent here, and that is the
+ * manifest's side of the rule (native-switch/source/guest_filesystem.cpp).
  */
-static bool isResolutionSegment(const char *text)
+/*
+ * THE RESOLUTION SEGMENT AND THE CANDIDATE ORDER LIVE IN THE SHARED HEADER.
+ *
+ * rr3::asset::isResolutionSegment() and rr3::asset::buildCandidates() are the
+ * ONE copy of the rules, and the manifest rewriters use the same ones -- see
+ * native-switch/source/rr3_asset_candidates.hpp and the lockstep note above.
+ */
+
+/*
+ * ONE CANDIDATE: a local file that can back a requested path.
+ *
+ * rr3::asset::Candidate, rr3::asset::buildCandidates() and
+ * rr3::asset::selectCandidate() are the shared ones now: the endpoint and the
+ * manifest rewriters build the SAME ordered list and pick from it with the
+ * SAME rule, so the digest a manifest publishes is the digest of the bytes
+ * this endpoint sends. See native-switch/source/rr3_asset_candidates.hpp.
+ */
+typedef rr3::asset::Candidate AssetCandidate;
+
+/*
+ * THE RESOLUTION CHAIN, HIGH TO LOW.
+ *
+ * The alias walks DOWN this chain and never up, because that is the
+ * direction the port's runtime path space already falls back in: a
+ * 2048x1536 request may be answered from the 960x640 tree, never the other
+ * way round (native-switch/source/guest_filesystem.cpp:1474-1496). The asset
+ * path space has to agree with the runtime path space, or the guest md5s
+ * one file and renders another.
+ */
+/*
+ * THE RESOLUTION CHAIN, THE APPEND AND THE SPLIT LIVE IN THE SHARED HEADER.
+ *
+ * rr3::asset::resolutionChain(), rr3::asset::addCandidate() and
+ * rr3::asset::splitResolution() are the ONE copy of them, and the manifest
+ * rewriters build their candidate lists with the same functions.
+ */
+
+/*
+ * THE SPLIT LIVES IN THE SHARED HEADER: rr3::asset::splitResolution().
+ */
+
+/*
+ * THE CANDIDATE LIST LIVES IN THE SHARED HEADER.
+ *
+ * rr3::asset::buildCandidates() is the ONE list, and the manifest rewriters
+ * build the SAME ordered list for the SAME requested path -- rules 1 to 6,
+ * including the guest's own download cache (rule 5, digest-gated) and the
+ * nearest lower resolution (rule 6). See
+ * native-switch/source/rr3_asset_candidates.hpp.
+ */
+static void assetCandidates(const char *path, std::vector<AssetCandidate> &out)
 {
-    if (text == nullptr) {
-        return false;
-    }
-    const char *cursor = text;
-    int digits = 0;
-    while (*cursor >= '0' && *cursor <= '9') {
-        ++cursor;
-        ++digits;
-    }
-    if (digits == 0 || *cursor != 'x') {
-        return false;
-    }
-    ++cursor;
-    digits = 0;
-    while (*cursor >= '0' && *cursor <= '9') {
-        ++cursor;
-        ++digits;
-    }
-    if (digits == 0) {
-        return false;
-    }
-    return *cursor == '\0' || *cursor == '/';
+    rr3::asset::buildCandidates(path, out);
 }
 
-static unsigned assetCandidates(const char *path, char out[4][384])
+/*
+ * THE REVERSE ALIAS GOES LAST, NOT SECOND -- and it still does.
+ *
+ * The card's "assets_<res>" tree is the game's INSTALLED revision and the
+ * volume's "gui_assets/<res>" tree is the shipped data-pack revision. For
+ * 960x640 they are DIFFERENT files:
+ *
+ *   .depot/assets_960x640/common/sprites.android.atlas        24,689 B
+ *       md5 4321352770b573a6b71d57547b2b3885   -- 165 image entries,
+ *       and MISSING ten menu sprites (gradient.png, common_info_button.png,
+ *       common_info_button_down.png, fb_logo.png, apple_sign_in_icon.png,
+ *       ...). Serving this one cost 20 "Failed to load image from atlas"
+ *       errors over 10 distinct sprites (archive
+ *       20261022-031343-eden-gfsalias-r1).
+ *   files/.depot/gui_assets/960x640/common/sprites.android.atlas
+ *                                                            39,199 B
+ *       md5 c72568828875f4e2a6b11f5c944e27e0   -- 248 image entries, the
+ *       sprite-complete one, and byte-identical to the card's
+ *       .depot/gui_assets/960x640/common/sprites_0.rgb.pvr.z.
+ *
+ * So the card's assets_<res> copy is a STALE revision and is a LAST-RESORT
+ * fallback only. Putting it second made it win the endpoint's "first
+ * candidate that exists" fallback, which is what the fallback is FOR when
+ * no digest matches -- and it put a digest in the manifests that the
+ * runtime read path (which serves the volume) could never produce.
+ *
+ * The endpoint's md5 tie-breaker makes the ORDER irrelevant when a digest
+ * matches; it is the fallback that the order decides, so the stale copy
+ * goes last. It is candidate 4 above, after the two same-name candidates,
+ * and the nearest lower resolution is after it.
+ */
+
+/*
+ * The candidate list, as one printable line: every name that was tried, in
+ * the order they were tried. A truncation says so, because a line that
+ * stops in the middle reads like a short list.
+ */
+static void describeCandidates(const std::vector<AssetCandidate> &candidates,
+                               char *out, size_t outSize)
 {
-    unsigned count = 0;
-    if (path == nullptr) {
-        return 0u;
+    if (out == nullptr || outSize == 0u) {
+        return;
     }
-    __builtin_snprintf(out[count], sizeof(out[count]), ".depot%s", path);
-    ++count;
-    __builtin_snprintf(out[count], sizeof(out[count]), "files/.depot%s", path);
-    ++count;
-    if (strncmp(path, "/assets_", 8) == 0) {
-        const char *rest = strchr(path + 8, '/');
-        if (rest != nullptr) {
-            char resolution[32];
-            const size_t n = (size_t)(rest - (path + 8));
-            if (n < sizeof(resolution)) {
-                memcpy(resolution, path + 8, n);
-                resolution[n] = '\0';
-                __builtin_snprintf(out[count], sizeof(out[count]),
-                                   "files/.depot/gui_assets/%s%s", resolution, rest);
-                ++count;
-            }
+    out[0] = '\0';
+    size_t used = 0u;
+    for (unsigned c = 0; c < candidates.size(); ++c) {
+        const int written = __builtin_snprintf(out + used, outSize - used, "%s%s",
+                                               (c > 0u) ? "|" : "",
+                                               candidates[c].path);
+        if (written < 0 || (size_t)written >= outSize - used) {
+            __builtin_snprintf(out + outSize - 4u, 4u, "...");
+            return;
         }
+        used += (size_t)written;
     }
-    /* THE REVERSE ALIAS GOES LAST, NOT SECOND.
-     *
-     * The card's "assets_<res>" tree is the game's INSTALLED revision and the
-     * volume's "gui_assets/<res>" tree is the shipped data-pack revision. For
-     * 960x640 they are DIFFERENT files:
-     *
-     *   .depot/assets_960x640/common/sprites.android.atlas        24,689 B
-     *       md5 4321352770b573a6b71d57547b2b3885   -- 165 image entries,
-     *       and MISSING ten menu sprites (gradient.png, common_info_button.png,
-     *       common_info_button_down.png, fb_logo.png, apple_sign_in_icon.png,
-     *       ...). Serving this one cost 20 "Failed to load image from atlas"
-     *       errors over 10 distinct sprites (archive
-     *       20261022-031343-eden-gfsalias-r1).
-     *   files/.depot/gui_assets/960x640/common/sprites.android.atlas
-     *                                                            39,199 B
-     *       md5 c72568828875f4e2a6b11f5c944e27e0   -- 248 image entries, the
-     *       sprite-complete one, and byte-identical to the card's
-     *       .depot/gui_assets/960x640/common/sprites_0.rgb.pvr.z.
-     *
-     * So the card's assets_<res> copy is a STALE revision and is a LAST-RESORT
-     * fallback only. Putting it second made it win the endpoint's "first
-     * candidate that exists" fallback, which is what the fallback is FOR when
-     * no digest matches -- and it put a digest in the manifests that the
-     * runtime read path (which serves the volume) could never produce.
-     *
-     * The endpoint's md5 tie-breaker makes the ORDER irrelevant when a digest
-     * matches; it is the fallback that the order decides, so the stale copy
-     * goes last.
-     */
-    if (strncmp(path, "/gui_assets/", 12) == 0) {
-        const char *rest = strchr(path + 12, '/');
-        if (rest != nullptr) {
-            char resolution[32];
-            const size_t n = (size_t)(rest - (path + 12));
-            if (n < sizeof(resolution)) {
-                memcpy(resolution, path + 12, n);
-                resolution[n] = '\0';
-                if (isResolutionSegment(resolution)) {
-                    __builtin_snprintf(out[count], sizeof(out[count]),
-                                       ".depot/assets_%s%s", resolution, rest);
-                    ++count;
-                }
-            }
-        }
+}
+
+/*
+ * The resolution an answer came from, when it is NOT the resolution that was
+ * asked for -- that is, the nearest lower resolution the alias used. "-" when
+ * the answer is the requested resolution, or when the request has no
+ * resolution at all.
+ *
+ * The rule is the shared one, so the manifest side can report the same alias
+ * for the same path.
+ */
+static const char *aliasOf(const char *requested, const AssetCandidate *answered)
+{
+    if (requested == nullptr || answered == nullptr) {
+        return "-";
     }
-    return count;
+    return rr3::asset::aliasResolution(requested, *answered);
 }
 
 /* Read a local file through the port's own filesystem and MD5 it. */
@@ -932,6 +1064,88 @@ static bool readLocalAsset(const char *guestPath, std::vector<uint8_t> &out,
     }
     md5.finish(digest);
     return true;
+}
+
+/*
+ * THE CONTROLS FOR THE ASSET ENDPOINT.
+ *
+ * A run in which the endpoint served NOTHING is indistinguishable from a run
+ * in which the endpoint never ran at all: both say "no cc-asset-req line
+ * with answered=1", and both are what a broken instrument looks like. So the
+ * endpoint proves itself ONCE per process with three request-shaped paths:
+ *
+ *   one that MUST resolve, and it resolves in the VOLUME -- not on the card
+ *   -- because the volume's gui-sd tree is guaranteed by the data manifest
+ *   (rr3-data-manifest.json names files/.depot/gui_assets/960x640/ as that
+ *   volume's sentinel, and the volume ships
+ *   files/.depot/gui_assets/960x640/agreement/sprites.android.atlas, 399 B);
+ *
+ *   one that MUST NOT resolve and carries no resolution segment;
+ *
+ *   one that MUST NOT resolve and DOES carry one, so it also proves that
+ *   the nearest-lower-resolution alias does not INVENT a file.
+ *
+ * Each control line states what was EXPECTED and what was OBSERVED, so a
+ * control that fails says so on its own line instead of leaving the reader
+ * to infer it from the absence of a line. And the positive control is what
+ * makes a zero-hit result legible: "served=0" next to a control that says
+ * "expect=present observed=present" is a real zero, and next to a control
+ * that says "expect=present observed=missing" it is a broken instrument.
+ */
+static void runAssetEndpointControls(void)
+{
+    static bool done = false;
+    if (done) {
+        return;
+    }
+    done = true;
+
+    struct Control {
+        const char *expect;
+        const char *path;
+    };
+    const Control controls[3] = {
+        {"present", "/gui_assets/960x640/agreement/sprites.android.atlas"},
+        {"missing", "/gui_assets/960x640/__rr3_control_no_such_asset__.bin"},
+        {"missing", "/assets_2048x1536/__rr3_control_no_such_asset__.bin"},
+    };
+
+    for (unsigned i = 0; i < 3u; ++i) {
+        std::vector<AssetCandidate> candidates;
+        assetCandidates(controls[i].path, candidates);
+        // THE MANIFEST SIDE OF THE SHARED SELECTION: "does this path resolve
+        // to a local file at all", with no digest to match against. That is
+        // what this control asks.
+        const rr3::asset::Selection selection = rr3::asset::selectCandidate(
+            candidates, nullptr,
+            [](const AssetCandidate &candidate, unsigned index, char outDigest[33],
+               unsigned long long &outSize, std::vector<uint8_t> &bytes) -> bool {
+                (void)index;
+                return readLocalAsset(candidate.path, bytes, outDigest, outSize);
+            });
+        const int chosenIndex = selection.index;
+        const bool present = (chosenIndex >= 0);
+        const bool asExpected =
+            (present == (strcmp(controls[i].expect, "present") == 0));
+        char tried[1024];
+        describeCandidates(candidates, tried, sizeof(tried));
+        char details[2048];
+        __builtin_snprintf(details, sizeof(details),
+                           "expect=%s observed=%s path=%s candidates=%u"
+                           " tried=%.1000s answered=%d answered_path=%.240s"
+                           " size=%llu md5=%.32s control_ok=%d",
+                           controls[i].expect, present ? "present" : "missing",
+                           controls[i].path, (unsigned)candidates.size(), tried,
+                           present ? 1 : 0,
+                           (chosenIndex >= 0) ? candidates[chosenIndex].path : "-",
+                           selection.size, selection.digest, asExpected ? 1 : 0);
+        rr3::guestViewWideLog("cc-asset-control", (unsigned long long)i,
+                              (unsigned long long)candidates.size(), details);
+        if (!asExpected) {
+            warning("asset endpoint control FAILED: expect=%s path=%s\n",
+                    controls[i].expect, controls[i].path);
+        }
+    }
 }
 
 /* The response bodies waiting to be delivered, and the lock that guards
@@ -1156,6 +1370,11 @@ static void http_init(JNIEnv *env, jobject self, jstring /*userAgent*/,
             decodeAssetRequestPath(req->body, req->bodyLen, payload, path,
                                    sizeof(path));
         if (assetShaped) {
+            /* THE CONTROLS RUN FIRST, ONCE PER PROCESS, so that a run in
+             * which nothing was served is still legible: the control lines
+             * say whether the endpoint is working at all. */
+            runAssetEndpointControls();
+
             /* The full request: the triples, one per pending asset. */
             std::vector<AssetRequest> entries;
             size_t base = 0;
@@ -1171,46 +1390,51 @@ static void http_init(JNIEnv *env, jobject self, jstring /*userAgent*/,
                  * asked for is the tie breaker: a candidate whose md5
                  * matches is the file the guest wants, whatever else is
                  * lying around under a similar name. */
-                char candidates[4][384];
-                const unsigned candidateCount =
-                    assetCandidates(entry.path, candidates);
-                const char *chosen = nullptr;
-                char chosenMd5[33] = {0};
-                unsigned long long chosenSize = 0;
+                std::vector<AssetCandidate> candidates;
+                assetCandidates(entry.path, candidates);
+                const unsigned candidateCount = (unsigned)candidates.size();
+                /* THE ONE SELECTION RULE, shared with the manifest rewriters.
+                 *
+                 * The endpoint side of it: the digest the guest asked for on
+                 * the wire is the expected digest, so the candidate whose
+                 * digest MATCHES it is the answer -- the guest's own download
+                 * cache included, which is exactly what rule 5's digest gate
+                 * is for -- and the first candidate that exists is the
+                 * fallback when nothing matches.
+                 *
+                 * The manifest side of it publishes the digest of the
+                 * candidate THIS call picks, so the bytes the endpoint sends
+                 * and the digest the manifest publishes are the same bytes by
+                 * construction.
+                 *
+                 * ONE MOVE, NOT TWO. The first version of this ran the move
+                 * twice -- once for "first candidate that exists" and once for
+                 * "the md5 matches" -- and the second move took the bytes OUT
+                 * of the buffer that was about to be appended: the block went
+                 * out with size 0 and the guest answered "not found on server
+                 * or download failed." (measured, archive
+                 * 20261021-223727-eden-assetdl3: the assets whose md5 MATCHED
+                 * were the ones that failed, and the ones whose md5 differed
+                 * -- the bytes kept by the first branch -- arrived.) */
                 std::vector<uint8_t> chosenBytes;
-                for (unsigned c = 0; c < candidateCount; ++c) {
-                    std::vector<uint8_t> bytes;
-                    char digest[33];
-                    unsigned long long size = 0;
-                    if (!readLocalAsset(candidates[c], bytes, digest, size)) {
-                        continue;
-                    }
-                    /* The FIRST candidate that exists is the fallback; a
-                     * candidate whose md5 matches the one the guest asked
-                     * for REPLACES it. Both are the same move: the bytes
-                     * travel with the choice.
-                     *
-                     * ONE MOVE, NOT TWO. The first version of this ran the
-                     * move twice -- once for "first candidate that exists"
-                     * and once for "the md5 matches" -- and the second move
-                     * took the bytes OUT of the buffer that was about to be
-                     * appended: the block went out with size 0 and the guest
-                     * answered "not found on server or download failed."
-                     * (measured, archive 20261021-223727-eden-assetdl3: the
-                     * assets whose md5 MATCHED were the ones that failed,
-                     * and the ones whose md5 differed -- the bytes kept by
-                     * the first branch -- arrived.) */
-                    const bool isMatch = (strcasecmp(digest, entry.md5) == 0);
-                    if (chosen == nullptr || isMatch) {
-                        chosen = candidates[c];
-                        chosenBytes = std::move(bytes);
-                        chosenSize = size;
-                        memcpy(chosenMd5, digest, sizeof(chosenMd5));
-                    }
-                    if (isMatch) {
-                        break;
-                    }
-                }
+                const rr3::asset::Selection selection = rr3::asset::selectCandidate(
+                    candidates, entry.md5,
+                    [](const AssetCandidate &candidate, unsigned index, char digest[33],
+                       unsigned long long &size, std::vector<uint8_t> &bytes) -> bool {
+                        (void)index;
+                        return readLocalAsset(candidate.path, bytes, digest, size);
+                    },
+                    &chosenBytes);
+                const int chosenIndex = selection.index;
+                char chosenMd5[33] = {0};
+                memcpy(chosenMd5, selection.digest, sizeof(chosenMd5));
+                const unsigned long long chosenSize = selection.size;
+                const AssetCandidate *chosen =
+                    (chosenIndex >= 0) ? &candidates[chosenIndex] : nullptr;
+
+                /* The candidate list, as one printable line. */
+                char tried[1024];
+                describeCandidates(candidates, tried, sizeof(tried));
 
                 if (chosen == nullptr) {
                     /* NO LOCAL FILE. Nothing is invented for it: the
@@ -1218,14 +1442,15 @@ static void http_init(JNIEnv *env, jobject self, jstring /*userAgent*/,
                     ++missing;
                     if (s_assetReqLines < 64u) {
                         ++s_assetReqLines;
-                        char details[640];
+                        char details[2048];
                         __builtin_snprintf(
                             details, sizeof(details),
-                            "n=%u id=%u path=%s md5=%s candidates=%u"
+                            "n=%u id=%u path=%.200s want_md5=%.40s"
+                            " digest_field=wire candidates=%u tried=%.1000s"
                             " answered=0 reason=no-known-answer-shape"
                             " detail=no-local-file",
                             s_assetReqTotal, entry.id, entry.path, entry.md5,
-                            candidateCount);
+                            candidateCount, tried);
                         rr3::guestViewWideLog("cc-asset-req",
                                               (unsigned long long)entry.id,
                                               (unsigned long long)s_assetReqTotal,
@@ -1245,13 +1470,18 @@ static void http_init(JNIEnv *env, jobject self, jstring /*userAgent*/,
                     ++s_assetReqLines;
                     const bool md5Matches =
                         (strcasecmp(chosenMd5, entry.md5) == 0);
-                    char details[1200];
+                    char details[2048];
                     __builtin_snprintf(
                         details, sizeof(details),
-                        "n=%u id=%u path=%.250s want_md5=%.40s src=%.380s"
-                        " size=%llu src_md5=%.32s answered=1 md5_match=%d",
+                        "n=%u id=%u path=%.200s want_md5=%.40s"
+                        " digest_field=wire candidates=%u tried=%.1000s"
+                        " answered=%.240s src=%.240s"
+                        " size=%llu src_md5=%.32s answered=1 md5_match=%d"
+                        " alias=%s",
                         s_assetReqTotal, entry.id, entry.path, entry.md5,
-                        chosen, chosenSize, chosenMd5, md5Matches ? 1 : 0);
+                        candidateCount, tried, chosen->path, chosen->path,
+                        chosenSize, chosenMd5, md5Matches ? 1 : 0,
+                        aliasOf(entry.path, chosen));
                     rr3::guestViewWideLog("cc-asset-req",
                                           (unsigned long long)entry.id,
                                           (unsigned long long)s_assetReqTotal,
@@ -1259,7 +1489,7 @@ static void http_init(JNIEnv *env, jobject self, jstring /*userAgent*/,
                     if (authLogBudget()) {
                         trace("cc-asset-req: id=%u path=%s -> %s (%llu B)"
                               " md5 %s (want %s)",
-                              entry.id, entry.path, chosen, chosenSize,
+                              entry.id, entry.path, chosen->path, chosenSize,
                               chosenMd5, entry.md5);
                     }
                 }

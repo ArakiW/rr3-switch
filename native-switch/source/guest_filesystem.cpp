@@ -5,6 +5,7 @@
 #include "rr3/recovery_guard.hpp"
 #include "rr3/rr3_md5.hpp"
 #include "bionic_errno.hpp"
+#include "rr3_asset_candidates.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -32,15 +33,84 @@ constexpr const char* kLooseDataRoot =
     "sdmc:/switch/rr3-native-rehost/data/loose";
 // Last successfully opened gui directory (for DT_UNKNOWN recovery in readdir).
 const char* g_lastOpendirPath = nullptr;
-// When listing the bare gui_assets folder, synthesize children the guest
-// expects. 2048x1536 lives on the HD volume (rr3gui0) and does not appear in
-// the SD listing; AndroidHigh.plist selects High → 2048x1536. 1280x720 is
-// the Switch panel size. contentDevice already routes 2048x1536 to rr3gui0
-// and rewriteGuiResolutionPath sends 1280x720 to 960x640.
-bool g_injectGui1280 = false;
+// When listing the bare gui_assets folder, synthesize the ONE child the
+// volumes do not list but the guest expects: 2048x1536 lives on the HD volume
+// (rr3gui0) and does not appear in the SD listing; AndroidHigh.plist selects
+// High → 2048x1536. contentDevice already routes 2048x1536 to rr3gui0.
+//
+// 1280x720 IS NOT INJECTED ANY MORE, and the reason is MEASURED, not
+// preferred. The guest builds its "Res order:" OUT OF THE LISTING: in the
+// archives from BEFORE the bionic-dirent fix (20261021-165605-eden-assetalias
+// and its three neighbours) the guest printed
+//
+//     Res order:
+//     share) Current res: 1280, 720
+//     original [2] (960.000000, 640.000000) - 1.500000
+//     ...
+//
+// -- an EMPTY "Res order:" while the current resolution WAS printed. So the
+// current resolution is not added on its own; the entry the guest showed for
+// 1280x720 came from the folder this file used to invent, and the fake entry
+// put the guest on the one resolution the volumes ship NEITHER a tree NOR a
+// leaf format for. The guest's own table already ranks 960x640 first
+// ("actual [2] (960,640)"), so the resolution the guest actually wants is
+// the one the volumes ship. See the long note at the injection site.
 bool g_injectGui2048 = false;
 int g_injectIndex = 0;
 dirent g_fakeGuiEntry{};
+// THE REAL CHILDREN OF THE CURRENT gui_assets LISTING, AND THE NAME THE PORT
+// ADDED TO IT.
+//
+// The injection may only ADD a name the listing does not already contain.
+// Before this was tracked, the core tree -- which really does ship
+// files/.depot/gui_assets/2048x1536 -- was shown "2048x1536" TWICE, once as
+// a real entry and once as the injected one (MEASURED, archive
+// 20261023-175553-eden-vptr, guest-view.log L2228 and L2232).
+char g_guiListingChildren[512]{};
+char g_guiListingInjected[64]{};
+bool g_guiListingOpen = false;
+
+// THE NAMES ALREADY IN THE CURRENT gui_assets LISTING.
+bool guiListingHasChild(const char* name) {
+    if (name == nullptr || name[0] == '\0') return false;
+    const size_t n = std::strlen(name);
+    for (const char* p = g_guiListingChildren; (p = std::strstr(p, name)) != nullptr;
+         p += n) {
+        const bool leftOk = (p == g_guiListingChildren) || (p[-1] == ' ');
+        const bool rightOk = (p[n] == '\0') || (p[n] == ' ');
+        if (leftOk && rightOk) return true;
+    }
+    return false;
+}
+
+void noteGuiListingChild(const char* name) {
+    if (name == nullptr || name[0] == '\0') return;
+    if (std::strcmp(name, ".") == 0 || std::strcmp(name, "..") == 0) return;
+    if (guiListingHasChild(name)) return;
+    size_t used = std::strlen(g_guiListingChildren);
+    const size_t n = std::strlen(name);
+    if (used + n + 2 >= sizeof(g_guiListingChildren)) return;
+    if (used != 0) g_guiListingChildren[used++] = ' ';
+    std::memcpy(g_guiListingChildren + used, name, n + 1);
+}
+
+// THE LISTING THE GUEST WAS SHOWN, ONCE, WHEN THE LISTING ENDS.
+//
+// This answers "which resolution can the guest choose from" without having to
+// read the guest's own banner: it names the real children of the gui_assets
+// root and the one the port added to them.
+void logGuiAssetsListing() {
+    if (!g_guiListingOpen) return;
+    g_guiListingOpen = false;
+    char details[0x300];
+    std::snprintf(details, sizeof(details),
+                  "root=%s real=%s injected=%s",
+                  g_lastOpendirPath != nullptr ? g_lastOpendirPath : "-",
+                  g_guiListingChildren[0] != '\0' ? g_guiListingChildren : "-",
+                  g_guiListingInjected[0] != '\0' ? g_guiListingInjected : "-");
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "gui-assets-listing", 0, 0, details);
+}
 
 // ---------------------------------------------------------------------------
 // BIONIC'S struct dirent. The host's cannot be handed to the guest.
@@ -2922,6 +2992,89 @@ bool isConsistentBaseListPath(const char* guestPath) {
            std::strcmp(pathBasename(guestPath), kBaseListLeaf) == 0;
 }
 
+// ---------------------------------------------------------------------------
+// THE PER-CATEGORY GUI ASSET LIST -- "asset_list_base_gui_assets.txt".
+//
+// WHY IT EXISTS.
+//
+//   The guest does not read ONE asset list. It reads the big base list
+//   (files/.depot/asset_list_base.txtCache.txt, 4,212,795 B) AND the
+//   per-category lists under files/apk/res/ ("asset_list_base_<category>.txt")
+//   and merges them into its own .depot/asset_list_base.txtCache.txt, which
+//   is the table the download check compares against.
+//
+//   MEASURED 2026-10-23: the merged list the guest produced on the card had
+//   NO entry for /gui_assets/960x640/common/sprites.android.atlas at all --
+//   not under the "gui_assets" spelling and not under the "assets_960x640"
+//   one -- while every other asset's entry survived. A merge that DROPS an
+//   entry is a merge that saw the same path twice with two DIFFERENT
+//   digests, and the conflict is resolved by removing the entry.
+//
+//   Two lists published two different digests for that one path:
+//
+//     files/.depot/asset_list_base.txtCache.txt   (REWRITTEN by the port)
+//         /gui_assets/960x640/common/sprites.android.atlas
+//         c72568828875f4e2a6b11f5c944e27e0   <- the bytes the port serves
+//     files/apk/res/asset_list_base_gui_assets.txt   (298,223 B)
+//         /gui_assets/960x640/common/sprites.android.atlas
+//         bba63527235d60c88863fa10e111abc6   <- EA's factory digest
+//
+//   The second one was served VERBATIM out of the read-only volume, because
+//   the rewrite machinery only knew about the update list and the big base
+//   list. bba63527... describes NEITHER the card's copy of the atlas nor the
+//   volume's copy (MEASURED: 43213527..., 24,689 B, and c7256882...,
+//   39,199 B), so no bytes the port can serve ever matched it, and the guest
+//   answered "didn't match its MD5" 24 times -- for this one asset only.
+//
+//   So the per-category list is rewritten the same way the base list is: the
+//   SAME override set, the SAME exact-path lookup, the same "only the md5
+//   column changes" rule. After the rewrite the two lists publish the SAME
+//   digest for the asset, the merge keeps the entry, and the compare has a
+//   digest to compare against.
+//
+//   The override set is collectAssetOverrides() -- the same function the
+//   completed gui-assets manifest uses, reading the same recorded-path file
+//   the base list's own pass reads -- so the two lists are rewritten from ONE
+//   set by construction and cannot disagree about a path they both name.
+// ---------------------------------------------------------------------------
+
+// The per-category list, the leaf the guest reads it under.
+constexpr const char* kGuiBaseListLeaf = "asset_list_base_gui_assets.txt";
+// The guest path the list is read under.
+constexpr const char* kGuiBaseListGuestPath = "files/apk/res/asset_list_base_gui_assets.txt";
+// The rewritten copy, on the card. The cache root is already a writable root
+// (ensureWritableRoots), so this needs no new directory.
+constexpr const char* kConsistentGuiBaseListPath =
+    "sdmc:/switch/rr3-native-rehost/cache/asset_list_base_gui_assets.txt";
+// The key of the override set the rewritten list was built from, beside the
+// list itself, so a card that is wiped loses the cache with it.
+constexpr const char* kGuiBaseListKeyPath =
+    "sdmc:/switch/rr3-native-rehost/cache/asset_list_base_gui_assets.txt.key";
+
+// What the port knows about the rewritten per-category list, so the serve
+// line can name the file the list came from, the file that is served, and
+// the counts -- on a rebuilt run AND on a cached one.
+struct ConsistentGuiList {
+    const char* served{nullptr};
+    char source[0x600]{};
+    char destination[0x600]{};
+    unsigned entries{0};
+    unsigned rewritten{0};
+    unsigned kept{0};
+};
+ConsistentGuiList gConsistentGuiList{};
+
+// True when the guest path is the per-category GUI asset list the port
+// rewrites.
+//
+// THE LEAF, NOT THE WHOLE PATH: the guest asks for this list under more
+// than one root (files/apk/res/... and files/.depot/... both name it), and
+// the base list's own predicate works the same way.
+bool isConsistentGuiBaseListPath(const char* guestPath) {
+    return guestPath != nullptr &&
+           std::strcmp(pathBasename(guestPath), kGuiBaseListLeaf) == 0;
+}
+
 // THE ASSET PATH behind a guest path, in the spelling the asset lists use.
 //
 // The guest writes a downloaded asset to "<asset path>.ast", under its own
@@ -3094,12 +3247,21 @@ int withReadFallback(const Resolution& resolution, const char* guestPath,
     // ones it serves.
     {
         const char* consistent = nullptr;
+        // TRUE when the copy on offer is the rewritten PER-CATEGORY GUI list,
+        // so the serve line below can name its source, its destination and
+        // its counts.
+        bool guiList = false;
         if (gConsistentListServed != nullptr && isConsistentListPath(guestPath)) {
             consistent = gConsistentListServed;
         }
         else if (gConsistentBaseListServed != nullptr &&
                  isConsistentBaseListPath(guestPath)) {
             consistent = gConsistentBaseListServed;
+        }
+        else if (gConsistentGuiList.served != nullptr &&
+                 isConsistentGuiBaseListPath(guestPath)) {
+            consistent = gConsistentGuiList.served;
+            guiList = true;
         }
         if (consistent != nullptr) {
             ++attempts;
@@ -3112,6 +3274,28 @@ int withReadFallback(const Resolution& resolution, const char* guestPath,
                               consistent, rc, errno);
                 appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                                     "assetlist-serve", 0, 0, diag);
+            }
+            if (guiList) {
+                // THE PER-CATEGORY LIST'S OWN SERVE LINE.
+                //
+                // It names the file the list was READ FROM, the file that is
+                // SERVED, how many entries the list has and how many of them
+                // were rewritten -- so a run can tell "the guest read the
+                // rewritten list" from "the guest read the shipped one" and
+                // from "the rewrite found nothing to change", which are three
+                // different observations and used to look like one.
+                char diag[1400];
+                std::snprintf(diag, sizeof(diag),
+                              "guest=%.200s source=%.300s out=%.300s entries=%u "
+                              "rewritten=%u kept=%u rc=%d errno=%d",
+                              guestPath != nullptr ? guestPath : "-",
+                              gConsistentGuiList.source,
+                              gConsistentGuiList.destination,
+                              gConsistentGuiList.entries,
+                              gConsistentGuiList.rewritten,
+                              gConsistentGuiList.kept, rc, errno);
+                appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                    "assetlist-serve-gui", 0, 0, diag);
             }
             if (rc == 0) {
                 if (servedOut != nullptr) {
@@ -3379,6 +3563,15 @@ unsigned long long systemTickMillis(uint64_t ticks) {
     return (ticks * 1000ull) / frequency;
 }
 
+// The ".ast" stream probe, defined below. The bulk path reports the digest
+// of the buffer it hands the guest through it, so the memory-backed streams
+// are measured by the same line as the ordinary ones -- and the control on
+// the memory-backed path is measured by exactly the code path that could
+// hand out a stale buffer.
+void emitAstStreamLine(const char* guestPath, const char* servedPath, const char* mode,
+                        unsigned long long fileSizeAtOpen, unsigned long long bytesHanded,
+                        const char* handedDigest);
+
 // Open a large file into memory and hand back a memory-backed stream.
 //
 // Returns false when the file is not bulk-worthy, or when the bulk path is
@@ -3398,6 +3591,35 @@ bool bulkOpenFile(const char* candidate, const char* mode, std::FILE** out) {
             if (stream == nullptr) {
                 return false;
             }
+            // THE CACHED BUFFER'S DIGEST, and WHEN IT WAS CACHED.
+            //
+            // A cache hit hands the guest bytes that were read EARLIER. If the
+            // file changed since, the guest gets the old bytes and hashes
+            // them -- which is exactly the shape of a "didn't match its MD5"
+            // that no amount of correct serving can clear. So the digest and
+            // the age of the cached buffer are on the line.
+            char cachedDigest[33]{};
+            {
+                Md5 md5;
+                md5.begin();
+                if (entry.size > 0) {
+                    md5.update(entry.data, entry.size);
+                }
+                md5.finish(cachedDigest);
+            }
+            char details[768];
+            std::snprintf(details, sizeof(details),
+                          "path=%s size=%zu cached_md5=%.32s",
+                          candidate, entry.size, cachedDigest);
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                "bulk-cache-hit", index, 0, details);
+            // THE SAME MEASUREMENT THE ORDINARY PATH MAKES. A cache hit
+            // hands the guest bytes that were read EARLIER, and the fresh
+            // disk read is what says whether those are still the file's
+            // bytes. The digest below is of the buffer the guest is about
+            // to read, so this line is a fact about the guest's bytes and
+            // not about the file.
+            emitAstStreamLine(nullptr, candidate, mode, entry.size, entry.size, cachedDigest);
             *out = stream;
             return true;
         }
@@ -3464,6 +3686,24 @@ bool bulkOpenFile(const char* candidate, const char* mode, std::FILE** out) {
         std::free(buffer);
         return false;
     }
+    // THE DIGEST OF THE BYTES THE GUEST WILL ACTUALLY READ.
+    //
+    // The "fopen-asset" line reports the SIZE of the file the resolver
+    // picked. That is not what the guest receives: this buffer is. A guest
+    // that hashes the stream it was handed can therefore disagree with the
+    // port about the bytes, and the port's own read-back of the same file
+    // agrees with nobody. So the digest is computed HERE, on the exact
+    // buffer that becomes the guest's stream, and it is logged next to the
+    // size the guest will see.
+    char servedDigest[33]{};
+    {
+        Md5 md5;
+        md5.begin();
+        if (total > 0) {
+            md5.update(buffer, total);
+        }
+        md5.finish(servedDigest);
+    }
     // Cache it. The slot may already hold an entry; that entry's buffer is
     // NOT freed -- a guest stream may still point into it.
     BulkReadEntry& entry = gBulkReads[gBulkReadNext];
@@ -3479,12 +3719,359 @@ bool bulkOpenFile(const char* candidate, const char* mode, std::FILE** out) {
         char details[768];
         std::snprintf(details, sizeof(details),
                       "path=%s size=%zu pieces=%u piece_kb=%zu ms=%llu "
-                      "bytes_per_ms=%llu",
+                      "bytes_per_ms=%llu served_md5=%.32s",
                       candidate, total, pieces, chunk / 1024, totalMillis,
-                      totalMillis != 0 ? total / totalMillis : total);
+                      totalMillis != 0 ? total / totalMillis : total,
+                      servedDigest);
         appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                             "bulk-read", gBulkReadCount, 0, details);
     }
+    // The digest of the buffer the guest is about to read, measured by the
+    // same line the ordinary path uses.
+    emitAstStreamLine(nullptr, candidate, mode, total, total, servedDigest);
+    *out = stream;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// THE ".ast" STREAM PROBE -- the missing sample.
+//
+// WHY IT EXISTS.
+//
+// The guest's own md5 check compares the digest of the file it just wrote
+// (the ".ast") against the digest the manifest publishes for that asset.
+// The port had three samples of "the same file", and NOT ONE of them was
+// the bytes the guest hashed:
+//
+//   * the endpoint hashes the bytes it SERVED (a copy still in memory);
+//   * the "ast-readback" instrument re-reads the file from disk after the
+//     write;
+//   * the "served-digest" instrument re-reads it again, later.
+//
+// So when the guest rejects an asset that every port-side instrument calls
+// perfect, none of those three can explain it: they were never looking at
+// the bytes the guest hashed. That is the hole this probe fills.
+//
+// WHAT IT REPORTS, per stream:
+//
+//   file_size_at_open          the size of the file at the moment of the open
+//   bytes_handed_to_guest      how many bytes the guest can read from it
+//   digest_of_handed_bytes     the digest of EXACTLY those bytes
+//   digest_of_fresh_disk_read  the digest of an INDEPENDENT second read
+//   agree                      1 when the two samples are the same
+//
+// For the ordinary path the port serves the guest FROM THE PROBE'S OWN
+// BUFFER, so digest_of_handed_bytes is a fact and not a claim. The second
+// sample goes through a different syscall path (raw read(2), not stdio) and
+// its own buffer, so the two are genuinely independent.
+//
+// THE CONTROL CAN FAIL. The control streams carry expect_md5 -- the digest
+// the port AND the guest both report for them -- and expect_match is the
+// comparison of the measured digest against that constant. A control that
+// cannot fail is not a control.
+// ---------------------------------------------------------------------------
+
+constexpr char kAstStreamLogPath[] = "sdmc:/switch/rr3-native-rehost.guest-view.log";
+
+// Below this the ordinary path answers, so the probe takes it over and the
+// digest it reports is the digest of the bytes the guest really gets. It is
+// the same boundary the bulk path uses, so the two never both claim a file.
+constexpr unsigned long long kAstStreamMaxBytes = 256ull * 1024ull;
+// The total the probe may hold at once. The buffers are NEVER freed -- a
+// guest stream may still point into one -- so this budget is the only thing
+// that bounds the probe's memory.
+constexpr unsigned long long kAstStreamBudgetBytes = 24ull * 1024ull * 1024ull;
+
+unsigned long long gAstStreamHeldBytes = 0;
+unsigned gAstStreamCount = 0;
+
+// THE CONTROLS.
+//
+// Every one of these is an asset the guest accepts, and every one carries
+// the digest the port AND the guest independently report.
+//
+//   bulk         the memory-backed path, where a stale buffer could have
+//                been handed out -- and the file the port's own endpoint
+//                logs as 4e063961c02bc8487524d415556b5095
+//   plain        the ordinary path, the same shape as the suspect
+//   suspect-*    the suspect itself, in BOTH of the spellings it is served
+//                under: the asset file and the ".ast" the guest hashes
+struct AstStreamControl {
+    const char* label;
+    const char* servedSuffix;
+    const char* expectMd5;
+};
+constexpr AstStreamControl kAstStreamControls[] = {
+    {"bulk", "/gui_assets/960x640/common/sprites_0.rgb.pvr.z",
+     "4e063961c02bc8487524d415556b5095"},
+    {"plain", "/assets_480x320/common/sprites.android.atlas",
+     "7f546f712bf2681e4269643d999226d4"},
+    {"suspect-asset", "/assets_960x640/common/sprites.android.atlas",
+     "c72568828875f4e2a6b11f5c944e27e0"},
+    {"suspect-ast", "/gui_assets/960x640/common/sprites.android.atlas",
+     "c72568828875f4e2a6b11f5c944e27e0"},
+};
+
+// The control whose served path ends with this suffix, or with the suffix
+// followed by ".ast" -- the guest writes the ".ast" for the same asset, and
+// it holds the same bytes.
+const AstStreamControl* astStreamControlFor(const char* servedPath) {
+    if (servedPath == nullptr) {
+        return nullptr;
+    }
+    const size_t pathLength = std::strlen(servedPath);
+    for (const AstStreamControl& control : kAstStreamControls) {
+        const size_t suffixLength = std::strlen(control.servedSuffix);
+        if (pathLength < suffixLength) {
+            continue;
+        }
+        const char* tail = servedPath + pathLength - suffixLength;
+        if (std::strcmp(tail, control.servedSuffix) == 0) {
+            return &control;
+        }
+        if (pathLength >= suffixLength + 4 &&
+            std::strcmp(servedPath + pathLength - 4, ".ast") == 0 &&
+            std::strcmp(servedPath + pathLength - suffixLength - 4, control.servedSuffix) == 0) {
+            return &control;
+        }
+    }
+    return nullptr;
+}
+
+// Is this a stream the probe reports on?
+bool astStreamIsTracked(const char* servedPath) {
+    if (servedPath == nullptr) {
+        return false;
+    }
+    if (astStreamControlFor(servedPath) != nullptr) {
+        return true;
+    }
+    const size_t length = std::strlen(servedPath);
+    return length >= 4 && std::strcmp(servedPath + length - 4, ".ast") == 0;
+}
+
+// THE OTHER REPRESENTATION.
+//
+// The guest's compare site reverses the bytes within each 4-byte word of the
+// digest it computed (0x1cdcb10-0x1cdcb8c) and compares the result with the
+// 16 bytes it parsed out of the manifest text. So the same 16 bytes have two
+// possible forms, and a disagreement between the forms would look like a
+// corrupt download instead of a byte-order disagreement. Both are printed
+// side by side so the difference shows up as a difference.
+//
+// This takes the 32 hex characters and swaps the four byte-pairs inside each
+// 4-byte word: "c7256882" becomes "826825c7".
+void astStreamWordReversedHex(const char* hex32, char out[33]) {
+    if (hex32 == nullptr || out == nullptr) {
+        return;
+    }
+    for (unsigned word = 0; word < 4u; ++word) {
+        for (unsigned byte = 0; byte < 4u; ++byte) {
+            const unsigned source = (word * 4u + (3u - byte)) * 2u;
+            out[word * 8u + byte * 2u] = hex32[source];
+            out[word * 8u + byte * 2u + 1u] = hex32[source + 1u];
+        }
+    }
+    out[32] = '\0';
+}
+
+// AN INDEPENDENT SECOND READ.
+//
+// A different syscall path from the probe's own read (raw read(2), not
+// stdio), its own buffer, its own digest. It is the only sample in the port
+// that is taken at the moment the guest's stream is opened and that shares
+// no buffer with the sample it is compared against.
+//
+// The buffer is file-scope, not stack: this runs on the guest's thread, and
+// 64 KiB of stack there has killed runs before. Two threads may hash at
+// once, and the flag makes the second one report "not measured" instead of a
+// torn digest.
+bool astStreamFreshDiskDigest(const char* path, char out[33], unsigned long long* sizeOut) {
+    if (path == nullptr || out == nullptr) {
+        return false;
+    }
+    out[0] = '\0';
+    static unsigned char buffer[8 * 1024];
+    static volatile bool busy = false;
+    if (busy) {
+        return false;
+    }
+    busy = true;
+    const int fd = ::open(path, O_RDONLY);
+    if (fd < 0) {
+        busy = false;
+        return false;
+    }
+    Md5 digest;
+    digest.begin();
+    unsigned long long total = 0;
+    bool failed = false;
+    for (;;) {
+        const ssize_t got = ::read(fd, buffer, sizeof(buffer));
+        if (got < 0) {
+            failed = true;
+            break;
+        }
+        if (got == 0) {
+            break;
+        }
+        digest.update(buffer, static_cast<size_t>(got));
+        total += static_cast<unsigned long long>(got);
+    }
+    ::close(fd);
+    busy = false;
+    if (failed) {
+        return false;
+    }
+    digest.finish(out);
+    if (sizeOut != nullptr) {
+        *sizeOut = total;
+    }
+    return true;
+}
+
+// THE LINE.
+void emitAstStreamLine(const char* guestPath, const char* servedPath, const char* mode,
+                        unsigned long long fileSizeAtOpen, unsigned long long bytesHanded,
+                        const char* handedDigest) {
+    if (servedPath == nullptr || handedDigest == nullptr || !astStreamIsTracked(servedPath)) {
+        return;
+    }
+    const AstStreamControl* control = astStreamControlFor(servedPath);
+
+    char diskDigest[33]{};
+    unsigned long long diskBytes = 0;
+    const bool haveDisk = astStreamFreshDiskDigest(servedPath, diskDigest, &diskBytes);
+    // agree = 1 only when BOTH samples are the same and the sizes agree.
+    // "na" means the second sample could not be taken, which is NOT a
+    // disagreement -- and saying so is the whole point of the field.
+    const char* agree = "na";
+    if (haveDisk) {
+        agree = (diskBytes == bytesHanded && std::strcmp(diskDigest, handedDigest) == 0) ? "1" : "0";
+    }
+
+    char reversed[33]{};
+    astStreamWordReversedHex(handedDigest, reversed);
+
+    char details[1536];
+    int written = std::snprintf(details, sizeof(details),
+                                 "path=%.300s served=%.300s mode=%s "
+                                 "file_size_at_open=%llu bytes_handed_to_guest=%llu "
+                                 "digest_of_handed_bytes=%s digest_of_fresh_disk_read=%s "
+                                 "agree=%s md5_hex=%s md5_wordrev_hex=%s",
+                                 guestPath != nullptr ? guestPath : "-",
+                                 servedPath,
+                                 mode != nullptr ? mode : "-",
+                                 fileSizeAtOpen,
+                                 bytesHanded,
+                                 handedDigest,
+                                 haveDisk ? diskDigest : "-",
+                                 agree,
+                                 handedDigest,
+                                 reversed);
+    if (written < 0 || static_cast<size_t>(written) >= sizeof(details)) {
+        written = 0;
+    }
+    if (control != nullptr) {
+        const int expect = asset::digestEquals(handedDigest, control->expectMd5) ? 1 : 0;
+        const int extra = std::snprintf(details + written, sizeof(details) - written,
+                                        " control=%s expect_md5=%s expect_match=%d",
+                                        control->label, control->expectMd5, expect);
+        if (extra > 0 && static_cast<size_t>(written + extra) < sizeof(details)) {
+            written += extra;
+        }
+    }
+    appendGuestBootLine(kAstStreamLogPath, "ast-stream", ++gAstStreamCount, 0, details);
+}
+
+// THE ORDINARY-PATH PROBE.
+//
+// The port's ordinary read path hands the guest a std::FILE* on the real
+// file. Nothing in the port sees the bytes the guest then reads from it,
+// and the port's own read-back instruments read the file a SECOND time --
+// so a port that says "the file hashes to X" is not, by itself, evidence
+// that the guest hashed X.
+//
+// THIS MAKES IT EVIDENCE: the probe reads the file once, keeps the bytes,
+// and serves the guest FROM THOSE BYTES. The digest it reports is the
+// digest of the bytes the guest will read, because those are the bytes it
+// gets.
+//
+// The cost is memory: the buffer is never freed, because a guest stream may
+// still point into it. The budget is what bounds that, and the ordinary
+// path is left completely unchanged for every file the probe declines.
+bool probeAstStream(const char* guestPath, const char* servedPath, const char* mode,
+                    std::FILE** out) {
+    if (guestPath == nullptr || servedPath == nullptr || mode == nullptr || out == nullptr) {
+        return false;
+    }
+    // A read-only open only. A write or an update needs a real fd.
+    if (std::strchr(mode, 'w') != nullptr || std::strchr(mode, 'a') != nullptr ||
+        std::strchr(mode, '+') != nullptr) {
+        return false;
+    }
+    if (!astStreamIsTracked(servedPath)) {
+        return false;
+    }
+    const int fd = ::open(servedPath, O_RDONLY);
+    if (fd < 0) {
+        return false;
+    }
+    struct stat info{};
+    if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode)) {
+        ::close(fd);
+        return false;
+    }
+    const unsigned long long fileSize = static_cast<unsigned long long>(info.st_size);
+    // Zero-length and bulk-sized files are left to the paths that already
+    // handle them: a zero-length file has no digest to compare, and a
+    // bulk-sized one is the bulk path's, with its own digest instrument.
+    if (fileSize == 0 || fileSize >= kAstStreamMaxBytes) {
+        ::close(fd);
+        return false;
+    }
+    if (gAstStreamHeldBytes + fileSize > kAstStreamBudgetBytes) {
+        ::close(fd);
+        return false;
+    }
+    unsigned char* buffer = static_cast<unsigned char*>(std::malloc(static_cast<size_t>(fileSize)));
+    if (buffer == nullptr) {
+        ::close(fd);
+        return false;
+    }
+    size_t done = 0;
+    bool failed = false;
+    while (done < fileSize) {
+        const ssize_t got = ::read(fd, buffer + done, static_cast<size_t>(fileSize - done));
+        if (got <= 0) {
+            failed = true;
+            break;
+        }
+        done += static_cast<size_t>(got);
+    }
+    ::close(fd);
+    if (failed || done != fileSize) {
+        std::free(buffer);
+        return false;
+    }
+
+    // THE DIGEST OF THE BYTES THE GUEST IS ABOUT TO GET.
+    char handedDigest[33]{};
+    {
+        Md5 digest;
+        digest.begin();
+        digest.update(buffer, done);
+        digest.finish(handedDigest);
+    }
+
+    std::FILE* stream = ::fmemopen(buffer, done, "rb");
+    if (stream == nullptr) {
+        std::free(buffer);
+        return false;
+    }
+    // The buffer is NEVER freed: the guest holds the stream.
+    gAstStreamHeldBytes += done;
+    emitAstStreamLine(guestPath, servedPath, mode, fileSize, done, handedDigest);
     *out = stream;
     return true;
 }
@@ -3593,6 +4180,232 @@ void logApkResReachabilityOnce() {
                         "apk-res-reach", 0, 0, line);
 }
 
+// ---------------------------------------------------------------------------
+// THE GUI-ASSET REQUEST CENSUS.
+//
+// WHY: a texture leaf is named by TWO things -- the resolution segment and
+// the leaf format -- and the port can answer a request only when the volume
+// ships THAT file in THAT tree. The defect this census was built for is a
+// MISMATCH between the two, so they are counted together: "1280x720/dxt.dds,
+// 24 requests, 0 hits" says something a count of failures alone does not.
+//
+// WHAT IT COUNTS: every stat and every open the guest makes for a path
+// under "gui_assets/", keyed by (resolution segment, leaf format), split
+// into requests / hits / misses. The stat is the guest's EXISTENCE PROBE and
+// the open is what the guest actually CONSUMED, so a key with hits and no
+// opens is a file the guest found and could not read.
+//
+// IT IS DELIBERATELY NOT A "stat-path" LINE. stat-path logs FAILURES, and
+// budgets successes out after 600 calls -- which is why the baseline run
+// (archive 20261023-175553-eden-vptr) could report "108 requests under
+// 1280x720, 0 succeeded" while the same run went on to READ 471,920 bytes
+// of rr3gui1:/files/.depot/gui_assets/960x640/common/sprites_0.rgb.pvr.z.
+// An instrument that only sees failures cannot tell "the port served
+// nothing" from "the instrument cannot see a success". This one sees both.
+//
+// THE POSITIVE CONTROL IS BELOW, AND IT IS NOT OPTIONAL.
+// ---------------------------------------------------------------------------
+constexpr unsigned kGuiCensusSlots = 48;
+constexpr unsigned kGuiCensusSummaryEvery = 50;
+
+struct GuiCensusEntry {
+    char res[16];
+    char fmt[16];
+    unsigned statReq;
+    unsigned statHit;
+    unsigned statMiss;
+    unsigned openReq;
+    unsigned openHit;
+    unsigned openMiss;
+    bool firstLogged;
+};
+
+GuiCensusEntry gGuiCensus[kGuiCensusSlots];
+unsigned gGuiCensusKeys = 0;
+unsigned gGuiCensusRequests = 0;
+unsigned gGuiCensusSummaries = 0;
+bool gGuiCensusBusy = false;
+bool gGuiCensusSelfTestDone = false;
+
+// THE RESOLUTION SEGMENT AND THE LEAF FORMAT OF A GUI-ASSET REQUEST.
+//
+// The resolution segment is the directory right after "gui_assets/", and the
+// format is what the leaf's extension says the PIXELS are in -- ".z" is the
+// compression, not the format, so ".dxt.dds.z" and ".dxt.dds" are one format.
+bool guiAssetKey(const char* guestPath, char* res, size_t resSize,
+                 char* fmt, size_t fmtSize) {
+    if (guestPath == nullptr || res == nullptr || fmt == nullptr) return false;
+    const char* marker = std::strstr(guestPath, "gui_assets/");
+    if (marker == nullptr) return false;
+    const char* after = marker + std::strlen("gui_assets/");
+    const char* slash = std::strchr(after, '/');
+    if (slash == nullptr || slash == after) return false;
+    const size_t resLen = static_cast<size_t>(slash - after);
+    if (resLen + 1 > resSize) return false;
+    std::memcpy(res, after, resLen);
+    res[resLen] = '\0';
+    const char* leaf = std::strrchr(slash + 1, '/');
+    leaf = (leaf != nullptr) ? leaf + 1 : slash + 1;
+    char leafCopy[0x200];
+    std::snprintf(leafCopy, sizeof(leafCopy), "%s", leaf);
+    size_t n = std::strlen(leafCopy);
+    if (n > 2 && std::strcmp(leafCopy + n - 2, ".z") == 0) {
+        leafCopy[n - 2] = '\0';
+    }
+    const char* format = "other";
+    if (std::strstr(leafCopy, ".rgb.pvr") != nullptr) format = "rgb.pvr";
+    else if (std::strstr(leafCopy, ".ptc.pvr") != nullptr) format = "ptc.pvr";
+    else if (std::strstr(leafCopy, ".dxt.dds") != nullptr) format = "dxt.dds";
+    else if (std::strstr(leafCopy, ".etc.dds") != nullptr) format = "etc.dds";
+    else if (std::strstr(leafCopy, ".atc.dds") != nullptr) format = "atc.dds";
+    else if (std::strstr(leafCopy, ".android.atlas") != nullptr) format = "atlas";
+    else if (std::strstr(leafCopy, ".pvr") != nullptr) format = "pvr";
+    else if (std::strstr(leafCopy, ".dds") != nullptr) format = "dds";
+    std::snprintf(fmt, fmtSize, "%s", format);
+    return true;
+}
+
+GuiCensusEntry* guiCensusSlot(const char* res, const char* fmt) {
+    for (unsigned i = 0; i < gGuiCensusKeys; ++i) {
+        if (std::strcmp(gGuiCensus[i].res, res) == 0 &&
+            std::strcmp(gGuiCensus[i].fmt, fmt) == 0) {
+            return &gGuiCensus[i];
+        }
+    }
+    if (gGuiCensusKeys >= kGuiCensusSlots) return nullptr;
+    GuiCensusEntry* entry = &gGuiCensus[gGuiCensusKeys++];
+    std::snprintf(entry->res, sizeof(entry->res), "%s", res);
+    std::snprintf(entry->fmt, sizeof(entry->fmt), "%s", fmt);
+    entry->firstLogged = false;
+    return entry;
+}
+
+// THE CENSUS, AS ONE LINE.
+//
+// "res/fmt:stat req/hit/miss open req/hit/miss" -- the three numbers are
+// always in that order, so a reader can split the line without a legend.
+void logGuiCensusSummary(const char* why) {
+    char details[0x900];
+    int n = std::snprintf(details, sizeof(details),
+                          "requests=%u keys=%u %s |", gGuiCensusRequests,
+                          gGuiCensusKeys, why);
+    for (unsigned i = 0; i < gGuiCensusKeys; ++i) {
+        if (n < 0 || n >= static_cast<int>(sizeof(details))) break;
+        const GuiCensusEntry& e = gGuiCensus[i];
+        n += std::snprintf(details + n, sizeof(details) - n,
+                           " %s/%s:stat %u/%u/%u open %u/%u/%u",
+                           e.res, e.fmt, e.statReq, e.statHit, e.statMiss,
+                           e.openReq, e.openHit, e.openMiss);
+    }
+    if (n < 0) return;
+    if (n >= static_cast<int>(sizeof(details))) {
+        n = static_cast<int>(sizeof(details)) - 1;
+    }
+    details[n] = '\0';
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "gui-asset-census", ++gGuiCensusSummaries, 0, details);
+}
+
+// THE POSITIVE CONTROL.
+//
+// An instrument that can only report "miss" looks exactly like a perfect
+// instrument on a broken port: every request fails, the census says "0 hits",
+// and nobody can tell "the port serves nothing" from "the instrument cannot
+// see a success". So the census is REQUIRED to classify two probes it makes
+// itself, through the SAME resolver and the SAME classifier it uses for the
+// guest's requests:
+//
+//   present  .depot/gui_assets/960x640/common/sprites_0.rgb.pvr.z  -> must hit
+//   absent   .depot/gui_assets/1280x720/common/sprites_0.dxt.dds.z -> must miss
+//
+// Both are MEASURED facts about the deployed volumes (archive
+// 20261023-175553-eden-vptr): the first is stat'ed OK (471,920 B, stat-layout
+// at L39299), the second is ENOENT (stat-path rc=-1 errno=2 at L7740). The
+// line reports ok=1 only when the classifier agrees with the filesystem on
+// BOTH, and it prints the path each probe actually resolved to.
+void guiAssetCensusSelfTest() {
+    if (gGuiCensusSelfTestDone) return;
+    gGuiCensusSelfTestDone = true;
+    gGuiCensusBusy = true;
+    struct Probe {
+        const char* guestPath;
+        bool expectHit;
+        const char* label;
+    };
+    const Probe probes[] = {
+        {"sdmc:/switch/rr3-native-rehost/.depot/gui_assets/960x640/common/sprites_0.rgb.pvr.z",
+         true, "present"},
+        {"sdmc:/switch/rr3-native-rehost/.depot/gui_assets/1280x720/common/sprites_0.dxt.dds.z",
+         false, "absent"},
+    };
+    int ok = 1;
+    char present[640]{};
+    char absent[640]{};
+    for (const Probe& probe : probes) {
+        Resolution resolution{};
+        struct stat host{};
+        int rc = -1;
+        if (resolvePath(probe.guestPath, false, resolution)) {
+            rc = withReadFallback(resolution, probe.guestPath,
+                [&host](const char* candidate) { return ::stat(candidate, &host); });
+        }
+        const bool hit = (rc == 0);
+        char res[16]{};
+        char fmt[16]{};
+        const bool keyed = guiAssetKey(probe.guestPath, res, sizeof(res),
+                                       fmt, sizeof(fmt));
+        const char* classified = hit ? "hit" : "miss";
+        const bool good = keyed && (hit == probe.expectHit);
+        if (!good) ok = 0;
+        char* slot = probe.expectHit ? present : absent;
+        std::snprintf(slot, 640, "%s rc=%d errno=%d classified=%s key=%s/%s "
+                                   "resolved=%s",
+                      probe.label, rc, rc == 0 ? 0 : errno, classified,
+                      res, fmt,
+                      resolution.primary[0] != '\0' ? resolution.primary : "-");
+    }
+    gGuiCensusBusy = false;
+    char details[0x900];
+    std::snprintf(details, sizeof(details),
+                  "ok=%d | %s | %s", ok, present, absent);
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "gui-asset-selftest", 0, static_cast<unsigned long long>(ok),
+                        details);
+}
+
+// ONE GUI-ASSET REQUEST.
+void censusGuiAssetRequest(const char* guestPath, int rc, bool isOpen) {
+    if (gGuiCensusBusy) return;
+    char res[16]{};
+    char fmt[16]{};
+    if (!guiAssetKey(guestPath, res, sizeof(res), fmt, sizeof(fmt))) return;
+    if (!gGuiCensusSelfTestDone) guiAssetCensusSelfTest();
+    GuiCensusEntry* entry = guiCensusSlot(res, fmt);
+    if (entry == nullptr) return;
+    ++gGuiCensusRequests;
+    if (isOpen) {
+        ++entry->openReq;
+        if (rc == 0) ++entry->openHit; else ++entry->openMiss;
+    } else {
+        ++entry->statReq;
+        if (rc == 0) ++entry->statHit; else ++entry->statMiss;
+    }
+    if (!entry->firstLogged) {
+        entry->firstLogged = true;
+        char details[0x300];
+        std::snprintf(details, sizeof(details),
+                      "key=%s/%s first_request=%s rc=%d api=%s",
+                      entry->res, entry->fmt,
+                      guestPath != nullptr ? guestPath : "-", rc,
+                      isOpen ? "open" : "stat");
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "gui-asset-census-new", 0, 0, details);
+    }
+    if (gGuiCensusRequests % kGuiCensusSummaryEvery == 0) {
+        logGuiCensusSummary("periodic");
+    }
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -3634,38 +4447,44 @@ void logApkResReachabilityOnce() {
 // The local files that can back a requested asset path, in the order the pack
 // endpoint tries them.
 //
-// THIS IS THE ENDPOINT'S ORDER, CHARACTER FOR CHARACTER
-// (cc_http_request.cpp assetCandidates):
+// THIS LIST IS NOT SPELLED OUT HERE ANY MORE, BECAUSE THERE IS NO SECOND COPY
+// OF IT TO SPELL OUT.
+//
+// It used to be: this file carried a hand-written copy of the endpoint's
+// order, and the endpoint carried its own, and the file's own rule said they
+// had to "stay in lockstep" -- "two copies of a list in two files can only
+// ever agree by accident". They did NOT agree: the endpoint grew rules 5 and
+// 6 (the guest's own download cache and the nearest lower resolution) and
+// this copy did not, so the endpoint could answer a path from a file this
+// resolver never looked at, and the manifest published a digest that did not
+// describe the bytes the endpoint sent.
+//
+// BOTH SIDES NOW CALL THE SAME FUNCTIONS OUT OF THE SAME HEADER:
+// native-switch/source/rr3_asset_candidates.hpp.
+//
+//   rr3::asset::buildCandidates()   the ordered candidate list
+//   rr3::asset::selectCandidate()   which candidate is the answer
+//
+// The digest a manifest publishes is the digest of the candidate the shared
+// selection picks, so the bytes the endpoint sends and the digest the guest
+// compares against are the same bytes by construction.
+// THE CANDIDATE LIST IS THE SHARED ONE.
+//
+// rr3::asset::buildCandidates() -- native-switch/source/rr3_asset_candidates.hpp
+// -- is the ONE list, and the pack endpoint calls the same function
+// (cc_http_request.cpp assetCandidates() is now a one-line wrapper around it).
+// The rules are:
 //
 //   1. the guest's OWN depot on the card, under the same relative name:
 //      ".depot" + path
 //   2. the volume tree with the same relative name: "files/.depot" + path
 //   3. the gui_assets tree, for the server's "/assets_<res>/" spelling:
 //      "files/.depot/gui_assets/<res>" + rest
-//
-// It is spelled out HERE as well because the list and the endpoint have to
-// agree on it: the list's md5 is the digest of the file the endpoint picks,
-// so a different order on the two sides would put the digest of one file
-// next to the bytes of another.
-// THE CANDIDATE LIST, CHARACTER FOR CHARACTER THE SAME AS THE PACK ENDPOINT'S.
-//
-// cc_http_request.cpp assetCandidates() (owned by another area) offers, for
-// the guest's "/gui_assets/<res>/X" spelling:
-//
-//   1. ".depot/gui_assets/<res>/X"        the card's gui_assets tree
-//   2. "files/.depot/gui_assets/<res>/X"  the volume
-//   3. ".depot/assets_<res>/X"            the card's installed tree, LAST
-//
-// and, for the "/assets_<res>/X" spelling:
-//
-//   1. ".depot/assets_<res>/X"            the card's installed tree
-//   2. "files/.depot/assets_<res>/X"      the volume
-//   3. "files/.depot/gui_assets/<res>/X"  the volume's alias
-//
-// THIS LIST MUST STAY IN LOCKSTEP WITH THAT ONE. The digest the manifest
-// rewrite writes into the list is the digest of the bytes the endpoint sends;
-// two copies of a list in two files can only ever agree by accident, and when
-// they disagree the guest md5s one revision and renders another.
+//   4. the card's installed tree, for the guest's "/gui_assets/<res>/" spelling:
+//      ".depot/assets_<res>" + rest
+//   5. the guest's own download cache, "<path>.ast", for BOTH spellings --
+//      digest-gated, so a leftover of an older revision is never the answer
+//   6. the nearest LOWER resolution (2048x1536 -> 960x640 -> 480x320)
 //
 // WHY THE REVERSE ALIAS IS IN THE LIST: the guest asks for the asset under
 // the "gui_assets/<res>/X" spelling, but the ONLY manifest that names it
@@ -3677,74 +4496,82 @@ void logApkResReachabilityOnce() {
 // received against the digest published for the other spelling. ONE digest,
 // TWO spellings, so the two spellings MUST reach the same file.
 //
-// THE RESOLVER (applyVolumeFirstAssetOrder) now answers BOTH spellings with
-// the volume's copy of the logical asset, so the candidate that answers here
-// is the candidate that answers there -- and it is the same file the guest's
-// own runtime read serves.
-static void assetCandidates(const char* path, char out[4][384], unsigned& countOut) {
-    countOut = 0;
-    if (path == nullptr) {
-        return;
+// WHY THE ALIAS IS IN THE LIST (rule 6): a 2048x1536 request for a weekly
+// event asset has no 2048x1536 copy ANYWHERE -- not on the card, not in the
+// seven volumes, not in the data packs. The 960x640 and the 480x320 trees do
+// have it, and the port's own runtime path space already falls back that way.
+// So the endpoint answers it from the lower resolution, and the manifest has
+// to publish the digest of the ALIASED file's bytes under the REQUESTED path:
+// a digest of a file at the requested resolution that does not exist would
+// describe bytes the port never sends.
+static void assetCandidates(const char* path, std::vector<asset::Candidate>& out) {
+    asset::buildCandidates(path, out);
+}
+
+// READS ONE CANDIDATE THROUGH THE PORT'S OWN CHAIN.
+//
+// The SAME read chain the endpoint uses: resolvePath() for the candidate's
+// device path, and withReadFallback() for the volume primary, its alias and
+// the app-local card copy derived from the primary. So the bytes hashed here
+// are the bytes the endpoint will send.
+//
+// guestFopen() -- the endpoint's own reader -- is resolvePath() plus
+// withReadFallback() plus two additions that do not change the bytes of an
+// asset: the stub suppression, which names five configuration files and never
+// an asset, and the bulk-open cache, which serves the same content from
+// memory.
+//
+// servedOut[index] receives the path that answered, because the selection can
+// land on a candidate that is not the last one read.
+bool probeAssetCandidate(const asset::Candidate& candidate, unsigned index,
+                         char digest[33], unsigned long long& sizeOut,
+                         std::vector<unsigned char>& bytes,
+                         std::vector<std::string>& servedOut) {
+    Resolution resolution{};
+    if (!resolvePath(candidate.path, false, resolution)) {
+        return false;
     }
-    std::snprintf(out[countOut], sizeof(out[countOut]), ".depot%s", path);
-    ++countOut;
-    std::snprintf(out[countOut], sizeof(out[countOut]), "files/.depot%s", path);
-    ++countOut;
-    // THE REVERSE ALIAS GOES LAST, NOT SECOND.
-    //
-    // The card's "assets_<res>" tree is the game's INSTALLED revision and the
-    // volume's "gui_assets/<res>" tree is the shipped data-pack revision. For
-    // 960x640 they are DIFFERENT files:
-    //
-    //   .depot/assets_960x640/common/sprites.android.atlas        24,689 B
-    //       md5 4321352770b573a6b71d57547b2b3885   -- 165 image entries, and
-    //       MISSING ten menu sprites (gradient.png, common_info_button.png,
-    //       fb_logo.png, apple_sign_in_icon.png, ...).
-    //   files/.depot/gui_assets/960x640/common/sprites.android.atlas
-    //                                                            39,199 B
-    //       -- 248 image entries, the sprite-complete one.
-    //
-    // Putting the card's stale copy second made it win the "first candidate
-    // that exists" fallback, which is exactly what the fallback is FOR when
-    // no digest matches -- and it put a digest in the manifests that the
-    // runtime read path (which serves the volume) could never produce.
-    //
-    // The endpoint's md5 tie-breaker makes the ORDER irrelevant when a digest
-    // matches; it is the fallback that the order decides, so the stale copy
-    // goes last. THIS LIST IS THE SAME LIST, CHARACTER FOR CHARACTER, AS
-    // cc_http_request.cpp assetCandidates().
-    if (std::strncmp(path, "/gui_assets/", 12) == 0) {
-        const char* rest = std::strchr(path + 12, '/');
-        if (rest != nullptr) {
-            char resolution[32];
-            const size_t length = static_cast<size_t>(rest - (path + 12));
-            if (length < sizeof(resolution)) {
-                std::memcpy(resolution, path + 12, length);
-                resolution[length] = '\0';
-                if (isResolutionSegment(resolution)) {
-                    std::snprintf(out[countOut], sizeof(out[countOut]),
-                                  ".depot/assets_%s%s", resolution, rest);
-                    ++countOut;
-                }
+    const int rc = withReadFallback(
+        resolution, candidate.path,
+        [&bytes, &servedOut, index](const char* path) -> int {
+            std::FILE* file = std::fopen(path, "rb");
+            if (file == nullptr) {
+                return -1;
             }
-        }
-    }
-    if (std::strncmp(path, "/assets_", 8) == 0) {
-        const char* rest = std::strchr(path + 8, '/');
-        if (rest != nullptr) {
-            char resolution[32];
-            const size_t length = static_cast<size_t>(rest - (path + 8));
-            if (length < sizeof(resolution)) {
-                std::memcpy(resolution, path + 8, length);
-                resolution[length] = '\0';
-                if (isResolutionSegment(resolution)) {
-                    std::snprintf(out[countOut], sizeof(out[countOut]),
-                                  "files/.depot/gui_assets/%s%s", resolution, rest);
-                    ++countOut;
-                }
+            if (std::fseek(file, 0, SEEK_END) != 0) {
+                std::fclose(file);
+                return -1;
             }
-        }
+            const long size = std::ftell(file);
+            if (size < 0 || std::fseek(file, 0, SEEK_SET) != 0) {
+                std::fclose(file);
+                return -1;
+            }
+            bytes.resize(static_cast<size_t>(size));
+            const size_t got = (size > 0)
+                ? std::fread(bytes.data(), 1, static_cast<size_t>(size), file)
+                : 0u;
+            std::fclose(file);
+            if (got != static_cast<size_t>(size)) {
+                bytes.clear();
+                return -1;
+            }
+            if (index < servedOut.size()) {
+                servedOut[index] = path;
+            }
+            return 0;
+        });
+    if (rc != 0) {
+        return false;
     }
+    Md5 md5;
+    md5.begin();
+    if (!bytes.empty()) {
+        md5.update(bytes.data(), bytes.size());
+    }
+    md5.finish(digest);
+    sizeOut = static_cast<unsigned long long>(bytes.size());
+    return true;
 }
 
 bool resolveAssetLocalFile(const char* assetPath, char* outPath, size_t outPathSize,
@@ -3758,84 +4585,38 @@ bool resolveAssetLocalFile(const char* assetPath, char* outPath, size_t outPathS
     if (sizeOut != nullptr) {
         *sizeOut = 0;
     }
-    char candidates[4][384];
-    unsigned count = 0;
-    assetCandidates(assetPath, candidates, count);
-    // THE FIRST CANDIDATE THAT EXISTS WINS -- the same rule the endpoint
-    // falls back on, so the digest written in the list is the digest of the
-    // bytes the endpoint serves.
+    // THE ONE CANDIDATE LIST: rules 1 to 6, from the shared header, so the
+    // manifest side and the endpoint see the same files in the same order --
+    // including the guest's own download cache (rule 5) and the nearest lower
+    // resolution (rule 6).
+    std::vector<asset::Candidate> candidates;
+    assetCandidates(assetPath, candidates);
+    // THE MANIFEST SIDE OF THE SHARED SELECTION. There is no expected digest
+    // here, because the digest is what this function computes: the first
+    // candidate that exists is the answer, so the digest written into a list
+    // is the digest of the bytes the endpoint sends for the same path.
     //
-    // THE LAST CANDIDATE (the alias) WAS TRIED HERE AND MEASURED WORSE: with
-    // the alias's digest in the lists the endpoint's tie-break serves the
-    // VOLUME's copy of the atlases, and the guest then loads FEWER of them
-    // (606 sprite references and 58 gui/processed references, against 1,190
-    // and 265 with the first candidate -- archive
-    // 20261022-015912-eden-md5alias-r3 against 20261022-014615-eden-md5fix-v3-r1).
-    // The atlases the guest renders come out of the card's tree, so the card's
-    // copy is the one the digest has to describe.
-    //
-    // The cost of this rule is that the two spellings of one asset can name
-    // two different files -- "/assets_960x640/common/sprites.android.atlas"
-    // reaches the card's 24,689 B copy and "/gui_assets/960x640/common/
-    // sprites.android.atlas" reaches the volume's 39,199 B copy -- and the
-    // guest checks both against ONE md5. That is where the 12 residual
-    // "didn't match its MD5" come from, and closing it needs the two
-    // spellings to name one file, which is a decision about which tree is
-    // authoritative and not a decision this function can make on its own.
-    for (unsigned index = 0; index < count; ++index) {
-        Resolution resolution{};
-        if (!resolvePath(candidates[index], false, resolution)) {
-            continue;
-        }
-        // The SAME read chain the endpoint uses: the volume primary, its
-        // alias, and the app-local card copy derived from the primary. So the
-        // bytes hashed here are the bytes the endpoint will send.
-        std::vector<unsigned char> bytes;
-        char served[0x600]{};
-        const int rc = withReadFallback(
-            resolution, candidates[index],
-            [&bytes, &served](const char* candidate) -> int {
-                std::FILE* file = std::fopen(candidate, "rb");
-                if (file == nullptr) {
-                    return -1;
-                }
-                if (std::fseek(file, 0, SEEK_END) != 0) {
-                    std::fclose(file);
-                    return -1;
-                }
-                const long size = std::ftell(file);
-                if (size < 0 || std::fseek(file, 0, SEEK_SET) != 0) {
-                    std::fclose(file);
-                    return -1;
-                }
-                bytes.resize(static_cast<size_t>(size));
-                const size_t got = (size > 0)
-                    ? std::fread(bytes.data(), 1, static_cast<size_t>(size), file)
-                    : 0u;
-                std::fclose(file);
-                if (got != static_cast<size_t>(size)) {
-                    bytes.clear();
-                    return -1;
-                }
-                std::snprintf(served, sizeof(served), "%s", candidate);
-                return 0;
-            });
-        if (rc != 0) {
-            continue;
-        }
-        Md5 md5;
-        md5.begin();
-        if (!bytes.empty()) {
-            md5.update(bytes.data(), bytes.size());
-        }
-        md5.finish(digest);
-        std::snprintf(outPath, outPathSize, "%s", served);
-        if (sizeOut != nullptr) {
-            *sizeOut = static_cast<unsigned long long>(bytes.size());
-        }
-        return true;
+    // The guest's own download cache ("<path>.ast") is the answer only when
+    // NOTHING ELSE backs the path: a leftover of an older revision is not the
+    // asset, and publishing its digest would hand the guest bytes that are not
+    // the revision it asked for.
+    std::vector<std::string> served(candidates.size());
+    const asset::Selection selection = asset::selectCandidate(
+        candidates, nullptr,
+        [&served](const asset::Candidate& candidate, unsigned index, char outDigest[33],
+                  unsigned long long& outSize, std::vector<unsigned char>& bytes) -> bool {
+            return probeAssetCandidate(candidate, index, outDigest, outSize, bytes,
+                                       served);
+        });
+    if (selection.index < 0) {
+        return false;
     }
-    return false;
+    std::snprintf(outPath, outPathSize, "%s", served[selection.index].c_str());
+    std::memcpy(digest, selection.digest, 33);
+    if (sizeOut != nullptr) {
+        *sizeOut = selection.size;
+    }
+    return true;
 }
 
 // The asset list the guest checks its downloads against -- its leaf name,
@@ -4295,6 +5076,218 @@ bool repairInstalledCopies(unsigned* repairedOut, unsigned* checkedOut) {
     return true;
 }
 
+// THE ENDPOINT'S ANSWER for a path, when the guest asks for `expected`.
+//
+// This is the endpoint's own selection -- the shared candidate list and the
+// shared rule, with the endpoint's expected digest -- so what it returns is
+// what the endpoint would send for that path. Returns false when nothing
+// answers.
+//
+// `aliasOut` receives the resolution the answer came from when it is NOT the
+// resolution that was asked for (the nearest lower resolution), and "-" when
+// the answer is at the requested resolution.
+bool endpointAnswerFor(const char* path, const char* expected,
+                        asset::Selection& selectionOut, std::string& sourceOut,
+                        std::string& aliasOut) {
+    std::vector<asset::Candidate> candidates;
+    asset::buildCandidates(path, candidates);
+    std::vector<std::string> served(candidates.size());
+    selectionOut = asset::selectCandidate(
+        candidates, expected,
+        [&served](const asset::Candidate& candidate, unsigned index, char outDigest[33],
+                  unsigned long long& outSize, std::vector<unsigned char>& bytes) -> bool {
+            return probeAssetCandidate(candidate, index, outDigest, outSize, bytes,
+                                       served);
+        });
+    if (selectionOut.index < 0) {
+        sourceOut = "-";
+        aliasOut = "-";
+        return false;
+    }
+    sourceOut = served[selectionOut.index];
+    aliasOut = asset::aliasResolution(path, candidates[selectionOut.index]);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// THE DIGEST INVARIANT, CHECKED DIRECTLY.
+//
+// THE INVARIANT. For every asset path the guest can request, the digest a
+// manifest publishes for that path must be the md5 of the bytes the endpoint
+// sends for that path.
+//
+// WHY IT NEEDS AN INSTRUMENT. The manifest side and the endpoint side share
+// one candidate list and one selection rule now, so they cannot drift -- but
+// "cannot drift" is a claim about the CODE, and the claim that matters is
+// about the BYTES. This checks the bytes: for every path the port serves it
+// takes the digest the manifests publish, asks the endpoint's own selection
+// what it would send for that path when the guest asks for that digest, and
+// compares the two.
+//
+// WHAT IT REPORTS. One line per asset ("asset-invariant") with the published
+// digest, the served digest, whether they agree and which file answered; and
+// a summary line with the counts. A disagreement is a broken invariant, and
+// it is printed, not counted away.
+//
+// THE CONTROLS. "0 disagreements" is only a fact if the check RAN, so the
+// audit carries two controls:
+//
+//   agree:  the volume's sentinel -- files/.depot/gui_assets/960x640/
+//           agreement/sprites.android.atlas, which the data manifest
+//           guarantees and which the endpoint's own control already uses --
+//           is checked for agreement. It is a path that is KNOWN to agree,
+//           and it can FAIL: the file can be missing, and the invariant can
+//           be broken for it.
+//
+//   detect: the SAME path with ONE hex digit of the published digest
+//           changed. The checker MUST report a disagreement. A checker that
+//           reports agreement on a deliberately wrong digest cannot report
+//           anything, and then "0 disagreements" would mean nothing.
+//
+// So a run with 0 disagreements and control_ok=1 is a real zero, and a run
+// with 0 disagreements and control_ok=0 is a broken instrument.
+// ---------------------------------------------------------------------------
+// THE CHECK ITSELF: does the digest a manifest publishes for a path equal the
+// digest the endpoint would send for that path?
+//
+// One function, used by the audit AND by the controls, so the "detect"
+// control below exercises the very comparison the audit makes. A control that
+// tested a different comparison would not prove that the audit can report a
+// disagreement.
+bool assetDigestsAgree(const asset::Selection& selection, const char* published) {
+    return selection.index >= 0 && asset::digestEquals(selection.digest, published);
+}
+
+void auditAssetDigestInvariant() {
+    const uint64_t startTick = armGetSystemTick();
+    const uint64_t tickFreq = armGetSystemTickFreq();
+
+    // 1. THE PUBLISHED DIGESTS: the override set the base list and the
+    //    per-category gui list are rewritten from.
+    std::vector<std::pair<std::string, std::string>> published;
+    collectAssetOverrides(published);
+
+    // 2. EACH ONE.
+    unsigned checked = 0;
+    unsigned agreed = 0;
+    unsigned disagreed = 0;
+    unsigned unresolved = 0;
+    unsigned logged = 0;
+    for (const std::pair<std::string, std::string>& entry : published) {
+        asset::Selection selection{};
+        std::string source;
+        std::string alias;
+        const bool found = endpointAnswerFor(entry.first.c_str(),
+                                             entry.second.c_str(), selection, source,
+                                             alias);
+        ++checked;
+        const bool agree = assetDigestsAgree(selection, entry.second.c_str());
+        if (!found) {
+            ++unresolved;
+        }
+        else if (agree) {
+            ++agreed;
+        }
+        else {
+            ++disagreed;
+        }
+        if (logged < 240u) {
+            ++logged;
+            char diag[1100];
+            std::snprintf(diag, sizeof(diag),
+                          "path=%s published=%.32s served=%.32s agree=%d found=%d "
+                          "src=%.300s alias=%s cache=%d",
+                          entry.first.c_str(), entry.second.c_str(),
+                          found ? selection.digest : "-", agree ? 1 : 0,
+                          found ? 1 : 0, found ? source.c_str() : "-",
+                          found ? alias.c_str() : "-",
+                          selection.fromDownloadCache ? 1 : 0);
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                "asset-invariant", logged, 0, diag);
+        }
+    }
+
+    // 3. THE CONTROLS.
+    //
+    // The control path is the volume's sentinel: files/.depot/gui_assets/
+    // 960x640/agreement/sprites.android.atlas. The data manifest names that
+    // directory as the volume's own sentinel and the volume ships the file
+    // (399 B), and the endpoint's own control already uses the same path.
+    const char* const kControlPath =
+        "/gui_assets/960x640/agreement/sprites.android.atlas";
+    char controlPublished[33]{};
+    char controlSource[0x600]{};
+    unsigned long long controlSize = 0;
+    const bool controlResolved =
+        resolveAssetLocalFile(kControlPath, controlSource, sizeof(controlSource),
+                               controlPublished, &controlSize);
+    asset::Selection controlSelection{};
+    std::string controlAnswer;
+    std::string controlAlias;
+    const bool controlFound =
+        controlResolved && endpointAnswerFor(kControlPath, controlPublished,
+                                             controlSelection, controlAnswer,
+                                             controlAlias);
+    const bool controlAgree = assetDigestsAgree(controlSelection, controlPublished);
+    // THE DETECT CONTROL: the same path, with ONE hex digit of the published
+    // digest changed. The checker MUST report a disagreement here.
+    char corrupted[33]{};
+    std::memcpy(corrupted, controlPublished, sizeof(corrupted));
+    if (corrupted[0] != '\0') {
+        corrupted[0] = (corrupted[0] == '0') ? '1' : '0';
+    }
+    asset::Selection detectSelection{};
+    std::string detectAnswer;
+    std::string detectAlias;
+    const bool detectFound =
+        controlResolved && endpointAnswerFor(kControlPath, corrupted, detectSelection,
+                                             detectAnswer, detectAlias);
+    const bool controlDetected =
+        controlResolved && !assetDigestsAgree(detectSelection, corrupted);
+    const int agreeControlOk = (controlResolved && controlAgree) ? 1 : 0;
+    const int detectControlOk = (controlResolved && controlDetected) ? 1 : 0;
+    {
+        char diag[900];
+        std::snprintf(diag, sizeof(diag),
+                      "expect=agree observed=%s path=%s published=%.32s served=%.32s "
+                      "resolved=%d agree=%d control_ok=%d",
+                      controlAgree ? "agree" : "disagree", kControlPath,
+                      controlPublished, controlFound ? controlSelection.digest : "-",
+                      controlResolved ? 1 : 0, controlAgree ? 1 : 0, agreeControlOk);
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "asset-invariant-control", 0, 0, diag);
+    }
+    {
+        char diag[900];
+        std::snprintf(diag, sizeof(diag),
+                      "expect=disagree observed=%s path=%s published=%.32s served=%.32s "
+                      "resolved=%d detected=%d control_ok=%d",
+                      controlDetected ? "disagree" : "agree", kControlPath, corrupted,
+                      detectFound ? detectSelection.digest : "-",
+                      controlResolved ? 1 : 0, controlDetected ? 1 : 0,
+                      detectControlOk);
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "asset-invariant-control", 1, 0, diag);
+    }
+
+    // 4. THE SUMMARY.
+    const uint64_t elapsedMs = (armGetSystemTick() - startTick) * 1000ULL /
+                               (tickFreq != 0 ? tickFreq : 1);
+    {
+        char diag[768];
+        std::snprintf(diag, sizeof(diag),
+                      "checked=%u agreed=%u disagreed=%u unresolved=%u published=%zu "
+                      "controls=2 agree_control=%d detect_control=%d control_ok=%d "
+                      "ms=%llu",
+                      checked, agreed, disagreed, unresolved, published.size(),
+                      agreeControlOk, detectControlOk,
+                      (agreeControlOk && detectControlOk) ? 1 : 0,
+                      (unsigned long long)elapsedMs);
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "asset-invariant-summary", 0, disagreed, diag);
+    }
+}
+
 bool buildConsistentBaseList(unsigned* rewrittenOut, unsigned* unresolvedOut) {
     if (rewrittenOut != nullptr) {
         *rewrittenOut = 0;
@@ -4608,6 +5601,876 @@ bool buildConsistentBaseList(unsigned* rewrittenOut, unsigned* unresolvedOut) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// THE PER-CATEGORY GUI LIST: THE REWRITE, ITS INSTRUMENT, AND THE CENSUS.
+// ---------------------------------------------------------------------------
+
+// What a scan of one asset list found.
+//
+// "rewritten" counts the entries the port OVERRIDES -- the ones whose digest
+// the port replaces with the digest of the bytes it serves. "kept" counts
+// the entries it does NOT override: the shipped digest stays there, by
+// design. "disagree" counts the overridden entries whose published digest is
+// NOT the override set's digest -- the defect this whole change is about,
+// in a form a run can count.
+struct ListScan {
+    unsigned entries{0};
+    unsigned rewritten{0};
+    unsigned kept{0};
+    unsigned disagree{0};
+    char firstRewritten[256]{};
+    char firstKept[256]{};
+    char firstDisagree[256]{};
+    char disagreePublished[40]{};
+    char disagreePort[40]{};
+};
+
+// THE DIGEST COLUMN OF ONE LINE, WITHOUT ITS TRAILING CARRIAGE RETURN.
+//
+// The lists are tab-separated and the md5 is the SECOND field. A shipped
+// list that ends its lines with CRLF would otherwise publish "bba63527...\r"
+// and every comparison against it would fail for a reason that has nothing
+// to do with the bytes.
+std::string digestFieldOf(const std::string& line, size_t tab) {
+    const size_t next = line.find('\t', tab + 1);
+    std::string digest = (next == std::string::npos)
+        ? line.substr(tab + 1)
+        : line.substr(tab + 1, next - tab - 1);
+    while (!digest.empty() &&
+           (digest.back() == '\r' || digest.back() == '\n' || digest.back() == ' ')) {
+        digest.pop_back();
+    }
+    return digest;
+}
+
+// TWO DIGESTS, COMPARED WITHOUT REGARD TO CASE.
+//
+// The override set's digests are lowercase hex, because they come from the
+// md5 implementation. A shipped list that published them in uppercase names
+// the SAME bytes, and a case-sensitive comparison would report that list as
+// DISAGREEING -- a loud false alarm in the one instrument that is supposed
+// to be able to say "the lists agree".
+bool digestsEqual(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (size_t index = 0; index < a.size(); ++index) {
+        const char left = (a[index] >= 'A' && a[index] <= 'F')
+            ? static_cast<char>(a[index] - 'A' + 'a') : a[index];
+        const char right = (b[index] >= 'A' && b[index] <= 'F')
+            ? static_cast<char>(b[index] - 'A' + 'a') : b[index];
+        if (left != right) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Scans one asset list against the override set.
+//
+// THE OVERRIDE SET IS A SORTED VECTOR, so the lookup is a binary search and
+// the scan costs one pass over the list.
+void scanAssetList(const std::string& text,
+                   const std::vector<std::pair<std::string, std::string>>& overrides,
+                   ListScan& out) {
+    const auto byPath = [](const std::pair<std::string, std::string>& entry,
+                           const std::string& path) {
+        return entry.first < path;
+    };
+    size_t position = 0;
+    while (position < text.size()) {
+        const size_t end = text.find('\n', position);
+        const size_t lineEnd = (end == std::string::npos) ? text.size() : end;
+        const std::string line = text.substr(position, lineEnd - position);
+        position = (end == std::string::npos) ? text.size() : end + 1;
+        const size_t tab = line.find('\t');
+        if (tab == std::string::npos) {
+            // A header line: it names no asset.
+            continue;
+        }
+        const std::string path = line.substr(0, tab);
+        ++out.entries;
+        auto it = std::lower_bound(overrides.begin(), overrides.end(), path, byPath);
+        if (it == overrides.end() || it->first != path) {
+            ++out.kept;
+            if (out.firstKept[0] == '\0') {
+                std::snprintf(out.firstKept, sizeof(out.firstKept), "%s", path.c_str());
+            }
+            continue;
+        }
+        ++out.rewritten;
+        if (out.firstRewritten[0] == '\0') {
+            std::snprintf(out.firstRewritten, sizeof(out.firstRewritten), "%s",
+                          path.c_str());
+        }
+        const std::string published = digestFieldOf(line, tab);
+        if (!digestsEqual(published, it->second)) {
+            ++out.disagree;
+            if (out.firstDisagree[0] == '\0') {
+                std::snprintf(out.firstDisagree, sizeof(out.firstDisagree), "%s",
+                              path.c_str());
+                std::snprintf(out.disagreePublished, sizeof(out.disagreePublished),
+                              "%s", published.c_str());
+                std::snprintf(out.disagreePort, sizeof(out.disagreePort), "%s",
+                              it->second.c_str());
+            }
+        }
+    }
+}
+
+// THE POSITIVE CONTROL for the per-category list instrument.
+//
+// The instrument reports every entry it rewrote. A run in which it rewrote
+// NOTHING and a run in which the instrument was BROKEN would look the same
+// if the instrument only ever reported rewrites. So the control reports BOTH
+// a rewritten sample and a deliberately-known-UNCHANGED sample, plus the
+// counts that make "nothing matched" and "nothing was looked at" two
+// different observations.
+//
+// Both samples are known BEFORE the run: a rewritten sample is an entry the
+// port overrides (the port's digest replaces the shipped one there, by
+// design), and a known-unchanged sample is an entry the port does NOT
+// override (the shipped digest stays there, by design).
+void logGuiListControl(const char* status, const ListScan& scan, size_t overrides) {
+    char diag[1400];
+    std::snprintf(diag, sizeof(diag),
+                  "status=%s entries=%u rewritten=%u kept=%u disagree=%u "
+                  "overrides=%zu rewritten_sample=%s kept_sample=%s",
+                  (status != nullptr && status[0] != '\0') ? status : "?",
+                  scan.entries, scan.rewritten, scan.kept, scan.disagree,
+                  overrides,
+                  (scan.firstRewritten[0] != '\0') ? scan.firstRewritten : "none",
+                  (scan.firstKept[0] != '\0') ? scan.firstKept : "none");
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "assetlist-gui-control", 0, 0, diag);
+}
+
+// Reads a whole file into `out`. Used for the card copies, whose path is
+// already a real path.
+bool readWholeFile(const char* path, std::string& out) {
+    if (path == nullptr) {
+        return false;
+    }
+    std::FILE* file = std::fopen(path, "rb");
+    if (file == nullptr) {
+        return false;
+    }
+    if (std::fseek(file, 0, SEEK_END) != 0) {
+        std::fclose(file);
+        return false;
+    }
+    const long size = std::ftell(file);
+    if (size < 0 || std::fseek(file, 0, SEEK_SET) != 0) {
+        std::fclose(file);
+        return false;
+    }
+    out.assign(static_cast<size_t>(size), '\0');
+    const size_t got = (size > 0)
+        ? std::fread(&out[0], 1, static_cast<size_t>(size), file)
+        : 0u;
+    std::fclose(file);
+    if (got != static_cast<size_t>(size)) {
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+// TRUE when the rewritten per-category list on the card was built from THIS
+// override set, and the pass can be skipped.
+//
+// The rewritten list is a pure function of the shipped list (read-only, never
+// changes) and the override set, so an unchanged override set means the file
+// on the card is already correct. The key file is 33 bytes; reading it and
+// the list's own size is the whole cost of the check.
+//
+// The list's OWN size is checked too, because the key alone would happily
+// bless a list that was deleted or truncated after the key was written.
+bool guiBaseListCacheIsCurrent(const char* key) {
+    if (key == nullptr || key[0] == '\0') {
+        return false;
+    }
+    std::FILE* keyFile = std::fopen(kGuiBaseListKeyPath, "rb");
+    if (keyFile == nullptr) {
+        return false;
+    }
+    char stored[64]{};
+    size_t got = std::fread(stored, 1, sizeof(stored) - 1, keyFile);
+    std::fclose(keyFile);
+    if (got == 0) {
+        return false;
+    }
+    while (got > 0 && (stored[got - 1] == '\n' || stored[got - 1] == '\r' ||
+                       stored[got - 1] == ' ')) {
+        stored[--got] = '\0';
+    }
+    if (std::strcmp(stored, key) != 0) {
+        return false;
+    }
+    struct stat info{};
+    if (::stat(kConsistentGuiBaseListPath, &info) != 0 || info.st_size <= 0) {
+        return false;
+    }
+    return true;
+}
+
+// Records the override set the rewritten per-category list was built from.
+//
+// IT IS RECORDED ONLY AFTER THE LIST IT DESCRIBES IS ON THE CARD. Writing it
+// first would let a later boot bless a list that was never written.
+void writeGuiBaseListCacheKey(const char* key) {
+    if (key == nullptr || key[0] == '\0') {
+        return;
+    }
+    char tempPath[0x600]{};
+    std::snprintf(tempPath, sizeof(tempPath), "%s.tmp", kGuiBaseListKeyPath);
+    std::FILE* file = std::fopen(tempPath, "wb");
+    if (file == nullptr) {
+        return;
+    }
+    std::fprintf(file, "%s\n", key);
+    std::fclose(file);
+    std::remove(kGuiBaseListKeyPath);
+    std::rename(tempPath, kGuiBaseListKeyPath);
+}
+
+// Rewrite the per-category GUI asset list so that every entry the guest has
+// ACTUALLY asked for describes the bytes the port serves.
+//
+// THE SAME OVERRIDE SET AS THE BASE LIST. collectAssetOverrides() reads the
+// same recorded-path file, resolves every recorded path with the same
+// resolver and expands each into both spellings, so the per-category list and
+// the base list are rewritten from ONE set and publish the SAME digest for a
+// path they both name.
+//
+// THE SAME EXACT-PATH LOOKUP. An entry is rewritten only when the list names
+// a path the override set holds, under that path's EXACT spelling. The
+// alternate spelling is NOT tried here: the two spellings of one asset do
+// not necessarily name one file, and a digest taken from the other spelling
+// is a digest of bytes the guest is not looking at. The base list's own
+// lookup works the same way, which is what makes the two lists agree.
+//
+// A FAILURE HERE COSTS THE CONSISTENCY AND NOTHING ELSE: the shipped list
+// is still served, and the log line says why.
+bool buildConsistentGuiBaseList(unsigned* rewrittenOut, unsigned* keptOut) {
+    if (rewrittenOut != nullptr) {
+        *rewrittenOut = 0;
+    }
+    if (keptOut != nullptr) {
+        *keptOut = 0;
+    }
+    const uint64_t startTick = armGetSystemTick();
+    const uint64_t tickFreq = armGetSystemTickFreq();
+
+    // 1. THE OVERRIDE SET -- THE SAME SET THE BASE LIST IS REWRITTEN WITH.
+    std::vector<std::pair<std::string, std::string>> overrides;
+    collectAssetOverrides(overrides);
+
+    // 2. THE CACHE KEY: the digest of the OVERRIDE SET.
+    //
+    // The rewrite is a pure function of two things: the shipped list (which
+    // never changes -- it is inside a read-only volume) and the override
+    // set. So when the override set is unchanged, the rewritten list on the
+    // card is already correct and the pass can be skipped.
+    char overrideKey[33]{};
+    {
+        Md5 md5;
+        md5.begin();
+        for (const auto& entry : overrides) {
+            const std::string line = entry.first + "\t" + entry.second + "\n";
+            md5.update(line.data(), line.size());
+        }
+        md5.finish(overrideKey);
+    }
+
+    // 3. THE CACHED COPY.
+    //
+    // The counts and the samples are read back OUT OF THE CARD COPY rather
+    // than remembered from the run that wrote it, so a cached run reports
+    // the same thing a rebuilt run reports. A cached run that reported
+    // zeroes would be indistinguishable from a list with no entries in it.
+    if (guiBaseListCacheIsCurrent(overrideKey)) {
+        std::string cached;
+        ListScan scan{};
+        if (readWholeFile(kConsistentGuiBaseListPath, cached)) {
+            scanAssetList(cached, overrides, scan);
+        }
+        char source[0x600]{};
+        Resolution resolution{};
+        if (resolvePath(kGuiBaseListGuestPath, false, resolution)) {
+            std::snprintf(source, sizeof(source), "%s", resolution.primary);
+        }
+        std::snprintf(gConsistentGuiList.source, sizeof(gConsistentGuiList.source),
+                      "%s", source);
+        std::snprintf(gConsistentGuiList.destination,
+                      sizeof(gConsistentGuiList.destination), "%s",
+                      kConsistentGuiBaseListPath);
+        gConsistentGuiList.entries = scan.entries;
+        gConsistentGuiList.rewritten = scan.rewritten;
+        gConsistentGuiList.kept = scan.kept;
+        gConsistentGuiList.served = gConsistentGuiList.destination;
+        const uint64_t elapsedMs = (armGetSystemTick() - startTick) * 1000ULL /
+                                   (tickFreq != 0 ? tickFreq : 1);
+        char diag[1100];
+        std::snprintf(diag, sizeof(diag),
+                      "entries=%u rewritten=%u kept=%u overrides=%zu bytes=- ms=%llu "
+                      "written=1 cached=1 key=%.32s source=%s out=%s",
+                      scan.entries, scan.rewritten, scan.kept, overrides.size(),
+                      (unsigned long long)elapsedMs, overrideKey, source,
+                      kConsistentGuiBaseListPath);
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "assetlist-rewrite-gui", 0, 0, diag);
+        logGuiListControl("OK-CACHED", scan, overrides.size());
+        if (rewrittenOut != nullptr) {
+            *rewrittenOut = scan.rewritten;
+        }
+        if (keptOut != nullptr) {
+            *keptOut = scan.kept;
+        }
+        return true;
+    }
+
+    // 4. THE LIST, read through the port's own resolver, so the bytes are
+    //    the bytes the guest would have read.
+    Resolution resolution{};
+    if (!resolvePath(kGuiBaseListGuestPath, false, resolution)) {
+        ListScan scan{};
+        logGuiListControl("FAILED-RESOLVE", scan, overrides.size());
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "assetlist-rewrite-gui", 0, 0,
+                            "FAILED reason=resolve list=files/apk/res/asset_list_base_gui_assets.txt");
+        return false;
+    }
+    std::string text;
+    char served[0x600]{};
+    const int rc = withReadFallback(
+        resolution, kGuiBaseListGuestPath,
+        [&text, &served](const char* candidate) -> int {
+            std::FILE* file = std::fopen(candidate, "rb");
+            if (file == nullptr) {
+                return -1;
+            }
+            if (std::fseek(file, 0, SEEK_END) != 0) {
+                std::fclose(file);
+                return -1;
+            }
+            const long size = std::ftell(file);
+            if (size < 0 || std::fseek(file, 0, SEEK_SET) != 0) {
+                std::fclose(file);
+                return -1;
+            }
+            text.assign(static_cast<size_t>(size), '\0');
+            const size_t got = (size > 0)
+                ? std::fread(&text[0], 1, static_cast<size_t>(size), file)
+                : 0u;
+            std::fclose(file);
+            if (got != static_cast<size_t>(size)) {
+                text.clear();
+                return -1;
+            }
+            std::snprintf(served, sizeof(served), "%s", candidate);
+            return 0;
+        });
+    if (rc != 0) {
+        ListScan scan{};
+        logGuiListControl("FAILED-READ", scan, overrides.size());
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "assetlist-rewrite-gui", 0, 0,
+                            "FAILED reason=read list=files/apk/res/asset_list_base_gui_assets.txt");
+        return false;
+    }
+
+    // 5. THE LINES. The path text, the order, the count and the field layout
+    //    are preserved exactly; only the md5 of an entry the port overrides
+    //    changes, and it changes to the digest of the bytes the port serves.
+    const auto byPath = [](const std::pair<std::string, std::string>& entry,
+                           const std::string& path) {
+        return entry.first < path;
+    };
+    const auto lookup = [&overrides, &byPath](const std::string& path) -> const std::string* {
+        auto it = std::lower_bound(overrides.begin(), overrides.end(), path, byPath);
+        if (it != overrides.end() && it->first == path) {
+            return &it->second;
+        }
+        return nullptr;
+    };
+    std::string out;
+    out.reserve(text.size() + 4096);
+    ListScan scan{};
+    unsigned logged = 0;
+    size_t position = 0;
+    while (position < text.size()) {
+        const size_t end = text.find('\n', position);
+        const size_t lineEnd = (end == std::string::npos) ? text.size() : end;
+        const std::string line = text.substr(position, lineEnd - position);
+        position = (end == std::string::npos) ? text.size() : end + 1;
+        const size_t tab = line.find('\t');
+        if (tab == std::string::npos) {
+            // A header line: copied through untouched.
+            out += line;
+            out += '\n';
+            continue;
+        }
+        ++scan.entries;
+        const std::string path = line.substr(0, tab);
+        const std::string* digest = lookup(path);
+        if (digest == nullptr) {
+            // THE DELIBERATELY-KNOWN-UNCHANGED ENTRY. The port does not
+            // override this path, so the shipped digest stays, by design.
+            ++scan.kept;
+            if (scan.firstKept[0] == '\0') {
+                std::snprintf(scan.firstKept, sizeof(scan.firstKept), "%s",
+                              path.c_str());
+            }
+            out += line;
+            out += '\n';
+            continue;
+        }
+        ++scan.rewritten;
+        if (scan.firstRewritten[0] == '\0') {
+            std::snprintf(scan.firstRewritten, sizeof(scan.firstRewritten), "%s",
+                          path.c_str());
+        }
+        const std::string published = digestFieldOf(line, tab);
+        out += path;
+        out += '\t';
+        out += *digest;
+        // The rest of the line, if the layout has more fields.
+        const size_t next = line.find('\t', tab + 1);
+        if (next != std::string::npos) {
+            out += line.substr(next);
+        }
+        out += '\n';
+        // ONE LINE PER OVERRIDDEN ENTRY: the path, the digest before and
+        // after, and the file the new digest was taken from.
+        //
+        // The digest written is the OVERRIDE SET's digest, so the two lists
+        // the guest reads cannot disagree. The re-resolve is here for the
+        // "source=" field and for the check: if the file behind the path
+        // changed since the override set was collected, the new digest and
+        // the served one would differ, and the line says so.
+        if (logged < 80u) {
+            ++logged;
+            char source[0x600]{};
+            char servedDigest[33]{};
+            unsigned long long size = 0;
+            const bool resolved = resolveAssetLocalFile(
+                path.c_str(), source, sizeof(source), servedDigest, &size);
+            char diag[1700];
+            std::snprintf(diag, sizeof(diag),
+                          "path=%s md5=%s->%s size=%llu source=%s served_md5=%s "
+                          "digest_match=%d",
+                          path.c_str(), published.c_str(), digest->c_str(), size,
+                          resolved ? source : "none",
+                          resolved ? servedDigest : "-",
+                          (resolved && servedDigest == *digest) ? 1 : 0);
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                "assetlist-entry-gui", logged, 0, diag);
+        }
+    }
+
+    // 6. WRITE IT, through a temporary name, and REMOVE the target first:
+    //    libnx's fsdev rename does NOT overwrite an existing file.
+    char tempPath[0x600]{};
+    std::snprintf(tempPath, sizeof(tempPath), "%s.tmp", kConsistentGuiBaseListPath);
+    std::FILE* output = std::fopen(tempPath, "wb");
+    bool written = false;
+    int writeErrno = 0;
+    if (output != nullptr) {
+        const size_t bytes = out.empty() ? 0u : std::fwrite(out.data(), 1, out.size(), output);
+        const bool flushed = (bytes == out.size());
+        const int closeResult = std::fclose(output);
+        writeErrno = errno;
+        written = flushed && (closeResult == 0);
+        if (written) {
+            std::remove(kConsistentGuiBaseListPath);
+            written = std::rename(tempPath, kConsistentGuiBaseListPath) == 0;
+            if (!written) {
+                writeErrno = errno;
+            }
+            else {
+                // THE CARD NEEDS TIME. See waitForCardFile(): the file lands
+                // on the card long after the write returns, and the guest
+                // reads this list early. Waiting here, before the guest
+                // starts, is the difference between the guest reading the
+                // REWRITTEN list and reading the SHIPPED one.
+                const bool landed = waitForCardFile(kConsistentGuiBaseListPath,
+                                                    out.size(), 30000u);
+                if (!landed) {
+                    writeErrno = ETIMEDOUT;
+                }
+            }
+        }
+    }
+    else {
+        writeErrno = errno;
+    }
+    const uint64_t elapsedMs = (armGetSystemTick() - startTick) * 1000ULL /
+                               (tickFreq != 0 ? tickFreq : 1);
+    char diag[1200];
+    std::snprintf(diag, sizeof(diag),
+                  "entries=%u rewritten=%u kept=%u overrides=%zu bytes=%zu ms=%llu "
+                  "written=%d cached=0 key=%.32s errno=%d source=%s out=%s",
+                  scan.entries, scan.rewritten, scan.kept, overrides.size(),
+                  out.size(), (unsigned long long)elapsedMs, written ? 1 : 0,
+                  overrideKey, writeErrno, served, kConsistentGuiBaseListPath);
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "assetlist-rewrite-gui", 0, 0, diag);
+    logGuiListControl(written ? "OK" : "FAILED-WRITE", scan, overrides.size());
+    if (rewrittenOut != nullptr) {
+        *rewrittenOut = scan.rewritten;
+    }
+    if (keptOut != nullptr) {
+        *keptOut = scan.kept;
+    }
+    if (!written) {
+        return false;
+    }
+    std::snprintf(gConsistentGuiList.source, sizeof(gConsistentGuiList.source),
+                  "%s", served);
+    std::snprintf(gConsistentGuiList.destination, sizeof(gConsistentGuiList.destination),
+                  "%s", kConsistentGuiBaseListPath);
+    gConsistentGuiList.entries = scan.entries;
+    gConsistentGuiList.rewritten = scan.rewritten;
+    gConsistentGuiList.kept = scan.kept;
+    gConsistentGuiList.served = gConsistentGuiList.destination;
+    writeGuiBaseListCacheKey(overrideKey);
+    return true;
+}
+
+// Reads one asset list THE WAY THE PORT SERVES IT, and scans it against the
+// override set.
+//
+// "THE WAY THE PORT SERVES IT" is the whole point: the census answers "what
+// does the GUEST get", so the list has to be read through the same resolver
+// and the same fallback chain the guest's own read goes through -- which
+// means the rewritten copies come back rewritten, and an unre-written list
+// comes back exactly as the volume ships it.
+bool scanServedAssetList(
+    const char* guestPath,
+    const std::vector<std::pair<std::string, std::string>>& overrides,
+    ListScan& scan, char* servedOut, size_t servedOutSize) {
+    if (guestPath == nullptr) {
+        return false;
+    }
+    if (servedOut != nullptr && servedOutSize > 0) {
+        servedOut[0] = '\0';
+    }
+    Resolution resolution{};
+    if (!resolvePath(guestPath, false, resolution)) {
+        return false;
+    }
+    std::string text;
+    char served[0x600]{};
+    const int rc = withReadFallback(
+        resolution, guestPath,
+        [&text, &served](const char* candidate) -> int {
+            // THE BULK PATH FIRST. The base list is 4,212,795 B, and libnx's
+            // ordinary read path asks the FS service for the whole size in
+            // one request, is refused, and falls back to 4 KiB pieces --
+            // ~1029 service round trips for one file. The bulk path reads it
+            // in pieces the service serves in one round trip each, and hands
+            // back a memory-backed stream.
+            std::FILE* file = nullptr;
+            if (!bulkOpenFile(candidate, "rb", &file)) {
+                file = std::fopen(candidate, "rb");
+            }
+            if (file == nullptr) {
+                return -1;
+            }
+            if (std::fseek(file, 0, SEEK_END) != 0) {
+                std::fclose(file);
+                return -1;
+            }
+            const long size = std::ftell(file);
+            if (size < 0 || std::fseek(file, 0, SEEK_SET) != 0) {
+                std::fclose(file);
+                return -1;
+            }
+            text.assign(static_cast<size_t>(size), '\0');
+            const size_t got = (size > 0)
+                ? std::fread(&text[0], 1, static_cast<size_t>(size), file)
+                : 0u;
+            std::fclose(file);
+            if (got != static_cast<size_t>(size)) {
+                text.clear();
+                return -1;
+            }
+            std::snprintf(served, sizeof(served), "%s", candidate);
+            return 0;
+        });
+    if (rc != 0) {
+        return false;
+    }
+    scanAssetList(text, overrides, scan);
+    if (servedOut != nullptr && servedOutSize > 0) {
+        std::snprintf(servedOut, servedOutSize, "%s", served);
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// THE DIGEST CENSUS: does any list the guest reads still publish a digest
+// the port does not serve?
+//
+// THE QUESTION. The guest merges the lists it reads into one table, and a
+// path that two lists describe with two DIFFERENT digests is dropped by the
+// merge -- so the guest ends up with no digest at all for that asset and
+// answers "didn't match its MD5" without ever comparing anything. The
+// rewrite makes the lists the port CONTROLS agree; this census says whether
+// a list the port does NOT control still disagrees.
+//
+// IT IS A SCANNER, SO IT CARRIES A POSITIVE CONTROL. The lists the port
+// rewrites are scanned with it, and those MUST agree with the override set
+// on every path they name -- so a census that finds them disagreeing, or
+// that finds no agreement at all while the override set is not empty, is a
+// broken scanner and not a finding.
+//
+// The lists are a FIXED table, not a directory walk: the census must not
+// depend on being able to enumerate a read-only volume, and it must not
+// read anything the guest does not read. The INVENTORY below is the other
+// half -- it walks the volume and names every list it ships.
+//
+// EVERY LIST IS READ THE WAY THE PORT SERVES IT, so what the census
+// reports is what the GUEST gets, not what the factory shipped.
+// ---------------------------------------------------------------------------
+void censusAssetListDigests() {
+    std::vector<std::pair<std::string, std::string>> overrides;
+    collectAssetOverrides(overrides);
+
+    struct CensusTarget {
+        const char* label;
+        const char* path;
+        // TRUE when the port rewrites this list, so it MUST agree with the
+        // override set on every path it names.
+        bool controlled;
+    };
+    static const CensusTarget kTargets[] = {
+        { "base",     "files/.depot/asset_list_base.txtCache.txt",     true  },
+        { "gui",      "files/apk/res/asset_list_base_gui_assets.txt",  true  },
+        { "core",     "files/apk/res/asset_list_gui_assets_core.txt",  true  },
+        { "updates",  "files/.depot/asset_list_updates.txt",           false },
+        { "base-apkres", "files/apk/res/asset_list_base.txt",          false },
+    };
+
+    ListScan guiScan{};
+    bool guiSeen = false;
+    for (const CensusTarget& target : kTargets) {
+        ListScan scan{};
+        char served[0x600]{};
+        if (!scanServedAssetList(target.path, overrides, scan, served,
+                                 sizeof(served))) {
+            char diag[900];
+            std::snprintf(diag, sizeof(diag),
+                          "list=%s path=%s read=0 overrides=%zu",
+                          target.label, target.path, overrides.size());
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                "assetlist-census", 0, 0, diag);
+            continue;
+        }
+        if (std::strcmp(target.label, "gui") == 0) {
+            guiScan = scan;
+            guiSeen = true;
+        }
+        char diag[1400];
+        std::snprintf(diag, sizeof(diag),
+                      "list=%s path=%s served=%s read=1 entries=%u rewritten=%u "
+                      "kept=%u disagree=%u overrides=%zu control=%s",
+                      target.label, target.path, served, scan.entries,
+                      scan.rewritten, scan.kept, scan.disagree, overrides.size(),
+                      target.controlled
+                          ? ((scan.disagree == 0) ? "MUST_AGREE-OK" : "MUST_AGREE-BROKEN")
+                          : "REPORT");
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "assetlist-census", 0, 0, diag);
+        if (scan.firstDisagree[0] != '\0') {
+            char mismatch[900];
+            std::snprintf(mismatch, sizeof(mismatch),
+                          "list=%s asset=%s published=%s port=%s",
+                          target.label, scan.firstDisagree,
+                          scan.disagreePublished, scan.disagreePort);
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                "assetlist-census-mismatch", 0, 0, mismatch);
+        }
+    }
+
+    // THE POSITIVE CONTROL, on its own line, so that a census with no
+    // findings is still distinguishable from a census that did not run.
+    //
+    // The rewritten per-category list was BUILT from the override set, so
+    // the paths it names that the override set holds carry the override
+    // set's digest. The control counts those agreements: a count of ZERO
+    // while the override set is not empty means the scanner did not look,
+    // not that the lists agree.
+    const char* status = "NO-OVERRIDE-HIT";
+    if (!guiSeen) {
+        status = "LIST-UNREADABLE";
+    }
+    else if (overrides.empty()) {
+        status = "NO-OVERRIDES";
+    }
+    else if (guiScan.rewritten == 0) {
+        status = "NO-OVERRIDE-HIT";
+    }
+    else if (guiScan.disagree != 0) {
+        status = "BROKEN";
+    }
+    else {
+        status = "OK";
+    }
+    char control[900];
+    std::snprintf(control, sizeof(control),
+                  "status=%s overrides=%zu control_agreements=%u "
+                  "control_disagreements=%u",
+                  status, overrides.size(),
+                  (guiScan.rewritten > guiScan.disagree)
+                      ? guiScan.rewritten - guiScan.disagree : 0u,
+                  guiScan.disagree);
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "assetlist-census-control", 0, 0, control);
+}
+
+// ---------------------------------------------------------------------------
+// THE INVENTORY: every asset list the volume ships under files/apk/res/.
+//
+// The census above works from a FIXED table, because a census that depends
+// on being able to enumerate a read-only volume is a census that can fail
+// for a reason of its own. This inventory is the other half: it names EVERY
+// asset list the volume ships there, so "is there another list that
+// publishes the stale digest" is a question with a list behind it instead of
+// a question about a table somebody wrote down.
+//
+// It is bounded and it cannot fail the boot: a directory that cannot be
+// opened is one log line, and the scan stops after a fixed number of lists.
+//
+// THE POSITIVE CONTROL is the cross-check with the census above: the
+// inventory scans the rewritten per-category list too, and the two scanners
+// have to report the SAME counts for it. Two scanners that disagree about
+// the same file are two scanners, and that is visible in the log.
+// ---------------------------------------------------------------------------
+void censusAssetListInventory() {
+    std::vector<std::pair<std::string, std::string>> overrides;
+    collectAssetOverrides(overrides);
+
+    Resolution resolution{};
+    if (!resolvePath("files/apk/res", false, resolution)) {
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "assetlist-inventory", 0, 0,
+                            "status=FAILED reason=resolve dir=files/apk/res");
+        return;
+    }
+    DIR* directory = ::opendir(resolution.primary);
+    if (directory == nullptr && errno == ENOENT && resolution.fallback[0] != '\0') {
+        directory = ::opendir(resolution.fallback);
+    }
+    if (directory == nullptr) {
+        char diag[600];
+        std::snprintf(diag, sizeof(diag),
+                      "status=FAILED reason=opendir dir=%s errno=%d",
+                      resolution.primary, errno);
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "assetlist-inventory", 0, 0, diag);
+        return;
+    }
+    std::vector<std::string> names;
+    for (;;) {
+        struct dirent* entry = ::readdir(directory);
+        if (entry == nullptr) {
+            break;
+        }
+        const char* name = entry->d_name;
+        if (name == nullptr || name[0] == '.' ||
+            std::strncmp(name, "asset_list", 10) != 0) {
+            continue;
+        }
+        names.push_back(name);
+    }
+    ::closedir(directory);
+    std::sort(names.begin(), names.end());
+
+    // THE INVENTORY LINE: every name the volume ships, in one line.
+    char inventory[3072]{};
+    size_t used = 0;
+    for (const std::string& name : names) {
+        const int written = std::snprintf(inventory + used,
+                                          sizeof(inventory) - used, "%s%s",
+                                          used ? " " : "", name.c_str());
+        if (written <= 0) {
+            break;
+        }
+        used += static_cast<size_t>(written);
+        if (used >= sizeof(inventory) - 1) {
+            break;
+        }
+    }
+    char summary[400];
+    std::snprintf(summary, sizeof(summary),
+                  "status=OK lists=%zu overrides=%zu names=%s",
+                  names.size(), overrides.size(), inventory);
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "assetlist-inventory", 0, 0, summary);
+
+    // AND THEN EVERY ONE OF THEM IS SCANNED, so a list that publishes a
+    // digest the port does not serve is found rather than suspected.
+    constexpr unsigned kInventoryScanCap = 16;
+    constexpr unsigned long long kInventoryScanMaxBytes = 1024ull * 1024ull;
+    unsigned scanned = 0;
+    unsigned skipped = 0;
+    unsigned disagreements = 0;
+    for (const std::string& name : names) {
+        if (scanned >= kInventoryScanCap) {
+            ++skipped;
+            continue;
+        }
+        char guestPath[0x600]{};
+        std::snprintf(guestPath, sizeof(guestPath), "files/apk/res/%s",
+                      name.c_str());
+        // THE SIZE, BEFORE THE READ. A list this big is not worth the boot
+        // time, and the big base list is already in the census table above.
+        Resolution probe{};
+        long long bytes = -1;
+        if (resolvePath(guestPath, false, probe)) {
+            struct stat info{};
+            if (::stat(probe.primary, &info) == 0) {
+                bytes = static_cast<long long>(info.st_size);
+            }
+        }
+        if (bytes < 0 ||
+            static_cast<unsigned long long>(bytes) > kInventoryScanMaxBytes) {
+            ++skipped;
+            continue;
+        }
+        ListScan scan{};
+        char served[0x600]{};
+        if (!scanServedAssetList(guestPath, overrides, scan, served,
+                                 sizeof(served))) {
+            continue;
+        }
+        ++scanned;
+        if (scan.disagree == 0) {
+            continue;
+        }
+        ++disagreements;
+        char diag[900];
+        std::snprintf(diag, sizeof(diag),
+                      "list=%s asset=%s published=%s port=%s entries=%u "
+                      "rewritten=%u kept=%u disagree=%u bytes=%lld served=%s",
+                      name.c_str(), scan.firstDisagree, scan.disagreePublished,
+                      scan.disagreePort, scan.entries, scan.rewritten,
+                      scan.kept, scan.disagree, bytes, served);
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "assetlist-inventory-mismatch", 0, 0, diag);
+    }
+    char totals[400];
+    std::snprintf(totals, sizeof(totals),
+                  "status=%s scanned=%u skipped=%u disagreeing_lists=%u "
+                  "overrides=%zu",
+                  (disagreements == 0) ? "OK" : "DISAGREE", scanned, skipped,
+                  disagreements, overrides.size());
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "assetlist-inventory-summary", 0, 0, totals);
+}
+
 // The dirent regression guard, public so that the boot line can report it.
 //
 // It depends on nothing but the converter and the real header: a known host
@@ -4760,6 +6623,44 @@ ExternalDataStatus mountExternalData() {
     // Volumes are mounted, so the resolver can now be exercised for real.
     // One bounded line, once per process. Loose mode returns above and skips it.
     logApkResReachabilityOnce();
+    // THE CARD'S INSTALLED COPIES, made to BE the bytes the port serves.
+    //
+    // THIS RUNS FIRST, BEFORE ANY MANIFEST IS BUILT. It used to run last.
+    //
+    // WHY THE ORDER IS THE WHOLE POINT. The manifests publish the digest of
+    // the file the port serves for a path, and the card's installed copy is
+    // the FIRST candidate for the "/assets_<res>/..." spelling -- so the
+    // override map reads the card's copy and publishes ITS digest. When the
+    // repair ran afterwards, the card's copy was REPLACED with the port's
+    // authoritative revision, and the digest the manifest had already
+    // published described the file that was just replaced:
+    //
+    //   published  4321352770b573a6b71d57547b2b3885  (24,689 B, the card's
+    //             stale installed copy)
+    //   served     c72568828875f4e2a6b11f5c944e27e0  (39,199 B, the volume's
+    //             revision, which the repair put in its place)
+    //
+    // The guest asks for the published digest, the endpoint answers with the
+    // other one, and the guest's md5 check fails on an asset that was correct
+    // a moment earlier. So the repair comes first, and every manifest is
+    // built from the card as it will be when the guest runs.
+    //
+    // It still runs BEFORE the guest starts, and it waits for each repaired
+    // file to land on the card (waitForCardFile), because the guest hashes
+    // the installed file while it decides what to download. The big lists
+    // that follow keep their own waits: the 4.2 MB base list lands on the
+    // card ~18.5 s after the write, and buildConsistentBaseList() waits for
+    // it before the guest can read it.
+    {
+        unsigned repaired = 0;
+        unsigned checked = 0;
+        repairInstalledCopies(&repaired, &checked);
+        char diag[256];
+        std::snprintf(diag, sizeof(diag), "checked=%u repaired=%u", checked,
+                      repaired);
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "installed-repair-summary", 0, repaired, diag);
+    }
     // THE COMPLETED GUI-ASSETS MANIFEST, built now because the volumes that
     // describe it are mounted and the card is writable.
     //
@@ -4808,21 +6709,42 @@ ExternalDataStatus mountExternalData() {
         unsigned unresolved = 0;
         buildConsistentBaseList(&rewritten, &unresolved);
     }
-    // THE CARD'S INSTALLED COPIES, made to BE the bytes the port serves.
+    // THE PER-CATEGORY GUI ASSET LIST, made to describe the bytes the port
+    // serves for the assets the guest has asked for.
     //
-    // This runs BEFORE the guest starts, and it waits for each repaired file
-    // to land on the card, because the guest hashes the installed file while
-    // it decides what to download.
+    // MEASURED 2026-10-23: this list (files/apk/res/
+    // asset_list_base_gui_assets.txt, 298,223 B) published the FACTORY digest
+    // bba63527235d60c88863fa10e111abc6 for
+    // /gui_assets/960x640/common/sprites.android.atlas while the rewritten
+    // base list published c72568828875f4e2a6b11f5c944e27e0 for the same
+    // path -- the bytes the port actually serves. The guest merges the two
+    // lists, the conflict DROPS the entry, and the download check has no
+    // digest to compare against: "didn't match its MD5", 24 times.
+    //
+    // It is rewritten from the SAME override set as the base list, so the two
+    // lists publish the SAME digest for a path they both name.
     {
-        unsigned repaired = 0;
-        unsigned checked = 0;
-        repairInstalledCopies(&repaired, &checked);
-        char diag[256];
-        std::snprintf(diag, sizeof(diag), "checked=%u repaired=%u", checked,
-                      repaired);
-        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
-                            "installed-repair-summary", 0, repaired, diag);
+        unsigned rewritten = 0;
+        unsigned kept = 0;
+        buildConsistentGuiBaseList(&rewritten, &kept);
     }
+    // THE DIGEST CENSUS: does any list the guest reads still publish a
+    // digest the port does not serve?
+    //
+    // It runs here, after the rewrites, because it is the census of what
+    // the GUEST GETS: every list is read the way the port serves it.
+    censusAssetListDigests();
+    // AND THE INVENTORY of the volume's asset lists, so "is there another
+    // list that publishes the stale digest" is answered with a list of
+    // lists rather than with a table somebody wrote down.
+    censusAssetListInventory();
+    // THE DIGEST INVARIANT, checked against the manifests that were just
+    // built and the endpoint's own selection for the same paths.
+    //
+    // It runs here, after the rewrites, because it audits what the GUEST
+    // GETS: the digest each manifest publishes against the digest the
+    // endpoint would send for the same path.
+    auditAssetDigestInvariant();
     return gStatus;
 }
 
@@ -5071,21 +6993,67 @@ std::FILE* guestFopen(const char* path, const char* mode) {
         // it, and it hands back a memory-backed stream, so the guest's own
         // freads cost nothing.
         const char* servedPointer = nullptr;
-        withReadFallback(resolution, path, [&file, mode](const char* candidate) {
+        withReadFallback(resolution, path, [&file, mode, path](const char* candidate) {
+            // THE PROBE COMES FIRST. For a ".ast" stream -- and for the two
+            // known-good control streams -- the port serves the guest from a
+            // buffer whose digest it has computed, so the port knows what
+            // the guest is about to hash and can say so. Every other file is
+            // served exactly as before.
+            if (probeAstStream(path, candidate, mode, &file)) {
+                return 0;
+            }
             if (bulkOpenFile(candidate, mode, &file)) {
                 return 0;
             }
             file = std::fopen(candidate, mode);
             return file == nullptr ? -1 : 0;
         }, &servedPointer);
-        // Copy the served path out of withReadFallback's frame. See the note
-        // on servedPath above: for the card candidate that pointer is a local
-        // of that function, and it is dead by the time the line below runs.
+        // Copy the served path out of withReadFallback's frame FIRST. See the
+        // note on servedPath above: for the card candidate that pointer is a
+        // local of that function, and it is dead by the time anything below
+        // runs. Reading it afterwards was a read of a dead stack slot.
         if (servedPointer != nullptr) {
             std::snprintf(servedPath, sizeof(servedPath), "%s", servedPointer);
             served = servedPath;
         }
+        // THE DIGEST OF THE BYTES THE GUEST WILL READ ON THIS STREAM.
+        //
+        // "fopen-asset" reports the SIZE of the file the resolver picked. The
+        // guest then hashes what it reads from the stream, so the digest of
+        // THAT stream is the number the guest's own md5 check uses. If the
+        // two ever disagree, the guest rejects a download the port believes
+        // it answered correctly -- and nothing in the port's own read-back
+        // would show it, because the read-back reads the file again.
+        //
+        // IT IS THE SERVED FILE THAT IS HASHED, NOT THE PRIMARY.
+        //
+        // The first version of this line hashed resolution.primary, which is
+        // only the FIRST of up to three candidates: when the alias or the
+        // card answered, the line reported the digest of a file the guest
+        // never read. MEASURED 2026-10-23: it printed the factory file's
+        // digest eb7f95be... for a request the guest actually read as
+        // e89f6ac8... -- an instrument that lies about the very thing it
+        // exists to measure. A lying instrument is worse than no instrument,
+        // so the digest is taken from the path that was SERVED.
+        if (file != nullptr && mode != nullptr && std::strchr(mode, 'w') == nullptr &&
+            std::strchr(mode, 'a') == nullptr && served != nullptr) {
+            char streamDigest[33]{};
+            if (digestOfLocalFile(served, streamDigest)) {
+                char details[900];
+                std::snprintf(details, sizeof(details),
+                              "primary=%s served=%s stream_md5=%.32s",
+                              resolution.primary,
+                              served,
+                              streamDigest);
+                appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                    "served-digest", 0, 0, details);
+            }
+        }
     }
+    // THE GUI-ASSET CENSUS. The open is what the guest actually CONSUMED: a
+    // key with a stat hit and no open hit is a file the guest found and
+    // could not read.
+    censusGuiAssetRequest(path, file != nullptr ? 0 : -1, true);
     if (file == nullptr && path != nullptr && path[0] != '\0') {
         appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                             "fopen-fail", 0, static_cast<unsigned long long>(errno),
@@ -5231,6 +7199,10 @@ int guestOpen(const char* path, int flags, ...) {
             fd = -1;
         }
     }
+    // THE GUI-ASSET CENSUS, the open side. The guest reads its texture
+    // pages through open/mmap, so this is the count of what it really
+    // consumed.
+    censusGuiAssetRequest(path, fd >= 0 ? 0 : -1, true);
     if (path != nullptr &&
         (std::strstr(path, "Shaders") != nullptr ||
          std::strstr(path, ".vsh") != nullptr ||
@@ -5757,6 +7729,10 @@ int guestStat(const char* path, struct stat* output) {
         logStatLayout(resolution.primary, output, host);
     }
     logStatPath(path, resolution, rc, rc == 0 ? 0 : errno);
+    // THE GUI-ASSET CENSUS. This is the guest's EXISTENCE PROBE, and it is
+    // the only place where "the guest asked for this resolution in this
+    // format" and "the port could answer it" are both known at once.
+    censusGuiAssetRequest(path, rc, false);
     logWatchedResult("guestStat", path, resolution.primary, rc, rc == 0 ? 0 : errno,
                      ok ? static_cast<long long>(host.st_size) : -1LL,
                      ok ? static_cast<unsigned>(host.st_mode) : 0u);
@@ -5880,10 +7856,13 @@ DIR* guestOpendir(const char* path) {
                 if (*p == '/') slash = p;
             }
             if (slash != nullptr) leaf = slash + 1;
-            g_injectGui1280 = (leaf != nullptr &&
+            // Only the bare gui_assets root, not 960x640 itself.
+            g_injectGui2048 = (leaf != nullptr &&
                                std::strcmp(leaf, "gui_assets") == 0);
-            g_injectGui2048 = g_injectGui1280;
             g_injectIndex = 0;
+            g_guiListingChildren[0] = '\0';
+            g_guiListingInjected[0] = '\0';
+            g_guiListingOpen = g_injectGui2048;
         }
     }
     return directory;
@@ -5892,28 +7871,97 @@ DIR* guestOpendir(const char* path) {
 void* guestReaddir(DIR* directory) {
     gResolveApi = "guestReaddir";
     struct dirent* entry = ::readdir(directory);
-    if (entry == nullptr && g_injectIndex < 2 &&
+    if (entry != nullptr && g_injectGui2048 && entry->d_name[0] != '\0') {
+        noteGuiListingChild(entry->d_name);
+    }
+    // THE INJECTION: 2048x1536 ONLY.
+    //
+    // WHY 2048x1536 AND NOT 1280x720. 2048x1536 is the one resolution the
+    // SD volume (rr3gui1) does not list: it lives on the HD volume
+    // (rr3gui0), and AndroidHigh.plist selects High -> 2048x1536, so the
+    // guest has to be able to SEE it. That reason is unchanged by anything
+    // below, so the injection stays.
+    //
+    // WHY 1280x720 IS GONE. It was injected because "1280x720 is the Switch
+    // panel size", and the guest runs at 1280x720 -- but a folder the port
+    // invents is a folder the volumes do not ship, and the guest's own
+    // banner then shows what that costs. MEASURED on the baseline run
+    // (archive 20261023-175553-eden-vptr, guest-view.log L2236-L2242), the
+    // guest printed:
+    //
+    //     Res order:
+    //     (1280.000000, 720.000000) - 1.777778 - gui_assets/1280x720/
+    //     (960.000000, 640.000000)   - 1.500000 - gui_assets/960x640/
+    //     (480.000000, 320.000000)   - 1.500000 - gui_assets/480x320/
+    //
+    // and it then asked for THAT tree's texture leaves:
+    //
+    //     .depot/gui_assets/1280x720/splash/sprites_0.dxt.dds.z   rc=-1
+    //     .depot/gui_assets/1280x720/splash/sprites_0.etc.dds.z   rc=-1
+    //     ... 108 such requests, 0 of them served.
+    //
+    // The reason it asked for ".dxt.dds.z" and not ".rgb.pvr.z" is that the
+    // guest has NO published leaf name for 1280x720: the base asset list
+    // names 8,472 gui_assets files and NOT ONE of them is under 1280x720
+    // (MEASURED on the card, cache/asset_list_base.txtCache.txt). So the
+    // guest falls back to probing the texture formats its GL stack claims
+    // (S3TC + ETC1, no PVRTC), and every one of those probes misses,
+    // because the volumes ship .rgb.pvr.z and .rgb.pvr.z is not in the
+    // probe list.
+    //
+    // The entry is not the current resolution by itself. MEASURED in the
+    // archives from BEFORE the bionic-dirent fix (20261021-165605-eden-
+    // assetalias and its three neighbours): the guest printed
+    //
+    //     Res order:
+    //     share) Current res: 1280, 720
+    //     original [2] (960.000000, 640.000000) - 1.500000
+    //
+    // -- an EMPTY "Res order:" next to a printed current resolution. The
+    // "Res order:" list is therefore built OUT OF THE LISTING, and the
+    // 1280x720 entry in it was this injection and nothing else.
+    //
+    // WITHOUT THE ENTRY the guest's own table takes over, and it already
+    // ranks the resolution the volumes ship first ("actual [2] (960.000000,
+    // 640.000000)"), so the guest reads the 960x640 tree and takes its leaf
+    // names from the atlas it finds there (texture_formats=".rgb.pvr") --
+    // the names the volumes actually ship.
+    //
+    // The resolution ALIAS is untouched: rewriteGuiResolutionPath() still
+    // answers a guest path that names 1280x720 (or 1024x768, 768x576,
+    // 1920x1080, 1080p, 720p) from the 960x640 tree, so a guest that asks
+    // for 1280x720 ANYWAY still gets served.
+    //
+    // AND THE INJECTION NO LONGER DUPLICATES A REAL ENTRY: it adds
+    // 2048x1536 only when the listing does not already contain it (the core
+    // tree really does ship one, and the baseline run showed it twice:
+    // guest-view.log L2228 and L2232).
+    if (entry == nullptr && g_injectIndex < 1 &&
         g_lastOpendirPath != nullptr &&
         std::strstr(g_lastOpendirPath, "gui_assets") != nullptr) {
-        const char* name = (g_injectIndex == 0) ? "2048x1536" : "1280x720";
-        if (g_injectIndex == 0 && !g_injectGui2048) {
+        if (!g_injectGui2048 || guiListingHasChild("2048x1536")) {
             g_injectIndex = 1;
-            name = "1280x720";
+            entry = nullptr;
         }
-        if (g_injectIndex == 1 && !g_injectGui1280) {
-            g_injectIndex = 2;
-            return nullptr;
+        else {
+            ++g_injectIndex;
+            std::memset(&g_fakeGuiEntry, 0, sizeof(g_fakeGuiEntry));
+            std::strcpy(g_fakeGuiEntry.d_name, "2048x1536");
+            g_fakeGuiEntry.d_type = DT_DIR;
+            std::snprintf(g_guiListingInjected, sizeof(g_guiListingInjected),
+                          "2048x1536");
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                "readdir-inject", 0,
+                                static_cast<unsigned long long>(DT_DIR),
+                                "2048x1536");
+            entry = &g_fakeGuiEntry;
         }
-        ++g_injectIndex;
-        std::memset(&g_fakeGuiEntry, 0, sizeof(g_fakeGuiEntry));
-        std::strcpy(g_fakeGuiEntry.d_name, name);
-        g_fakeGuiEntry.d_type = DT_DIR;
-        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
-                            "readdir-inject", 0,
-                            static_cast<unsigned long long>(DT_DIR), name);
-        entry = &g_fakeGuiEntry;
     }
     if (entry == nullptr) {
+        // The listing is over. Say what it contained, once, so the next run
+        // can read the resolution the guest was able to choose from without
+        // having to reconstruct it from the readdir lines.
+        logGuiAssetsListing();
         return nullptr;
     }
     if (entry->d_name[0] != '\0') {
