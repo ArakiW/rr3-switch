@@ -79,6 +79,23 @@ bool gfxOfflineNetwork();
 // gates async requests at 0xab2c30, where 0 is what prevents a wedge.
 bool gfxMenuGateOpen();
 
+// "rookiehub=1": the guest's Firebase Remote Config answer for "enable_rookie"
+// is TRUE.
+//
+// This is the front-end layout gate. The guest's FrontEnd2::EventMapScreen
+// builds main_menu/main_menu_twosquare.xml (the tile hub) only when its
+// predicate 0x13833cc is TRUE, and that predicate's first term is the
+// RookieChampionshipManager's +8 byte, which the manager's own initialiser at
+// guest 0x1382c50 fills from
+// Platform.GetBooleanValueFromRemoteConfig("enable_rookie"). With the switch
+// off the answer is FALSE, which is what the port has always returned.
+//
+// The switch is PER KEY on purpose: the guest asks the same Java method for
+// fourteen other flags (enable_mtx_tile, override_client_unlock_levels,
+// enable_ad_feature_crew_hire, ...), and answering TRUE for all of them would
+// change gameplay, not just the menu.
+bool gfxRookieHubEnabled();
+
 // "ccdone=1": invoke the Cloudcell continuation captured by the endpoint stub.
 // That is the only path that clears the guest's `pending` flag. Experiment only
 // -- the record it decodes carries an assert whose accepted shape is unproven.

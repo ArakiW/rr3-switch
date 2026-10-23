@@ -9,6 +9,7 @@
 // Mesa path: forward to __real_* with the arguments untouched.
 
 #include "rr3/gfx_backend.hpp"
+#include "rr3/gfx_text_probe.hpp"
 
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
@@ -732,6 +733,7 @@ extern "C" void __wrap_glGetAttachedShaders(GLuint program, GLsizei maxCount,
 // ---- buffers ---------------------------------------------------------------
 
 extern "C" void __wrap_glBindBuffer(GLenum target, GLuint buffer) {
+    gfxTextProbeBindBuffer(target, buffer);
     if (gfxNullActive()) {
         gfxNoteVoidCall();
         s_bufferBoundSize = s_bufferSize[bufferSlot(target)];
@@ -742,6 +744,7 @@ extern "C" void __wrap_glBindBuffer(GLenum target, GLuint buffer) {
 
 extern "C" void __wrap_glBufferData(GLenum target, GLsizeiptr size,
                                     const void* data, GLenum usage) {
+    gfxTextProbeBufferData(target, size, data);
     if (gfxNullActive()) {
         gfxNoteVoidCall();
         s_bufferSize[bufferSlot(target)] = size;
@@ -754,6 +757,7 @@ extern "C" void __wrap_glBufferData(GLenum target, GLsizeiptr size,
 
 extern "C" void __wrap_glBufferSubData(GLenum target, GLintptr offset,
                                        GLsizeiptr size, const void* data) {
+    gfxTextProbeBufferSubData(target, offset, size, data);
     if (gfxNullActive()) {
         gfxNoteVoidCall();
         const GLsizeiptr current = s_bufferSize[bufferSlot(target)];
@@ -1118,6 +1122,7 @@ extern "C" void __wrap_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
         return;
     }
     gfxNoteDrawArrays();
+    gfxTextProbeDraw(mode, first, count);
     __real_glDrawArrays(mode, first, count);
 }
 

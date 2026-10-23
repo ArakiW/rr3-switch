@@ -1,6 +1,7 @@
 #include "rr3/guest_input.hpp"
 
 #include "rr3/elf_preflight.hpp"
+#include "rr3/guest_touch.hpp"
 #include "rr3/recovery_guard.hpp"
 
 #include <switch.h>
@@ -97,6 +98,11 @@ bool prepareGuestControllerInput() {
     g_ready = g_setButton != nullptr && g_setJoystick != nullptr &&
               g_connected != nullptr;
     g_connectedIssued = false;
+    // The touch path is a DIFFERENT set of guest exports
+    // (MainActivity.onTouch{Begin,Move,End}JNI), so it is resolved here but
+    // its readiness does not gate the controller. It is OFF by default: with
+    // no control file on the card, guest_touch.cpp never calls the guest.
+    prepareGuestTouchInput();
     return g_ready;
 }
 
@@ -134,6 +140,12 @@ bool connectGuestController(void* jniEnvironment, void* activityObject,
 
 void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
                               GuestPadHandle* padOpaque, int deviceId) {
+    // The touch pump runs BEFORE the controller's early-out: the touch
+    // exports are a different set of guest entry points and the control file
+    // has to work on its own. It is called from the same frame loop that
+    // calls the guest's render entry point, which is the same relationship
+    // the guest's own GLView.queueEvent() has on Android.
+    pumpGuestTouchInput(jniEnvironment, activityObject);
     if (!g_ready || jniEnvironment == nullptr || padOpaque == nullptr) {
         return;
     }

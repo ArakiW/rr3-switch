@@ -1638,6 +1638,76 @@ void fontNoteSummary(uintptr_t bmpData) {
                      0, details);
 }
 
+// A value whose length is known.
+//
+// makeJniString's helpers stop at 192 bytes, which was the size of the table's
+// value back when the value was 128 bytes long. The value is 512 bytes now,
+// and a paragraph that arrives as UTF-16 becomes up to THREE UTF-8 bytes per
+// code unit, so the 192-byte stop would cut a Chinese paragraph in half.
+bool rawEqualsN(const char* left, const char* right, size_t length) {
+    if (left == nullptr || right == nullptr) {
+        return false;
+    }
+    for (size_t index = 0; index < length; ++index) {
+        if (left[index] != right[index]) {
+            return false;
+        }
+        if (left[index] == '\0') {
+            return true;
+        }
+    }
+    // The stored value must not be longer than the new one, or "ab" and "abc"
+    // would be the same string.
+    return left[length] == '\0';
+}
+
+void rawCopyN(char* destination, size_t capacity, const char* source, size_t length) {
+    if (destination == nullptr || capacity == 0) {
+        return;
+    }
+    size_t index = 0;
+    while (index < length && index + 1 < capacity) {
+        destination[index] = source[index];
+        ++index;
+    }
+    destination[index] = '\0';
+}
+
+uintptr_t makeJniStringN(const char* value, size_t length) {
+    if (value == nullptr) {
+        value = "";
+        length = 0;
+    }
+    if (length >= sizeof(g_jniStrings[0].value)) {
+        length = sizeof(g_jniStrings[0].value) - 1;
+    }
+    for (size_t index = 0; index < kMaxJniStrings; ++index) {
+        if (g_jniStrings[index].magic == kJniStringMagic &&
+            rawEqualsN(g_jniStrings[index].value, value, length)) {
+            return reinterpret_cast<uintptr_t>(&g_jniStrings[index]);
+        }
+    }
+    for (size_t index = 0; index < kMaxJniStrings; ++index) {
+        if (g_jniStrings[index].magic != kJniStringMagic) {
+            g_jniStrings[index].magic = kJniStringMagic;
+            rawCopyN(g_jniStrings[index].value, sizeof(g_jniStrings[index].value), value,
+                     length);
+            const uintptr_t handle = reinterpret_cast<uintptr_t>(&g_jniStrings[index]);
+            registerHostHandle(handle, "makeJniStringN/table");
+            return handle;
+        }
+    }
+    // Every slot is taken, so the oldest one is recycled. The guest deletes the
+    // string it has just used, so a slot that is kMaxJniStrings creations old
+    // is long dead.
+    const size_t index = g_jniStringCursor;
+    g_jniStringCursor = (g_jniStringCursor + 1) % kMaxJniStrings;
+    rawCopyN(g_jniStrings[index].value, sizeof(g_jniStrings[index].value), value, length);
+    const uintptr_t handle = reinterpret_cast<uintptr_t>(&g_jniStrings[index]);
+    registerHostHandle(handle, "makeJniStringN/ring");
+    return handle;
+}
+
 uintptr_t makeJniString(const char* value) {
     if (value == nullptr) {
         value = "";
@@ -2497,33 +2567,110 @@ uintptr_t jniNewStringUTF(uintptr_t /*env*/, const char* bytes) {
     return makeJniString(bytes);
 }
 
-// Slot 163 is the guest's OWN string slot.
+// UTF-16LE -> UTF-8.
 //
-// MEASURED 2026-10-24 from libRealRacing3.so: the guest builds the Java
-// String for a paragraph with a call through JNIEnv slot 163 -- guest
-// 0x12a77b4 is "ldr x8, [x8, #0x518]" (0x518 / 8 = 163) followed by "blr x8",
-// with x0 = the JNIEnv and x1 = the UTF-8 buffer the text was copied into.
-// 129 call sites in the guest load that slot; the GlyphVector path is one of
-// them.
-//
-// The port's table answered slot 163 with the default stub, which returns
-// null. So the guest's jstring handle came back as 0, the port's
-// jniStringValue(0) answered the empty string, and EVERY paragraph arrived
-// with no text at all: the class resolved, the layout ran, and the panel was
-// still blank. That is the part of the blank text that had nothing to do with
-// GlyphVector.
-//
-// The port's NewStringUTF lives at slot 167, which the guest also uses (429
-// call sites), so both slots are the guest's string slot and both are wired.
-//
-// THE GUARD: an argument that is one of this port's own jstring handles is
-// not a C string. Reading it as one would be a wild pointer read, so such an
-// argument is answered with the stub's null instead.
-uintptr_t jniNewStringUTFSlot163(uintptr_t env, const char* bytes) {
-    if (bytes == nullptr) {
+// The guest's strings arrive through NewString (slot 163), whose buffer is a
+// sequence of UTF-16 code units. Surrogate pairs are joined; a lone surrogate
+// becomes U+FFFD, because a Java String cannot hold one and the glyph raster
+// needs a code point it can look up.
+size_t decodeUtf16ToUtf8(const uint16_t* chars, int32_t count, char* out,
+                          size_t capacity) {
+    if (out == nullptr || capacity == 0) {
         return 0;
     }
-    const uintptr_t value = reinterpret_cast<uintptr_t>(bytes);
+    size_t written = 0;
+    if (chars != nullptr) {
+        for (int32_t index = 0; index < count; ++index) {
+            uint32_t code = chars[index];
+            if (code >= 0xD800 && code <= 0xDBFF && index + 1 < count) {
+                const uint32_t low = chars[index + 1];
+                if (low >= 0xDC00 && low <= 0xDFFF) {
+                    code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+                    ++index;
+                }
+            }
+            if (code >= 0xD800 && code <= 0xDFFF) {
+                code = 0xFFFD;
+            }
+            size_t needed = 1;
+            if (code >= 0x10000) {
+                needed = 4;
+            } else if (code >= 0x800) {
+                needed = 3;
+            } else if (code >= 0x80) {
+                needed = 2;
+            }
+            if (written + needed >= capacity) {
+                break;
+            }
+            if (needed == 1) {
+                out[written++] = static_cast<char>(code);
+            } else if (needed == 2) {
+                out[written++] = static_cast<char>(0xC0 | (code >> 6));
+                out[written++] = static_cast<char>(0x80 | (code & 0x3F));
+            } else if (needed == 3) {
+                out[written++] = static_cast<char>(0xE0 | (code >> 12));
+                out[written++] = static_cast<char>(0x80 | ((code >> 6) & 0x3F));
+                out[written++] = static_cast<char>(0x80 | (code & 0x3F));
+            } else {
+                out[written++] = static_cast<char>(0xF0 | (code >> 18));
+                out[written++] = static_cast<char>(0x80 | ((code >> 12) & 0x3F));
+                out[written++] = static_cast<char>(0x80 | ((code >> 6) & 0x3F));
+                out[written++] = static_cast<char>(0x80 | (code & 0x3F));
+            }
+        }
+    }
+    out[written] = '\0';
+    return written;
+}
+
+// Slot 163 is NewString -- a UTF-16 buffer plus a length -- NOT NewStringUTF.
+//
+// MEASURED 2026-10-24 from libRealRacing3.so, in the guest's own GlyphVector
+// path. The slot is loaded and CALLED DIRECTLY there (it is not one of the
+// lazy pointer caches), so the argument setup is visible:
+//
+//   initWithParagraph path, guest 0x12a7758..0x12a77b8
+//       sxtw  x8, w0            ; w0 = the character count
+//       adds  x8, x8, x8        ; x8 = count * 2  -> TWO BYTES PER CHARACTER
+//       csinv x0, x8, xzr, lo   ; malloc(count * 2)
+//       ...                    ; the game's string object writes UTF-16 into it
+//       ldr   x8, [x22]         ; the game's string object
+//       ldr   x8, [x8, #0x28]   ; -> the length
+//       blr   x8
+//       ldr   x8, [x22]
+//       mov   w2, w0            ; w2 = the character count
+//       mov   x1, x24           ; x1 = the UTF-16 buffer
+//       ldr   x8, [x8, #0x518]  ; 0x518 / 8 = 163
+//       blr   x8                ; NewString(env, chars, count)
+//
+//   init path, guest 0x12a75ac..0x12a75c0: the same three arguments.
+//
+// THREE arguments are set up, and the buffer is allocated at TWICE the count,
+// so x1 is a UTF-16 buffer of x2 code units. JNI slot 163 is
+// NewString(const jchar* unicode, jsize len); NewStringUTF is slot 167.
+//
+// The table numbering is corroborated by two other slots the same code uses:
+// 0x320 (slot 100) is GetIntField and 0xb8 (slot 23) is DeleteLocalRef, and
+// the guest uses them exactly where those two functions belong.
+//
+// THE PORT GOT THIS WRONG, AND IT IS THE REASON THE TEXT IS GARBAGE.
+// The port answered slot 163 with a UTF-8 reader, so it read the UTF-16
+// buffer as a NUL-terminated C string and stopped at the first NUL byte --
+// which, in UTF-16, comes after EVERY ASCII character. The runtime
+// fingerprint in archive 20261024-030340-eden-glyph5 is exact: nine different
+// UI labels arrived as one character each ("S" for START, "C" for CONTINUE,
+// "A", "T", "1", "0", "2", "9", "7"), and the CJK labels arrived as mojibake
+// whose bytes are the raw UTF-16 code units.
+//
+// THE GUARD: an argument that is one of this port's own jstring handles is
+// not a character buffer. Reading it as one would be a wild pointer read, so
+// such an argument is answered with the stub's null instead.
+uintptr_t jniNewStringSlot163(uintptr_t env, const uint16_t* chars, int32_t count) {
+    if (chars == nullptr) {
+        return 0;
+    }
+    const uintptr_t value = reinterpret_cast<uintptr_t>(chars);
     const uintptr_t tableLow =
         reinterpret_cast<uintptr_t>(&g_jniStrings[0]);
     const uintptr_t tableHigh =
@@ -2532,11 +2679,37 @@ uintptr_t jniNewStringUTFSlot163(uintptr_t env, const char* bytes) {
         (value >= tableLow && value < tableHigh)) {
         return 0;
     }
-    const uintptr_t handle = makeJniString(bytes);
+    if (count < 0) {
+        count = 0;
+    }
+    // The count comes from the guest. The port's own string value is 512
+    // bytes, so a string longer than that cannot be stored anyway, and the
+    // cap keeps a wild count from turning into an out-of-bounds read.
+    constexpr int32_t kMaxCodeUnits = 1024;
+    if (count > kMaxCodeUnits) {
+        count = kMaxCodeUnits;
+    }
+    // The table's value is 512 bytes, so the UTF-8 form of a long paragraph
+    // does not fit; the longest code unit count the buffer can hold is
+    // therefore bounded by the room the UTF-8 form needs.
+    char utf8[sizeof(g_jniStrings[0].value)];
+    const size_t length = decodeUtf16ToUtf8(chars, count, utf8, sizeof(utf8) - 1);
+    const uintptr_t handle = makeJniStringN(utf8, length);
     if (perCallLogAllow("jni-utf163")) {
-        char details[192];
-        __builtin_snprintf(details, sizeof(details), "slot=163 len=%u text=%s",
-                           (unsigned)rawStrlen(bytes), bytes);
+        // The RAW arguments and the RAW bytes, so the log can be checked
+        // against the guest's own count instead of against a strlen.
+        char raw[48];
+        size_t shown = 0;
+        for (int32_t i = 0; i < count && shown < sizeof(raw) - 4; ++i) {
+            const uint16_t unit = chars[i];
+            shown += static_cast<size_t>(__builtin_snprintf(
+                raw + shown, sizeof(raw) - shown, "%04X ", unit));
+        }
+        raw[shown] = '\0';
+        char details[288];
+        __builtin_snprintf(details, sizeof(details),
+                           "slot=163 NewString units=%d utf8Bytes=%u raw=[%s] text=%s",
+                           count, (unsigned)length, raw, utf8);
         guestViewWideLog("jni-utf163", 0, handle, details);
     }
     (void)env;
@@ -4826,13 +4999,69 @@ void jniCallStaticVoidMethod(uintptr_t env, uintptr_t clazz,
 // activity instance exists; the host lifecycle already advances g_gameState
 // after each callback, so only acknowledge the call here.
 uintptr_t jniCallStaticBooleanMethodV(uintptr_t /*env*/, uintptr_t /*clazz*/,
-                                      uintptr_t methodId, void* /*args*/) {
+                                      uintptr_t methodId, void* args) {
     const char* name = jniMethodName(methodId);
     if (name == nullptr) {
         return 0;
     }
     if (rawEquals(name, "setGameState")) {
         return 1;
+    }
+    // ONE KEY, ONE ANSWER.
+    //
+    // Platform.GetBooleanValueFromRemoteConfig(String) is the guest's Firebase
+    // Remote Config query, and the guest asks the SAME method for fourteen
+    // different flags -- enable_mtx_tile, override_client_unlock_levels,
+    // enable_ad_feature_crew_hire, enable_dynamic_ads, enable_rookie and ten
+    // more. The METHOD NAME cannot tell them apart: the key is the ARGUMENT.
+    // The name table below answers FALSE for all of them, which is the
+    // behaviour this port has always had, and it stays that way for every key
+    // except one.
+    //
+    // "enable_rookie" is the one that matters, because it is the front-end
+    // layout gate:
+    //
+    //   * the guest's cc::RookieChampionshipManager initialiser at 0x1382c50
+    //     asks Java for that key and stores the answer in its +8 byte
+    //     (0x1382d70 -> 0x1382d78);
+    //   * FrontEnd2::EventMapScreen's predicate 0x13833cc requires that byte to
+    //     be non-zero before it builds main_menu/main_menu_twosquare.xml
+    //     (0xdacf84) instead of main_menu/main_menu_career_page.xml
+    //     (0xdad680).
+    //
+    // The other two predicate terms already hold (measured mgr0c = 0 and
+    // *(G+0x47c) = 4), so this answer is the whole lever. gfxRookieHubEnabled()
+    // is the "rookiehub=1" switch in sdmc:/switch/rr3-gfx.conf and defaults to
+    // OFF, which is exactly the old answer.
+    if (rawEquals(name, "GetBooleanValueFromRemoteConfig")) {
+        const JniMethodRecord* rec = findJniMethod(methodId);
+        const char* sig = rec != nullptr && rec->signature[0] != '\0'
+                              ? rec->signature
+                              : nullptr;
+        jvalue argv[kMaxGuestVarArgs];
+        __builtin_memset(argv, 0, sizeof(argv));
+        const size_t argc =
+            sig != nullptr ? decodeGuestVarArgs(args, sig, argv, kMaxGuestVarArgs)
+                           : 0;
+        const char* key =
+            argc >= 1 ? jniStringValue(reinterpret_cast<uintptr_t>(argv[0].l))
+                      : nullptr;
+        if (key != nullptr) {
+            // The KEY is the whole point of this slot, so it is written down:
+            // "the port answered TRUE for enable_rookie" and "the port never saw
+            // the key" look identical from the outside otherwise.
+            char detail[128];
+            __builtin_snprintf(detail, sizeof(detail), "key=%s answer=%u",
+                               key, gfxRookieHubEnabled() &&
+                                           rawEquals(key, "enable_rookie")
+                                       ? 1u
+                                       : 0u);
+            guestViewWideLog("rc-boolean", methodId, 0, detail);
+        }
+        if (key != nullptr && rawEquals(key, "enable_rookie") &&
+            gfxRookieHubEnabled()) {
+            return 1;
+        }
     }
     const uintptr_t result = platformBoolForMethod(name) ? 1u : 0u;
     if (gateScalarNameInteresting(name)) {
@@ -4999,7 +5228,7 @@ void ensureInitialized() {
     g_jniTable[102] = reinterpret_cast<void*>(&jniGetFloatField);     // GetFloatField
     g_jniTable[144] = reinterpret_cast<void*>(&jniGetFieldID);        // GetStaticFieldID
     g_jniTable[167] = reinterpret_cast<void*>(&jniNewStringUTF);      // NewStringUTF
-g_jniTable[163] = reinterpret_cast<void*>(&jniNewStringUTFSlot163); // NewStringUTF (the guest's own slot)
+g_jniTable[163] = reinterpret_cast<void*>(&jniNewStringSlot163); // NewString (UTF-16 + length)
     g_jniTable[168] = reinterpret_cast<void*>(&jniGetStringUTFLength); // GetStringUTFLength
     g_jniTable[169] = reinterpret_cast<void*>(&jniGetStringUTFChars); // GetStringUTFChars
     g_jniTable[170] = reinterpret_cast<void*>(&jniNoop);              // ReleaseStringUTFChars

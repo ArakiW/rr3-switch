@@ -243,6 +243,45 @@ struct ConfState {
     // (FacebookWorker.java:129) -- there is no real Facebook session here and
     // never will be. Off by default.
     bool cloudcellSocialOk = false;
+    // "rookiehub=1" -- answer the guest's Firebase Remote Config query
+    // Platform.GetBooleanValueFromRemoteConfig("enable_rookie") with TRUE.
+    //
+    // WHY THIS IS THE MAIN-MENU GATE, from the guest binary and nothing else:
+    //
+    //   FrontEnd2::EventMapScreen's screen-construction routine
+    //   (FDE [0xdacf08,0xdad624)) picks between two roots for the same slot:
+    //
+    //     root A  main_menu/main_menu_twosquare.xml   loaded at 0xdacf84
+    //     root B  main_menu/main_menu_career_page.xml loaded at 0xdad680, from
+    //              the caller at 0xdac5a4-0xdac5d4, when the predicate is FALSE
+    //
+    // and the predicate is 0x13833cc([this+0x4c0]):
+    //
+    //     0x13833d4  ldrb w8, [x0, #8]     ; != 0
+    //     0x13833dc  ldr  w8, [x0, #0xc]   ; != 5
+    //     0x13833e8  bl   0x10ab9a8       ; G + 0x478
+    //     0x13833ec  ldr  w8, [x0, #4]    ; *(G+0x47c) != 0x14
+    //
+    // The object at this+0x4c0 is the cc::RookieChampionshipManager singleton
+    // (published into .bss 0x1f95cd8 by its own constructor at 0x1382a74; the
+    // EventMapScreen constructor at 0xdac038 reads the same GOT slot 0x1f6d840).
+    //
+    // Its +8 byte is written by its own initialiser at 0x1382c50, and THAT is
+    // where the Remote Config key comes in:
+    //
+    //     0x1382ce4  "Rookie_Enable"       -> native map lookup (0x9a2530)
+    //     0x1382d30  +8 = (lookup == 0)
+    //     0x1382d40  if (lookup != 0) skip the JNI query
+    //     0x1382d48  "enable_rookie"
+    //     0x1382d70  bl 0x12b9db0 -> Platform.GetBooleanValueFromRemoteConfig
+    //     0x1382d78  +8 = (that answer) & 1
+    //
+    // So +8 is 1 exactly when the guest's own Remote Config answer for
+    // "enable_rookie" is TRUE, and the predicate's other two terms are already
+    // satisfied (measured: mgr0c = 0 and *(G+0x47c) = 4). Off by default:
+    // with the switch off the port answers FALSE for every remote-config
+    // boolean, which is what it has always done.
+    bool rookieHub = false;
     // "ccsynth=1" -- install the host's synthetic Cloudcell object. Default is
     // 0, which LETS THE GUEST BUILD ITS OWN. The guest's constructor
     // (0x1cbe03c) allocates 0x4d0 bytes, publishes the object into this very
@@ -508,6 +547,11 @@ void readConf() {
                  std::strcmp(key, "cc-social-ok") == 0 ||
                  std::strcmp(key, "socialok") == 0) {
             s_conf.cloudcellSocialOk = parseSwitch(value);
+        }
+        else if (std::strcmp(key, "rookiehub") == 0 ||
+                 std::strcmp(key, "rookie-hub") == 0 ||
+                 std::strcmp(key, "rookieenable") == 0) {
+            s_conf.rookieHub = parseSwitch(value);
         }
         else if (std::strcmp(key, "zeropage") == 0) {
             s_conf.zeroPage = parseSwitch(value);
@@ -779,6 +823,15 @@ bool gfxCloudcellLoginOk() {
 bool gfxCloudcellSocialOk() {
     ensureResolved();
     return s_conf.cloudcellSocialOk;
+}
+
+// "rookiehub=1": the guest's Firebase Remote Config answer for "enable_rookie"
+// is TRUE, which is what makes the front end build the main_menu_twosquare
+// root instead of the career page. See the ConfState field for the guest
+// addresses that make the chain readable end to end.
+bool gfxRookieHubEnabled() {
+    ensureResolved();
+    return s_conf.rookieHub;
 }
 
 // "ccmode=now|bg": WHICH CONTEXT invokes the Cloudcell continuation the guest

@@ -59,6 +59,7 @@
 #include "../../eap_port/platform_adapter.h"
 #include "../../eap_port/trace_adapter.h"
 #include "../../../include/rr3/guest_view_trace.hpp"
+#include "../../../include/rr3/gfx_text_probe.hpp"
 #include "../jni.h"
 #include "../jni_internals.h"
 #include "glyph_vector.h"
@@ -980,9 +981,26 @@ void renderText(uintptr_t self, uintptr_t fontHandle, const char* text,
     } else {
         // init(): the ink box of the whole string, grown by one pixel at the
         // top and one at the bottom, exactly as GlyphVector.java does.
+        //
+        // Android's Paint.getTextBounds() is BASELINE RELATIVE: bounds.top is
+        // the distance from the baseline UP to the ink (negative) and
+        // bounds.bottom the distance DOWN to the ink (positive). The loop
+        // above works in paragraph-box coordinates, where the first line's
+        // baseline sits at metrics.ascent, so the baseline has to be taken
+        // back off here.
+        //
+        // The Java then does:
+        //     rect.top--;  i = rect.bottom + 1;  rect.bottom = i;
+        //     offsetX = -rect.left;  offsetY = -i;
+        //     boundsW = rect.width();  boundsH = rect.height();
+        // so offsetY is -(descent + 1), NOT -(baseline + descent + 1). The
+        // port measured the paragraph-box bottom instead, which put offsetY
+        // one whole ASCENT away from the Java's value -- a 124 px shift for a
+        // 175 px font, which moves the label off the widget it belongs to.
+        const float baseline = metrics.ascent;
         const float left = hasInk ? inkLeft : 0.f;
-        const float top = hasInk ? inkTop : 0.f;
-        const float bottom = hasInk ? inkBottom : 0.f;
+        const float top = hasInk ? inkTop - baseline : 0.f;
+        const float bottom = hasInk ? inkBottom - baseline : 0.f;
         const float grownTop = top - 1.f;
         const float grownBottom = bottom + 1.f;
         facade->numLines = 1;
@@ -1026,7 +1044,16 @@ void renderText(uintptr_t self, uintptr_t fontHandle, const char* text,
         state->plan.boundsLeft = boundsLeft;
         state->plan.pixelTopOffset = hasInk ? inkTop : 0.f;
         state->plan.singleOriginX = facade->offsetX;
-        state->plan.singleOriginY = 1.f - (hasInk ? inkTop : 0.f);
+        // drawText(str, -rect.left, -rect.top, paint): the BASELINE goes at
+        // -rect.top in the bitmap, and rect.top is the baseline-relative ink
+        // top MINUS one (the Java grows the box by a pixel at the top).
+        //
+        // The baseline-relative ink top is inkTop - ascent, because inkTop
+        // above is the paragraph-box coordinate. Using the paragraph-box
+        // value here put the baseline 123 px ABOVE the texture for a 175 px
+        // font, and every row of the glyph was clipped away: the texture was
+        // uploaded with no ink in it at all.
+        state->plan.singleOriginY = 1.f - (hasInk ? inkTop - metrics.ascent : 0.f);
         state->plan.textureWidth = textureWidth;
         state->plan.textureHeight = textureHeight;
         state->plan.usedLines = usedLines;
@@ -1187,6 +1214,9 @@ bool uploadTexture(uintptr_t self) {
     facade->texId = static_cast<int32_t>(texture);
     facade->texWidth = textureWidth;
     facade->texHeight = textureHeight;
+    // Tell the text-draw probe which texture is the label texture, so it can
+    // tell the label's draw apart from the game's other 40,000 draws.
+    rr3::gfxTextProbeNoteTexture(texture, textureWidth, textureHeight);
     return true;
 }
 
