@@ -4404,6 +4404,26 @@ constexpr uint64_t kFeGateMgrWord0cOff     = 0xCUL;
 // manager".
 constexpr uint64_t kFeGateRegistryRootOff = 0xA8ULL;
 constexpr uint64_t kFeGateEventMapInstOff = 0x2850ULL;
+// THE STATE THAT REGISTERS THE FRONT-END ACTION TABLE.
+//
+// MEASURED 2026-10-23 (ELF, archive-independent): the front-end entry
+// 0xa679a0 is reached from FOUR tail-callers, and the one that sets the
+// "front end is up" byte (.bss 0x1f9d461) is 0xa67fcc -- which is entry #45
+// of a 317-entry {fn, ctx} action table at 0x1e78b70, dispatched by a
+// RUNTIME LOCALIZED NAME (the name is not in the .so at all).
+//
+// The table is filled by 0xe1d8bc, and that function has exactly ONE call
+// site, and it is GATED:
+//
+//   0xe3b618  ldr  w8, [x0, #0x5d0]
+//   0xe3b61c  cmp  w8, #3
+//   0xe3b620  b.ne #0xe3b630        ; state != 3 -> the table is NEVER filled
+//   0xe3b628  bl  #0xe27304          ; -> 0xe1d8bc
+//
+// and the field advances 1 -> 2 -> 3 through the setter 0xe3bd64. So
+// "the state is not 3" is the measurable form of "the front end can never
+// start", and it is read here from the manager object.
+constexpr uint64_t kFeGateState5d0Off = 0x5D0ULL;
 // THE "FRONT END IS UP" FLAG. 0xa67fcc stores 1 into this .bss byte
 // immediately before it tail-calls the front-end entry 0xa679a0, and 0xed4898
 // reads it as a gate. So the byte answers "was the front end entered"
@@ -4427,12 +4447,14 @@ struct FeGateSample {
     ProbeValue regRoot{};
     ProbeValue evInst{};
     ProbeValue frontEndUp{};
+    ProbeValue mgrState{};
+    ProbeValue scrState{};
     bool gMatch{false};
     bool mgrCellMatch{false};
     const char* gForm{"none"};
     const char* g2Form{"none"};
     unsigned readable{0};
-    unsigned total{11};
+    unsigned total{13};
 };
 
 FeGateSample sampleFeGate(uintptr_t bias) {
@@ -4489,10 +4511,13 @@ FeGateSample sampleFeGate(uintptr_t bias) {
             static_cast<uintptr_t>(s.screenMgr.value + kFeGateEventMapInstOff), 8);
         s.frontEndUp = probeReadGuest(bias,
             static_cast<uintptr_t>(bias + kFeGateFrontEndUpCellElfVa), 1);
+        s.scrState = probeReadGuest(bias,
+            static_cast<uintptr_t>(s.screenMgr.value + kFeGateState5d0Off), 4);
     } else {
         const char* why = s.screenMgr.ok ? "null" : s.screenMgr.reason;
         s.regRoot.reason = why;
         s.evInst.reason = why;
+        s.scrState.reason = why;
     }
 
     // The RookieChampionshipManager. The CELL is read directly, because that
@@ -4502,6 +4527,12 @@ FeGateSample sampleFeGate(uintptr_t bias) {
     // each other instead of one of them being taken on faith.
     s.mgr = probeReadGuest(bias,
         static_cast<uintptr_t>(bias + kFeGateMgrCellElfVa), 8);
+    if (s.mgr.ok && s.mgr.value != 0) {
+        s.mgrState = probeReadGuest(bias,
+            static_cast<uintptr_t>(s.mgr.value + kFeGateState5d0Off), 4);
+    } else {
+        s.mgrState.reason = s.mgr.ok ? "null" : s.mgr.reason;
+    }
     const ProbeValue mgrSlot = probeReadGuest(bias,
         static_cast<uintptr_t>(bias + kFeGateMgrGotElfVa), 8);
     const ProbeCell mgrResolved =
@@ -4531,6 +4562,8 @@ FeGateSample sampleFeGate(uintptr_t bias) {
     if (s.regRoot.ok) { ++s.readable; }
     if (s.evInst.ok) { ++s.readable; }
     if (s.frontEndUp.ok) { ++s.readable; }
+    if (s.mgrState.ok) { ++s.readable; }
+    if (s.scrState.ok) { ++s.readable; }
     return s;
 }
 
@@ -4578,6 +4611,8 @@ void emitFeGateSample(uint64_t frames, const char* carrier,
     char regRootText[32];
     char evInstText[32];
     char feUpText[16];
+    char mgrStText[24];
+    char scrStText[24];
     char controlText[16];
     char predText[16];
 
@@ -4591,7 +4626,7 @@ void emitFeGateSample(uint64_t frames, const char* carrier,
                            s.st47c.value == kFeGateStateBlocked ? 1 : 0);
     }
 
-    char line[640];
+    char line[768];
     __builtin_snprintf(
         line, sizeof(line),
         "fe-gate: f=%llu t=%llu via=%s g=%s gok=%c gsrc=%s g2=%s g2ok=%c"
@@ -4599,6 +4634,7 @@ void emitFeGateSample(uint64_t frames, const char* carrier,
         " mgr=%s mgrok=%c mgrcellok=%c mgr8=%s mgr8ok=%c mgr0c=%s mgr0cok=%c"
         " screenmgr=%s screenmgr_ok=%c screen_find=not-probed"
         " regroot=%s regrootok=%c evinst=%s evinstok=%c feup=%s feupok=%c"
+        " mgrst=%s mgrstok=%c scrst=%s scrstok=%c"
         " pred13833cc=%s pred13833cc_src=derived readable=%u/%u ctrl=%s",
         (unsigned long long)frames,
         (unsigned long long)elapsedMs,
@@ -4626,6 +4662,10 @@ void emitFeGateSample(uint64_t frames, const char* carrier,
         s.evInst.ok ? '1' : '0',
         probeText(s.frontEndUp, feUpText, sizeof(feUpText), false),
         s.frontEndUp.ok ? '1' : '0',
+        probeText(s.mgrState, mgrStText, sizeof(mgrStText), false),
+        s.mgrState.ok ? '1' : '0',
+        probeText(s.scrState, scrStText, sizeof(scrStText), false),
+        s.scrState.ok ? '1' : '0',
         feGateDerivedPredicate(s, predText, sizeof(predText)),
         s.readable, s.total,
         probeControlVerdict(resolveMainImageLoadBias(), controlText,
