@@ -19,10 +19,12 @@
 #include "rr3/recovery_guard.hpp"
 #include "rr3/tls_probe.hpp"
 
-// The PNG writer, for the framebuffer capture. It lives next to the other
-// guest-view instruments so that "what the guest drew" is a picture and not
-// a colour triple.
-#include "rr3_png_write.hpp"
+// The framebuffer capture. It lives in its own translation unit
+// (guest_frame_capture.cpp) so that this file's layout barely moves: the
+// first version of the capture was written inline here, and the next
+// three Eeden runs died 42-55 s in -- earlier than any run with the
+// previous binary -- even though the capture never executed in them.
+#include "rr3/guest_frame_capture.hpp"
 
 // The deferred-callback pump (jni_compat/classes/cloudcell_defer.cpp). It is
 // called on the thread that runs the guest's per-frame callbacks, bracketing
@@ -8334,26 +8336,14 @@ void* frameLoopDriver(void* opaque) {
             // open" is not a question a colour triple can answer. So write
             // the frame out as a PNG.
             //
-            // glReadPixels hands back rows BOTTOM-UP and PNG stores them
-            // top-down, so the image is flipped here instead of being saved
-            // upside down.
-            //
             // The file name carries the frame number, because the question
             // is not "what does one frame look like" but "does the picture
             // change once the front end is up".
             {
-                static unsigned char row[1280 * 4];
-                for (int y = 0; y < 720 / 2; ++y) {
-                    unsigned char* top = px + static_cast<size_t>(y) * 1280 * 4;
-                    unsigned char* bot = px + static_cast<size_t>(719 - y) * 1280 * 4;
-                    std::memcpy(row, top, sizeof(row));
-                    std::memcpy(top, bot, sizeof(row));
-                    std::memcpy(bot, row, sizeof(row));
-                }
                 char path[128];
                 std::snprintf(path, sizeof(path),
                     "sdmc:/switch/rr3-native-rehost/frame-%06u.png", frame);
-                const bool wrote = rr3::writePngRgba(path, 1280, 720, px);
+                const bool wrote = rr3::writeFramePng(path, px, 1280, 720);
                 char pdiag[192];
                 std::snprintf(pdiag, sizeof(pdiag),
                     "frame=%u png=%s path=%s", frame,
