@@ -4389,6 +4389,26 @@ constexpr uint64_t kFeGateState47cOff      = 0x47CULL;
 constexpr uint64_t kFeGateScreenMgrOff     = 0x17F8ULL;
 constexpr uint64_t kFeGateMgrByte8Off      = 0x8ULL;
 constexpr uint64_t kFeGateMgrWord0cOff     = 0xCUL;
+// The SCREEN REGISTRY, and the EventMapScreen instance inside the manager.
+//
+// The registry is an intrusive red-black tree at "mgr+0xa0" whose ROOT pointer
+// is stored at "mgr+0xa8" (the sentinel is embedded there too). A root of 0
+// means the registry is EMPTY, and then ScreenManager::Find("EventMapScreen")
+// (0x14a7d5c) returns NULL and the front-end entry bails at GATE B.
+//
+// The only thing that FILLS the registry is MainMenuManager::Init (0x14a1a14),
+// which calls the vtable's slot 3 (0x14bfb0c) -- "RegisterAllScreens" -- and
+// that in turn calls Register("EventMapScreen", mgr+0x2850). The manager's own
+// constructor does NOT call it (0 "blr" in 0x14c6600, checked with a positive
+// control). So "is the root non-zero" is exactly "was Init ever run on THIS
+// manager".
+constexpr uint64_t kFeGateRegistryRootOff = 0xA8ULL;
+constexpr uint64_t kFeGateEventMapInstOff = 0x2850ULL;
+// THE "FRONT END IS UP" FLAG. 0xa67fcc stores 1 into this .bss byte
+// immediately before it tail-calls the front-end entry 0xa679a0, and 0xed4898
+// reads it as a gate. So the byte answers "was the front end entered"
+// without running any guest code from the host sampler thread.
+constexpr uint64_t kFeGateFrontEndUpCellElfVa = 0x1F9D461ULL;
 // The two values that SHUT a gate.
 constexpr uint32_t kFeGateStateBlocked     = 20U;
 constexpr uint32_t kFeGateMgrBlocked       = 5U;
@@ -4404,12 +4424,15 @@ struct FeGateSample {
     ProbeValue mgr8{};
     ProbeValue mgr0c{};
     ProbeValue screenMgr{};
+    ProbeValue regRoot{};
+    ProbeValue evInst{};
+    ProbeValue frontEndUp{};
     bool gMatch{false};
     bool mgrCellMatch{false};
     const char* gForm{"none"};
     const char* g2Form{"none"};
     unsigned readable{0};
-    unsigned total{8};
+    unsigned total{11};
 };
 
 FeGateSample sampleFeGate(uintptr_t bias) {
@@ -4451,6 +4474,27 @@ FeGateSample sampleFeGate(uintptr_t bias) {
         s.screenMgr.reason = why;
     }
 
+    // THE REGISTRY AND THE SCREEN INSTANCE.
+    //
+    // Two reads that between them say whether GATE B can pass at all:
+    //   regRoot == 0    -> the registry is EMPTY -> Find() returns NULL -> GATE B
+    //   regRoot != 0    -> the registry HAS entries -> GATE B is open
+    //   evInst's vptr   -> must be 0x1e6c558 (FrontEnd::EventMapScreen); the
+    //                      dynamic_cast at GATE C is a DOWNCAST to a base and
+    //                      there is no subclass, so it cannot fail.
+    if (s.screenMgr.ok && s.screenMgr.value != 0) {
+        s.regRoot = probeReadGuest(bias,
+            static_cast<uintptr_t>(s.screenMgr.value + kFeGateRegistryRootOff), 8);
+        s.evInst = probeReadGuest(bias,
+            static_cast<uintptr_t>(s.screenMgr.value + kFeGateEventMapInstOff), 8);
+        s.frontEndUp = probeReadGuest(bias,
+            static_cast<uintptr_t>(bias + kFeGateFrontEndUpCellElfVa), 1);
+    } else {
+        const char* why = s.screenMgr.ok ? "null" : s.screenMgr.reason;
+        s.regRoot.reason = why;
+        s.evInst.reason = why;
+    }
+
     // The RookieChampionshipManager. The CELL is read directly, because that
     // is where the guest's own constructor (0x1382a74: `str x0,[x8]` with
     // x8 = the .bss cell 0x1f95cd8) publishes it -- and the GOT slot that
@@ -4484,6 +4528,9 @@ FeGateSample sampleFeGate(uintptr_t bias) {
     if (s.mgr8.ok) { ++s.readable; }
     if (s.mgr0c.ok) { ++s.readable; }
     if (s.screenMgr.ok) { ++s.readable; }
+    if (s.regRoot.ok) { ++s.readable; }
+    if (s.evInst.ok) { ++s.readable; }
+    if (s.frontEndUp.ok) { ++s.readable; }
     return s;
 }
 
@@ -4528,6 +4575,9 @@ void emitFeGateSample(uint64_t frames, const char* carrier,
     char mgr8Text[24];
     char mgr0cText[24];
     char screenMgrText[32];
+    char regRootText[32];
+    char evInstText[32];
+    char feUpText[16];
     char controlText[16];
     char predText[16];
 
@@ -4548,6 +4598,7 @@ void emitFeGateSample(uint64_t frames, const char* carrier,
         " gmatch=%c st478=%s st478ok=%c st47c=%s st47cok=%c gateA_bail=%s"
         " mgr=%s mgrok=%c mgrcellok=%c mgr8=%s mgr8ok=%c mgr0c=%s mgr0cok=%c"
         " screenmgr=%s screenmgr_ok=%c screen_find=not-probed"
+        " regroot=%s regrootok=%c evinst=%s evinstok=%c feup=%s feupok=%c"
         " pred13833cc=%s pred13833cc_src=derived readable=%u/%u ctrl=%s",
         (unsigned long long)frames,
         (unsigned long long)elapsedMs,
@@ -4569,6 +4620,12 @@ void emitFeGateSample(uint64_t frames, const char* carrier,
         s.mgr0c.ok ? '1' : '0',
         probeText(s.screenMgr, screenMgrText, sizeof(screenMgrText), true),
         s.screenMgr.ok ? '1' : '0',
+        probeText(s.regRoot, regRootText, sizeof(regRootText), true),
+        s.regRoot.ok ? '1' : '0',
+        probeText(s.evInst, evInstText, sizeof(evInstText), true),
+        s.evInst.ok ? '1' : '0',
+        probeText(s.frontEndUp, feUpText, sizeof(feUpText), false),
+        s.frontEndUp.ok ? '1' : '0',
         feGateDerivedPredicate(s, predText, sizeof(predText)),
         s.readable, s.total,
         probeControlVerdict(resolveMainImageLoadBias(), controlText,

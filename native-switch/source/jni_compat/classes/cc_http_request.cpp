@@ -1517,10 +1517,36 @@ static bool deliverAssetResponse(JNIEnv *env, CCHttpRequest *req)
         kCCHttpCompleteCallback);
 
     std::vector<uint8_t> body;
-    if (!takeAssetResponse(req, (uint64_t)req->callback, body) ||
-        body.empty()) {
+    if (!takeAssetResponse(req, (uint64_t)req->callback, body)) {
         return false;
     }
+    /* AN EMPTY BODY IS STILL AN ANSWER.
+     *
+     * The port omits the block of an asset it has no file for -- nothing is
+     * invented for it -- so a request whose assets are ALL missing produces an
+     * empty block sequence. The old code refused to deliver an empty body,
+     * which meant the request was NEVER answered: the guest's HTTP worker
+     * kept it pending, the completion never came, and the guest logged
+     *
+     *   CC: ASSET DOWNLOAD ERROR! [...] [MSG: Download failed - incomplete
+     *   Download.] ... httpCode : 0
+     *
+     * httpCode 0 is the transport-level "no answer at all", not an HTTP
+     * error the guest can handle. Measured in archive
+     * 20261022-032739-eden-gfsalias2-r1: a request with two assets, both
+     * missing, was logged as "assets=2 served=0 missing=2 answered=0
+     * reason=no-known-answer-shape detail=no-local-file" and then never
+     * completed. The five assets that are genuinely absent from all seven
+     * volumes (the lexus_is_f350_catalunya weekly-event pair at 2048x1536 and
+     * 480x320, menu-carselect_porsche.banim, particle_test.pvr,
+     * detailmap_road_surface_norm_b.pvr) are all in this shape.
+     *
+     * Delivering the empty body completes the request with HTTP 200 and a
+     * body the guest's reader walks from end to end finding nothing -- which
+     * is the same "incomplete download" the guest reports, but on a request
+     * that is FINISHED. It cannot affect the assets that do resolve: the
+     * body is only empty when nothing at all was served.
+     */
     if (data_callback == nullptr || complete_callback == nullptr) {
         warning("HttpRequest: success natives missing (data=%p complete=%p); "
                 "asset request %p stays pending\n",
@@ -1541,6 +1567,16 @@ static bool deliverAssetResponse(JNIEnv *env, CCHttpRequest *req)
     }
     env->SetByteArrayRegion(array, 0, (jsize)body.size(),
                              (const jbyte *)body.data());
+
+    if (body.empty()) {
+        /* Say it plainly in the log: this request WAS answered, with nothing
+         * in it. "the guest never got an answer" and "the guest got an empty
+         * answer" are different facts, and only the second one lets the guest
+         * finish the request. */
+        rr3::guestViewWideLog("cc-asset-deliver", 2, 0,
+                               "empty answer delivered (every asset in this "
+                               "request had no local file); status=200");
+    }
 
     data_callback(env, (jobject)req, req->callback, array, (jint)body.size());
     complete_callback(env, (jobject)req, req->callback, 200);

@@ -376,6 +376,8 @@ extern "C" void __wrap_glGenTextures(GLsizei n, GLuint* textures) {
         return;
     }
     __real_glGenTextures(n, textures);
+    // Counted on the Mesa path too: see the note on the draw counters.
+    gfxNoteTexturesCreated(static_cast<uint64_t>(n < 0 ? 0 : n));
 }
 
 extern "C" void __wrap_glGenBuffers(GLsizei n, GLuint* buffers) {
@@ -418,7 +420,10 @@ extern "C" GLuint __wrap_glCreateShader(GLenum type) {
         gfxNoteShaderCreated(shader, type);
         return shader;
     }
-    return __real_glCreateShader(type);
+    const GLuint shader = __real_glCreateShader(type);
+    // Counted on the Mesa path too: see the note on the draw counters.
+    gfxNoteShaderCreated(shader, type);
+    return shader;
 }
 
 extern "C" GLuint __wrap_glCreateProgram(void) {
@@ -427,7 +432,10 @@ extern "C" GLuint __wrap_glCreateProgram(void) {
         gfxNoteProgramCreated();
         return gfxNextObjectId();
     }
-    return __real_glCreateProgram();
+    const GLuint program = __real_glCreateProgram();
+    // Counted on the Mesa path too: see the note on the draw counters.
+    gfxNoteProgramCreated();
+    return program;
 }
 
 extern "C" GLint __wrap_glGetUniformLocation(GLuint program, const GLchar* name) {
@@ -530,6 +538,8 @@ extern "C" void __wrap_glCompileShader(GLuint shader) {
         return;
     }
     __real_glCompileShader(shader);
+    // Counted on the Mesa path too: see the note on the draw counters.
+    gfxNoteCompile();
 }
 
 extern "C" void __wrap_glLinkProgram(GLuint program) {
@@ -539,6 +549,8 @@ extern "C" void __wrap_glLinkProgram(GLuint program) {
         return;
     }
     __real_glLinkProgram(program);
+    // Counted on the Mesa path too: see the note on the draw counters.
+    gfxNoteLink();
 }
 
 extern "C" void __wrap_glValidateProgram(GLuint program) {
@@ -1086,13 +1098,26 @@ extern "C" void __wrap_glGetShaderPrecisionFormat(GLenum shadertype,
 }
 
 // ---- draws -----------------------------------------------------------------
-
+//
+// THE DRAW COUNTER MUST WORK ON THE BACKEND WE ACTUALLY RUN.
+//
+// The draw counters used to be incremented only on the null backend, so on the
+// Mesa backend -- the one every real run uses -- "draws=0/0" was printed no
+// matter what the guest did. That is an instrument that cannot tell "the
+// guest drew nothing" from "the counter is not wired here", and this project
+// has already lost time to exactly that confusion: the summary reported
+// "draws=0/0" for all 52 archived runs, which reads as "the game never
+// rendered" and is NOT a statement about the guest at all.
+//
+// The Mesa path counts too now. The counter is incremented next to the real
+// call, so it counts what the guest actually asked the GPU to draw.
 extern "C" void __wrap_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
     if (gfxNullActive()) {
         gfxNoteVoidCall();
         gfxNoteDrawArrays();
         return;
     }
+    gfxNoteDrawArrays();
     __real_glDrawArrays(mode, first, count);
 }
 
@@ -1103,6 +1128,7 @@ extern "C" void __wrap_glDrawElements(GLenum mode, GLsizei count, GLenum type,
         gfxNoteDrawElements();
         return;
     }
+    gfxNoteDrawElements();
     __real_glDrawElements(mode, count, type, indices);
 }
 

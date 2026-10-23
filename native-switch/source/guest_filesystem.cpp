@@ -956,7 +956,7 @@ bool alternateAssetSpelling(const char* text, char* out, size_t outSize) {
 // distinguishing property of a FILE here is its extension: every file in
 // these trees is named "<something>.<ext>" ("sprites.android.atlas",
 // "sprites_0.rgb.pvr.z", "GlobalStyles.gui") and no directory in them is.
-void applyCardFirstAssetOrder(Resolution& resolution, const char* contentRelative) {
+void applyVolumeFirstAssetOrder(Resolution& resolution, const char* contentRelative) {
     if (contentRelative == nullptr) {
         return;
     }
@@ -972,46 +972,61 @@ void applyCardFirstAssetOrder(Resolution& resolution, const char* contentRelativ
     if (std::strncmp(tail, prefix, std::strlen(prefix)) == 0) {
         tail += std::strlen(prefix);
     }
-    // The OTHER spelling of the same logical asset, on the card and in the
-    // volume.
+    // The OTHER spelling of the same logical asset.
     char other[0x500]{};
     if (!alternateAssetSpelling(tail, other, sizeof(other))) {
         return;
     }
-    char cardOwn[0x600]{};
-    std::snprintf(cardOwn, sizeof(cardOwn), "%s/.depot/%s", kAppRoot, tail);
-    char cardOther[0x600]{};
-    std::snprintf(cardOther, sizeof(cardOther), "%s/.depot/%s", kAppRoot, other);
 
-    // THE CARD'S "assets_<res>" TREE IS ALWAYS THE PRIMARY, for BOTH
-    // spellings, and the card's "gui_assets/<res>" tree is the fallback.
+    // THE VOLUME'S COPY OF THE LOGICAL ASSET IS THE PRIMARY, AND THE CARD'S
+    // "assets_<res>" COPY IS THE FALLBACK. THIS IS THE OPPOSITE OF THE
+    // PREVIOUS RULE, AND THE MEASUREMENT THAT REVERSED IT IS BELOW.
     //
-    // WHY IT CANNOT BE THE PATH'S OWN SPELLING: the card's gui_assets tree
-    // holds the guest's own DOWNLOADS, and a download that was served from an
-    // older revision leaves a STALE copy there. MEASURED 2026-10-22: the
-    // card's .depot/gui_assets/960x640/common/sprites_0.rgb.pvr.z was
-    // 471,920 B with md5 4e063961 (the volume's revision, downloaded by an
-    // earlier build), while the card's
-    // .depot/assets_960x640/common/sprites_0.rgb.pvr.z is 574,733 B with md5
-    // 09ec9c79 -- and the update list names 09ec9c79. So the base list and
-    // the update list named two different digests for the same texture, the
-    // guest compared one against the other, and the asset failed with
-    // "didn't match its MD5".
+    // MEASURED 2026-10-22, on the deployed volumes (RomFS.contains() on
+    // gui-sd.romfs / gui-hd.romfs, and the card's own files):
     //
-    // With the card's assets_<res> tree first, BOTH spellings name the same
-    // file, and it is the one the server's update list describes.
-    char cardAssets[0x600]{};
-    char cardGui[0x600]{};
-    if (std::strncmp(tail, "gui_assets/", 11) == 0) {
-        std::snprintf(cardGui, sizeof(cardGui), "%s", cardOwn);
-        std::snprintf(cardAssets, sizeof(cardAssets), "%s", cardOther);
+    //   volume  gui_assets/960x640/common/sprites.android.atlas   39,199 B
+    //           and its bytes carry gradient.png, common_info_button.png,
+    //           fb_logo.png and apple_sign_in_icon.png -- the TEN sprites
+    //           that the card's copy is missing (the card's copy has 165
+    //           image entries, the volume's has 248).
+    //   card    assets_960x640/common/sprites.android.atlas        24,689 B
+    //           md5 43213527... and NONE of those ten sprite names.
+    //
+    // The card's "assets_<res>" tree is the game's INSTALLED revision and it
+    // is STALE; the volume's "gui_assets/<res>" tree is the shipped data-pack
+    // revision and it is complete. Promoting the card's copy to the primary
+    // therefore put a STALE file in front of the guest for both the digest
+    // the port publishes and the bytes the endpoint sends, while the
+    // RUNTIME read (the app-root form, which is NOT aliased) kept serving
+    // the volume's copy -- so the file the guest md5s and the file the
+    // runtime renders were two different revisions of one asset. That is
+    // the "didn't match its MD5" (24 lines, one asset) and the
+    // "Failed to load image from atlas" (20 lines, 10 sprites).
+    //
+    // So the volume's copy is the primary here, for BOTH spellings, and the
+    // two spellings still meet at ONE file -- which is what the self-test's
+    // bit 4 asserts. The card's "assets_<res>" copy stays reachable as the
+    // fallback (it is the only copy of the live weekly-event assets, which
+    // no volume ships: gui_assets/<res>/events/.../lexus_is_f350_catalunya
+    // is MISS in core.romfs, gui-sd.romfs and gui-hd.romfs alike).
+    //
+    // The card's "gui_assets/<res>" copy (the guest's own downloads) is the
+    // THIRD candidate: it is derived from the primary by appLocalPath() in
+    // withReadFallback(), so it is reached only when neither the volume nor
+    // the installed copy has the file.
+    const char* volumeTail = (std::strncmp(tail, "gui_assets/", 11) == 0) ? tail : other;
+    char volumeRelative[0x500]{};
+    std::snprintf(volumeRelative, sizeof(volumeRelative), "files/.depot/%s", volumeTail);
+    char volumePath[0x600]{};
+    if (!writeContentPath(volumePath, sizeof(volumePath), volumeRelative)) {
+        return;
     }
-    else {
-        std::snprintf(cardAssets, sizeof(cardAssets), "%s", cardOwn);
-        std::snprintf(cardGui, sizeof(cardGui), "%s", cardOther);
-    }
-    std::snprintf(resolution.primary, sizeof(resolution.primary), "%s", cardAssets);
-    std::snprintf(resolution.fallback, sizeof(resolution.fallback), "%s", cardGui);
+    const char* installedTail = (std::strncmp(tail, "assets_", 7) == 0) ? tail : other;
+    char installed[0x600]{};
+    std::snprintf(installed, sizeof(installed), "%s/.depot/%s", kAppRoot, installedTail);
+    std::snprintf(resolution.primary, sizeof(resolution.primary), "%s", volumePath);
+    std::snprintf(resolution.fallback, sizeof(resolution.fallback), "%s", installed);
     resolution.readOnly = true;
     resolution.mapped = true;
 }
@@ -1596,6 +1611,38 @@ const char* pathBasename(const char* path) {
     return base;
 }
 
+// TRUE for a path whose LEAF ends in ".ast".
+//
+// A ".ast" PATH IS CARD-ONLY, AND THIS IS THE PREDICATE THAT SAYS SO.
+//
+// WHY. The guest downloads an asset, writes the bytes to "<asset>.ast" on the
+// card, and then RE-OPENS that file to md5 it. Every ".ast" the guest ever
+// sees is therefore a file it wrote moments earlier: the seven romfs volumes
+// ship no ".ast" file at all, and the card's three ".ast" files (measured
+// 2026-10-22 on the deployed card) are all of them leftovers of a download
+// that never completed.
+//
+// So a ".ast" path has exactly ONE legitimate home -- the card -- and
+// mapping it into a content/volume tree can only ever produce the WRONG
+// file: the volume's copy of the same name WITHOUT the suffix (the volume
+// ships "sprites.android.atlas", not "sprites.android.atlas.ast"), which is
+// a different revision of the same asset.
+//
+// The guest's own naming rule puts the download cache under the
+// "gui_assets/<res>" spelling (measured: the guest wrote
+// ".depot/gui_assets/960x640/common/sprites.android.atlas.ast" while it
+// REQUESTED "/assets_960x640/common/sprites.android.atlas"), so this one
+// predicate covers both spellings: the card path it resolves to is the same
+// file either way.
+bool isAstLeaf(const char* path) {
+    if (path == nullptr) {
+        return false;
+    }
+    const char* leaf = pathBasename(path);
+    const size_t length = std::strlen(leaf);
+    return length > 4 && std::strcmp(leaf + length - 4, ".ast") == 0;
+}
+
 int watchedPathClass(const char* path) {
     if (path == nullptr) {
         return -1;
@@ -1743,6 +1790,31 @@ bool resolvePathImpl(const char* path, bool writing, Resolution& resolution);
 
 bool resolvePath(const char* path, bool writing, Resolution& resolution) {
     const bool resolved = resolvePathImpl(path, writing, resolution);
+    if (resolved && isAstLeaf(path)) {
+        // THE ".ast" RULE: CARD-ONLY, AND IT IS ENFORCED HERE, IN THE ONE
+        // PLACE EVERY PATH TAKES.
+        //
+        // resolvePathImpl() has already turned the guest's path into a
+        // content-relative path and then into a device path ("rr3gui1:/files/
+        // .depot/..."). For a ".ast" that device path is WRONG: no volume
+        // ships a ".ast" file, so the lookup can only ever land on the
+        // volume's copy of the same name WITHOUT the suffix.
+        //
+        // The card path is derived with appLocalPath() -- THE SAME function
+        // redirectWriteToAppLocal() uses for a write -- so the ".ast" the
+        // guest writes, the ".ast" it reads back and the ".ast" guestRename()
+        // moves are one file by construction, and none of them is ever a
+        // read-only volume path.
+        char card[0x600]{};
+        if (appLocalPath(resolution.primary, card, sizeof(card))) {
+            std::snprintf(resolution.primary, sizeof(resolution.primary), "%s", card);
+            // A ".ast" has exactly one home: no alias, no second candidate.
+            resolution.fallback[0] = '\0';
+            resolution.readOnly = false;
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                "map-ast", 0, 0, resolution.primary);
+        }
+    }
     if (resolved && writing) {
         // EVERY write goes through here, so this is the one place that has to
         // know that a write aimed at a read-only volume cannot work. The
@@ -1937,7 +2009,7 @@ bool resolvePathImpl(const char* path, bool writing, Resolution& resolution) {
         // So: the asset path space gets the card's copy, the runtime path
         // space keeps the volume's, and the two lists and the endpoint all
         // name the same bytes because they all live in the asset path space.
-        applyCardFirstAssetOrder(resolution, prefixed);
+        applyVolumeFirstAssetOrder(resolution, prefixed);
         return true;
     }
     if (startsWith(relative, "res/")) {
@@ -2300,6 +2372,49 @@ constexpr const char* kAssetPathFile =
 // The digest comes from the SAME resolver the pack endpoint uses, so the
 // bytes a list names and the bytes the endpoint sends are the same bytes by
 // construction.
+// ONE ASSET, TWO SPELLINGS, ONE KEY.
+//
+// The guest writes a download to "<asset path>.ast" under ITS OWN spelling, and
+// the asset lists name the same file under the OTHER one: the update list says
+// "/assets_960x640/common/sprites.android.atlas" and the base list says
+// "/gui_assets/960x640/common/sprites.android.atlas". The override set is keyed
+// by the path STRING, so an entry the guest produced under one spelling never
+// matched the line the other spelling names -- and the base list kept the
+// SHIPPED digest for it.
+//
+// MEASURED 2026-10-22: the shipped base list (files/.depot/asset_list_base.
+// txtCache.txt in core.romfs, 4,212,795 B, 40,863 lines) names
+//   /gui_assets/960x640/common/sprites.android.atlas
+//       bba63527235d60c88863fa10e111abc6
+// while the port served, and the update list named,
+//   c72568828875f4e2a6b11f5c944e27e0   (the volume's copy, 39,199 B).
+// The guest compared the bytes it had with bba63527..., answered "didn't match
+// its MD5" 12 times, and NEVER INSTALLED the file -- the rename that installs
+// a download only happens AFTER the check passes. The card's installed copy of
+// that atlas still carries its old mtime, which is the physical proof.
+//
+// So the override set carries BOTH spellings of every asset it knows.
+void appendOverrideWithBothSpellings(
+    std::vector<std::pair<std::string, std::string>>& out,
+    const std::string& path, const std::string& digest) {
+    out.emplace_back(path, digest);
+    std::string tail = path;
+    size_t begin = 0;
+    while (begin < tail.size() && tail[begin] == '/') {
+        ++begin;
+    }
+    tail = tail.substr(begin);
+    const std::string prefix = "files/.depot/";
+    if (tail.compare(0, prefix.size(), prefix) == 0) {
+        tail = tail.substr(prefix.size());
+    }
+    char other[0x500]{};
+    if (!alternateAssetSpelling(tail.c_str(), other, sizeof(other))) {
+        return;
+    }
+    out.emplace_back(std::string("/") + other, digest);
+}
+
 void collectAssetOverrides(std::vector<std::pair<std::string, std::string>>& out) {
     out.clear();
     std::vector<std::string> requested;
@@ -2343,12 +2458,11 @@ void collectAssetOverrides(std::vector<std::pair<std::string, std::string>>& out
                                   &size)) {
             continue;
         }
-        out.emplace_back(path, std::string(digest));
+        appendOverrideWithBothSpellings(out, path, std::string(digest));
     }
     std::sort(out.begin(), out.end());
     out.erase(std::unique(out.begin(), out.end()), out.end());
 }
-
 // A forward declaration: the definition sits next to the base-list rewrite,
 // where the recorded-path file is in scope.
 void collectAssetOverrides(std::vector<std::pair<std::string, std::string>>& out);
@@ -3539,8 +3653,8 @@ void logApkResReachabilityOnce() {
 // the guest's "/gui_assets/<res>/X" spelling:
 //
 //   1. ".depot/gui_assets/<res>/X"        the card's gui_assets tree
-//   2. ".depot/assets_<res>/X"            the card's installed tree
-//   3. "files/.depot/gui_assets/<res>/X"  the volume
+//   2. "files/.depot/gui_assets/<res>/X"  the volume
+//   3. ".depot/assets_<res>/X"            the card's installed tree, LAST
 //
 // and, for the "/assets_<res>/X" spelling:
 //
@@ -3563,9 +3677,10 @@ void logApkResReachabilityOnce() {
 // received against the digest published for the other spelling. ONE digest,
 // TWO spellings, so the two spellings MUST reach the same file.
 //
-// THE RESOLVER (applyCardFirstAssetOrder) puts the same three strings into
-// the resolution's three slots, in the same order, so the candidate that
-// answers here is the candidate that answers there.
+// THE RESOLVER (applyVolumeFirstAssetOrder) now answers BOTH spellings with
+// the volume's copy of the logical asset, so the candidate that answers here
+// is the candidate that answers there -- and it is the same file the guest's
+// own runtime read serves.
 static void assetCandidates(const char* path, char out[4][384], unsigned& countOut) {
     countOut = 0;
     if (path == nullptr) {
@@ -3573,7 +3688,31 @@ static void assetCandidates(const char* path, char out[4][384], unsigned& countO
     }
     std::snprintf(out[countOut], sizeof(out[countOut]), ".depot%s", path);
     ++countOut;
-    // THE REVERSE ALIAS, before the volume's copy of the same logical asset.
+    std::snprintf(out[countOut], sizeof(out[countOut]), "files/.depot%s", path);
+    ++countOut;
+    // THE REVERSE ALIAS GOES LAST, NOT SECOND.
+    //
+    // The card's "assets_<res>" tree is the game's INSTALLED revision and the
+    // volume's "gui_assets/<res>" tree is the shipped data-pack revision. For
+    // 960x640 they are DIFFERENT files:
+    //
+    //   .depot/assets_960x640/common/sprites.android.atlas        24,689 B
+    //       md5 4321352770b573a6b71d57547b2b3885   -- 165 image entries, and
+    //       MISSING ten menu sprites (gradient.png, common_info_button.png,
+    //       fb_logo.png, apple_sign_in_icon.png, ...).
+    //   files/.depot/gui_assets/960x640/common/sprites.android.atlas
+    //                                                            39,199 B
+    //       -- 248 image entries, the sprite-complete one.
+    //
+    // Putting the card's stale copy second made it win the "first candidate
+    // that exists" fallback, which is exactly what the fallback is FOR when
+    // no digest matches -- and it put a digest in the manifests that the
+    // runtime read path (which serves the volume) could never produce.
+    //
+    // The endpoint's md5 tie-breaker makes the ORDER irrelevant when a digest
+    // matches; it is the fallback that the order decides, so the stale copy
+    // goes last. THIS LIST IS THE SAME LIST, CHARACTER FOR CHARACTER, AS
+    // cc_http_request.cpp assetCandidates().
     if (std::strncmp(path, "/gui_assets/", 12) == 0) {
         const char* rest = std::strchr(path + 12, '/');
         if (rest != nullptr) {
@@ -3590,8 +3729,6 @@ static void assetCandidates(const char* path, char out[4][384], unsigned& countO
             }
         }
     }
-    std::snprintf(out[countOut], sizeof(out[countOut]), "files/.depot%s", path);
-    ++countOut;
     if (std::strncmp(path, "/assets_", 8) == 0) {
         const char* rest = std::strchr(path + 8, '/');
         if (rest != nullptr) {
@@ -3911,6 +4048,253 @@ bool buildConsistentAssetList(const char* listPath, const char* outputPath,
 //
 // The entries the guest has not asked for keep the server's md5: the port is
 // not claiming to have a digest for a file it has not resolved.
+// WAIT FOR THE CARD TO ACTUALLY HOLD THE FILE.
+//
+// fclose() returning is NOT the file being on the card.
+//
+// MEASURED 2026-10-23, archive 20261023-005427-eden-gateB-r1: the port's own
+// trace says the base-list rewrite took 198 ms ("ms=198"), and Eden's
+// timestamps show the 4.2 MB file landing on the card 18.5 SECONDS later
+// (t=5.23 the .tmp is written, t=23.75 the rename lands). The guest reads the
+// base list at its 4th log ordinal -- inside that window -- so it read the
+// SHIPPED list, whose digest for
+// /gui_assets/960x640/common/sprites.android.atlas is
+// bba63527235d60c88863fa10e111abc6, while the port serves
+// c72568828875f4e2a6b11f5c944e27e0.
+//
+// That is the whole of the 24 "didn't match its MD5" lines, and it is why the
+// guest never INSTALLED the atlas: the card's installed copy still carries its
+// old mtime, because the guest gives up before the rename.
+//
+// The port is the only party that can arrange the ordering, and the guest has
+// not started yet when this runs, so the wait is free.
+bool waitForCardFile(const char* path, size_t expectedBytes, unsigned timeoutMs) {
+    if (path == nullptr || expectedBytes == 0) {
+        return false;
+    }
+    const uint64_t frequency = armGetSystemTickFreq();
+    const uint64_t start = armGetSystemTick();
+    for (;;) {
+        struct stat info{};
+        if (::stat(path, &info) == 0 &&
+            static_cast<unsigned long long>(info.st_size) == expectedBytes) {
+            return true;
+        }
+        const uint64_t elapsed = (armGetSystemTick() - start) * 1000ULL /
+                                 (frequency != 0 ? frequency : 1);
+        if (elapsed >= timeoutMs) {
+            return false;
+        }
+        usleep(100 * 1000);
+    }
+}
+
+// The md5 of a file, read straight off the card.
+bool digestOfLocalFile(const char* path, char out[33]) {
+    if (path == nullptr || out == nullptr) {
+        return false;
+    }
+    out[0] = '\0';
+    std::FILE* file = std::fopen(path, "rb");
+    if (file == nullptr) {
+        return false;
+    }
+    Md5 md5;
+    md5.begin();
+    std::vector<unsigned char> chunk(64u * 1024u);
+    for (;;) {
+        const size_t got = std::fread(chunk.data(), 1, chunk.size(), file);
+        if (got > 0) {
+            md5.update(chunk.data(), got);
+        }
+        if (got < chunk.size()) {
+            break;
+        }
+    }
+    std::fclose(file);
+    md5.finish(out);
+    return true;
+}
+
+// REPAIR THE CARD'S INSTALLED COPIES.
+//
+// WHY. The guest installs a download by renaming "<asset>.ast" onto
+// "<asset>", and the rename only happens AFTER the downloaded bytes pass the
+// guest's md5 check. So a stale file at the installed path is a standing
+// "out of date" verdict: the guest re-downloads, the check keeps failing,
+// and the stale file is never replaced. The port's own rename comment says
+// the same thing: "the installed file stays STALE -- which is exactly what
+// the guest then md5s against the manifest and rejects with 'didn't match
+// its MD5'".
+//
+// MEASURED 2026-10-23, archive 20261023-133539-eden-astcard: the card's
+// ".depot/assets_960x640/common/" still carried the 24,689 B revision
+// (md5 43213527..., mtime 2026-10-22 01:14) that an EARLIER build of this
+// port wrote there, while ".depot/assets_2048x1536/common/" and
+// ".depot/assets_480x320/common/" had been refreshed to the revision the
+// port serves (13:37). The guest reported "didn't match its MD5" 24 times
+// for exactly the 960x640 pair, and for neither of the other two.
+//
+// WHAT IT DOES. For every asset the guest has recorded, the card's installed
+// copy is compared with the bytes the port serves for that asset, and the
+// installed copy is REPLACED when they differ. The replacement is the
+// volume's own revision, read from the volume.
+//
+// WHAT IT DOES NOT DO. It does not invent a file, it does not touch a
+// volume, and it does not touch an asset the port serves from the card
+// itself -- those are already consistent by construction.
+bool repairInstalledCopies(unsigned* repairedOut, unsigned* checkedOut) {
+    if (repairedOut != nullptr) {
+        *repairedOut = 0;
+    }
+    if (checkedOut != nullptr) {
+        *checkedOut = 0;
+    }
+    // 1. THE RECORDED PATHS. The same file the base-list rewrite reads, so
+    //    the two passes see the same set of assets.
+    std::vector<std::string> requested;
+    {
+        std::FILE* file = std::fopen(kAssetPathFile, "rb");
+        if (file != nullptr) {
+            char line[1024];
+            while (std::fgets(line, sizeof(line), file) != nullptr) {
+                std::string path = line;
+                while (!path.empty() &&
+                       (path.back() == '\n' || path.back() == '\r')) {
+                    path.pop_back();
+                }
+                size_t begin = 0;
+                while (begin < path.size() && path[begin] == '/') {
+                    ++begin;
+                }
+                if (begin >= path.size()) {
+                    continue;
+                }
+                // WITH the leading separator, because that is the form the
+                // resolver takes ("/assets_<res>/..."). The card path is
+                // built from the tail, which has none.
+                requested.push_back("/" + path.substr(begin));
+            }
+            std::fclose(file);
+        }
+    }
+    std::sort(requested.begin(), requested.end());
+    requested.erase(std::unique(requested.begin(), requested.end()),
+                    requested.end());
+
+    // 2. EACH ONE.
+    unsigned logged = 0;
+    for (const std::string& assetPath : requested) {
+        const std::string tail = assetPath.substr(1);
+        char source[0x600]{};
+        char digest[33]{};
+        unsigned long long size = 0;
+        if (!resolveAssetLocalFile(assetPath.c_str(), source, sizeof(source),
+                                   digest, &size)) {
+            if (logged < 60u) {
+                ++logged;
+                char diag[320];
+                std::snprintf(diag, sizeof(diag), "path=%s resolved=0", tail.c_str());
+                appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                    "repair-candidate", logged, 0, diag);
+            }
+            continue;
+        }
+        // The card's installed copy of this asset, under BOTH spellings: the
+        // one the guest asked for, and the other one it names.
+        std::vector<std::string> spellings;
+        spellings.push_back(tail);
+        char other[0x500]{};
+        if (alternateAssetSpelling(tail.c_str(), other, sizeof(other))) {
+            spellings.push_back(other);
+        }
+        for (const std::string& spelling : spellings) {
+            char cardPath[0x600]{};
+            std::snprintf(cardPath, sizeof(cardPath), "%s/.depot/%s", kAppRoot,
+                          spelling.c_str());
+            struct stat info{};
+            if (::stat(cardPath, &info) != 0 || !S_ISREG(info.st_mode)) {
+                if (logged < 60u) {
+                    ++logged;
+                    char diag[900];
+                    std::snprintf(diag, sizeof(diag),
+                                  "path=%s resolved=1 digest=%.32s card=%s "
+                                  "present=0 source=%s",
+                                  tail.c_str(), digest, cardPath, source);
+                    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                        "repair-candidate", logged, 0, diag);
+                }
+                continue;
+            }
+            if (checkedOut != nullptr) {
+                ++*checkedOut;
+            }
+            char cardDigest[33]{};
+            if (!digestOfLocalFile(cardPath, cardDigest)) {
+                continue;
+            }
+            if (std::strcmp(cardDigest, digest) == 0) {
+                continue;
+            }
+            // REPLACE IT WITH THE BYTES THE PORT SERVES.
+            bool written = false;
+            std::FILE* input = std::fopen(source, "rb");
+            if (input != nullptr) {
+                char tempPath[0x600]{};
+                std::snprintf(tempPath, sizeof(tempPath), "%s.tmp", cardPath);
+                std::FILE* output = std::fopen(tempPath, "wb");
+                if (output != nullptr) {
+                    std::vector<unsigned char> chunk(64u * 1024u);
+                    bool ok = true;
+                    for (;;) {
+                        const size_t got =
+                            std::fread(chunk.data(), 1, chunk.size(), input);
+                        if (got > 0 &&
+                            std::fwrite(chunk.data(), 1, got, output) != got) {
+                            ok = false;
+                            break;
+                        }
+                        if (got < chunk.size()) {
+                            break;
+                        }
+                    }
+                    written = ok && std::fclose(output) == 0;
+                    std::fclose(input);
+                    if (written) {
+                        // libnx's rename does NOT overwrite an existing file.
+                        std::remove(cardPath);
+                        written = std::rename(tempPath, cardPath) == 0;
+                        if (written) {
+                            // THE CARD NEEDS TIME. The bytes are not on the
+                            // card when fclose() returns (MEASURED: the 4.2 MB
+                            // base list lands ~18.5 s after the write), and
+                            // the guest hashes the installed file at boot.
+                            written = waitForCardFile(
+                                cardPath, static_cast<size_t>(size), 30000u);
+                        }
+                    }
+                }
+                else {
+                    std::fclose(input);
+                }
+            }
+            char diag[900];
+            std::snprintf(diag, sizeof(diag),
+                          "spelling=%s card=%s old=%.32s new=%.32s bytes=%llu "
+                          "written=%d source=%s",
+                          spelling.c_str(), cardPath, cardDigest, digest, size,
+                          written ? 1 : 0, source);
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                "installed-repair", 0,
+                                written ? 1u : 0u, diag);
+            if (written && repairedOut != nullptr) {
+                ++*repairedOut;
+            }
+        }
+    }
+    return true;
+}
+
 bool buildConsistentBaseList(unsigned* rewrittenOut, unsigned* unresolvedOut) {
     if (rewrittenOut != nullptr) {
         *rewrittenOut = 0;
@@ -3980,7 +4364,7 @@ bool buildConsistentBaseList(unsigned* rewrittenOut, unsigned* unresolvedOut) {
             }
             continue;
         }
-        overrides.emplace_back(path, std::string(digest));
+        appendOverrideWithBothSpellings(overrides, path, std::string(digest));
     }
     const uint64_t overridesMs = (armGetSystemTick() - overridesTick) * 1000ULL /
                                  (tickFreq != 0 ? tickFreq : 1);
@@ -4177,6 +4561,18 @@ bool buildConsistentBaseList(unsigned* rewrittenOut, unsigned* unresolvedOut) {
             written = std::rename(tempPath, kConsistentBaseListPath) == 0;
             if (!written) {
                 writeErrno = errno;
+            }
+            else {
+                // THE CARD NEEDS TIME. See waitForCardFile(): the 4.2 MB lands
+                // on the card ~18.5 s after the write, and the guest reads the
+                // base list long before that. Waiting here, before the guest
+                // starts, is the difference between the guest reading the
+                // REWRITTEN list and reading the SHIPPED one.
+                const bool landed = waitForCardFile(kConsistentBaseListPath,
+                                                    out.size(), 30000u);
+                if (!landed) {
+                    writeErrno = ETIMEDOUT;
+                }
             }
         }
     }
@@ -4412,6 +4808,21 @@ ExternalDataStatus mountExternalData() {
         unsigned unresolved = 0;
         buildConsistentBaseList(&rewritten, &unresolved);
     }
+    // THE CARD'S INSTALLED COPIES, made to BE the bytes the port serves.
+    //
+    // This runs BEFORE the guest starts, and it waits for each repaired file
+    // to land on the card, because the guest hashes the installed file while
+    // it decides what to download.
+    {
+        unsigned repaired = 0;
+        unsigned checked = 0;
+        repairInstalledCopies(&repaired, &checked);
+        char diag[256];
+        std::snprintf(diag, sizeof(diag), "checked=%u repaired=%u", checked,
+                      repaired);
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "installed-repair-summary", 0, repaired, diag);
+    }
     return gStatus;
 }
 
@@ -4465,15 +4876,12 @@ uint64_t guestFilesystemSelfTest() {
         std::strcmp(value.primary, "rr3core:/files/.depot/langs.utf8") == 0) bits |= 1;
     value = {};
     if (resolvePath(".depot/gui_assets/2048x1536/probe.bin", false, value) &&
-        startsWith(value.primary, "sdmc:/switch/rr3-native-rehost/.depot/assets_2048x1536/") &&
-        // AND the card's installed copy of the same logical asset is the
-        // fallback, with the HD volume's copy behind it. Both halves of the
-        // rule are asserted here, so the boot gate (main.cpp: the guest does
-        // not start unless filesystemTest == 0x1fff) fails if either half
-        // breaks. Before this, the rule was a REWRITE, which cost this very
-        // bit -- fsTest 0x1ffd -- and stopped the guest from starting at all
-        // (archive 20261021-174619-eden-menugate-terms).
-        startsWith(value.fallback, "sdmc:/switch/rr3-native-rehost/.depot/gui_assets/2048x1536/")) {
+        // THE VOLUME'S COPY IS THE PRIMARY: it is the file the guest's own
+        // runtime read serves and the file the port publishes the digest of.
+        startsWith(value.primary, "rr3gui0:/files/.depot/gui_assets/2048x1536/") &&
+        // AND THE CARD'S INSTALLED COPY IS THE FALLBACK, for the assets the
+        // volumes do not ship (the live weekly-event tree).
+        startsWith(value.fallback, "sdmc:/switch/rr3-native-rehost/.depot/assets_2048x1536/")) {
         bits |= 2;
     }
     value = {};
@@ -4482,21 +4890,26 @@ uint64_t guestFilesystemSelfTest() {
     // "files/.depot/gui_assets/960x640/X" and "files/.depot/assets_960x640/X"
     // are the same asset, and the port's manifest rewrite, the pack endpoint
     // and the guest's read-back all have to name the same bytes. When they
-    // did not, the guest wrote the volume's atlas, compared it with the
-    // card's digest and answered "didn't match its MD5" -- 12 times, on that
-    // one asset (archive 20261022-023023-eden-md5ship-r6).
+    // did not, the guest wrote one revision and compared it with another's
+    // digest and answered "didn't match its MD5" -- 24 times, on that one
+    // asset (archive 20261022-054635-eden-gfsalias14-r1).
     //
-    // The two chains are each other's: the "gui_assets" spelling falls back
-    // to the card's "assets_<res>" copy, and the "assets_<res>" spelling
-    // falls back to the card's "gui_assets" tree, and both end at the
-    // volume's copy of the same logical asset.
+    // THE FILE THEY NOW MEET AT IS THE VOLUME'S COPY, because that is the
+    // copy the guest's own runtime read serves (the app-root form is not
+    // aliased to the card), and the digest the port publishes has to be the
+    // digest of the file the guest can actually read back. The card's
+    // "assets_<res>" copy is the fallback: it is a STALE revision of the
+    // 960x640 atlas (24,689 B, 165 image entries, against the volume's
+    // 39,199 B, 248 entries) and it is the only copy of the live weekly-event
+    // assets, which no volume ships.
     if (resolvePath(".depot/gui_assets/960x640/probe.bin", false, value) &&
-        startsWith(value.primary, "sdmc:/switch/rr3-native-rehost/.depot/assets_960x640/") &&
-        startsWith(value.fallback, "sdmc:/switch/rr3-native-rehost/.depot/gui_assets/960x640/")) {
+        startsWith(value.primary, "rr3gui1:/files/.depot/gui_assets/960x640/") &&
+        startsWith(value.fallback, "sdmc:/switch/rr3-native-rehost/.depot/assets_960x640/")) {
         Resolution alias{};
         if (resolvePath(".depot/assets_960x640/probe.bin", false, alias) &&
-            startsWith(alias.primary, "sdmc:/switch/rr3-native-rehost/.depot/assets_960x640/") &&
-            startsWith(alias.fallback, "sdmc:/switch/rr3-native-rehost/.depot/gui_assets/960x640/")) {
+            // THE SAME FILE, from the other spelling.
+            startsWith(alias.primary, "rr3gui1:/files/.depot/gui_assets/960x640/") &&
+            startsWith(alias.fallback, "sdmc:/switch/rr3-native-rehost/.depot/assets_960x640/")) {
             bits |= 4;
         }
     }
@@ -5593,8 +6006,42 @@ int guestRename(const char* oldPath, const char* newPath) {
     if (!resolvePath(oldPath, true, oldResolution) ||
         !resolvePath(newPath, true, newResolution) ||
         rejectReadOnlyWrite(oldResolution, true) ||
-        rejectReadOnlyWrite(newResolution, true)) return -1;
-    return ::rename(oldResolution.primary, newResolution.primary);
+        rejectReadOnlyWrite(newResolution, true)) {
+        // THE INSTALL FAILED BEFORE THE RENAME. Log it: the guest installs a
+        // download by renaming "<asset>.ast" onto "<asset>", and if the two
+        // paths do not resolve the installed file stays STALE -- which is
+        // exactly what the guest then md5s against the manifest and rejects
+        // with "didn't match its MD5".
+        char diag[640];
+        std::snprintf(diag, sizeof(diag),
+                      "resolve-failed old=%s new=%s oldp=%s newp=%s",
+                      oldPath != nullptr ? oldPath : "-",
+                      newPath != nullptr ? newPath : "-",
+                      oldResolution.primary, newResolution.primary);
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "rename", 0, 0, diag);
+        return -1;
+    }
+    // BOTH ARGUMENTS ARE CARD PATHS, AND THAT IS THE POINT.
+    //
+    // The guest installs a download by renaming "<asset>.ast" onto
+    // "<asset>". resolvePath() is called with writing=true, so
+    // redirectWriteToAppLocal() has already moved a volume path onto the
+    // card -- and the ".ast" rule in resolvePath() has already made the OLD
+    // path the card's own ".ast", the very file the guest wrote. So ::rename
+    // moves THAT file, and never tries to rename a read-only volume path.
+    const int rc = ::rename(oldResolution.primary, newResolution.primary);
+    {
+        char diag[640];
+        std::snprintf(diag, sizeof(diag),
+                      "rc=%d errno=%d old=%s new=%s oldg=%s newg=%s",
+                      rc, errno, oldResolution.primary, newResolution.primary,
+                      oldPath != nullptr ? oldPath : "-",
+                      newPath != nullptr ? newPath : "-");
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "rename", 0, (unsigned long long)rc, diag);
+    }
+    return rc;
 }
 
 int guestUnlink(const char* path) {
