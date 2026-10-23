@@ -79,4 +79,71 @@ void pumpGuestTouchInput(void* jniEnvironment, void* activityObject);
 // The control file's path, for logging and for tests.
 const char* guestTouchControlPath();
 
+// ---- the shared injection primitive -----------------------------------------
+//
+// The file control and the hardware touch path go through ONE function, so
+// both reach the guest through the same entry points, with the same argument
+// order and the same log line. Two call sites that each look right is how a
+// port ends up with a touch path that works from a script and not from a
+// finger.
+
+// What the guest has to be told, in the guest's own terms.
+enum class GuestTouchAction {
+    Begin,    // onTouchBeginJNI(id, x, y)
+    Move,     // onTouchMoveJNI(id, x, y)
+    End,      // onTouchEndJNI(id, x, y, last=true)
+    Release,  // onTouchEndJNI(id, x, y, last=false)
+};
+
+// The guest's own touch state, read back from the guest's touch object.
+//
+// "down" is the byte the guest's touch object SHIPS with set to 1 and with
+// x=y=-1, and the guest's engine stores a new point only when no finger is
+// down -- so a press that arrives while this says down=1 is swallowed. Read
+// it before pressing and release that pointer first.
+struct GuestTouchState {
+    bool valid;      // the guest's touch object could be read at all
+    bool down;       // the guest believes a finger is down
+    int pointerId;   // the pointer the guest believes is down
+    int x;
+    int y;
+    unsigned paused; // the guest's paused gate (engine + 0x4d0)
+    unsigned focus;  // the guest's focus gate (engine + 0x4d1)
+};
+
+// Reads the guest's own touch state. Returns an all-zero state when the
+// guest's touch object cannot be read.
+GuestTouchState readGuestTouchState();
+
+// Injects one event into the guest's touch path and logs it.
+//
+// `phase` is the log line's phase name: "touch-inject" for the file control,
+// "touch-hw-inject" for the hardware path. The detail format is the same for
+// both, so one reader understands both.
+void injectGuestTouchEvent(void* jniEnvironment, void* activityObject,
+                           GuestTouchAction action, int pointerId, int x, int y,
+                           bool last, const char* phase);
+
+// True while the file control's control file is on the card. The file
+// control owns the guest's touch path while it is, and the hardware path
+// stands down. Presence is sampled by the file control's own poll, which
+// reaches the card every third frame; until that first poll has happened,
+// guestTouchControlHasPolled() is false and the hardware path stands down
+// too.
+bool guestTouchControlFilePresent();
+
+// True while the file control has events queued that have not been injected
+// yet (due or not).
+bool guestTouchControlHasPending();
+
+// True in the frame in which the file control injected an event. The
+// hardware path is pumped right after the file control's, in the same frame,
+// so this is what keeps the two from putting two pointers down at once.
+bool guestTouchControlInjectedThisFrame();
+
+// True once the file control has looked at the card at least once. Until
+// then it cannot say whether a control file is there, and the hardware path
+// stands down rather than guess.
+bool guestTouchControlHasPolled();
+
 }  // namespace rr3

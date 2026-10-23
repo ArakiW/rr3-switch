@@ -94,11 +94,18 @@ bool touchPointerPlausible(uintptr_t address) {
 bool touchMemoryReadable(uintptr_t address) {
     constexpr uintptr_t kPageMask = ~static_cast<uintptr_t>(0xFFF);
     const uintptr_t page = address & kPageMask;
-    static uintptr_t s_cachedPage = 0;
-    static bool s_cachedReadable = false;
-    static bool s_cachedValid = false;
-    if (s_cachedValid && page == s_cachedPage) {
-        return s_cachedReadable;
+    // A FOUR-entry cache, not a one-entry one, because the per-frame touch
+    // path reads three distinct pages -- the activity holder, the engine
+    // object and the touch object -- in a fixed order. A one-entry cache
+    // misses on every one of them, so every frame paid three svcQueryMemory
+    // calls; four entries hold all three and a warm frame loop pays none.
+    static uintptr_t s_cachedPage[4] = {0, 0, 0, 0};
+    static bool s_cachedReadable[4] = {false, false, false, false};
+    static bool s_cachedValid[4] = {false, false, false, false};
+    for (int i = 0; i < 4; ++i) {
+        if (s_cachedValid[i] && page == s_cachedPage[i]) {
+            return s_cachedReadable[i];
+        }
     }
     MemoryInfo info{};
     u32 pageInfo = 0;
@@ -108,9 +115,16 @@ bool touchMemoryReadable(uintptr_t address) {
     } else {
         readable = (info.perm & Perm_R) != 0;
     }
-    s_cachedPage = page;
-    s_cachedReadable = readable;
-    s_cachedValid = true;
+    int slot = 0;
+    for (int i = 1; i < 4; ++i) {
+        if (!s_cachedValid[i]) {
+            slot = i;
+            break;
+        }
+    }
+    s_cachedPage[slot] = page;
+    s_cachedReadable[slot] = readable;
+    s_cachedValid[slot] = true;
     return readable;
 }
 
@@ -188,43 +202,53 @@ struct TouchState {
     unsigned down;
 };
 
-TouchState readTouchState() {
-    TouchState state{};
+// The engine object behind the GOT slot, or 0 when it cannot be read.
+//
+// TWO dereferences, and the second one is the one that matters.
+//
+//   0x12b39d8: adrp x8, #0x1f6e000
+//   0x12b39dc: ldr  x8, [x8, #0x540]   <- x8 = *(0x1f6e540)  ("holder")
+//   0x12b39e0: ldr  x8, [x8]           <- x8 = *holder      (the activity)
+//   0x12b39e8: ldrb w9, [x8, #0x4d0]   <- the paused flag
+//
+// and onWindowFocusChangedJNI (0x12b3508) does the same two steps and
+// then writes the focus flag at activity+0x4d1. Reading only ONE level
+// gives the holder, whose +0x4d0/+0x4d1 are not those flags -- which is
+// why an earlier version of this read-back reported focus=0 while the
+// guest demonstrably had focus.
+uintptr_t readEngineObject() {
     static uintptr_t renderExport = 0;
     if (renderExport == 0) {
         renderExport = resolveMainImageExport(
             "Java_com_firemint_realracing_MainActivity_onViewRenderJNI");
         if (renderExport == 0) {
-            return state;
+            return 0;
         }
     }
     // The slot is inside the guest image, so it is mapped for the whole run.
     const uintptr_t slot = renderExport + kTouchSingletonSlotDelta;
     if (!guestImageContains(slot, sizeof(uint64_t))) {
-        return state;
+        return 0;
     }
     uint64_t holder = 0;
     if (!touchReadWord(slot, &holder) || holder == 0) {
-        return state;
+        return 0;
     }
-    // TWO dereferences, and the second one is the one that matters.
-    //
-    //   0x12b39d8: adrp x8, #0x1f6e000
-    //   0x12b39dc: ldr  x8, [x8, #0x540]   <- x8 = *(0x1f6e540)  ("holder")
-    //   0x12b39e0: ldr  x8, [x8]           <- x8 = *holder      (the activity)
-    //   0x12b39e8: ldrb w9, [x8, #0x4d0]   <- the paused flag
-    //
-    // and onWindowFocusChangedJNI (0x12b3508) does the same two steps and
-    // then writes the focus flag at activity+0x4d1. Reading only ONE level
-    // gives the holder, whose +0x4d0/+0x4d1 are not those flags -- which is
-    // why an earlier version of this read-back reported focus=0 while the
-    // guest demonstrably had focus.
     uint64_t activityWord = 0;
     if (!touchReadWord(static_cast<uintptr_t>(holder), &activityWord) ||
         activityWord == 0) {
+        return 0;
+    }
+    return static_cast<uintptr_t>(activityWord);
+}
+
+TouchState readTouchState() {
+    TouchState state{};
+    const uintptr_t engine = readEngineObject();
+    if (engine == 0) {
         return state;
     }
-    state.engine = static_cast<uintptr_t>(activityWord);
+    state.engine = engine;
     state.engineReadable = true;
 
     uint8_t paused = 0;
@@ -344,6 +368,23 @@ unsigned g_controlMisses = 0;
 size_t g_controlConsumed = 0;
 unsigned char g_controlSignature[kControlSignatureBytes] = {0};
 bool g_controlHaveSignature = false;
+// Whether the control file is there at the last poll. The hardware touch
+// path stands down while it is: the file control owns the guest's touch path
+// while its script is on the card.
+bool g_controlFilePresent = false;
+// Whether the file control injected an event in the frame that is being
+// pumped RIGHT NOW. The hardware path is pumped right after the file
+// control's, in the same frame, so without this the file control could
+// inject a press and the hardware path could inject a second one in the
+// same frame.
+bool g_controlInjectedThisFrame = false;
+// Whether the file control has looked at the card at least once. Until it
+// has, it cannot say whether a control file is there, and the hardware touch
+// path -- which is pumped right after it, in the same frame -- stands down.
+// MEASURED: the file control's first poll is on the third pump, and without
+// this a synthetic finger injected on pump 2 reached the guest while a
+// control file was on the card.
+bool g_controlPolledOnce = false;
 // The port's frame counter. The frame loop pumps input once per iteration,
 // so this counts the guest's frames to within one.
 unsigned g_pumpCount = 0;
@@ -465,11 +506,14 @@ bool parseLine(const char* line, TouchEvent* event, char* why,
 // open, because the host may delete and recreate it (a delete/recreate is a
 // new file, and a held handle would keep reading the old one).
 void drainControlFile() {
+    g_controlPolledOnce = true;
     std::FILE* file = std::fopen(kTouchControlPath, "rb");
     if (file == nullptr) {
         g_controlMisses++;
+        g_controlFilePresent = false;
         return;
     }
+    g_controlFilePresent = true;
     if (!g_armed) {
         g_armed = true;
         char detail[320];
@@ -582,6 +626,8 @@ bool prepareGuestTouchInput() {
     g_controlMisses = 0;
     g_controlConsumed = 0;
     g_controlHaveSignature = false;
+    g_controlFilePresent = false;
+    g_controlPolledOnce = false;
     g_pumpCount = 0;
     g_queueHead = 0;
     g_queueTail = 0;
@@ -596,7 +642,113 @@ const char* guestTouchControlPath() {
     return kTouchControlPath;
 }
 
+// ---- the shared injection primitive -----------------------------------------
+
+namespace {
+
+const char* guestTouchActionName(GuestTouchAction action) {
+    switch (action) {
+    case GuestTouchAction::Begin:
+        return "down";
+    case GuestTouchAction::Move:
+        return "move";
+    case GuestTouchAction::End:
+        return "up";
+    case GuestTouchAction::Release:
+        return "release";
+    }
+    return "?";
+}
+
+}  // namespace
+
+GuestTouchState readGuestTouchState() {
+    GuestTouchState out{};
+    const TouchState state = readTouchState();
+    out.valid = state.valid;
+    out.down = state.down != 0;
+    out.pointerId = state.pointerId;
+    out.x = state.x;
+    out.y = state.y;
+    out.paused = state.paused;
+    out.focus = state.focus;
+    return out;
+}
+
+void injectGuestTouchEvent(void* jniEnvironment, void* activityObject,
+                           GuestTouchAction action, int pointerId, int x, int y,
+                           bool last, const char* phase) {
+    if (!g_ready || jniEnvironment == nullptr) {
+        return;
+    }
+    const char* fn = "?";
+    uintptr_t fnAddress = 0;
+    unsigned long long elfVa = kGuestOnTouchBeginVa;
+    switch (action) {
+    case GuestTouchAction::Begin:
+        g_begin(jniEnvironment, activityObject, pointerId,
+                static_cast<float>(x), static_cast<float>(y));
+        fn = "onTouchBeginJNI";
+        fnAddress = reinterpret_cast<uintptr_t>(g_begin);
+        break;
+    case GuestTouchAction::Move:
+        g_move(jniEnvironment, activityObject, pointerId,
+               static_cast<float>(x), static_cast<float>(y));
+        fn = "onTouchMoveJNI";
+        fnAddress = reinterpret_cast<uintptr_t>(g_move);
+        elfVa = kGuestOnTouchMoveVa;
+        break;
+    case GuestTouchAction::End:
+    case GuestTouchAction::Release:
+        // `last` = 1 is what Android's ACTION_UP produces: GLView.java:290
+        // passes motionEvent.getActionMasked() == 1, which is true for
+        // ACTION_UP and false for ACTION_POINTER_UP.
+        g_end(jniEnvironment, activityObject, pointerId, static_cast<float>(x),
+              static_cast<float>(y), last ? 1 : 0);
+        fn = "onTouchEndJNI";
+        fnAddress = reinterpret_cast<uintptr_t>(g_end);
+        elfVa = kGuestOnTouchEndVa;
+        break;
+    }
+
+    char detail[288];
+    const TouchState state = readTouchState();
+    std::snprintf(detail, sizeof(detail),
+                  "x=%d y=%d action=%s id=%d fn=%s elfva=%llx frame=%u "
+                  "guest{valid=%d eng=%llx obj=%llx paused=%u focus=%u "
+                  "enabled=%u gid=%d gx=%d gy=%d down=%u}",
+                  x, y, guestTouchActionName(action), pointerId, fn, elfVa,
+                  g_pumpCount, state.valid ? 1 : 0,
+                  static_cast<unsigned long long>(state.engine),
+                  static_cast<unsigned long long>(state.touchObject),
+                  state.paused, state.focus, state.enabled, state.pointerId,
+                  state.x, state.y, state.down);
+    appendGuestBootLine(kTouchLogPath,
+                        phase != nullptr ? phase : "touch-inject", 941,
+                        static_cast<unsigned long long>(fnAddress), detail);
+}
+
+bool guestTouchControlFilePresent() {
+    return g_controlFilePresent;
+}
+
+bool guestTouchControlHasPending() {
+    return g_queueHead != g_queueTail;
+}
+
+bool guestTouchControlInjectedThisFrame() {
+    return g_controlInjectedThisFrame;
+}
+
+bool guestTouchControlHasPolled() {
+    return g_controlPolledOnce;
+}
+
 void pumpGuestTouchInput(void* jniEnvironment, void* activityObject) {
+    // Cleared first, and before the early-out below: this flag says "the
+    // file control injected in THIS frame", and the hardware path is pumped
+    // right after this one, in the same frame.
+    g_controlInjectedThisFrame = false;
     if (!g_ready || jniEnvironment == nullptr) {
         return;
     }
@@ -667,9 +819,10 @@ void pumpGuestTouchInput(void* jniEnvironment, void* activityObject) {
         g_queueTail = (g_queueTail + kQueueCapacity - 1) % kQueueCapacity;
     }
 
-    const char* fn = "?";
-    uintptr_t fnAddress = 0;
-    unsigned long long elfVa = kGuestOnTouchBeginVa;
+    // The guest call and the log line are the SHARED ones: the hardware
+    // touch path makes the same calls through the same function, so a touch
+    // from a finger and a touch from a script are indistinguishable to the
+    // guest and to whoever reads the log.
     switch (event.action) {
     case kActionDown:
         // RELEASE A STUCK POINTER FIRST.
@@ -704,46 +857,29 @@ void pumpGuestTouchInput(void* jniEnvironment, void* activityObject) {
                                     release);
             }
         }
-        g_begin(jniEnvironment, activityObject, event.id,
-                static_cast<float>(event.x), static_cast<float>(event.y));
-        fn = "onTouchBeginJNI";
-        fnAddress = reinterpret_cast<uintptr_t>(g_begin);
+        injectGuestTouchEvent(jniEnvironment, activityObject,
+                              GuestTouchAction::Begin, event.id, event.x,
+                              event.y, false, "touch-inject");
         break;
     case kActionMove:
-        g_move(jniEnvironment, activityObject, event.id,
-               static_cast<float>(event.x), static_cast<float>(event.y));
-        fn = "onTouchMoveJNI";
-        fnAddress = reinterpret_cast<uintptr_t>(g_move);
-        elfVa = kGuestOnTouchMoveVa;
+        injectGuestTouchEvent(jniEnvironment, activityObject,
+                              GuestTouchAction::Move, event.id, event.x,
+                              event.y, false, "touch-inject");
         break;
     case kActionUp:
         // `last` = 1 is what Android's ACTION_UP produces: GLView.java:290
         // passes motionEvent.getActionMasked() == 1, which is true for
         // ACTION_UP and false for ACTION_POINTER_UP.
-        g_end(jniEnvironment, activityObject, event.id,
-              static_cast<float>(event.x), static_cast<float>(event.y), 1);
-        fn = "onTouchEndJNI";
-        fnAddress = reinterpret_cast<uintptr_t>(g_end);
-        elfVa = kGuestOnTouchEndVa;
+        injectGuestTouchEvent(jniEnvironment, activityObject,
+                              GuestTouchAction::End, event.id, event.x,
+                              event.y, true, "touch-inject");
         break;
     default:
         break;
     }
-
-    char detail[288];
-    const TouchState state = readTouchState();
-    std::snprintf(detail, sizeof(detail),
-                  "x=%d y=%d action=%s id=%d fn=%s elfva=%llx frame=%u "
-                  "guest{valid=%d eng=%llx obj=%llx paused=%u focus=%u "
-                  "enabled=%u gid=%d gx=%d gy=%d down=%u}",
-                  event.x, event.y, actionName(event.action), event.id, fn,
-                  elfVa, g_pumpCount, state.valid ? 1 : 0,
-                  static_cast<unsigned long long>(state.engine),
-                  static_cast<unsigned long long>(state.touchObject),
-                  state.paused, state.focus, state.enabled, state.pointerId,
-                  state.x, state.y, state.down);
-    appendGuestBootLine(kTouchLogPath, "touch-inject", 941,
-                        static_cast<unsigned long long>(fnAddress), detail);
+    // The event is in the guest now. The hardware path is pumped right after
+    // this one, in the same frame, and it must not add a second pointer.
+    g_controlInjectedThisFrame = true;
 }
 
 }  // namespace rr3

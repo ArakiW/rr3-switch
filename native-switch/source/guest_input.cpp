@@ -2,6 +2,7 @@
 
 #include "rr3/elf_preflight.hpp"
 #include "rr3/guest_touch.hpp"
+#include "rr3/guest_touch_hw.hpp"
 #include "rr3/recovery_guard.hpp"
 
 #include <switch.h>
@@ -103,6 +104,12 @@ bool prepareGuestControllerInput() {
     // its readiness does not gate the controller. It is OFF by default: with
     // no control file on the card, guest_touch.cpp never calls the guest.
     prepareGuestTouchInput();
+    // The hardware touchscreen is a THIRD path: the console's own digitizer,
+    // read through libnx, turned into the same guest calls. It is ON by
+    // default -- a touchscreen that needs a switch flipped is not a
+    // touchscreen -- and it stands down on its own while the file control
+    // owns the guest's touch path.
+    prepareGuestTouchHardware();
     return g_ready;
 }
 
@@ -146,6 +153,11 @@ void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
     // calls the guest's render entry point, which is the same relationship
     // the guest's own GLView.queueEvent() has on Android.
     pumpGuestTouchInput(jniEnvironment, activityObject);
+    // The hardware touchscreen, right after it and on the same thread. The
+    // file control owns the guest's touch path while its file is on the
+    // card, and the hardware path stands down for it -- so the two never
+    // inject in the same frame.
+    pumpGuestTouchHardware(jniEnvironment, activityObject);
     if (!g_ready || jniEnvironment == nullptr || padOpaque == nullptr) {
         return;
     }
