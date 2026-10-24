@@ -53,6 +53,8 @@
 
 #include "rr3/gfx_text_probe.hpp"
 #include "rr3/guest_view_trace.hpp"
+#include "rr3/gfx_backend.hpp"
+#include "rr3/guest_frame_capture.hpp"
 
 namespace rr3 {
 namespace {
@@ -67,6 +69,125 @@ constexpr GLenum kGlTextureWidth = 0x1000;
 constexpr GLenum kGlTextureHeight = 0x1001;
 extern "C" void glGetTexLevelParameteriv(GLenum target, GLint level, GLenum pname,
                                          GLint* params);
+
+// ---------------------------------------------------------------------------
+// The probe's own configuration file
+// ---------------------------------------------------------------------------
+//
+// WHY A SEPARATE FILE
+// ------------------
+// The port's rr3-gfx.conf is read ONCE into a 4096-byte buffer and the card's
+// copy is 4087 bytes long. One more line there would be dropped in silence --
+// the exact failure this project has already paid for once. The probe
+// therefore reads its OWN file, and an absent file means "the census is off",
+// so a run with no probe configuration is the run that was measured before.
+//
+//   census=1    count the engine's 2D program draws, every frame
+//   detail=1    report every draw of the watched program, every frame
+//   watch=<n>   the program to watch (0 = auto: the 2D program with most draws)
+//   from=<n>    first frame of the window (0 = from the first frame)
+//   to=<n>      last frame of the window (0 = to the last frame)
+//
+// The frame numbers are the port's own swap count: gfxFrameCount() counts
+// eglSwapBuffers, so the draws the guest issues during swap N+1 are counted
+// under N. The census line therefore carries the swap count and the reader
+// adds one.
+constexpr const char* kProbeConf = "sdmc:/switch/rr3-probe.conf";
+
+struct ProbeConfig {
+    bool census = false;
+    bool detail = false;
+    unsigned long long watch = 0;   // 0 = auto
+    unsigned long long from = 0;
+    unsigned long long to = 0;
+    unsigned long long every = 1;   // report the detail on every Nth frame
+    unsigned long long pngFrom = 0;
+    unsigned long long pngTo = 0;
+    unsigned long long pngEvery = 1;
+    unsigned long long pngMax = 60;
+    bool loaded = false;
+    const char* source = "absent";
+};
+
+unsigned long long parseU64(const char* text) {
+    if (text == nullptr || text[0] == '\0') {
+        return 0;
+    }
+    return strtoull(text, nullptr, 10);
+}
+
+const ProbeConfig& probeConfig() {
+    static ProbeConfig config;
+    if (config.loaded) {
+        return config;
+    }
+    config.loaded = true;
+    FILE* file = fopen(kProbeConf, "rb");
+    if (file == nullptr) {
+        return config;
+    }
+    config.source = kProbeConf;
+    char buffer[1024];
+    const size_t read = fread(buffer, 1, sizeof(buffer) - 1, file);
+    fclose(file);
+    buffer[read] = '\0';
+    char* cursor = buffer;
+    while (cursor != nullptr && cursor[0] != '\0') {
+        char* line = cursor;
+        char* next = strchr(line, '\n');
+        if (next != nullptr) {
+            *next = '\0';
+            cursor = next + 1;
+        } else {
+            cursor = nullptr;
+        }
+        char* hash = strchr(line, '#');
+        if (hash != nullptr) {
+            *hash = '\0';
+        }
+        char* eq = strchr(line, '=');
+        if (eq == nullptr) {
+            continue;
+        }
+        *eq = '\0';
+        char* key = line;
+        char* value = eq + 1;
+        while (*key == ' ' || *key == '\t') {
+            ++key;
+        }
+        while (*value == ' ' || *value == '\t') {
+            ++value;
+        }
+        if (strcmp(key, "census") == 0) {
+            config.census = strcmp(value, "1") == 0;
+        } else if (strcmp(key, "detail") == 0) {
+            config.detail = strcmp(value, "1") == 0;
+        } else if (strcmp(key, "watch") == 0) {
+            config.watch = parseU64(value);
+        } else if (strcmp(key, "from") == 0) {
+            config.from = parseU64(value);
+        } else if (strcmp(key, "to") == 0) {
+            config.to = parseU64(value);
+        } else if (strcmp(key, "every") == 0) {
+            config.every = parseU64(value);
+            if (config.every == 0) {
+                config.every = 1;
+            }
+        } else if (strcmp(key, "pngfrom") == 0) {
+            config.pngFrom = parseU64(value);
+        } else if (strcmp(key, "pngto") == 0) {
+            config.pngTo = parseU64(value);
+        } else if (strcmp(key, "pngevery") == 0) {
+            config.pngEvery = parseU64(value);
+            if (config.pngEvery == 0) {
+                config.pngEvery = 1;
+            }
+        } else if (strcmp(key, "pngmax") == 0) {
+            config.pngMax = parseU64(value);
+        }
+    }
+    return config;
+}
 
 // ---------------------------------------------------------------------------
 // The glyph textures
@@ -517,9 +638,13 @@ unsigned long long g_drawOrdinal = 0;
 constexpr int kTextDrawBudget = 3000;
 constexpr int kFirstDrawBudget = 96;
 constexpr int kProgramDrawBudget = 1200;
+// The detail mode reports one line per distinct texture per frame, so its
+// budget is spent in frames rather than in sessions.
+constexpr int kFrameDrawBudget = 24000;
 int g_textDraws = 0;
 int g_firstDraws = 0;
 int g_programDraws = 0;
+int g_frameDraws = 0;
 
 // The set of glyph textures already reported. Open addressing, power of two.
 constexpr size_t kSeenSlots = 8192;
@@ -601,6 +726,248 @@ void rememberTextProgram(GLuint program) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The per-frame census of the guest's programs
+// ---------------------------------------------------------------------------
+//
+// WHY THIS EXISTS
+// ---------------
+// The hud-draw phase reports the FIRST draw of each (program, texture) pair in
+// the WHOLE SESSION. That is the right instrument for "what does this widget
+// look like", and it answers the race question with a silent no: the HUD
+// draws the same handful of textures every frame, so the first frame has
+// already spent the census and every frame of the race has nothing NEW to
+// report. "28 draws" is 28 distinct textures met once each over the whole
+// session -- most of them in the front end -- and NOT 28 quads in the race.
+//
+// The census counts EVERY frame instead, for EVERY program, so the race is a
+// time series: which program drew how many quads, with which textures, in
+// which frame. That is what separates "the HUD is drawn but lands somewhere
+// invisible" from "the guest never draws the HUD".
+//
+// The frame number is the port's swap count. gfxFrameCount() counts
+// eglSwapBuffers and the swap happens AFTER the guest's render, so the draws
+// issued during swap N+1 are counted under N.
+constexpr int kCensusSlots = 256;
+constexpr int kCensusTextures = 24;
+
+struct CensusEntry {
+    GLuint program = 0;
+    unsigned long long draws = 0;
+    int textureCount = 0;
+    int textureOverflow = 0;
+    GLuint textures[kCensusTextures] = {0};
+};
+
+CensusEntry g_census[kCensusSlots];
+bool g_censusUsed[kCensusSlots];
+int g_censusProgramCount = 0;
+unsigned long long g_censusFrame = 0;
+unsigned long long g_censusDraws = 0;
+bool g_censusStarted = false;
+
+CensusEntry* censusEntryFor(GLuint program) {
+    if (program == 0) {
+        return nullptr;
+    }
+    const size_t start = static_cast<size_t>((program * 2654435761u) & (kCensusSlots - 1));
+    for (size_t probe = 0; probe < static_cast<size_t>(kCensusSlots); ++probe) {
+        const size_t at = (start + probe) & (kCensusSlots - 1);
+        if (!g_censusUsed[at]) {
+            g_censusUsed[at] = true;
+            g_census[at].program = program;
+            ++g_censusProgramCount;
+            return &g_census[at];
+        }
+        if (g_census[at].program == program) {
+            return &g_census[at];
+        }
+    }
+    return nullptr;
+}
+
+// Appends text to a bounded buffer. Defined further down with the other
+// helpers; declared here because the census uses it.
+void appendText(char* buffer, size_t capacity, const char* text);
+
+// The census line for the frame that just ended.
+void censusFlush() {
+    if (!g_censusStarted) {
+        return;
+    }
+    const ProbeConfig& config = probeConfig();
+    char details[900];
+    details[0] = '\0';
+    char part[192];
+    int framePrograms = 0;
+    for (int index = 0; index < kCensusSlots; ++index) {
+        if (g_censusUsed[index] && g_census[index].draws > 0) {
+            ++framePrograms;
+        }
+    }
+    snprintf(part, sizeof(part), "draws=%llu programs=%d",
+             g_censusDraws, framePrograms);
+    appendText(details, sizeof(details), part);
+    // The watched program is captured BEFORE the ranking loop, because that
+    // loop zeroes the draw counts it has already reported.
+    unsigned long long watchDraws = 0;
+    int watchTextureCount = 0;
+    GLuint watchTextures[12] = {0};
+    if (config.watch != 0) {
+        for (int index = 0; index < kCensusSlots; ++index) {
+            if (!g_censusUsed[index] || g_census[index].program != config.watch) {
+                continue;
+            }
+            watchDraws = g_census[index].draws;
+            watchTextureCount = g_census[index].textureCount;
+            for (int index2 = 0; index2 < 12 && index2 < watchTextureCount;
+                 ++index2) {
+                watchTextures[index2] = g_census[index].textures[index2];
+            }
+        }
+    }
+    // The programs with the most draws first: the interesting one is the one
+    // the HUD uses, and it is not necessarily the lowest-numbered. Twelve are
+    // reported because in a race the 3D world uses several programs, and a
+    // report that stopped at six would have pushed the HUD's own program off
+    // the end of the list exactly when it matters.
+    for (int rank = 0; rank < 12; ++rank) {
+        const CensusEntry* best = nullptr;
+        for (int index = 0; index < kCensusSlots; ++index) {
+            if (!g_censusUsed[index]) {
+                continue;
+            }
+            if (g_census[index].draws == 0) {
+                continue;
+            }
+            if (best == nullptr || g_census[index].draws > best->draws) {
+                best = &g_census[index];
+            }
+        }
+        if (best == nullptr) {
+            break;
+        }
+        snprintf(part, sizeof(part), " p%u=%llu", best->program, best->draws);
+        appendText(details, sizeof(details), part);
+        if (best->textureCount > 0) {
+            snprintf(part, sizeof(part), " t%u=", best->program);
+            appendText(details, sizeof(details), part);
+            const int listed = best->textureCount < 8 ? best->textureCount : 8;
+            for (int index = 0; index < listed; ++index) {
+                snprintf(part, sizeof(part), "%s%u", index == 0 ? "" : ",",
+                         best->textures[index]);
+                appendText(details, sizeof(details), part);
+            }
+            if (best->textureCount > listed) {
+                snprintf(part, sizeof(part), ",+%d", best->textureCount - listed);
+                appendText(details, sizeof(details), part);
+            }
+        }
+        // Take the entry out of the running so the next rank finds another.
+        g_census[static_cast<int>(best - g_census)].draws = 0;
+    }
+    // The watched program is listed even when it is not among the busiest:
+    // the reader asked for it by name, so it must be in the line.
+    if (config.watch != 0) {
+        snprintf(part, sizeof(part), " watch%llu=%llu", config.watch, watchDraws);
+        appendText(details, sizeof(details), part);
+        if (watchTextureCount > 0) {
+            snprintf(part, sizeof(part), " wt%llu=", config.watch);
+            appendText(details, sizeof(details), part);
+            for (int index2 = 0; index2 < 12 && index2 < watchTextureCount;
+                 ++index2) {
+                snprintf(part, sizeof(part), "%s%u", index2 == 0 ? "" : ",",
+                         watchTextures[index2]);
+                appendText(details, sizeof(details), part);
+            }
+        }
+    }
+    guestViewWideLog("hud-census", g_censusFrame, config.watch, details);
+}
+
+// The count of draws per program for the frame in progress.
+//
+// The texture is read only when it is worth reading: for the engine's own 2D
+// programs (which is where the HUD's widgets live) and for the FIRST draw of
+// any other program in the frame. The 3D world submits millions of quads and
+// the census does not need their texture names, so the bound texture is not
+// queried for them.
+void censusNoteDraw(GLuint program) {
+    const ProbeConfig& config = probeConfig();
+    if (!config.census && !config.detail) {
+        return;
+    }
+    const unsigned long long frame = gfxFrameCount();
+    if (!g_censusStarted || frame != g_censusFrame) {
+        censusFlush();
+        g_censusFrame = frame;
+        g_censusStarted = true;
+        g_censusDraws = 0;
+        for (int index = 0; index < kCensusSlots; ++index) {
+            if (g_censusUsed[index]) {
+                g_census[index].draws = 0;
+                g_census[index].textureCount = 0;
+                g_census[index].textureOverflow = 0;
+            }
+        }
+    }
+    ++g_censusDraws;
+    CensusEntry* entry = censusEntryFor(program);
+    if (entry == nullptr) {
+        return;
+    }
+    const bool firstOfProgram = entry->draws == 0;
+    ++entry->draws;
+    if (!isTextProgram(program) && !firstOfProgram) {
+        return;
+    }
+    GLint bound = 0;
+    ::glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+    const GLuint texture = static_cast<GLuint>(bound);
+    if (texture == 0) {
+        return;
+    }
+    for (int index = 0; index < entry->textureCount; ++index) {
+        if (entry->textures[index] == texture) {
+            return;
+        }
+    }
+    if (entry->textureCount < kCensusTextures) {
+        entry->textures[entry->textureCount++] = texture;
+    } else {
+        ++entry->textureOverflow;
+    }
+}
+
+// The (program, texture) pairs already reported IN THIS FRAME. The detail
+// mode reports a draw once per frame, so a HUD that redraws the same
+// textures every frame is still measured every frame.
+constexpr size_t kFramePairSlots = 4096;
+uint64_t g_seenFramePairs[kFramePairSlots];
+bool g_seenFramePairUsed[kFramePairSlots];
+unsigned long long g_framePairFrame = 0;
+
+bool firstDrawOfPairThisFrame(unsigned long long frame, GLuint program, GLuint texture) {
+    if (frame != g_framePairFrame) {
+        memset(g_seenFramePairUsed, 0, sizeof(g_seenFramePairUsed));
+        g_framePairFrame = frame;
+    }
+    const uint64_t key = (static_cast<uint64_t>(program) << 32) | texture;
+    const size_t start = static_cast<size_t>((key * 2654435761u) & (kFramePairSlots - 1));
+    for (size_t probe = 0; probe < kFramePairSlots; ++probe) {
+        const size_t at = (start + probe) & (kFramePairSlots - 1);
+        if (!g_seenFramePairUsed[at]) {
+            g_seenFramePairUsed[at] = true;
+            g_seenFramePairs[at] = key;
+            return true;
+        }
+        if (g_seenFramePairs[at] == key) {
+            return false;
+        }
+    }
+    return false;
+}
+
 // The (program, texture) pairs already reported. The HUD draws the same few
 // textures every frame; the first draw of each pair is the one that says
 // what the HUD is putting on the screen.
@@ -637,6 +1004,65 @@ void appendText(char* buffer, size_t capacity, const char* text) {
     snprintf(buffer + used, capacity - used, "%s", text);
 }
 
+// ---------------------------------------------------------------------------
+// The same-instant PNG
+// ---------------------------------------------------------------------------
+//
+// WHY
+// ---
+// The readback is the probe's own measurement: it reads the quad's rectangle
+// out of the framebuffer immediately after the draw. The archive's PNGs are
+// a DIFFERENT instrument -- the port's frame loop reads the whole back
+// buffer at the start of a frame and writes it out -- but they are taken at
+// a different moment, so a disagreement between them cannot be attributed.
+//
+// This writes a PNG of the whole back buffer at the exact instant of the
+// readback, so the two can be compared on the same pixels. The capture
+// window is narrow on purpose: each picture is 1.4 MB and the card is slow.
+unsigned long long g_pngCaptures = 0;
+
+void captureSameInstantPng() {
+    const ProbeConfig& config = probeConfig();
+    if (config.pngMax == 0) {
+        return;
+    }
+    if (g_pngCaptures >= config.pngMax) {
+        return;
+    }
+    const unsigned long long frame = gfxFrameCount();
+    if (frame < config.pngFrom || frame > config.pngTo) {
+        return;
+    }
+    if (config.pngEvery > 1 && (frame % config.pngEvery) != 0) {
+        return;
+    }
+    // Only the visible framebuffer: a draw into an FBO is not on the screen,
+    // and the picture would not show it.
+    GLint framebuffer = 0;
+    ::glGetIntegerv(GL_FRAMEBUFFER_BINDING, &framebuffer);
+    if (framebuffer != 0) {
+        return;
+    }
+    static unsigned char pixels[1280 * 720 * 4];
+    ::glReadPixels(0, 0, 1280, 720, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    char path[160];
+    // The name starts with "frame-" so the harness archives it with the
+    // other framebuffer pictures: an instrument that is not archived is an
+    // instrument nobody can check.
+    snprintf(path, sizeof(path),
+             "sdmc:/switch/rr3-native-rehost/frame-hud-%06llu-%llu.png",
+             frame, static_cast<unsigned long long>(g_pending.ordinal));
+    const bool wrote = writeFramePng(path, pixels, 1280, 720);
+    ++g_pngCaptures;
+    char details[200];
+    snprintf(details, sizeof(details),
+             "frame=%llu draw=%llu tex=%u png=%s path=%s", frame,
+             static_cast<unsigned long long>(g_pending.ordinal),
+             static_cast<unsigned>(g_pending.texture), wrote ? "ok" : "FAILED",
+             path);
+    guestViewWideLog("hud-png", frame, static_cast<unsigned long long>(g_pending.ordinal),
+                     details);
+}
 }  // namespace
 
 void gfxTextProbeNoteTexture(GLuint id, int width, int height) {
@@ -741,6 +1167,8 @@ void gfxTextProbeBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size,
 void probeDrawImpl(GLenum mode, GLsizei count, const int* vertexIndices, bool indexed);
 
 void gfxTextProbeDraw(GLenum mode, GLint first, GLsizei count) {
+    // The census sees EVERY draw, including the ones this function skips.
+    censusNoteDraw(g_currentProgram);
     g_pending = PendingReport{};
     g_pending.active = false;
     if (count <= 0 || count > kMaxVertices) {
@@ -755,6 +1183,7 @@ void gfxTextProbeDraw(GLenum mode, GLint first, GLsizei count) {
 
 void gfxTextProbeDrawElements(GLenum mode, GLsizei count, GLenum type,
                               const void* indices) {
+    censusNoteDraw(g_currentProgram);
     g_pending = PendingReport{};
     g_pending.active = false;
     if (count <= 0 || count > kMaxVertices) {
@@ -801,6 +1230,21 @@ void probeDrawImpl(GLenum mode, GLsizei count, const int* vertexIndices, bool in
     const bool glyph = isGlyphTexture(static_cast<GLuint>(texture));
     const bool firstDraw = g_drawOrdinal <= static_cast<unsigned long long>(kFirstDrawBudget);
     const char* phaseName = "text-draw";
+
+    // The census counts EVERY draw, before any of the reporting gates: the
+    // gates below spend their budget on the first draw of each pair in the
+    // whole session, and a census that is gated by them would go silent
+    // exactly where the answer is. It is called from the wrappers instead,
+    // because this function SKIPS every draw with more than eight vertices
+    // -- which is every 3D world quad the guest submits.
+    const ProbeConfig& config = probeConfig();
+    const unsigned long long frame = gfxFrameCount();
+    const bool inWindow = (config.from == 0 || frame >= config.from) &&
+                          (config.to == 0 || frame <= config.to);
+    const bool watched = config.detail && inWindow &&
+                         (config.watch == 0 || config.watch == g_currentProgram) &&
+                         (config.every <= 1 || (frame % config.every) == 0);
+
     if (!glyph && !firstDraw) {
         // Not a glyph texture: it is still worth reporting if it is a draw
         // with one of the HUD's own 2D programs, because that is where the
@@ -810,24 +1254,54 @@ void probeDrawImpl(GLenum mode, GLsizei count, const int* vertexIndices, bool in
         if (!isTextProgram(g_currentProgram)) {
             return;
         }
-        if (g_programDraws >= kProgramDrawBudget) {
-            return;
+        if (watched) {
+            // The detail mode: this pair is reported once per FRAME, not once
+            // per session, so a HUD that redraws the same textures every frame
+            // is measured in every frame of the race.
+            if (g_frameDraws >= kFrameDrawBudget) {
+                return;
+            }
+            if (!firstDrawOfPairThisFrame(frame, g_currentProgram,
+                                          static_cast<GLuint>(texture))) {
+                return;
+            }
+            ++g_frameDraws;
+            phaseName = "hud-frame-draw";
+        } else {
+            if (g_programDraws >= kProgramDrawBudget) {
+                return;
+            }
+            if (!firstDrawOfPair(g_currentProgram, static_cast<GLuint>(texture))) {
+                return;
+            }
+            ++g_programDraws;
+            phaseName = "hud-draw";
         }
-        if (!firstDrawOfPair(g_currentProgram, static_cast<GLuint>(texture))) {
-            return;
-        }
-        ++g_programDraws;
-        phaseName = "hud-draw";
     } else if (glyph) {
-        if (g_textDraws >= kTextDrawBudget) {
-            return;
+        if (watched) {
+            // A glyph texture drawn by the watched program, inside the
+            // window: reported once per frame, because the race's telemetry
+            // text would be a glyph texture the front end never used.
+            if (g_frameDraws >= kFrameDrawBudget) {
+                return;
+            }
+            if (!firstDrawOfPairThisFrame(frame, g_currentProgram,
+                                          static_cast<GLuint>(texture))) {
+                return;
+            }
+            ++g_frameDraws;
+            phaseName = "hud-frame-draw";
+        } else {
+            if (g_textDraws >= kTextDrawBudget) {
+                return;
+            }
+            // One report per glyph texture: the first draw of a texture is
+            // the draw that put that text on the screen.
+            if (!firstDrawOfTexture(static_cast<GLuint>(texture))) {
+                return;
+            }
+            ++g_textDraws;
         }
-        // One report per glyph texture: the first draw of a texture is the
-        // draw that put that text on the screen.
-        if (!firstDrawOfTexture(static_cast<GLuint>(texture))) {
-            return;
-        }
-        ++g_textDraws;
     } else {
         if (g_firstDraws >= kFirstDrawBudget) {
             return;
@@ -1317,6 +1791,14 @@ void gfxTextProbeDrawFinished() {
 
     guestViewWideLog("text-quad", static_cast<unsigned long long>(g_pending.texture),
                      static_cast<unsigned long long>(g_pending.ordinal), details);
+
+    // The same-instant PNG. The readback above is the FIRST instrument; this
+    // is the SECOND, and it is taken at the same moment, from the same
+    // framebuffer, through a different path: the whole back buffer is read
+    // out and written as a picture. If the two disagree about the pixels in
+    // the quad's rectangle, one of them is lying, and the archive shows
+    // which.
+    captureSameInstantPng();
 }
 
 }  // namespace rr3
