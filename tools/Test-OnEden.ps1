@@ -90,6 +90,56 @@ $stash = Join-Path $sdmcSwitch "_stale_$stamp"
 New-Item -ItemType Directory -Force -Path $stash | Out-Null
 New-Item -ItemType Directory -Force -Path $archiveRoot | Out-Null
 
+# THE HARNESS'S OWN STASH MUST NOT FILL THE CARD.
+#
+# Every run moves the previous run's logs ASIDE into a _stale_<stamp>
+# directory, and until now nothing ever removed them. By 2026-10-24 there
+# were 642 of them holding 5.40 GiB of old guest-view logs, on top of the
+# 10.5 GiB the guest actually needs (the seven data volumes and the
+# downloaded .depot).
+#
+# Eden's SD is a FIXED-CAPACITY FAT32 image, so the card filled up. And the
+# guest, which asked for 104 MB of free space to download its assets, said
+# so and died:
+#
+#   title='警告 - 资源下载'   需要空间: 104MB   可用空间: 0MB
+#   Shutting game down due to no diskspace.
+#
+# The run then ended at frame 18 with no race, no HUD, no probe output and
+# no framebuffer PNG -- which reads exactly like a port regression and is
+# not one. It is this harness's own leak, and it would have kept happening
+# for as long as the card was not cleaned by hand.
+#
+# So the stash is pruned at the START of every run, before the emulator
+# starts: everything older than the newest few runs is removed. The newest
+# few are kept so that a run can still be compared with its predecessors.
+$keepStaleRuns = 3
+$staleDirectories = @(Get-ChildItem $sdmcSwitch -Directory -Filter '_stale_*' -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending)
+if ($staleDirectories.Count -gt $keepStaleRuns) {
+    $prunedBytes = 0
+    $pruned = 0
+    foreach ($old in $staleDirectories[$keepStaleRuns..($staleDirectories.Count - 1)]) {
+        $oldFiles = @(Get-ChildItem $old.FullName -Recurse -File -ErrorAction SilentlyContinue)
+        $prunedBytes += ($oldFiles | Measure-Object -Property Length -Sum).Sum
+        Remove-Item -LiteralPath $old.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        $pruned++
+    }
+    Write-Host ("stale    : pruned {0} old stash directories ({1:N0} bytes), keeping the newest {2}" -f `
+        $pruned, $prunedBytes, $keepStaleRuns)
+}
+
+# THE CARD'S ROOM, BEFORE THE RUN. Eden's SD is a fixed-capacity FAT32
+# image, and the guest refuses to start when it cannot download its assets
+# (it says so, in Chinese, and exits). So the card's usage is reported
+# BEFORE the run as well as after it: a run that died of "no diskspace"
+# must not read like a port regression.
+$cardFilesBefore = @(Get-ChildItem $sdmcSwitch -Recurse -File -ErrorAction SilentlyContinue)
+$cardBytesBefore = ($cardFilesBefore | Measure-Object -Property Length -Sum).Sum
+if ($null -eq $cardBytesBefore) { $cardBytesBefore = 0 }
+Write-Host ("card     : {0} files, {1:N0} bytes on the SD card before the run" -f `
+    $cardFilesBefore.Count, $cardBytesBefore)
+
 foreach ($marker in $markers) {
     if (Test-Path $marker -PathType Leaf) {
         Move-Item -LiteralPath $marker -Destination (Join-Path $stash (Split-Path $marker -Leaf)) -Force
