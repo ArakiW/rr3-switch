@@ -514,6 +514,22 @@ constexpr size_t kSaveProbeBytes = 64;
 
 size_t bionicFwrite(const void* data, size_t size, size_t count, std::FILE* stream) {
     std::FILE* const real = translateBionicStandardFile(stream);
+    // The errno in the log line has to belong to THIS call. A successful
+    // fwrite does not clear errno, so without this the line reports
+    // whatever some earlier operation left behind.
+    //
+    // MEASURED 2026-10-24, archive 20261024-121533-eden-race-steer2: 64 of
+    // the 113 save writes printed "e=2(No such file or directory)" while
+    // every one of them wrote all of its bytes (gotItems=wantB,
+    // gotB=wantB, ferror=0). That reads exactly like "the game cannot save
+    // its profile" -- and it is false: doc/CC_Data on the card holds
+    // player_profile.2.dat, profile.dat and character.2.dat, and the
+    // guest's own "Error creating directory" line is the harmless EEXIST
+    // case the port already turns into a success.
+    //
+    // So the errno is cleared here, and the line carries an explicit
+    // verdict instead of leaving the reader to interpret a number.
+    errno = 0;
     const size_t written = std::fwrite(data, size, count, real);
     const size_t wantBytes = size * count;
     gFwriteCalls.fetch_add(1, std::memory_order_relaxed);
@@ -523,17 +539,20 @@ size_t bionicFwrite(const void* data, size_t size, size_t count, std::FILE* stre
         gFwriteShort.fetch_add(1, std::memory_order_relaxed);
     }
     if (shortWrite || wantBytes >= kSaveProbeBytes) {
-        char line[208];
+        char line[224];
         const int n = __builtin_snprintf(
             line, sizeof(line),
-            "fwrite-%s: wantB=%llu gotItems=%llu/%llu gotB=%llu ferror=%d e=%d(%s)",
+            "fwrite-%s: wantB=%llu gotItems=%llu/%llu gotB=%llu ferror=%d e=%d(%s)"
+            " verdict=%s",
             shortWrite ? "short" : "save",
             static_cast<unsigned long long>(wantBytes),
             static_cast<unsigned long long>(written),
             static_cast<unsigned long long>(count),
             static_cast<unsigned long long>(written * size),
             std::ferror(real) != 0, errno,
-            std::strerror(errno));
+            std::strerror(errno),
+            (!shortWrite && std::ferror(real) == 0) ? "wrote-all"
+                                                    : "INCOMPLETE");
         if (n > 0) {
             appendGuestBootLine(
                 "sdmc:/switch/rr3-native-rehost.guest-view.log", line, 0, 0);
