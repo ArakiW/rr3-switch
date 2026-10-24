@@ -87,6 +87,10 @@ ALLOWLIST = (
     ("Soaks|START SOAK", False),
     ("Character|Unlock + Own Everything", True),
     ("Debug Race Selector:", True),
+    ("Soaks|QUEUE SOAK:RACE LOOP", True),
+    ("Soaks|QUEUE SOAK:RACE LOOP - fast forward", True),
+    ("TestRecorder|Time Trial", True),
+    ("Main Menu|Enter Deep Link", True),
 )
 
 

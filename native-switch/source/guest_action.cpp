@@ -102,6 +102,12 @@ constexpr AllowedAction kAllowedActions[] = {
     // owner cannot be identified.
     {"Character|Unlock + Own Everything", true},
     {"Debug Race Selector:", true},
+    // The guest's own "start a race" commands. The guest's dispatcher calls
+    // them with the owner, so the port does the same.
+    {"Soaks|QUEUE SOAK:RACE LOOP", true},
+    {"Soaks|QUEUE SOAK:RACE LOOP - fast forward", true},
+    {"TestRecorder|Time Trial", true},
+    {"Main Menu|Enter Deep Link", true},
 };
 
 constexpr size_t kAllowedActionCount =
