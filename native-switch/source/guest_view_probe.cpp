@@ -8371,8 +8371,8 @@ void* frameLoopDriver(void* opaque) {
         // before and after this change can be compared on the same label.
         if (!gfxNullActive()) {
             static const unsigned kSchedule[] = {
-                30u, 120u, 300u, 600u, 1000u, 3000u, 7000u, 11000u, 15000u,
-                19000u, 23000u
+                30u, 120u, 300u, 600u, 1000u, 1200u, 1350u, 1500u, 1650u,
+                3000u, 7000u, 11000u, 15000u, 19000u, 23000u
             };
             static unsigned s_index = 0;
             if (s_index < (sizeof(kSchedule) / sizeof(kSchedule[0])) &&
