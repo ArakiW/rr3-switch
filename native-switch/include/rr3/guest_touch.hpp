@@ -51,6 +51,10 @@
 //             render call). This is what makes a script REPRODUCIBLE with no
 //             live host->port channel: the whole script can be on the card
 //             before the run starts and still land on the frame it names.
+//             BOTH the bracketed form above and the bare form
+//             "at <frame> <x> <y> <action>" are accepted. The bracketed form
+//             was documented here but NOT parsed before 2026-10-24, so every
+//             bracketed line was rejected as a badline; see guest_touch.cpp.
 //
 // The file is APPEND-ONLY: the host appends lines, the port injects each new
 // line exactly once. Blank lines and lines starting with '#' are comments.

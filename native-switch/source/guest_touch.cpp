@@ -459,9 +459,43 @@ bool parseLine(const char* line, TouchEvent* event, char* why,
         return false;
     }
     int dueAt = -1;
-    if (line[0] == 'a' && line[1] == 't' &&
-        (line[2] == ' ' || line[2] == '\t')) {
-        const char* rest = line + 2;
+    // The "at <frame>" prefix, in BOTH the bare form and the bracketed form.
+    //
+    // The bracketed form is the one the header documents ("[at <frame>] ...").
+    // It was NOT accepted before this change: the check below tested
+    // line[0] == 'a', so a leading '[' made the whole line fall through to
+    // the coordinate parse, which then failed with "expected '<x> <y>
+    // <down|move|up>'". MEASURED on Eden, archive
+    // 20261024-102025-eden-race-door: 36 lines of a bracketed script were
+    // rejected as badlines and 0 were queued, while the same script written
+    // without the brackets queued every line.
+    //
+    // The bare form is kept because it is what the port's own comment and
+    // the archives use, and a script that works today must not stop working.
+    const char* rest = nullptr;
+    if (line[0] == '[') {
+        // "[at <frame>] <x> <y> <action>": find the closing bracket and parse
+        // the frame number between "at" and "]".
+        if (std::strncmp(line + 1, "at", 2) != 0) {
+            std::snprintf(why, whyCapacity, "expected '[' 'at' <frame> ']'");
+            return false;
+        }
+        const char* number = line + 3;
+        int parsed = 0;
+        if (std::sscanf(number, " %d", &parsed) != 1 || parsed < 0) {
+            std::snprintf(why, whyCapacity, "'at' needs a frame number");
+            return false;
+        }
+        const char* close = std::strchr(number, ']');
+        if (close == nullptr) {
+            std::snprintf(why, whyCapacity, "'at <frame>]' is missing the ']'");
+            return false;
+        }
+        dueAt = parsed;
+        line = close + 1;
+    } else if (line[0] == 'a' && line[1] == 't' &&
+               (line[2] == ' ' || line[2] == '\t')) {
+        rest = line + 2;
         int parsed = 0;
         if (std::sscanf(rest, " %d", &parsed) != 1 || parsed < 0) {
             std::snprintf(why, whyCapacity, "'at' needs a frame number");
