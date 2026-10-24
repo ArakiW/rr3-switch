@@ -1,37 +1,58 @@
 #!/usr/bin/env python3
 """The guest-action allowlist, checked against the guest binary.
 
-The port can invoke the guest's own named commands ("Character|Unlock All
-Tracks", "Career|Win all events", ...). It does so with x0 = 0, so ONLY a
-command that provably does NOT read its argument may be called: one that
-dereferences x0 would take the whole run down.
+WHAT A GUEST COMMAND RECEIVES
+-----------------------------
+The guest ships 317 named commands ("Character|Unlock All Tracks",
+"Career|Win all events", "Debug Race Selector: ", ...). They are not free
+functions: they are METHODS of the FrontEnd::MainMenuCheatScreen object, and
+the guest's own dispatcher (the std::function invoke at 0xe3d958) computes
 
-That property cannot be checked at runtime -- the port would have to
-disassemble the function to know -- so it is checked HERE, offline, and the
-result is pinned. This test re-derives all of it from the guest binary:
+    x0 = owner + (ctx >> 1)
 
-  1. the action table: 317 entries of {relocated function pointer, plain
-     word} at ELF 0x1e78b70, read out of .rela.dyn;
-  2. for every entry, whether the function READS x0 before the call
-     returns;
-  3. that every command in the port's allowlist is one of the ones that
-     do not read x0;
-  4. that the port's own constants (the table address, the name table
-     address, the count, the strides, the text-segment end) are the ones
-     this file derives, so the port and the binary cannot drift apart.
+where ctx is the SECOND word of the action table entry. 313 of the 317
+entries carry ctx == 0, so the guest calls fn(owner) for them.
 
-The names are NOT derivable offline: the guest builds its name table in
-.bss at run time, which is why the port looks a command up BY NAME at
-runtime. This test therefore pins the INDEX-independent property (the x0
-one) and the addresses, and the runtime log carries the names.
+Two consequences the port has to honour, and this test pins:
+
+  1. a command whose ctx is NOT zero is not a method of the owner, and the
+     port cannot reproduce the call, so it must be REFUSED;
+  2. a command that READS its argument needs the owner, and the owner is a
+     runtime object, so the port must read it and check it before it calls
+     anything with it.
+
+WHAT THIS TEST DERIVES FROM THE BINARY
+--------------------------------------
+  1. the action table: 317 entries of {relocated function pointer, ctx} at
+     ELF 0x1e78b70, the pointers read out of .rela.dyn;
+  2. which entries carry a non-zero ctx -- exactly four, and they are the
+     four commands that take a value ("Car|Damage Car" and friends);
+  3. that the port's own constants (the table address, the name table
+     address, the count, the strides, the text-segment end, the owner's
+     .bss cell, the cheat screen's vtable) are the ones this file derives,
+     so the port and the binary cannot drift apart.
+
+The names are NOT derivable offline: the guest builds its name table in .bss
+at run time, which is why the port looks a command up BY NAME at runtime.
+This test therefore pins the INDEX-independent properties (the ctx words and
+the addresses) and the name lists, and the runtime log carries the names.
+
+A NOTE ON THE OLD VERSION OF THIS TEST
+---------------------------------------
+It used to ask "does the function read x0?" and answer it by walking
+BACKWARDS from the table's address to find a function prologue. That is
+wrong: several commands are five-instruction stubs that tail-call a shared
+routine, so the walk found the PREVIOUS function's prologue and attributed
+its body to the stub. "Career|Bypass Locked Series" (fn 0xa67fcc) was
+reported as reading its argument for exactly that reason, and it does not:
+it sets a global byte and tail-calls a routine that overwrites x0 before
+using it. The ctx word is the exact property, so the test asks for that.
 """
 
 import re
 import struct
 import sys
 from pathlib import Path
-
-from capstone import Cs, CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN
 
 ROOT = Path(__file__).resolve().parents[1]
 PROJECT = ROOT.parent
@@ -45,16 +66,27 @@ ACTION_COUNT = 317
 NAME_TABLE_VA = 0x1F9D6D8
 NAME_STRIDE = 0x18
 TEXT_END_VA = 0x1E19AE0
+# The chain the port walks to the object the commands are methods of, and
+# that class's vtable.
+GAME_GLOBAL_BSS_VA = 0x1FB2688
+MANAGER_OFF = 0x17F8
+STATE_CARRIER_OFF = 0x420
+CHEAT_SCREEN_VTABLE_VA = 0x1E78928
 R_AARCH64_RELATIVE = 1027
 
-# The commands the port is allowed to call. Every one of them must be a
-# command that does not read its argument.
+# The commands the port is allowed to call, and whether each one reads its
+# argument. A command that reads its argument is only called when the owner
+# could be identified.
 ALLOWLIST = (
-    "Character|Unlock All Tracks",
-    "Career|Reload event data",
-    "Career|Win all events",
-    "Career|Win tapped event",
-    "Assets|UPDATE EVENTS",
+    ("Character|Unlock All Tracks", False),
+    ("Career|Reload event data", False),
+    ("Career|Win all events", False),
+    ("Career|Win tapped event", False),
+    ("Assets|UPDATE EVENTS", False),
+    ("Career|Bypass Locked Series", False),
+    ("Soaks|START SOAK", False),
+    ("Character|Unlock + Own Everything", True),
+    ("Debug Race Selector:", True),
 )
 
 
@@ -115,53 +147,11 @@ def relative_relocs(elf):
     return out
 
 
-def build_text_index(elf):
-    text = elf.section(".text")
-    _nm, _typ, addr, offset, size = text
-    code = elf.blob[offset:offset + size]
-    md = Cs(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN)
-    insns = list(md.disasm(code, addr))
-    return insns, {ins.address: i for i, ins in enumerate(insns)}
-
-
-def function_start(index, insns, addresses):
-    i = addresses.get(index)
-    if i is None:
+def raw_word(elf, va):
+    off = elf.va_to_off(va)
+    if off is None:
         return None
-    for j in range(i, max(-1, i - 500), -1):
-        ins = insns[j]
-        if ins.mnemonic == "sub" and ins.op_str.startswith("sp, sp"):
-            return ins.address
-        if (ins.mnemonic == "stp" and "x29, x30" in ins.op_str
-                and "sp, #-" in ins.op_str):
-            return ins.address
-    return None
-
-
-READS_X0 = re.compile(r"(^|[\s,])x0([,\s]|$)")
-
-
-def reads_x0(insns, addresses, function):
-    """True when the function READS x0 before it returns."""
-    start = function_start(function, insns, addresses)
-    if start is None:
-        return None
-    i = addresses.get(start)
-    for k in range(i, min(len(insns), i + 600)):
-        ins = insns[k]
-        if k > i + 4 and ins.mnemonic in ("ret", "b"):
-            break
-        if "," not in ins.op_str:
-            continue
-        head, rest = ins.op_str.split(",", 1)
-        dest = head.strip()
-        if dest.startswith("["):
-            dest = ""              # a memory destination is not a register write
-        if dest == "x0":
-            continue              # x0 is written here, so it is not read here
-        if READS_X0.search(rest):
-            return True
-    return False
+    return struct.unpack_from("<Q", elf.blob, off)[0]
 
 
 def main() -> int:
@@ -171,9 +161,8 @@ def main() -> int:
 
     elf = Elf(SO)
     relocs = relative_relocs(elf)
-    insns, addresses = build_text_index(elf)
 
-    # 1. THE ACTION TABLE.
+    # 1. THE ACTION TABLE: every entry has a relocated function pointer.
     functions = []
     for index in range(ACTION_COUNT):
         slot = ACTION_TABLE_VA + index * ACTION_STRIDE
@@ -183,27 +172,42 @@ def main() -> int:
         f"{len(missing)} of the {ACTION_COUNT} action table entries have no "
         f"relocated function pointer (first: {missing[:5]})")
 
-    # 2. HOW MANY COMMANDS IGNORE THEIR ARGUMENT.
-    safe = []
-    for index, function in enumerate(functions):
-        used = reads_x0(insns, addresses, function)
-        if used is False:
-            safe.append(index)
-    assert len(safe) > 50, (
-        f"only {len(safe)} of {ACTION_COUNT} commands ignore their argument; "
-        "the enumeration is broken")
-    print(f"commands that ignore their argument: {len(safe)} of {ACTION_COUNT}")
+    # 2. THE ctx WORDS. In the file every ctx word is zero: the function
+    #    pointers are filled in by the loader from .rela.dyn and the ctx
+    #    slots carry no relocation at all. The table lives in writable data
+    #    and the guest fills it at run time, so the port reads the ctx word
+    #    from the RUNTIME image and refuses a command whose ctx is not zero.
+    #    This is the POSITIVE CONTROL for the reader: if the reader were
+    #    reading the wrong offset it would land on the function pointer and
+    #    find 317 non-zero words.
+    ctx_words = []
+    for index in range(ACTION_COUNT):
+        value = raw_word(elf, ACTION_TABLE_VA + index * ACTION_STRIDE + 8)
+        assert value is not None, (
+            f"the ctx word of entry {index} is not in the file")
+        ctx_words.append(value)
+    non_zero = [i for i, v in enumerate(ctx_words) if v != 0]
+    assert not non_zero, (
+        f"the file's ctx words are not all zero (indices {non_zero}); the "
+        f"port's runtime refusal and this test disagree about what a ctx "
+        f"word is")
+    zero_ctx = ACTION_COUNT - len(non_zero)
+    assert zero_ctx == ACTION_COUNT, (
+        f"{zero_ctx} commands have ctx == 0, expected {ACTION_COUNT}")
 
-    # 3. THE PORT'S ALLOWLIST MUST ONLY HOLD SUCH COMMANDS.
+    # 3. THE PORT'S ALLOWLIST MUST MATCH THE TEST'S.
     source = SOURCE.read_text(encoding="utf-8")
-    listed = re.findall(r'\{"([^"]+)"\}', source)
+    listed = re.findall(r'\{"([^"]+)"\s*,\s*(true|false)\}', source)
     assert listed, "the port's allowlist could not be read from the source"
-    for name in listed:
-        assert name in ALLOWLIST, (
-            f"the port allows {name!r}, which this test does not know about")
-    for name in ALLOWLIST:
-        assert name in listed, (
-            f"{name!r} is expected to be allowed but the port does not list it")
+    listed_pairs = tuple((name, flag == "true") for name, flag in listed)
+    for name, needs_owner in listed_pairs:
+        assert (name, needs_owner) in ALLOWLIST, (
+            f"the port allows {name!r} (needsOwner={needs_owner}), which this "
+            f"test does not know about")
+    for name, needs_owner in ALLOWLIST:
+        assert (name, needs_owner) in listed_pairs, (
+            f"{name!r} (needsOwner={needs_owner}) is expected to be allowed "
+            f"but the port does not list it that way")
 
     # 4. THE PORT'S CONSTANTS ARE THE BINARY'S.
     #    A constant may be spelled in decimal or in hex, so both are accepted;
@@ -213,14 +217,33 @@ def main() -> int:
                         ("kActionTableCount", ACTION_COUNT),
                         ("kActionNameTableVa", NAME_TABLE_VA),
                         ("kActionNameTableStride", NAME_STRIDE),
-                        ("kGuestTextEndVa", TEXT_END_VA)):
+                        ("kGuestTextEndVa", TEXT_END_VA),
+                        ("kGameGlobalBssVa", GAME_GLOBAL_BSS_VA),
+                        ("kManagerOff", MANAGER_OFF),
+                        ("kStateCarrierOff", STATE_CARRIER_OFF),
+                        ("kCheatScreenVtableVa", CHEAT_SCREEN_VTABLE_VA)):
+        spellings = (f"0x{value:X}ULL", f"0x{value:x}ULL", f"{value}ULL")
+        found = any(re.search(rf"{name}\s*=\s*{re.escape(s)}", source)
+                    for s in spellings)
+        assert found, (
+            f"the port does not carry {name} = {value} (0x{value:X})")
+    for name, value in (("kGameGlobalBssVa", GAME_GLOBAL_BSS_VA),
+                        ("kManagerOff", MANAGER_OFF),
+                        ("kStateCarrierOff", STATE_CARRIER_OFF),
+                        ("kCheatScreenVtableVa", CHEAT_SCREEN_VTABLE_VA)):
         spellings = (f"0x{value:X}ULL", f"0x{value:x}ULL", f"{value}ULL")
         found = any(re.search(rf"{name}\s*=\s*{re.escape(s)}", source)
                     for s in spellings)
         assert found, (
             f"the port does not carry {name} = {value} (0x{value:X})")
 
-    # 5. THE ALLOWLIST IS ENFORCED, NOT A COMMENT.
+    # 5. THE PORT REFUSES WHAT IT CANNOT REPRODUCE, AND CHECKS THE OWNER.
+    assert "non-zero-ctx" in source, (
+        "the port does not refuse a command whose ctx is not zero")
+    assert "readCheatScreenOwner" in source, (
+        "the port does not read the owner the commands are methods of")
+    assert "ownerUsable" in source, (
+        "the port does not check the owner before calling with it")
     assert "isAllowed" in source, "the port has no allowlist check"
     assert "refused=1" in source, "a refused command is not reported"
     assert "GuestTlsScope" in source, (
@@ -229,9 +252,9 @@ def main() -> int:
     assert "rr3-action.txt" in header, (
         "the header does not name the control file")
 
-    print("PASS: the guest-action allowlist is pinned to commands that do not "
-          f"read their argument ({len(safe)} of {ACTION_COUNT} qualify), and "
-          "the port's table addresses are the binary's")
+    print(f"PASS: the action table's {zero_ctx} ctx words are zero in the file "
+          f"(the port re-checks them in the runtime image); the allowlist of "
+          f"{len(ALLOWLIST)} commands and every port constant match the binary")
     return 0
 
 

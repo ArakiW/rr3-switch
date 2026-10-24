@@ -52,12 +52,29 @@ constexpr const char* kActionConfPath =
 // THE ALLOWLIST
 // ---------------------------------------------------------------------------
 //
-// A command is called with x0 = 0, so only commands that do NOT READ x0 may
-// be called at all. That property is checked offline against the guest
-// binary and pinned by tests/test_guest_action_contract.py, which re-derives
-// it from the same binary, so the two cannot drift apart. 122 of the 317
-// commands ignore their argument; the ones below are the content-unlocking
-// ones.
+// WHAT A COMMAND RECEIVES. The guest's cheat commands are METHODS of the
+// FrontEnd::MainMenuCheatScreen object. The guest's own dispatcher (the
+// std::function invoke at 0xe3d958) computes
+//
+//     x0 = owner + (ctx >> 1)
+//
+// and 313 of the 317 commands carry ctx == 0, so the guest calls fn(owner).
+// The port does the same, which is what lets it call the commands that READ
+// their argument instead of only the ones that ignore it.
+//
+// The owner lives in a .bss cell the guest fills when it builds the cheat
+// list: ELF 0x1fa1d00 (the GOT alias is 0x1f6dc88). The port checks the
+// pointer before it calls anything with it and refuses the call if the
+// object is not recognisable -- a wrong x0 takes the whole run down.
+//
+// The ctx word is the one thing the port cannot reproduce on its own: for a
+// command whose ctx is NOT zero the guest calls fn(owner + ctx/2), which is
+// not a method of the owner, and what that offset means is not established.
+// In the FILE every ctx word is zero -- the function pointers are filled in
+// by the loader from .rela.dyn, and the ctx slots carry no relocation -- but
+// the table lives in writable data and the guest builds it at run time, so
+// the port reads the ctx word from the RUNTIME image and refuses a command
+// whose ctx is not zero. The refusal is logged, not guessed at.
 //
 // The names here are only a first filter. The call itself is selected by
 // NAME against the guest's own runtime table, so even a wrong name here
@@ -65,25 +82,43 @@ constexpr const char* kActionConfPath =
 // that comes back is the one that is called.
 struct AllowedAction {
     const char* name;
+    // True when the command READS its argument. Such a command is only
+    // called when the owner could be identified, because calling it with a
+    // zero argument is what takes the guest down.
+    bool needsOwner;
 };
 
 constexpr AllowedAction kAllowedActions[] = {
-    {"Character|Unlock All Tracks"},
-    {"Career|Reload event data"},
-    {"Career|Win all events"},
-    {"Career|Win tapped event"},
-    {"Assets|UPDATE EVENTS"},
+    {"Character|Unlock All Tracks", false},
+    {"Career|Reload event data", false},
+    {"Career|Win all events", false},
+    {"Career|Win tapped event", false},
+    {"Assets|UPDATE EVENTS", false},
+    // These three set a global flag or load the owner themselves, so they
+    // never look at x0.
+    {"Career|Bypass Locked Series", false},
+    {"Soaks|START SOAK", false},
+    // These read x0: they are called with the owner, and refused when the
+    // owner cannot be identified.
+    {"Character|Unlock + Own Everything", true},
+    {"Debug Race Selector:", true},
 };
 
 constexpr size_t kAllowedActionCount =
     sizeof(kAllowedActions) / sizeof(kAllowedActions[0]);
 
-bool isAllowed(const char* name) {
+bool isAllowed(const char* name, bool* needsOwner) {
+    if (needsOwner != nullptr) {
+        *needsOwner = false;
+    }
     if (name == nullptr) {
         return false;
     }
     for (size_t i = 0; i < kAllowedActionCount; ++i) {
         if (std::strcmp(kAllowedActions[i].name, name) == 0) {
+            if (needsOwner != nullptr) {
+                *needsOwner = kAllowedActions[i].needsOwner;
+            }
             return true;
         }
     }
@@ -173,6 +208,91 @@ bool readGuestBytes(uintptr_t address, void* out, size_t bytes) {
 }
 
 // ---------------------------------------------------------------------------
+// THE OWNER
+// ---------------------------------------------------------------------------
+//
+// The cheat commands are METHODS of the FrontEnd::MainMenuCheatScreen, and
+// the guest's dispatcher calls them with that object in x0. The object is
+// reached by the chain the guest itself walks, and the port's own
+// front-end probe already walks it:
+//
+//     .bss 0x1fb2688          the game global G
+//     G + 0x17f8              the FrontEnd2::MainMenuManager
+//     manager + 0x420         the state carrier: a MainMenuCheatScreen
+//     ELF 0x1e78928           that class's vtable
+//
+// The vtable is the identity check. The constructor at 0xe1d374 installs
+// it, and it is the only vtable in the image that carries the cheat
+// screen's state machine, so an object whose first word is that vtable is
+// the cheat screen and nothing else.
+//
+// Two checks have to pass before the port calls anything with the pointer,
+// because a wrong x0 takes the whole run down:
+//
+//   1. the object's first word is the MainMenuCheatScreen vtable;
+//   2. the cheat list it owns (owner+0x450/+0x458) holds the 317 entries
+//      the guest registered.
+//
+// Both are reported in the log, so a run that refuses says WHY it refused,
+// and a run that accepts says what it accepted.
+constexpr uintptr_t kGameGlobalBssVa = 0x1FB2688ULL;
+constexpr uintptr_t kManagerOff = 0x17F8ULL;
+constexpr uintptr_t kStateCarrierOff = 0x420ULL;
+constexpr uintptr_t kCheatScreenVtableVa = 0x1E78928ULL;
+constexpr uintptr_t kOwnerListBeginOffset = 0x450ULL;
+constexpr uintptr_t kOwnerListEndOffset = 0x458ULL;
+constexpr uint64_t kExpectedCheatListSpan = 0x9E8ULL;   // 317 entries x 8 bytes
+
+struct OwnerProbe {
+    uint64_t game = 0;
+    uint64_t manager = 0;
+    uint64_t owner = 0;
+    uint64_t vptr = 0;
+    uint64_t listBegin = 0;
+    uint64_t listEnd = 0;
+    bool chainOk = false;
+    bool classMatches = false;
+    bool listMatches = false;
+};
+
+OwnerProbe readCheatScreenOwner(uintptr_t bias) {
+    OwnerProbe probe{};
+    uint64_t game = 0;
+    if (!readGuestBytes(bias + kGameGlobalBssVa, &game, 8) || game == 0) {
+        return probe;
+    }
+    probe.game = game;
+    uint64_t manager = 0;
+    if (!readGuestBytes(static_cast<uintptr_t>(game) + kManagerOff, &manager, 8) ||
+        manager == 0) {
+        return probe;
+    }
+    probe.manager = manager;
+    uint64_t owner = 0;
+    if (!readGuestBytes(static_cast<uintptr_t>(manager) + kStateCarrierOff, &owner, 8) ||
+        owner == 0 || !pointerPlausible(static_cast<uintptr_t>(owner))) {
+        return probe;
+    }
+    probe.owner = owner;
+    probe.chainOk = true;
+    if (!readGuestBytes(static_cast<uintptr_t>(owner), &probe.vptr, 8)) {
+        return probe;
+    }
+    if (!readGuestBytes(static_cast<uintptr_t>(owner) + kOwnerListBeginOffset,
+                        &probe.listBegin, 8)) {
+        return probe;
+    }
+    if (!readGuestBytes(static_cast<uintptr_t>(owner) + kOwnerListEndOffset,
+                        &probe.listEnd, 8)) {
+        return probe;
+    }
+    probe.classMatches = (probe.vptr == bias + kCheatScreenVtableVa);
+    probe.listMatches = (probe.listEnd >= probe.listBegin) &&
+                        (probe.listEnd - probe.listBegin) == kExpectedCheatListSpan;
+    return probe;
+}
+
+// ---------------------------------------------------------------------------
 // THE NAME TABLE
 // ---------------------------------------------------------------------------
 //
@@ -244,6 +364,32 @@ bool readActionName(uintptr_t bias, uint64_t index, char* out,
     return out[0] != '\0';
 }
 
+// Compares two command names, ignoring TRAILING whitespace.
+//
+// The guest's own names end with a colon AND A SPACE when the command takes
+// a value ("Debug Race Selector: "), and the control file cannot carry that
+// trailing space: the parser trims it, because a line's trailing whitespace
+// is not part of its name. So the name that arrives from the control file is
+// "Debug Race Selector:" and the name in the guest's table is "Debug Race
+// Selector: ", and an exact comparison would never match.
+bool namesMatch(const char* a, const char* b) {
+    if (a == nullptr || b == nullptr) {
+        return false;
+    }
+    size_t la = std::strlen(a);
+    size_t lb = std::strlen(b);
+    while (la > 0 && (a[la - 1] == ' ' || a[la - 1] == '\t')) {
+        --la;
+    }
+    while (lb > 0 && (b[lb - 1] == ' ' || b[lb - 1] == '\t')) {
+        --lb;
+    }
+    if (la != lb) {
+        return false;
+    }
+    return std::memcmp(a, b, la) == 0;
+}
+
 // Finds a command's index by NAME in the guest's own name table.
 bool findActionIndex(uintptr_t bias, const char* name, uint64_t* outIndex) {
     if (name == nullptr || outIndex == nullptr) {
@@ -262,7 +408,7 @@ bool findActionIndex(uintptr_t bias, const char* name, uint64_t* outIndex) {
         if (!readActionName(bias, index, candidate, sizeof(candidate))) {
             continue;
         }
-        if (std::strcmp(candidate, name) == 0) {
+        if (namesMatch(candidate, name)) {
             *outIndex = index;
             return true;
         }
@@ -400,6 +546,46 @@ void pumpGuestActions(unsigned long long frame) {
         return;
     }
 
+    // THE OWNER, read once per pump. The commands are methods of it, so it
+    // is what goes into x0 -- and a command that READS its argument needs it.
+    // The probe is reported when it CHANGES, so a run that cannot call the
+    // owner-reading commands says what it saw, and a run that can does not
+    // repeat the same line every pump.
+    const OwnerProbe owner = readCheatScreenOwner(bias);
+    const bool ownerUsable = owner.chainOk && (owner.classMatches || owner.listMatches);
+    {
+        static uint64_t s_lastOwner = 0;
+        static unsigned s_lastClass = 0;
+        static unsigned s_lastList = 0;
+        static unsigned s_lastUsable = 0;
+        const unsigned classBit = owner.classMatches ? 1u : 0u;
+        const unsigned listBit = owner.listMatches ? 1u : 0u;
+        const unsigned usableBit = ownerUsable ? 1u : 0u;
+        if (s_lastOwner != owner.owner || s_lastClass != classBit ||
+            s_lastList != listBit || s_lastUsable != usableBit) {
+            s_lastOwner = owner.owner;
+            s_lastClass = classBit;
+            s_lastList = listBit;
+            s_lastUsable = usableBit;
+            char details[384];
+            std::snprintf(details, sizeof(details),
+                          "owner=0x%llx chain=%d vptr=0x%llx class=%d "
+                          "list=0x%llx-0x%llx span=0x%llx listmatch=%d usable=%d",
+                          static_cast<unsigned long long>(owner.owner),
+                          owner.chainOk ? 1 : 0,
+                          static_cast<unsigned long long>(owner.vptr),
+                          owner.classMatches ? 1 : 0,
+                          static_cast<unsigned long long>(owner.listBegin),
+                          static_cast<unsigned long long>(owner.listEnd),
+                          static_cast<unsigned long long>(owner.listEnd >= owner.listBegin
+                                                              ? owner.listEnd - owner.listBegin
+                                                              : 0),
+                          owner.listMatches ? 1 : 0,
+                          ownerUsable ? 1 : 0);
+            logAction("guest-action-owner", 108, details);
+        }
+    }
+
     bool allDone = true;
     for (size_t i = 0; i < g_pendingCount; ++i) {
         PendingAction& entry = g_pending[i];
@@ -411,13 +597,12 @@ void pumpGuestActions(unsigned long long frame) {
             allDone = false;
             continue;
         }
-        if (!isAllowed(entry.name)) {
+        bool needsOwner = false;
+        if (!isAllowed(entry.name, &needsOwner)) {
             entry.refused = true;
             char details[256];
             std::snprintf(details, sizeof(details),
-                          "name=\"%.120s\" refused=1 reason=not-in-allowlist "
-                          "(the command may read its argument, and it is "
-                          "called with x0=0)",
+                          "name=\"%.120s\" refused=1 reason=not-in-allowlist",
                           entry.name);
             logAction("guest-action", 110 + static_cast<unsigned>(i), details);
             allDone = false;
@@ -450,6 +635,45 @@ void pumpGuestActions(unsigned long long frame) {
             allDone = false;
             continue;
         }
+        // THE ctx WORD. The guest's dispatcher calls fn(owner + (ctx >> 1)),
+        // so a command with a non-zero ctx is NOT a method of the owner and
+        // the port cannot reproduce the call. Four commands are like that
+        // ("Car|Damage Car" and friends); they are refused, and the refusal
+        // is logged rather than guessed at.
+        uint64_t ctx = 0;
+        if (!readGuestBytes(slot + 8, &ctx, 8)) {
+            allDone = false;
+            continue;
+        }
+        if (ctx != 0) {
+            entry.refused = true;
+            char details[256];
+            std::snprintf(details, sizeof(details),
+                          "name=\"%.120s\" idx=%llu refused=1 "
+                          "reason=non-zero-ctx-the-guest-would-call-owner+ctx/2",
+                          entry.name, static_cast<unsigned long long>(index));
+            logAction("guest-action", 110 + static_cast<unsigned>(i), details);
+            allDone = false;
+            continue;
+        }
+        // THE ARGUMENT. A command that reads x0 needs the owner; one that
+        // does not is called with zero, which is what it was called with
+        // before the owner was known.
+        uintptr_t argument = 0;
+        if (needsOwner) {
+            if (!ownerUsable) {
+                entry.refused = true;
+                char details[256];
+                std::snprintf(details, sizeof(details),
+                              "name=\"%.120s\" idx=%llu refused=1 "
+                              "reason=no-owner-the-command-reads-its-argument",
+                              entry.name, static_cast<unsigned long long>(index));
+                logAction("guest-action", 110 + static_cast<unsigned>(i), details);
+                allDone = false;
+                continue;
+            }
+            argument = static_cast<uintptr_t>(owner.owner);
+        }
         if (function < bias || function >= bias + kGuestTextEndVa) {
             char details[256];
             std::snprintf(details, sizeof(details),
@@ -462,19 +686,22 @@ void pumpGuestActions(unsigned long long frame) {
             allDone = false;
             continue;
         }
-        // CALL IT, with guest TLS and a zero argument.
+        // CALL IT, with guest TLS and the argument the guest would use.
         char before[256];
         std::snprintf(before, sizeof(before), "name=\"%.120s\" idx=%llu fn=0x%llx "
-                      "arg=0", entry.name,
+                      "arg=0x%llx owner=%d",
+                      entry.name,
                       static_cast<unsigned long long>(index),
-                      static_cast<unsigned long long>(function));
+                      static_cast<unsigned long long>(function),
+                      static_cast<unsigned long long>(argument),
+                      needsOwner ? 1 : 0);
         // The line BEFORE the call, so a command that takes the guest down
         // still leaves a record of WHICH command it was.
         logAction("guest-action", 110 + static_cast<unsigned>(i), before);
         {
             GuestTlsScope tls;
             using GuestActionFn = void (*)(uintptr_t);
-            reinterpret_cast<GuestActionFn>(function)(0);
+            reinterpret_cast<GuestActionFn>(function)(argument);
         }
         entry.done = true;
         char after[320];
