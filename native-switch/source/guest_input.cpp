@@ -71,6 +71,7 @@
 #include "rr3/guest_input_doors.hpp"
 #include "rr3/guest_touch.hpp"
 #include "rr3/guest_touch_hw.hpp"
+#include "rr3/race_state_probe.hpp"
 #include "rr3/recovery_guard.hpp"
 
 #include <switch.h>
@@ -410,6 +411,32 @@ void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
     VirtualPadState scripted{};
     const bool scriptedActive = virtualPadForFrame(g_frameCounter, &scripted);
 
+    // THE CLOSED LOOP.
+    //
+    // The race-state probe reads the guest's own race state out of guest
+    // memory (see source/race_state_probe.cpp) and computes the steering the
+    // car needs. When it is enabled it is the SINGLE authority for the
+    // throttle, the brake and the steering axis: the script and the physical
+    // pad are folded into the same state first and then overridden once, so
+    // the guest never sees a control change twice in one frame.
+    //
+    // It is OFF unless the control file
+    // sdmc:/switch/rr3-native-rehost/rr3-drive.txt exists and says
+    // enable=1, so every other experiment in this tree is unaffected.
+    pumpRaceStateProbe(g_frameCounter);
+    const bool driving = raceStateDriveEnabled();
+    const RaceDriveState& drive = raceDriveState();
+
+    if (driving) {
+        scripted.leftX = drive.steer;
+        scripted.buttons |= (1u << kBtnA);
+        if (drive.brake) {
+            scripted.buttons |= (1u << kBtnX);
+        } else {
+            scripted.buttons &= ~(1u << kBtnX);
+        }
+    }
+
     if (scriptedActive) {
         // The script drives the guest. The physical pad is ignored entirely
         // while it is active, so the two can never fight over one button.
@@ -438,8 +465,18 @@ void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
     static constexpr int kFaceOrdinals[] = {
         kBtnA, kBtnB, kBtnX, kBtnY, kBtnL1, kBtnR1, kBtnL2, kBtnR2,
     };
+    // The closed loop's overrides are folded into the held mask BEFORE any
+    // button is pushed, so the guest sees exactly one state per frame.
+    uint64_t effective = held;
+    if (driving) {
+        effective |= HidNpadButton_A;
+        effective &= ~static_cast<uint64_t>(HidNpadButton_X);
+        if (drive.brake) {
+            effective |= HidNpadButton_X;
+        }
+    }
     for (int i = 0; i < 8; ++i) {
-        emitButton(jniEnvironment, activityObject, deviceId, held,
+        emitButton(jniEnvironment, activityObject, deviceId, effective,
                    kFaceMasks[i], kFaceOrdinals[i], &g_lastFace[i]);
     }
 
@@ -475,7 +512,9 @@ void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
         const float v = static_cast<float>(raw) / 32767.0f;
         return v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
     };
-    emitAxis(jniEnvironment, activityObject, deviceId, norm(left.x),
+    // The closed loop owns the steering axis when it is on.
+    emitAxis(jniEnvironment, activityObject, deviceId,
+             driving ? drive.steer : norm(left.x),
              kAxisLThumbX, &g_lastLx);
     emitAxis(jniEnvironment, activityObject, deviceId, -norm(left.y),
              kAxisLThumbY, &g_lastLy);
