@@ -1,3 +1,70 @@
+// The Switch controller -> the guest's ControllerManager.
+//
+// TWO THINGS THIS FILE DECIDES, and both of them are about the TRIGGER.
+//
+// 1. WHAT A TRIGGER IS, AND WHAT IT IS WORTH.
+//
+//    THE GUEST'S CONVENTION. The guest's own Java
+//    (reverse/java/sources/com/firemint/realracing/ControllerManager.java)
+//    reads an Android trigger as a MotionEvent axis and hands it straight to
+//    the guest: SetJoystickValues(id, l, AXIS_LTRIGGER) and
+//    SetJoystickValues(id, r, AXIS_RTRIGGER) (ControllerManager.java:491-492),
+//    which is SetJoystickValueJNI(id, value, ordinal) with the ordinals 4 and
+//    5 of the ControllerAxis enum. Android normalises a one-sided trigger
+//    axis to 0..1 with 1.0 = fully pressed, and the guest passes the value
+//    through unchanged. So the port sends 0..1 too: 0.0 is released, 1.0 is
+//    fully pressed, and anything between is a partial press.
+//
+//    WHAT libnx ACTUALLY EXPOSES. There is NO analogue trigger in the
+//    ordinary Npad state: HidNpadCommonState (hid.h:1072) has no trigger
+//    field at all, so on a Pro Controller ZL and ZR are plain digital
+//    buttons. The only analogue trigger libnx can deliver is the GameCube
+//    one: PadState.gc_triggers[] (runtime/pad.h:25), raw 0x0..0x7FFF
+//    (hid.h:1094-1095), read with padGetGcTriggerPos().
+//
+//    WHY THE PORT HAD NONE. libnx's padUpdate() fills gc_triggers only on
+//    the branch where the controller reports HidNpadStyleTag_NpadGc (libnx
+//    pad.o, padUpdate: "tbnz w20, #5" on the style set returned by
+//    hidGetNpadStyleSet). The Gc style has to be declared to the HID
+//    service first, and padConfigureInput() is the only supported way to do
+//    that: it ends in hidSetSupportedNpadStyleSet(style_set) (libnx pad.o,
+//    padConfigureInput). The port declared HidNpadStyleSet_NpadStandard,
+//    which does NOT contain NpadGc (hid.h:245: FullKey|Handheld|JoyDual|
+//    JoyLeft|JoyRight), so the analogue trigger could never arrive and the
+//    port sent ZL/ZR as 1.0/0.0 -- all or nothing.
+//
+//    So the trigger is now read as: the analogue value when the controller
+//    actually has one, and the digital ZL/ZR bit otherwise. A Pro Controller
+//    gets the digital reading (it has no analogue trigger), a GameCube
+//    Controller gets the analogue one, and neither loses the button.
+//
+// 2. THE SCRIPTED PAD, which is how the experiments are driven.
+//
+//    The script lives on the card at sdmc:/switch/rr3-native-rehost/rr3-pad.txt
+//    and its format is:
+//
+//        [at <frame>] lx=<f> ly=<f> rx=<f> ry=<f> lt=<f> rt=<f> b=<hex>
+//
+//    EVERY KEY IS OPTIONAL and a key that is absent keeps the value it had
+//    before, so a script is a list of states over time rather than a list of
+//    complete snapshots. `at <frame>` is the PORT'S frame counter (the same
+//    counter the touch script uses), never a wall clock. The axis keys are
+//    the guest's own ControllerAxis ordinals, in the guest's own units:
+//    lx/ly = AXIS_LTHUMB_X/Y (0/1), rx/ry = AXIS_RTHUMB_X/Y (2/3),
+//    lt/rt = AXIS_LTRIGGER/AXIS_RTRIGGER (4/5). The sticks are signed
+//    (-1..1); the triggers are 0..1, 1.0 = fully pressed. `b` is a HEX
+//    bitmask over the guest's ControllerButtons ORDINALS (bit 0 = BTN_A,
+//    bit 2 = BTN_X, bit 6 = BTN_L2, bit 7 = BTN_R2, bit 8 = BTN_DPAD_LEFT),
+//    which is the guest's own numbering, not the Switch's.
+//
+//    THE LAST LINE WHOSE "at" FRAME IS <= THE CURRENT FRAME APPLIES. A
+//    script with no line at or before the current frame does not apply, and
+//    the physical controller is used instead.
+//
+//    The format and the parser that implements it are pinned by
+//    native-switch/tests/test_guest_pad_script_format.py, so the format
+//    documented here is the format that parses.
+
 #include "rr3/guest_input.hpp"
 
 #include "rr3/elf_preflight.hpp"
@@ -7,6 +74,8 @@
 #include "rr3/recovery_guard.hpp"
 
 #include <switch.h>
+
+#include <cstdio>
 
 namespace rr3 {
 namespace {
@@ -38,6 +107,20 @@ enum GuestAxis : int {
     kAxisLTrigger = 4,
     kAxisRTrigger = 5,
 };
+
+// The Npad style set the port declares to the HID service.
+//
+// The GameCube-controller style is the ONLY style that carries an analogue
+// trigger, so it has to be declared for the analogue value to arrive at all
+// (libnx's padConfigureInput ends in hidSetSupportedNpadStyleSet, and
+// padUpdate reads gc_triggers only where the controller reports NpadGc).
+// The standard styles are kept because they are what the port's sticks and
+// buttons come from.
+constexpr u32 kNpadStyleSet =
+    HidNpadStyleSet_NpadStandard | HidNpadStyleTag_NpadGc;
+
+// The raw analogue trigger is 0x0..0x7FFF (hid.h:1094-1095).
+constexpr float kGcTriggerFull = 32767.0f;
 
 // Java: void SetButtonValueJNI(int id, boolean pressed, int ordinal)
 using SetButtonFn = void (*)(void* env, void* self, int id, int pressed,
@@ -133,9 +216,78 @@ void emitAxis(void* env, void* self, int id, float value, int axis,
     }
 }
 
+// The trigger value, in the guest's units (0..1, 1.0 = fully pressed).
+//
+// `index` is 0 for the left trigger and 1 for the right, which is the
+// order of PadState.gc_triggers[].
+//
+// The analogue value is used when the controller reports one. It is not
+// simply "greater than zero": a GameCube Controller reports an analogue
+// trigger only while it is pressed, so zero means released, and the
+// digital ZL/ZR bit is then the same thing. The digital bit is also what a
+// Pro Controller has and all it has, so it stays the fallback -- dropping
+// it would take the trigger away from every ordinary controller.
+float triggerValue(const PadState* pad, uint64_t held, uint64_t digitalMask,
+                   unsigned index) {
+    const u32 raw = padGetGcTriggerPos(pad, index);
+    if (raw > 0) {
+        float value = static_cast<float>(raw) / kGcTriggerFull;
+        return value > 1.0f ? 1.0f : value;
+    }
+    return (held & digitalMask) != 0 ? 1.0f : 0.0f;
+}
+
+// The one instrument that says what the HID service actually reports.
+//
+// It answers a question the source cannot: whether the controller at
+// HidNpadIdType_No1 reports the GameCube style (which is what makes
+// padUpdate fill gc_triggers at all), and what the analogue trigger
+// reads. Without it, "the analogue trigger is zero" and "the analogue
+// trigger is not being delivered" are the same observation.
+void logTriggerState(unsigned long long frame, const PadState* pad,
+                     uint64_t held) {
+    static unsigned long long s_lastLogged = 0;
+    if (frame < s_lastLogged + 300ULL) {
+        return;
+    }
+    s_lastLogged = frame;
+    const u32 controllerStyle = hidGetNpadStyleSet(HidNpadIdType_No1);
+    char detail[224];
+    std::snprintf(
+        detail, sizeof(detail),
+        "f=%llu controller_style=0x%08x gc_bit=%u supported_style=0x%08x "
+        "gc_l=0x%05x gc_r=0x%05x buttons=0x%016llx",
+        frame, controllerStyle,
+        (controllerStyle & HidNpadStyleTag_NpadGc) != 0 ? 1u : 0u,
+        padGetStyleSet(pad), padGetGcTriggerPos(pad, 0),
+        padGetGcTriggerPos(pad, 1),
+        static_cast<unsigned long long>(held));
+    appendGuestBootLine(
+        "sdmc:/switch/rr3-native-rehost.guest-view.log", "pad-trigger", 947, 0,
+        detail);
+}
+
 } // namespace
 
 bool prepareGuestControllerInput() {
+    // Declare the Npad style set the HID service should support.
+    //
+    // The port declares HidNpadStyleSet_NpadStandard at start-up, which does
+    // NOT contain HidNpadStyleTag_NpadGc, and the GameCube style is the only
+    // one that carries an analogue trigger. libnx's padConfigureInput() is
+    // the only supported way to declare a style set (it ends in
+    // hidSetSupportedNpadStyleSet), so it is called again here with the Gc
+    // bit added.
+    //
+    // This runs BEFORE the first padUpdate (the frame loop pumps the pad
+    // long after the guest is up) and it re-declares the same Npad id types,
+    // so the only thing that changes is the added style bit.
+    //
+    // It is also the only way the analogue trigger can be CHECKED: the
+    // pad-trigger line in the guest-view log records what the controller
+    // actually reports, so "the analogue trigger is zero" and "the analogue
+    // trigger is not being delivered" stop being the same observation.
+    padConfigureInput(1, kNpadStyleSet);
     g_setButton = reinterpret_cast<SetButtonFn>(resolveMainImageExport(
         "Java_com_firemint_realracing_ControllerManager_SetButtonValueJNI"));
     g_setJoystick = reinterpret_cast<SetJoystickFn>(resolveMainImageExport(
@@ -332,11 +484,12 @@ void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
     emitAxis(jniEnvironment, activityObject, deviceId, -norm(right.y),
              kAxisRThumbY, &g_lastRy);
     emitAxis(jniEnvironment, activityObject, deviceId,
-             (held & HidNpadButton_ZL) != 0 ? 1.0f : 0.0f, kAxisLTrigger,
+             triggerValue(pad, held, HidNpadButton_ZL, 0), kAxisLTrigger,
              &g_lastLt);
     emitAxis(jniEnvironment, activityObject, deviceId,
-             (held & HidNpadButton_ZR) != 0 ? 1.0f : 0.0f, kAxisRTrigger,
+             triggerValue(pad, held, HidNpadButton_ZR, 1), kAxisRTrigger,
              &g_lastRt);
+    logTriggerState(g_frameCounter, pad, held);
     }
 
     ++g_frameCounter;
