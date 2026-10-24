@@ -68,6 +68,7 @@
 #include "rr3/guest_input.hpp"
 
 #include "rr3/elf_preflight.hpp"
+#include "rr3/guest_action.hpp"
 #include "rr3/guest_input_doors.hpp"
 #include "rr3/guest_touch.hpp"
 #include "rr3/guest_touch_hw.hpp"
@@ -483,6 +484,12 @@ void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
     static constexpr int kFaceOrdinals[] = {
         kBtnA, kBtnB, kBtnX, kBtnY, kBtnL1, kBtnR1, kBtnL2, kBtnR2,
     };
+    // The guest's OWN action commands run here, and for the same reason the
+    // input is pumped here: this is the frame-loop thread, just before the
+    // guest's render call, so the guest's state is consistent and the call
+    // is in the same place the port already calls into the guest.
+    pumpGuestActions(g_frameCounter);
+
     // The closed loop's overrides are folded into the held mask BEFORE any
     // button is pushed, so the guest sees exactly one state per frame.
     uint64_t effective = held;
