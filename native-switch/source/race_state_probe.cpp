@@ -152,12 +152,45 @@ constexpr uintptr_t kMapNodeValueOff = 0x38ULL;
 // thing here that is NOT proved by the guest's own code.
 constexpr char kRaceMetricsMapKey[] = "racemetrics";
 // The member offsets inside RuleSetModifier_RaceMetrics.
+//
+// WHAT IS ACTUALLY STORED AT THESE OFFSETS IS NOT THE VALUE.
+//
+// The guest registers each member with a NAME, and the registration call
+// (ELF 0x996ffc) writes a 16-byte DESCRIPTOR over the member's slot:
+//
+//     0x997074  str  x24, [x19]      ; *(this+OFF) = a unique id
+//     0x9970a0  bl   0x15c3640      ; hash of the member's name
+//     0x9970a4  str  x0, [x19, #8]  ; *(this+OFF+8) = the name hash
+//
+// and the id is a freshly minted unique number, not a pointer:
+//
+//     0x991edc  ldr  x0, [x8, #0x690] ; a counter
+//     0x991ee0  bl   0x10a24dc
+//     0x991eec  ldr  x0, [x8, #0x698] ; another counter
+//     0x991ef0  bl   0x10a24dc
+//     0x991ef8  bfi  x0, x19, #0x20, #0x20 ; id = (A << 32) | B
+//
+// So the value of m_nTotalLaps is NOT at this+0x20: the slot holds the
+// member's identity, and the VALUE lives in a central store keyed by that
+// identity. The registry is a .bss singleton at ELF 0x1f97980 (its id map
+// is at +0xc0).
+//
+// That is why the readings look like noise: they are unique ids and name
+// hashes, which change on every registration and are spread uniformly over
+// the whole 32-bit range. It is not a lap counter read at the wrong
+// offset; it is a descriptor read where the value was expected.
+//
+// The probe therefore REPORTS these slots as descriptors, not as lap
+// counts, and does not drive on them. Finding the value store is the open
+// question.
 constexpr uintptr_t kOffLapDistance = 0x08ULL;
 constexpr uintptr_t kOffTotalLaps = 0x20ULL;
 constexpr uintptr_t kOffPreviousSpline = 0x38ULL;
 constexpr uintptr_t kOffTotalSpline = 0x50ULL;
 constexpr uintptr_t kOffTopSpeed = 0x68ULL;
 constexpr uintptr_t kOffTotalTime = 0x88ULL;
+// The registry singleton that owns the ids, in the guest's .bss.
+constexpr uintptr_t kMemberRegistryBssVa = 0x1F97980ULL;
 // The vtable range in the guest image (.data.rel.ro), so that a word which
 // is a vptr can be told apart from a word which is a heap pointer.
 constexpr uintptr_t kVtableSectionLo = 0x1e1aae0ULL;
@@ -1240,71 +1273,81 @@ void pumpRaceStateProbe(unsigned long long frame) {
     // through the map, matched the key "racemetrics", and checked the
     // vptrs of both the RuleSet and the inline modifier.
     //
-    // And yet the readings are noise. So the readings are not being trusted
-    // and the RAW WORDS are dumped instead: the field that actually counts
-    // the laps is the one that behaves like a lap counter over time, and
-    // the only way to find it is to let the data say so.
+    // And yet the readings are noise: every named member holds a value that
+    // changes EVERY FRAME and is uniform over the whole 32-bit range, which
+    // is what a random number looks like and not what a lap counter looks
+    // like. So the readings are not being trusted and the RAW WORDS are
+    // dumped instead: the field that actually counts the laps is the one
+    // that behaves like a lap counter over time, and the only way to find
+    // it is to let the data say so.
     //
-    // One line per dump, every 30 frames, 24 words of the modifier and 28
-    // words of the RuleSet. "r=" is the modifier, "s=" is the RuleSet.
+    // THREE WINDOWS, because where the live data is is not known:
+    //   w=   the NEIGHBOURHOOD of the RuleSet (rs-0x100 .. rs+0x140). The
+    //        guest allocates sequentially, so a second, live metrics object
+    //        would very likely be next to the one the map points at.
+    //   p=   the POINTERS the modifier holds (it has two, at +0xb0 and
+    //        +0xb8) and the 0x90 bytes at each of their targets. The guest
+    //        keeps its references there, so this is where a live copy of
+    //        the metrics would be.
+    //   e=   the vector's element, printed FIRST because the line has a
+    //        budget and the interesting number must not be the one cut.
     if (g_metricsCount > 0 && g_ruleSetRaceMetrics != 0) {
-        char raw[768];
-        int written = std::snprintf(raw, sizeof(raw), "f=%llu r=", frame);
-        for (size_t off = 0; off < 0xC0 && written > 0 &&
-             written < static_cast<int>(sizeof(raw)) - 12; off += 4) {
+        char raw[4096];
+        int written = std::snprintf(raw, sizeof(raw), "f=%llu", frame);
+        uint64_t vectorBegin = 0;
+        if (readWord(g_ruleSetRaceMetrics + 0x08, &vectorBegin) && vectorBegin != 0) {
+            uint64_t element = 0;
+            readWord(static_cast<uintptr_t>(vectorBegin), &element);
+            written += std::snprintf(raw + written,
+                                     sizeof(raw) - static_cast<size_t>(written),
+                                     " e=%llx", static_cast<unsigned long long>(element));
+        }
+        written += std::snprintf(raw + written,
+                                 sizeof(raw) - static_cast<size_t>(written),
+                                 " w=");
+        for (int off = -0x100; off < 0x140; off += 4) {
+            if (written <= 0 || written >= static_cast<int>(sizeof(raw)) - 12) {
+                break;
+            }
             uint32_t word = 0;
-            readDword(g_metrics[0] + off, &word);
+            readDword(g_ruleSetRaceMetrics + off, &word);
             written += std::snprintf(raw + written,
                                      sizeof(raw) - static_cast<size_t>(written),
                                      "%08x", word);
         }
-        if (written > 0 && written < static_cast<int>(sizeof(raw)) - 4) {
+        // The modifier's own pointer members, and what they point at.
+        written += std::snprintf(raw + written,
+                                 sizeof(raw) - static_cast<size_t>(written),
+                                 " p=");
+        int pointers = 0;
+        for (size_t off = 0; off < 0xC0 && pointers < 3; off += 8) {
+            if (written <= 0 || written >= static_cast<int>(sizeof(raw)) - 64) {
+                break;
+            }
+            uint64_t pointer = 0;
+            if (!readWord(g_metrics[0] + off, &pointer) || pointer == 0) {
+                continue;
+            }
+            if (!looksLikePointer(bias, pointer)) {
+                continue;
+            }
+            ++pointers;
             written += std::snprintf(raw + written,
                                      sizeof(raw) - static_cast<size_t>(written),
-                                     " s=");
-            for (size_t off = 0; off < 0xE0 && written > 0 &&
-                 written < static_cast<int>(sizeof(raw)) - 12; off += 4) {
+                                     "[%llx:", static_cast<unsigned long long>(pointer));
+            for (size_t inner = 0; inner < 0x90; inner += 4) {
+                if (written <= 0 || written >= static_cast<int>(sizeof(raw)) - 12) {
+                    break;
+                }
                 uint32_t word = 0;
-                readDword(g_ruleSetRaceMetrics + off, &word);
+                readDword(static_cast<uintptr_t>(pointer) + inner, &word);
                 written += std::snprintf(raw + written,
                                          sizeof(raw) - static_cast<size_t>(written),
                                          "%08x", word);
             }
-        }
-        // THE VECTOR'S ELEMENT.
-        //
-        // The RuleSet_RaceMetrics keeps a std::vector of POINTERS to the
-        // metrics modifiers (the guest's constructor pushes the address of
-        // the inline one at +0x40), so the LIVE modifier is whatever the
-        // vector's element points at. The inline copy at +0x40 is only the
-        // one the constructor made: its named members hold high-entropy
-        // values, while an UNREGISTERED member at +0x80 counts up
-        // monotonically, which is what a template that nobody updates looks
-        // like next to a live object. So the element is read here, and so is
-        // the 0xE0 bytes at the address it points to.
-        uint64_t vectorBegin = 0;
-        if (readWord(g_ruleSetRaceMetrics + 0x08, &vectorBegin) && vectorBegin != 0) {
-            uint64_t element = 0;
-            if (readWord(static_cast<uintptr_t>(vectorBegin), &element)) {
-                written += std::snprintf(raw + written,
-                                         sizeof(raw) - static_cast<size_t>(written),
-                                         " e=%llx", static_cast<unsigned long long>(element));
-                if (element != 0) {
-                    uint64_t head = 0;
-                    readWord(static_cast<uintptr_t>(element), &head);
-                    written += std::snprintf(raw + written,
-                                             sizeof(raw) - static_cast<size_t>(written),
-                                             " ev=%llx", static_cast<unsigned long long>(head));
-                    for (size_t off = 8; off < 0xA0 && written > 0 &&
-                         written < static_cast<int>(sizeof(raw)) - 12; off += 4) {
-                        uint32_t word = 0;
-                        readDword(static_cast<uintptr_t>(element) + off, &word);
-                        written += std::snprintf(raw + written,
-                                                 sizeof(raw) - static_cast<size_t>(written),
-                                                 "%08x", word);
-                    }
-                }
-            }
+            written += std::snprintf(raw + written,
+                                     sizeof(raw) - static_cast<size_t>(written),
+                                     "]");
         }
         appendGuestBootLine(kGuestViewLogPath, "race-raw", 102, 0, raw);
     }
