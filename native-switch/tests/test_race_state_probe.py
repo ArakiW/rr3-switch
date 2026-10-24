@@ -111,6 +111,43 @@ def cstring(elf, va):
         return None
 
 
+# An Itanium mangled type name is a length-prefixed source name ("8GameMode")
+# or a mangled function name ("_ZN3EAE..."). Anything else in a __name slot
+# is not RTTI.
+MANGLED_NAME = re.compile(r"^(_Z[A-Za-z0-9_]*|[0-9]+[A-Za-z_][A-Za-z0-9_]*)$")
+
+
+def enumerate_vtables(elf, relocs):
+    """-> {address_point: (typeinfo_va, mangled_name)} for every vtable.
+
+    A vtable is found the way the runtime resolver finds it: the slot at
+    [vptr - 8] holds a relocated pointer to a typeinfo object, and that
+    typeinfo's own [typeinfo + 8] slot holds a relocated pointer to the
+    mangled class name. The address point is the typeinfo slot + 8.
+    """
+    out = {}
+    for slot, typeinfo in relocs.items():
+        name_va = relocs.get(typeinfo + 8)
+        if name_va is None:
+            continue
+        name = cstring(elf, name_va)
+        if name is None or not MANGLED_NAME.match(name):
+            continue
+        out[slot + 8] = (typeinfo, name)
+    return out
+
+
+def disasm(elf, lo, hi):
+    """[(address, mnemonic, op_str)] for the guest's code in [lo, hi)."""
+    from capstone import Cs, CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN
+
+    off = elf.va_to_off(lo)
+    code = elf.blob[off:off + (hi - lo)]
+    md = Cs(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN)
+    return [(ins.address, ins.mnemonic, ins.op_str)
+            for ins in md.disasm(code, lo)]
+
+
 def class_name_for_vptr(elf, relocs, vptr):
     """The mangled class name of the vtable whose address point is vptr."""
     typeinfo = relocs.get(vptr - 8)
@@ -241,9 +278,139 @@ def main() -> int:
     header = HEADER.read_text(encoding="utf-8")
     assert "27RuleSetModifier_RaceMetrics" in header
 
+    # 4. THE GAME MODE IS A POINTER MEMBER OF THE CGlobal, AT +0x10d88.
+    #
+    #    This is the chain the probe now follows. It is checked against the
+    #    guest's own instructions, because the chain the probe used to claim
+    #    ("the GameMode is built IN PLACE at owner + 0x17e00") was a
+    #    MIS-DECODE of these very instructions: w8 held 0x173f0 at
+    #    0x10af210 and was CLOBBERED with 0x1378 at 0x10af234, BEFORE the
+    #    add at 0x10af244.
+    #
+    #    Two INDEPENDENT readings of the guest have to agree, because one of
+    #    them already fooled us once: the mov/movk pair writes the LOW half
+    #    first, so 0x378 + (1 << 16) is 0x10378, NOT 0x1378. Dropping that
+    #    0x10000 gives 0x1d88, which is the offset the probe used to carry.
+    #
+    #    READER A: the teardown, ELF 0x10af1d4. x19 is `this`, and the
+    #    caller at ELF 0x13b6c28 passes *(*(GOT 0x1f6d5d8)) -- the CGlobal.
+    #      mov  w8, #0x378 ; movk w8, #1, lsl #16   -> w8 = 0x10378
+    #      add  x23, x19, x8
+    #      ldr  x1, [x23, #0xa10]                  -> +0x10d88
+    #
+    #    READER B: the mode creation, ELF 0xb08960. x19 is `this`.
+    #      mov  w8, #0xbb0 ; movk w8, #1, lsl #16   -> w8 = 0x10bb0
+    #      add  x23, x19, x8
+    #      str  x20, [x23, #0x1d8]                 -> +0x10d88
+    def chain_offset(lo, hi, add_pattern, load_pattern):
+        """(base displacement, load displacement) from the guest's code."""
+        base = None
+        load = None
+        w8 = 0
+        for _address, mnemonic, ops in disasm(elf, lo, hi):
+            if mnemonic == "mov" and re.match(r"w8, #(0x[0-9a-f]+|\d+)$", ops):
+                w8 = int(re.match(r"w8, #(0x[0-9a-f]+|\d+)$", ops).group(1), 0)
+            elif mnemonic == "movk" and re.match(r"w8, #(0x[0-9a-f]+|\d+), lsl #16$", ops):
+                high = int(re.match(r"w8, #(0x[0-9a-f]+|\d+), lsl #16$", ops).group(1), 0)
+                w8 = (w8 & 0xFFFF) | (high << 16)
+            elif mnemonic == "add" and re.match(add_pattern, ops):
+                base = w8
+            elif (load is None and mnemonic in ("ldr", "str")
+                  and re.match(load_pattern, ops)):
+                # The FIRST use of the base register, which is the one the
+                # chain is about. Later uses in the same function touch
+                # other members of the same object.
+                load = int(re.match(r".*#(0x[0-9a-f]+)\]$", ops).group(1), 16)
+        assert base is not None, f"no base add in [{lo:#x}, {hi:#x})"
+        assert load is not None, f"no offset load in [{lo:#x}, {hi:#x})"
+        return base, load
+
+    teardown_base, teardown_load = chain_offset(
+        0x10AF1D4, 0x10AF300, r"x23, x19, x8$",
+        r"x\d+, \[x23, #(0x[0-9a-f]+)\]$")
+    assert teardown_base == 0x10378, (
+        f"the teardown's base displacement is {teardown_base:#x}, expected "
+        "0x10378")
+    assert teardown_load == 0xA10, (
+        f"the teardown's load displacement is {teardown_load:#x}, expected "
+        "0xa10")
+
+    creation_base, creation_load = chain_offset(
+        0xB08960, 0xB089A0, r"x23, x19, x8$",
+        r"x\d+, \[x23, #(0x[0-9a-f]+)\]$")
+    assert creation_base == 0x10BB0, (
+        f"the creation site's base displacement is {creation_base:#x}, "
+        "expected 0x10bb0")
+    assert creation_load == 0x1D8, (
+        f"the creation site's load displacement is {creation_load:#x}, "
+        "expected 0x1d8")
+
+    game_mode_offset = teardown_base + teardown_load
+    creation_offset = creation_base + creation_load
+    assert game_mode_offset == 0x10D88, (
+        f"the teardown gives the GameMode at CGlobal+{game_mode_offset:#x}, "
+        "expected 0x10d88")
+    assert creation_offset == game_mode_offset, (
+        f"the two independent readings disagree: the teardown says "
+        f"CGlobal+{game_mode_offset:#x} and the creation site says "
+        f"CGlobal+{creation_offset:#x}")
+    assert "0x10d88ull" in source_lower, (
+        "the probe does not carry the GameMode member offset 0x10d88")
+
+    # 5. THE NEGATIVE CONTROL: A LIVE GameMode IS NEVER THE ABSTRACT BASE.
+    #
+    #    The port used to search guest memory for the address point of the
+    #    class "8GameMode" (0x1e98168). That search was structurally doomed:
+    #    the guest instantiates DERIVED classes (SoloMode, StandardRaceMode,
+    #    TimeTrialMode, ...), and a derived object's vptr is its own class's
+    #    address point. The archived run 20261024-194901-eden-racestate-heap2
+    #    proved it at runtime: 49 owner candidates, 0 hits.
+    #
+    #    So the check is: enumerate every vtable in the guest, take the ones
+    #    whose class is a concrete game mode, and assert that NONE of them
+    #    uses the abstract base's address point. The positive control is the
+    #    base itself, which the same enumeration must find.
+    vtables = enumerate_vtables(elf, relocs)
+    base_typeinfo = relocs.get(0x1E98168 - 8)
+    assert base_typeinfo is not None, (
+        "the guest's GameMode vtable has no typeinfo slot at "
+        f"{0x1E98168 - 8:#x}")
+    base_name = cstring(elf, relocs[base_typeinfo + 8])
+    assert base_name == "8GameMode", (
+        f"the GameMode typeinfo names {base_name!r}, expected '8GameMode'")
+
+    mode_classes = {point: name for point, (_ti, name) in vtables.items()
+                    if name.endswith("Mode") and name != "8GameMode"}
+    assert len(mode_classes) >= 10, (
+        f"only {len(mode_classes)} concrete '*Mode' classes were found "
+        "(expected well over 10); the enumeration is broken")
+    clashes = sorted(point for point in mode_classes
+                      if point == 0x1E98168)
+    assert not clashes, (
+        "a concrete game mode uses the abstract base's address point "
+        f"{clashes}; the negative control would be meaningless")
+    # And the base must NOT be among the concrete classes either.
+    assert "8GameMode" not in mode_classes.values(), (
+        "the abstract base was counted as a concrete mode class")
+
+    # 6. THE MAP KEY. The guest inserts the race metrics ruleset under the
+    #    key "racemetrics" (the global at 0x1f81250 holds that C string).
+    key_va = relocs.get(0x1F81250)
+    assert key_va is not None, (
+        "no relocated pointer at 0x1f81250, which the guest's own insert "
+        "loads to get the map key")
+    assert cstring(elf, key_va) == "racemetrics", (
+        f"the map key global holds {cstring(elf, key_va)!r}, "
+        "expected 'racemetrics'")
+    assert "racemetrics" in source, (
+        "the probe does not carry the map key it cross-checks")
+
     print("PASS: the race-state probe's vtables and member offsets agree with "
           "the guest binary "
-          f"({len(expected_classes)} classes, {len(expected_members)} members)")
+          f"({len(expected_classes)} classes, {len(expected_members)} members); "
+          f"the GameMode chain gives CGlobal+0x{game_mode_offset:x}; "
+          f"{len(mode_classes)} concrete game-mode classes, none of them the "
+          "abstract base")
     return 0
 
 

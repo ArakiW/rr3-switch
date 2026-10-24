@@ -19,33 +19,46 @@
 //       +0x88  m_nTotalTime
 //
 //   RuleSet_RaceMetrics            (RTTI "19RuleSet_RaceMetrics")
-//       +0x10  std::vector<RuleSetModifier_RaceMetrics>
-//       +0x40  the vector's inline storage: the first metrics object
+//       +0x40  the metrics modifier, built IN PLACE by the guest
 //
 //   GameMode                       (RTTI "8GameMode")
-//       +0x128 std::map<std::string, RuleSet_RaceMetrics*>
+//       +0x128 std::map<std::string, RuleSet*>
 //
 //   G (the CGlobal), reached through the GOT slot at ELF 0x1f6d5d8.
-//       G+0xa10  the GameMode, constructed in place
+//       G+0x10d88 the GameMode POINTER
 //
-// WHY THE PROBE SEARCHES INSTEAD OF FOLLOWING THE CHAIN BLINDLY
+// WHY THE PROBE FOLLOWS A POINTER INSTEAD OF LOOKING FOR A VTABLE
 // -------------------------------------------------------------
-// The chain above is real, but a pointer chain that is three links deep and
-// two of them are the guest's own std::map is exactly the kind of thing that
-// breaks silently: the map's node layout is the guest's, not the C++
-// standard's, and the GameMode is constructed at TWO offsets in the guest
-// (G+0xa10 and G+0x1d88). So the probe WALKS the object graph from the
-// GameMode and accepts an object only when its first word is EXACTLY the
-// vtable address of the class it claims to be.
+// The obvious way to find a live object in C++ memory is to search for its
+// vtable address. That is what the first version of this probe did, and it
+// could never work:
 //
-// That check is the identity check: an object's first word IS its vptr, and
-// the vtable's address was derived from the guest's own RTTI (the typeinfo's
-// __name "27RuleSetModifier_RaceMetrics" -> the typeinfo -> the vtable).
-// So "the object whose vptr is 0x1e4b3f8" is not a guess about a layout: it
-// is a statement about a class, and the class has a name.
+//   * The guest's "8GameMode" typeinfo has THIRTEEN vtable address points,
+//     because GameMode has virtual bases. A live object can hold any of
+//     them, and the port only knew one.
+//   * More decisively: the guest NEVER instantiates a bare GameMode. It
+//     instantiates 34 DERIVED classes (SoloMode, StandardRaceMode,
+//     TimeTrialMode, ...), and a derived object's vptr is its OWN class's
+//     address point, not the base's. So a search for the base's address
+//     point (0x1e98168) is structurally guaranteed to find nothing.
+//
+// The probe therefore follows the pointer the guest itself stores: the
+// CGlobal's member at +0x10d88 holds the current GameMode. That is the
+// guest's own bookkeeping, so it cannot be wrong about where the GameMode
+// is. The vptr is then read only to SAY WHICH MODE it is.
+//
+// The offset comes from TWO independent readings of the guest (the teardown
+// at ELF 0x10af1d4 and the mode creation at ELF 0xb08960), which agree.
+//
+// The map is walked rather than sampled: the guest also inserts a ruleset
+// under the key "grid", so the root node is not necessarily the race
+// metrics entry. The decision is the value's vptr (RuleSet_RaceMetrics has
+// no derived classes, so its address point is exact), and the key is
+// reported as an independent cross-check.
 //
 // WHAT THE PROBE REPORTS, PER FRAME
 // ---------------------------------
+//   the GameMode's address point (so a reader can name the mode class), the
 //   lap distance, total laps, previous/total spline distance, top speed and
 //   total time, for EVERY metrics object it finds, plus the derived rate of
 //   progress along the track's spline. The rate is what the closed-loop

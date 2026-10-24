@@ -95,9 +95,62 @@ namespace {
 // probe reads (rr3_InputDoors.cpp: kCGlobalGotSlotVa = 0x1f6d5d8).
 constexpr uintptr_t kCGlobalGotSlotVa = 0x1f6d5d8ULL;
 // The vtable ADDRESS POINTS (the value an object's first word holds).
+//
+// kGameModeVptrElfVa is the address point of the ABSTRACT BASE class
+// GameMode. It is kept ONLY as a negative control: the guest instantiates
+// 34 DERIVED GameMode classes (SoloMode, StandardRaceMode, TimeTrialMode,
+// ...) and never a bare GameMode, so a live object's first word is never
+// this value. The probe no longer searches for it; it follows the pointer
+// the guest itself stores and reads the vptr only to say which mode it is.
 constexpr uintptr_t kGameModeVptrElfVa = 0x1e98168ULL;
+// These two ARE exact: neither class has any derived class, so the address
+// point of the class is the address point of every live instance.
 constexpr uintptr_t kRuleSetRaceMetricsVptrElfVa = 0x1e4b378ULL;
 constexpr uintptr_t kRaceMetricsVptrElfVa = 0x1e4b3f8ULL;
+// The GameMode is a POINTER MEMBER of the CGlobal.
+//
+// THE PROVEN OFFSET IS 0x10d88. Two independent readings of the guest agree:
+//   the teardown, ELF 0x10af1d4 (x19 = the CGlobal, this):
+//     mov  w8, #0x378 ; movk w8, #1, lsl #16   ; w8 = 0x10378
+//     add  x23, x19, x8
+//     ldr  x1, [x23, #0xa10]                  ; -> CGlobal + 0x10d88
+//   the mode creation, ELF 0xb08960 (x19 = the CGlobal, this):
+//     mov  w8, #0xbb0 ; movk w8, #1, lsl #16   ; w8 = 0x10bb0
+//     add  x23, x19, x8
+//     str  x20, [x23, #0x1d8]                 ; -> CGlobal + 0x10d88
+//
+// NOTE THE ARITHMETIC: a mov/movk pair writes the LOW half first and the
+// high half second, so 0x378 + (1 << 16) is 0x10378, NOT 0x1378. A first
+// reading of this code dropped the 0x10000 and produced 0x1d88, which is
+// the offset this probe used to carry.
+//
+// The probe tries all three offsets the guest's own code mentions as
+// pointer members of the CGlobal and takes the first one that really leads
+// to a RuleSet_RaceMetrics, so a mis-read of the guest's arithmetic cannot
+// turn into a silent "not found".
+constexpr uintptr_t kCGlobalGameModeOff = 0x10D88ULL;
+constexpr uintptr_t kGameModeCandidateOffsets[] = {
+    0x10D88ULL,   // proven by two independent readings
+    0x1D88ULL,    // the mis-read (the 0x10000 dropped)
+    0x173F0ULL,   // the pointer member the teardown reads at ELF 0x10af224
+};
+constexpr int kGameModeCandidateCount =
+    static_cast<int>(sizeof(kGameModeCandidateOffsets) / sizeof(uintptr_t));
+// The guest's own map insert (ELF 0xfea280) gives the node layout, and it
+// is libc++'s (the guest links libc++_shared.so):
+//   node+0x00 left child, node+0x08 right child, node+0x10 parent,
+//   node+0x18 colour, node+0x20 the key (std::string), node+0x38 the value
+//   (a RuleSet*), and the node is 64 bytes ("mov w0, #0x40").
+constexpr uintptr_t kMapNodeLeftOff = 0x00ULL;
+constexpr uintptr_t kMapNodeRightOff = 0x08ULL;
+constexpr uintptr_t kMapNodeKeyOff = 0x20ULL;
+constexpr uintptr_t kMapNodeValueOff = 0x38ULL;
+// The key the guest inserts the race metrics under: the global at 0x1f81250
+// holds the C string "racemetrics" and the insert at 0xf16b7c loads it.
+// The probe reports where the string is found inside the key rather than
+// assuming libc++'s short-string layout, because the layout is the one
+// thing here that is NOT proved by the guest's own code.
+constexpr char kRaceMetricsMapKey[] = "racemetrics";
 // The member offsets inside RuleSetModifier_RaceMetrics.
 constexpr uintptr_t kOffLapDistance = 0x08ULL;
 constexpr uintptr_t kOffTotalLaps = 0x20ULL;
@@ -247,12 +300,24 @@ uintptr_t cGlobalObject() {
 // So: the root node is at map+8 (the map object at GameMode+0x128, so the
 // root node pointer is at GameMode+0x130), and the RuleSet_RaceMetrics
 // pointer is at root+0x38.
+//
+// THE MAP HOLDS MORE THAN ONE ENTRY. The guest also inserts a ruleset under
+// the key "grid" (StandardRaceMode's constructor, ELF 0x103dae8), so the
+// ROOT NODE IS NOT NECESSARILY the race metrics one. The probe therefore
+// WALKS THE WHOLE TREE and picks the node whose VALUE points at a
+// RuleSet_RaceMetrics, instead of assuming the root is it.
+//
+// The node layout is libc++'s -- the guest links libc++_shared.so -- and the
+// node is 64 bytes, so with the key (a 24-byte std::string) at node+0x20 and
+// the value at node+0x38, the two child pointers are the first two words.
 constexpr uintptr_t kGameModeMapOff = 0x128ULL;
 constexpr uintptr_t kMapRootOff = 0x08ULL;
-constexpr uintptr_t kMapNodeValueOff = 0x38ULL;
 // The RuleSet_RaceMetrics object is 0xe0 bytes (the guest allocates it with
 // operator_new(0xe0) at ELF 0xf16be8).
 constexpr uintptr_t kRuleSetRaceMetricsBytes = 0xE0ULL;
+// The metrics modifier is built IN PLACE inside the RuleSet_RaceMetrics at
+// +0x40 (the guest's constructor, ELF 0xb35938, constructs it at this+0x40).
+constexpr uintptr_t kRuleSetMetricsInlineOff = 0x40ULL;
 
 // ---- the heap scan -------------------------------------------------------
 //
@@ -264,8 +329,20 @@ uintptr_t g_metrics[4] = {0, 0, 0, 0};
 int g_metricsCount = 0;
 uintptr_t g_heapBase = 0;
 uintptr_t g_heapSize = 0;
-int g_ownerCandidates = 0;
-int g_ownerHits = 0;
+// The live GameMode's vptr, and whether it is (implausibly) the abstract
+// base class's address point. See kGameModeVptrElfVa.
+uintptr_t g_gameModeVptr = 0;
+bool g_gameModeIsBase = false;
+// Which of the candidate offsets actually led to the GameMode, and what
+// every candidate held. A reader can see which offsets were tried and what
+// they contained, so "not found" is never a black box.
+int g_gameModeCandidate = -1;
+uintptr_t g_candidatePointers[4] = {0, 0, 0, 0};
+uintptr_t g_candidateVptrs[4] = {0, 0, 0, 0};
+// How the map walk went: how many nodes it visited, and where inside the
+// key's 24 bytes the string "racemetrics" was found (or -1).
+int g_mapNodesVisited = 0;
+int g_mapKeyOffset = -1;
 uintptr_t g_cglobal = 0;
 
 // Forward declaration: the heap scan below uses the pointer filter, which is
@@ -592,9 +669,18 @@ uint32_t g_lastTotalLaps = 0xFFFFFFFFu;
 unsigned long long g_brakeUntilFrame = 0;
 unsigned long long g_lastFlipFrame = 0;
 
-void fillMetrics(RaceMetricsSample* out, uintptr_t address, uintptr_t vptr) {
+void fillMetrics(RaceMetricsSample* out, uintptr_t address) {
     out->address = address;
-    out->vptr = vptr;
+    // THE Vptr IS READ, NOT ASSUMED. The previous version was handed the
+    // EXPECTED address point and recorded that, so the log's "vptr_ok=1"
+    // was a tautology: it said "the constant equals itself". The probe's
+    // own identity check has to be a MEASUREMENT, or it checks nothing.
+    uint64_t head = 0;
+    if (readWord(address, &head)) {
+        out->vptr = static_cast<uintptr_t>(head);
+    } else {
+        out->vptr = 0;
+    }
     readDword(address + kOffLapDistance, &out->lapDistance);
     readDword(address + kOffTotalLaps, &out->totalLaps);
     readDword(address + kOffPreviousSpline, &out->previousSplineDistance);
@@ -610,161 +696,132 @@ void fillMetrics(RaceMetricsSample* out, uintptr_t address, uintptr_t vptr) {
     out->valid = true;
 }
 
-void discover() {
-    const uintptr_t bias = resolveMainImageLoadBias();
-    if (bias == 0) {
-        return;
+// Where inside the 24 bytes of a libc++ std::string does the text appear?
+//
+// The key's short-string layout is the one thing in this file that the
+// guest's own code does NOT spell out, so the probe REPORTS the offset
+// instead of assuming one. Returns -1 when the text is not in the inline
+// bytes (a long string keeps its characters on the heap).
+//
+// This is a cross-check, not the decision: the decision is the value's
+// vptr, which is exact.
+int findKeyBytes(uintptr_t keyAddress, const char* text) {
+    const size_t textLength = std::strlen(text);
+    if (textLength == 0 || textLength > 24) {
+        return -1;
     }
-    const uintptr_t g = cGlobalObject();
-    if (g == 0) {
-        return;
-    }
-    // STEP 1: the GameMode.
-    //
-    // The guest builds the GameMode IN PLACE inside another object. The
-    // guest's own code (ELF 0x10af1d4, the owner object's method) says
-    // where:
-    //
-    //   0x10af21c  mov  x19, x0        ; x19 = the owner object
-    //   0x10af244  add  x23, x19, x8   ; x8 = 0x173f0
-    //   0x10af298  ldr  x0, [x23, #0xa10]
-    //   0x10af2a0  bl   0xf168b4       ; the GameMode constructor
-    //
-    // so the GameMode's vptr is at owner+0x17e00. The guest builds a second
-    // GameMode at owner'+0x1d88 (ELF 0xb17218), so both offsets are tried.
-    //
-    // The owner is looked for two ways, cheapest first:
-    //   (a) the owner IS the CGlobal, so the GameMode's vptr is a word of
-    //       the CGlobal. Every word of the CGlobal is inside the guest
-    //       image, so this scan costs no syscalls at all.
-    //   (b) the owner is one of the objects the CGlobal points at, so each
-    //       of the CGlobal's pointers is tested at the two fixed offsets.
-    const uintptr_t gameModeVptr = bias + kGameModeVptrElfVa;
-    uintptr_t gameMode = 0;
-    int ownerCandidates = 0;
-    int ownerHits = 0;
-    g_cglobal = g;
-
-    // The owner object is big -- the GameMode sits at owner+0x17e00 -- so the
-    // CGlobal's own scan has to reach that far. 0x1a000 covers it.
-    for (size_t off = 0; off + 8 <= 0x1a000ULL && gameMode == 0; off += 8) {
-        uint64_t word = 0;
-        if (!readWord(g + off, &word)) {
-            continue;
+    uint8_t buffer[24];
+    for (size_t word = 0; word < 3; ++word) {
+        uint32_t bits = 0;
+        if (!readDword(keyAddress + word * 4, &bits)) {
+            return -1;
         }
-        if (word == gameModeVptr) {
-            gameMode = g + off;
-            break;
+        for (size_t byte = 0; byte < 4; ++byte) {
+            buffer[word * 4 + byte] = static_cast<uint8_t>((bits >> (byte * 8)) & 0xFF);
         }
     }
-    if (gameMode == 0) {
-        // (b) the owner is a sub-object of the CGlobal. The GameMode sits
-        // at owner+0x17e00, so ONE read per candidate is enough -- and ONE
-        // read is the whole point. The first version of this probe scanned
-        // each candidate's first 4 KiB, and reading 4 KiB of a cold,
-        // file-backed mapping under Eden is disk I/O on the guest's own
-        // thread: that version stalled the guest before it drew a frame.
-        for (size_t off = 0; off + 8 <= 0x3000ULL && gameMode == 0; off += 8) {
-            uint64_t word = 0;
-            if (!readWord(g + off, &word)) {
-                continue;
-            }
-            if (!looksLikePointer(bias, word)) {
-                continue;
-            }
-            const uintptr_t owner = static_cast<uintptr_t>(word);
-            ++ownerCandidates;
-            if (ownerCandidates > 48) {
+    for (size_t offset = 0; offset + textLength <= sizeof(buffer); ++offset) {
+        bool match = true;
+        for (size_t i = 0; i < textLength; ++i) {
+            if (buffer[offset + i] != static_cast<uint8_t>(text[i])) {
+                match = false;
                 break;
             }
-            uint64_t head = 0;
-            if (!readWord(owner + 0x17e00ULL, &head)) {
-                continue;
-            }
-            if (head == gameModeVptr) {
-                gameMode = owner + 0x17e00ULL;
-                ++ownerHits;
-            }
+        }
+        if (match) {
+            return static_cast<int>(offset);
         }
     }
-    g_ownerCandidates = ownerCandidates;
-    g_ownerHits = ownerHits;
-    if (gameMode == 0) {
-        // The GameMode is not reachable from the CGlobal by either route the
-        // guest's own code shows. The metrics object is still reachable: it
-        // is HEAP allocated, and the guest's heap region is one syscall
-        // away.
-        g_gameMode = 0;
-        findMetricsInHeap(bias, g);
-        return;
-    }
-    g_gameMode = gameMode;
+    return -1;
+}
 
-    // STEP 2: the metrics map. The GameMode's own map at GameMode+0x128;
-    // its root node is at map+8 and the node's value is at node+0x38.
+// Reads the GameMode's ruleset map and the metrics object behind it.
+//
+// Returns true when the chain produced a live RuleSet_RaceMetrics. The
+// results are written into the out-parameters only on success, so a
+// candidate that does not lead anywhere cannot leave half a state behind.
+bool followGameMode(uintptr_t bias, uintptr_t gameMode, uintptr_t* outRuleSet,
+                    uintptr_t* outMetrics) {
+    // The map at GameMode+0x128 holds MORE THAN ONE ENTRY -- StandardRaceMode
+    // also inserts a ruleset under the key "grid" (ELF 0x103dae8) -- so the
+    // root node is not necessarily the race metrics one. The probe WALKS THE
+    // WHOLE TREE and takes the node whose VALUE points at a
+    // RuleSet_RaceMetrics.
+    //
+    // The walk uses an explicit stack, never recursion: the guest's tree is
+    // tiny, but a corrupt pointer must not be able to blow the C stack.
+    const uintptr_t map = gameMode + kGameModeMapOff;
     uint64_t rootWord = 0;
-    if (!readWord(gameMode + kGameModeMapOff + kMapRootOff, &rootWord) ||
-        rootWord == 0) {
-        return;
+    if (!readWord(map + kMapRootOff, &rootWord) || rootWord == 0) {
+        return false;
     }
     const uintptr_t root = static_cast<uintptr_t>(rootWord);
     const uintptr_t ruleSetVptr = bias + kRuleSetRaceMetricsVptrElfVa;
     const uintptr_t metricsVptr = bias + kRaceMetricsVptrElfVa;
 
-    // The map holds one entry per race, and the guest inserts one in the
-    // GameMode's constructor, but the root of a tree is not necessarily the
-    // node wanted, so the root and its two children are checked.
-    uintptr_t candidates[3] = {root, 0, 0};
-    uint64_t childWord = 0;
-    if (readWord(root, &childWord)) {
-        candidates[1] = static_cast<uintptr_t>(childWord);
-    }
-    childWord = 0;
-    if (readWord(root + 8, &childWord)) {
-        candidates[2] = static_cast<uintptr_t>(childWord);
-    }
-
     uintptr_t ruleSet = 0;
-    for (int i = 0; i < 3 && ruleSet == 0; ++i) {
-        const uintptr_t node = candidates[i];
-        if (node == 0) {
+    int nodesVisited = 0;
+    int keyOffset = -1;
+    uintptr_t stack[64];
+    int stackSize = 0;
+    stack[stackSize++] = root;
+    while (stackSize > 0 && ruleSet == 0) {
+        const uintptr_t node = stack[--stackSize];
+        if (node == 0 || node == map + kMapRootOff) {
+            // The map's own header points at itself when the tree is empty;
+            // it is not a node.
             continue;
+        }
+        if (++nodesVisited > 64) {
+            break;
         }
         uint64_t value = 0;
-        if (!readWord(node + kMapNodeValueOff, &value) || value == 0) {
-            continue;
+        if (readWord(node + kMapNodeValueOff, &value) && value != 0) {
+            uint64_t head = 0;
+            if (readWord(static_cast<uintptr_t>(value), &head) && head == ruleSetVptr) {
+                ruleSet = static_cast<uintptr_t>(value);
+                keyOffset = findKeyBytes(node + kMapNodeKeyOff, kRaceMetricsMapKey);
+            }
         }
-        uint64_t head = 0;
-        if (!readWord(static_cast<uintptr_t>(value), &head)) {
-            continue;
+        uint64_t child = 0;
+        if (stackSize < 62 && readWord(node + kMapNodeLeftOff, &child) && child != 0 &&
+            child != node) {
+            stack[stackSize++] = static_cast<uintptr_t>(child);
         }
-        if (head == ruleSetVptr) {
-            ruleSet = static_cast<uintptr_t>(value);
+        child = 0;
+        if (stackSize < 62 && readWord(node + kMapNodeRightOff, &child) && child != 0 &&
+            child != node) {
+            stack[stackSize++] = static_cast<uintptr_t>(child);
         }
     }
     if (ruleSet == 0) {
-        g_ruleSetRaceMetrics = 0;
-        findMetricsInHeap(bias, g);
-        return;
+        return false;
     }
-    g_ruleSetRaceMetrics = ruleSet;
 
-    // STEP 3: the metrics object itself. The guest keeps a
-    // std::vector<RuleSetModifier_RaceMetrics> inside the
-    // RuleSet_RaceMetrics, and the vector's inline storage holds the object
-    // BY VALUE (ELF 0xb35940 constructs it at RuleSet_RaceMetrics+0x40), so
-    // the object may be embedded OR reached through a pointer. Both are
-    // checked, and both are checked by the vptr, so neither is a guess.
+    // The metrics modifier is built IN PLACE inside the RuleSet_RaceMetrics
+    // at +0x40 (the guest's constructor, ELF 0xb35938, constructs it at
+    // this+0x40). It may also be reached through a pointer, and both are
+    // checked BY THE VPTR, so neither is a guess.
+    uint64_t inlineHead = 0;
+    if (readWord(ruleSet + kRuleSetMetricsInlineOff, &inlineHead) &&
+        inlineHead == metricsVptr) {
+        *outRuleSet = ruleSet;
+        *outMetrics = ruleSet + kRuleSetMetricsInlineOff;
+        g_mapNodesVisited = nodesVisited;
+        g_mapKeyOffset = keyOffset;
+        return true;
+    }
     for (size_t off = 0; off + 8 <= kRuleSetRaceMetricsBytes; off += 8) {
         uint64_t word = 0;
         if (!readWord(ruleSet + off, &word)) {
             continue;
         }
         if (word == metricsVptr) {
-            // Embedded: the object starts here.
-            g_metrics[0] = ruleSet + off;
-            g_metricsCount = 1;
-            return;
+            *outRuleSet = ruleSet;
+            *outMetrics = ruleSet + off;
+            g_mapNodesVisited = nodesVisited;
+            g_mapKeyOffset = keyOffset;
+            return true;
         }
         if (!looksLikePointer(bias, word)) {
             continue;
@@ -774,10 +831,106 @@ void discover() {
             continue;
         }
         if (head == metricsVptr) {
-            g_metrics[0] = static_cast<uintptr_t>(word);
-            g_metricsCount = 1;
-            return;
+            *outRuleSet = ruleSet;
+            *outMetrics = static_cast<uintptr_t>(word);
+            g_mapNodesVisited = nodesVisited;
+            g_mapKeyOffset = keyOffset;
+            return true;
         }
+    }
+    return false;
+}
+
+void discover() {
+    const uintptr_t bias = resolveMainImageLoadBias();
+    if (bias == 0) {
+        return;
+    }
+    const uintptr_t g = cGlobalObject();
+    if (g == 0) {
+        return;
+    }
+    g_cglobal = g;
+
+    // ---------------------------------------------------------------------
+    // STEP 1: the GameMode.
+    //
+    // THE GUEST STORES IT AS A POINTER MEMBER OF THE CGlobal. Two
+    // independent readings of the guest agree on the offset:
+    //
+    //   the teardown, ELF 0x10af1d4 (x19 = the CGlobal, this):
+    //     0x10af22c  mov  w8, #0x378
+    //     0x10af234  movk w8, #1, lsl #16    ; w8 = 0x10378
+    //     0x10af244  add  x23, x19, x8
+    //     0x10af280  ldr  x1, [x23, #0xa10]  ; -> CGlobal + 0x10d88
+    //
+    //   the mode creation, ELF 0xb08960 (x19 = the CGlobal, this):
+    //     0xb08960   mov  w8, #0xbb0
+    //     0xb08964   movk w8, #1, lsl #16    ; w8 = 0x10bb0
+    //     0xb08968   add  x23, x19, x8
+    //     0xb0898c   str  x20, [x23, #0x1d8]; -> CGlobal + 0x10d88
+    //
+    // NOTE THE ARITHMETIC. A mov/movk pair writes the LOW half first and
+    // the high half second, so 0x378 + (1 << 16) is 0x10378, NOT 0x1378.
+    // A first reading of this code dropped the 0x10000 and produced
+    // 0x1d88, which is the offset this probe used to carry.
+    //
+    // THE GameMode IS ALWAYS A DERIVED CLASS. The guest instantiates 34 of
+    // them (SoloMode, StandardRaceMode, TimeTrialMode, ...) and never a bare
+    // GameMode, so the abstract base's address point (0x1e98168) is NOT the
+    // first word of any live GameMode. A probe that searches for that value
+    // therefore finds NOTHING, structurally, no matter how long it looks.
+    // That is exactly what the archived run did: 49 owner candidates,
+    // 0 hits.
+    //
+    // So the probe does not search for a vptr. It follows the pointer the
+    // guest itself stores, and reads the vptr only to say WHICH mode it is.
+    //
+    // THE CANDIDATES. The probe tries the offsets the guest's own code
+    // mentions as pointer members of the CGlobal and takes the first one
+    // that REALLY leads to a RuleSet_RaceMetrics. Every candidate's pointer
+    // and vptr go into the log, so a mis-read of the guest's arithmetic
+    // cannot turn into a silent "not found".
+    // ---------------------------------------------------------------------
+    for (int i = 0; i < kGameModeCandidateCount; ++i) {
+        g_candidatePointers[i] = 0;
+        g_candidateVptrs[i] = 0;
+        uint64_t pointer = 0;
+        if (!readWord(g + kGameModeCandidateOffsets[i], &pointer) || pointer == 0) {
+            continue;
+        }
+        g_candidatePointers[i] = static_cast<uintptr_t>(pointer);
+        const uintptr_t gameMode = static_cast<uintptr_t>(pointer);
+        uint64_t vptr = 0;
+        if (readWord(gameMode, &vptr)) {
+            g_candidateVptrs[i] = static_cast<uintptr_t>(vptr);
+        }
+        if (g_gameMode != 0) {
+            continue;
+        }
+        uintptr_t ruleSet = 0;
+        uintptr_t metrics = 0;
+        if (!followGameMode(bias, gameMode, &ruleSet, &metrics)) {
+            continue;
+        }
+        g_gameMode = gameMode;
+        g_gameModeCandidate = i;
+        g_gameModeVptr = g_candidateVptrs[i];
+        // NEGATIVE CONTROL, kept on purpose. A live GameMode whose vptr is
+        // the abstract base's address point would mean the guest DOES
+        // instantiate a bare GameMode, which would mean the whole class
+        // hierarchy above is wrong. The log carries the fact so a reader
+        // can check it.
+        g_gameModeIsBase = (g_gameModeVptr == bias + kGameModeVptrElfVa);
+        g_ruleSetRaceMetrics = ruleSet;
+        g_metrics[0] = metrics;
+        g_metricsCount = 1;
+    }
+    if (g_gameMode == 0) {
+        g_ruleSetRaceMetrics = 0;
+        g_metricsCount = 0;
+        findMetricsInHeap(bias, g);
+        return;
     }
 }
 
@@ -930,17 +1083,45 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
 void logSample(unsigned long long frame, const RaceStateSample& sample) {
     char detail[768];
     const int active = sample.activeIndex;
+    const uintptr_t bias = resolveMainImageLoadBias();
+    // The GameMode's vptr, and the ELF ADDRESS POINT it corresponds to. The
+    // runtime value is bias + address point, so the address point is what
+    // names the class offline: the guest has 34 derived GameMode classes and
+    // a reader can look the address point up in the guest's RTTI.
+    const uintptr_t modeAddressPoint =
+        (g_gameModeVptr > bias) ? (g_gameModeVptr - bias) : 0;
+    // EVERY CANDIDATE, so "not found" is never a black box: the reader sees
+    // what each of the guest's pointer members held.
+    char candidates[192];
+    int written = 0;
+    candidates[0] = '\0';
+    for (int i = 0; i < kGameModeCandidateCount && written < 180; ++i) {
+        const int n = std::snprintf(
+            candidates + written, sizeof(candidates) - static_cast<size_t>(written),
+            "%s%llx/%llx", (i == 0) ? "" : ",",
+            static_cast<unsigned long long>(g_candidatePointers[i]),
+            static_cast<unsigned long long>(g_candidateVptrs[i]));
+        if (n <= 0) {
+            break;
+        }
+        written += n;
+    }
     if (active < 0) {
         std::snprintf(
             detail, sizeof(detail),
-            "f=%llu g=0x%llx gm=0x%llx gm_ok=%d gm_vptr=0x%llx metrics=%d "
-            "active=-1 owncand=%d ownhit=%d heap=0x%llx+0x%llx "
+            "f=%llu g=0x%llx gm=0x%llx gm_ok=%d gm_vptr=0x%llx gm_ap=0x%llx "
+            "gm_base=%d gm_cand=%d cand=%s metrics=%d "
+            "active=-1 nodes=%d keyoff=%d heap=0x%llx+0x%llx "
             "drive=%d cfg=%d",
             frame, static_cast<unsigned long long>(g_cglobal),
             static_cast<unsigned long long>(sample.gameMode),
             sample.gameModeFound ? 1 : 0,
             static_cast<unsigned long long>(sample.gameModeVptr),
-            sample.metricsCount, g_ownerCandidates, g_ownerHits,
+            static_cast<unsigned long long>(modeAddressPoint),
+            g_gameModeIsBase ? 1 : 0,
+            g_gameModeCandidate, candidates,
+            sample.metricsCount,
+            g_mapNodesVisited, g_mapKeyOffset,
             static_cast<unsigned long long>(g_heapBase),
             static_cast<unsigned long long>(g_heapSize),
             g_drive.enabled ? 1 : 0,
@@ -949,8 +1130,9 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
         const RaceMetricsSample& m = sample.metrics[active];
         std::snprintf(
             detail, sizeof(detail),
-            "f=%llu g=0x%llx gm=0x%llx gm_ok=%d gm_vptr=0x%llx rs=0x%llx metrics=%d "
-            "active=%d owncand=%d ownhit=%d heap=0x%llx+0x%llx "
+            "f=%llu g=0x%llx gm=0x%llx gm_ok=%d gm_vptr=0x%llx gm_ap=0x%llx "
+            "gm_base=%d gm_cand=%d cand=%s rs=0x%llx metrics=%d "
+            "active=%d nodes=%d keyoff=%d heap=0x%llx+0x%llx "
             "cls=27RuleSetModifier_RaceMetrics m=0x%llx vptr_ok=%d "
             "laps=%u lapF=%.3f lapd=%u lapdF=%.3f prev=%u total=%u "
             "totalF=%.3f speed=%u speedF=%.3f time=%u timeF=%.3f "
@@ -960,12 +1142,16 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             static_cast<unsigned long long>(sample.gameMode),
             sample.gameModeFound ? 1 : 0,
             static_cast<unsigned long long>(sample.gameModeVptr),
+            static_cast<unsigned long long>(modeAddressPoint),
+            g_gameModeIsBase ? 1 : 0,
+            g_gameModeCandidate, candidates,
             static_cast<unsigned long long>(g_ruleSetRaceMetrics),
-            sample.metricsCount, active, g_ownerCandidates, g_ownerHits,
+            sample.metricsCount, active,
+            g_mapNodesVisited, g_mapKeyOffset,
             static_cast<unsigned long long>(g_heapBase),
             static_cast<unsigned long long>(g_heapSize),
             static_cast<unsigned long long>(m.address),
-            (m.vptr == resolveMainImageLoadBias() + kRaceMetricsVptrElfVa) ? 1 : 0,
+            (m.vptr == bias + kRaceMetricsVptrElfVa) ? 1 : 0,
             m.totalLaps, static_cast<double>(m.totalLapsF),
             m.lapDistance, static_cast<double>(m.lapDistanceF),
             m.previousSplineDistance, m.totalSplineDistance,
@@ -1023,7 +1209,7 @@ void pumpRaceStateProbe(unsigned long long frame) {
     g_sample.metricsCount = 0;
     if (g_metricsCount > 0) {
         RaceMetricsSample m{};
-        fillMetrics(&m, g_metrics[0], bias + kRaceMetricsVptrElfVa);
+        fillMetrics(&m, g_metrics[0]);
         updateProgress(frame, &m);
         g_sample.metrics[0] = m;
         g_sample.metricsCount = 1;
@@ -1043,6 +1229,84 @@ void pumpRaceStateProbe(unsigned long long frame) {
                           "f=%llu total_laps=%u changed=1", frame, laps);
             appendGuestBootLine(kGuestViewLogPath, "race-lap", 101, 0, detail);
         }
+    }
+
+    // THE RAW DUMP.
+    //
+    // The member offsets are proved by the guest's own member registration
+    // (m_nLapDistance +0x08, m_nTotalLaps +0x20, m_nPreviousSplineDistance
+    // +0x38, m_nTotalSplineDistanceTravelled +0x50, m_nTopGameSpeed +0x68,
+    // m_nTotalTime +0x88), and the OBJECT is proved too: the port found it
+    // through the map, matched the key "racemetrics", and checked the
+    // vptrs of both the RuleSet and the inline modifier.
+    //
+    // And yet the readings are noise. So the readings are not being trusted
+    // and the RAW WORDS are dumped instead: the field that actually counts
+    // the laps is the one that behaves like a lap counter over time, and
+    // the only way to find it is to let the data say so.
+    //
+    // One line per dump, every 30 frames, 24 words of the modifier and 28
+    // words of the RuleSet. "r=" is the modifier, "s=" is the RuleSet.
+    if (g_metricsCount > 0 && g_ruleSetRaceMetrics != 0) {
+        char raw[768];
+        int written = std::snprintf(raw, sizeof(raw), "f=%llu r=", frame);
+        for (size_t off = 0; off < 0xC0 && written > 0 &&
+             written < static_cast<int>(sizeof(raw)) - 12; off += 4) {
+            uint32_t word = 0;
+            readDword(g_metrics[0] + off, &word);
+            written += std::snprintf(raw + written,
+                                     sizeof(raw) - static_cast<size_t>(written),
+                                     "%08x", word);
+        }
+        if (written > 0 && written < static_cast<int>(sizeof(raw)) - 4) {
+            written += std::snprintf(raw + written,
+                                     sizeof(raw) - static_cast<size_t>(written),
+                                     " s=");
+            for (size_t off = 0; off < 0xE0 && written > 0 &&
+                 written < static_cast<int>(sizeof(raw)) - 12; off += 4) {
+                uint32_t word = 0;
+                readDword(g_ruleSetRaceMetrics + off, &word);
+                written += std::snprintf(raw + written,
+                                         sizeof(raw) - static_cast<size_t>(written),
+                                         "%08x", word);
+            }
+        }
+        // THE VECTOR'S ELEMENT.
+        //
+        // The RuleSet_RaceMetrics keeps a std::vector of POINTERS to the
+        // metrics modifiers (the guest's constructor pushes the address of
+        // the inline one at +0x40), so the LIVE modifier is whatever the
+        // vector's element points at. The inline copy at +0x40 is only the
+        // one the constructor made: its named members hold high-entropy
+        // values, while an UNREGISTERED member at +0x80 counts up
+        // monotonically, which is what a template that nobody updates looks
+        // like next to a live object. So the element is read here, and so is
+        // the 0xE0 bytes at the address it points to.
+        uint64_t vectorBegin = 0;
+        if (readWord(g_ruleSetRaceMetrics + 0x08, &vectorBegin) && vectorBegin != 0) {
+            uint64_t element = 0;
+            if (readWord(static_cast<uintptr_t>(vectorBegin), &element)) {
+                written += std::snprintf(raw + written,
+                                         sizeof(raw) - static_cast<size_t>(written),
+                                         " e=%llx", static_cast<unsigned long long>(element));
+                if (element != 0) {
+                    uint64_t head = 0;
+                    readWord(static_cast<uintptr_t>(element), &head);
+                    written += std::snprintf(raw + written,
+                                             sizeof(raw) - static_cast<size_t>(written),
+                                             " ev=%llx", static_cast<unsigned long long>(head));
+                    for (size_t off = 8; off < 0xA0 && written > 0 &&
+                         written < static_cast<int>(sizeof(raw)) - 12; off += 4) {
+                        uint32_t word = 0;
+                        readDword(static_cast<uintptr_t>(element) + off, &word);
+                        written += std::snprintf(raw + written,
+                                                 sizeof(raw) - static_cast<size_t>(written),
+                                                 "%08x", word);
+                    }
+                }
+            }
+        }
+        appendGuestBootLine(kGuestViewLogPath, "race-raw", 102, 0, raw);
     }
 
     updateDrive(frame, g_sample);
