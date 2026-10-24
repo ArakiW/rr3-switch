@@ -106,15 +106,66 @@ Mutex g_glyphMutex;
 
 // The faces the port can offer, in the order it prefers them.
 struct FaceChoice {
-    const char* needle;  // matched against the basename of the game's path
-    const char* romfs;   // the face inside the NRO
+    const char* file;   // the basename the guest asks for
+    const char* romfs;  // the face inside the NRO
 };
 
-constexpr FaceChoice kFaceChoices[] = {
-    {"ConduitITCPro-Bold", "romfs:/ui/ConduitITCPro-Bold.otf"},
-    {"ConduitITCPro", "romfs:/ui/ConduitITCPro-Regular.otf"},
-    {"EurostileLTStd-Bold", "romfs:/ui/EurostileLTStd-Bold.otf"},
-    {"EurostileLTStd", "romfs:/ui/EurostileLTStd-Bold.otf"},
+// THE GAME'S OWN FACES, BY EXACT NAME.
+//
+// The old table matched by SUBSTRING, which is what broke it: the needle
+// "EurostileLTStd" matches "EurostileLTStd-Demi.otf" AND
+// "EurostileLTStd.otf", and the table sent every one of them to
+// EurostileLTStd-Bold.otf. So the game's REGULAR weight was drawn bold, its
+// Demi was drawn bold, and its Ex2 was drawn bold. "ConduitITCPro" had the
+// same problem the other way: ConduitITCPro-ExtraBold.otf was drawn as
+// ConduitITCPro-Regular.otf.
+//
+// An exact name match cannot do that, and it is also what the guest asked
+// for: the guest's Java measures the UI text with the face it names, so the
+// port has to measure it with the same face or the laid-out paragraph is
+// not the paragraph the guest asked for.
+//
+// The faces that are not staged in this build simply fail to open, and the
+// caller falls back to the Conduit pair -- which is what happened before,
+// except that the log now says which face was really used.
+constexpr FaceChoice kGameFaces[] = {
+    {"ConduitITCPro-Regular.otf", "romfs:/ui/ConduitITCPro-Regular.otf"},
+    {"ConduitITCPro-Bold.otf", "romfs:/ui/ConduitITCPro-Bold.otf"},
+    {"ConduitITCPro-Medium.otf", "romfs:/ui/ConduitITCPro-Medium.otf"},
+    {"ConduitITCPro-ExtraBold.otf", "romfs:/ui/ConduitITCPro-ExtraBold.otf"},
+    {"EurostileLTStd.otf", "romfs:/ui/EurostileLTStd.otf"},
+    {"EurostileLTStd-Bold.otf", "romfs:/ui/EurostileLTStd-Bold.otf"},
+    {"EurostileLTStd-BoldEx2.otf", "romfs:/ui/EurostileLTStd-BoldEx2.otf"},
+    {"EurostileLTStd-BoldOblique.otf",
+     "romfs:/ui/EurostileLTStd-BoldOblique.otf"},
+    {"EurostileLTStd-Demi.otf", "romfs:/ui/EurostileLTStd-Demi.otf"},
+    {"EurostileLTStd-DemiOblique.otf",
+     "romfs:/ui/EurostileLTStd-DemiOblique.otf"},
+    {"EurostileLTStd-Ex2.otf", "romfs:/ui/EurostileLTStd-Ex2.otf"},
+    {"HelveticaNeueBold.ttf", "romfs:/ui/HelveticaNeueBold.ttf"},
+    {"LCD.ttf", "romfs:/ui/LCD.ttf"},
+    {"minion_pro_italic.otf", "romfs:/ui/minion_pro_italic.otf"},
+    {"myriadp0.otf", "romfs:/ui/myriadp0.otf"},
+};
+
+// THE FACES THAT ARE NOT TEXT.
+//
+// r3_symbols.ttf and r3_decals.ttf are the game's SYMBOL fonts. Measured
+// from the files: upem 2048, ascent 2.75 em, and the '0' of r3_symbols.ttf
+// advances 2.38 em with an ink box of 2.29 x 2.28 em. Those are the big
+// placeholder boxes the game draws its currency and badge art into, not
+// letters, and drawing a paragraph with them produces solid boxes.
+//
+// So the port deliberately draws those with the text face instead. It is a
+// DECISION in the source, not an accident of a missing needle, and the log
+// says when it happened.
+//
+// LCD.ttf is NOT in this list, even though its upem is 2048 too: it is the
+// game's display face for the HUD's digits, and its digit advances 0.71 em
+// with an ink box 0.62 x 1.00 em. It is used as it is.
+constexpr const char* kNonTextFaces[] = {
+    "r3_symbols.ttf",
+    "r3_decals.ttf",
 };
 
 const char* basenameOf(const char* path) {
@@ -130,25 +181,10 @@ const char* basenameOf(const char* path) {
     return last;
 }
 
-bool nameContains(const char* haystack, const char* needle) {
-    if (haystack == nullptr || needle == nullptr) {
-        return false;
-    }
-    const size_t nlen = strlen(needle);
-    if (nlen == 0) {
-        return true;
-    }
-    for (const char* p = haystack; *p != '\0'; ++p) {
-        size_t i = 0;
-        while (i < nlen && p[i] != '\0' && p[i] == needle[i]) {
-            ++i;
-        }
-        if (i == nlen) {
-            return true;
-        }
-    }
-    return false;
-}
+// (nameContains used to live here. It matched by SUBSTRING, which is what
+// sent "EurostileLTStd.otf" to the BOLD face: the exact-name table in
+// kGameFaces replaced it, and a substring match is exactly the thing that
+// must not decide which typeface a paragraph is measured with.)
 
 // The face the port draws the text with.
 //
@@ -176,19 +212,42 @@ bool nameContains(const char* haystack, const char* needle) {
 // has always used exactly these files.
 FT_Face openFace(const char* romfsPath);
 
+// Is this face one of the game's SYMBOL fonts, which the port deliberately
+// replaces with a text face? (See kNonTextFaces.)
+bool isNonTextFace(const char* base) {
+    if (base == nullptr) {
+        return false;
+    }
+    for (const char* name : kNonTextFaces) {
+        if (strcmp(base, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The face the port draws with, for a face the guest asked for.
+//
+// THE ORDER MATTERS:
+//   1. the game's own face, by EXACT name -- the one the guest measured
+//      its layout with;
+//   2. the Conduit pair, in the requested weight, for everything else.
+//
+// A face that is staged but not present in this build fails to open and
+// falls through to (2), which is what the port did before this table
+// existed.
 FT_Face openFaceFor(const char* requestedPath, bool bold) {
     const char* base = basenameOf(requestedPath);
-    for (const FaceChoice& choice : kFaceChoices) {
-        if (!nameContains(base, choice.needle)) {
+    for (const FaceChoice& choice : kGameFaces) {
+        if (strcmp(base, choice.file) != 0) {
             continue;
         }
-        const bool isBold = nameContains(choice.needle, "Bold");
-        if (isBold == bold) {
-            FT_Face face = openFace(choice.romfs);
-            if (face != nullptr) {
-                return face;
-            }
+        FT_Face face = openFace(choice.romfs);
+        if (face != nullptr) {
+            return face;
         }
+        // Not staged in this build: fall through to the family fallback.
+        break;
     }
     return openFace(bold ? "romfs:/ui/ConduitITCPro-Bold.otf"
                           : "romfs:/ui/ConduitITCPro-Regular.otf");
@@ -212,6 +271,32 @@ FT_Face openFace(const char* romfsPath) {
     snprintf(slot.key, sizeof(slot.key), "%s", romfsPath);
     ++g_faceCount;
     return face;
+}
+
+// The romfs path of a face that is already open, or "" when it is not one
+// of ours.
+//
+// THIS IS WHAT MAKES THE LOG HONEST. The old log line printed the path the
+// GUEST ASKED FOR together with the metrics of the face the port ACTUALLY
+// opened, and its openErr was a literal 0. So a line read
+//
+//     face=sdmc:/.../r3_symbols.ttf openErr=0 size=175.0 upem=1000
+//
+// and every reader -- including this project -- concluded that the symbol
+// font was a 1000-upem text face with 653 glyphs. It was not: the port was
+// drawing ConduitITCPro-Regular and calling it by the symbol font's name.
+//
+// The face's real identity is now reported next to the request.
+const char* facePath(FT_Face face) {
+    if (face == nullptr) {
+        return "";
+    }
+    for (size_t i = 0; i < g_faceCount; ++i) {
+        if (g_faces[i].face == face) {
+            return g_faces[i].key;
+        }
+    }
+    return "";
 }
 
 // The Chinese face, opened on demand. It is a big file, so it is only
@@ -671,11 +756,19 @@ void noteFace(const char* romfsPath, FT_Face face, FT_Error error, float sizePx,
     const float descent = face != nullptr && face->size != nullptr
                               ? static_cast<float>(-face->size->metrics.descender) / 64.f
                               : 0.f;
-    char details[288];
+    // THE FACE THAT WAS REALLY OPENED. `romfsPath` is what the guest asked
+    // for; the face may be a different file entirely, and the difference
+    // has to be visible in the log.
+    const char* actual = facePath(face);
+    char details[384];
     snprintf(details, sizeof(details),
-             "face=%s openErr=%d sizeErr=%d size=%.1f upem=%.0f ascentPx=%.1f "
-             "descentPx=%.1f scalable=%d glyphs=%ld",
-             romfsPath, (int)error, (int)sizeError, sizePx, em, ascent, descent,
+             "req=%s face=%s substituted=%d symbol=%d openErr=%d sizeErr=%d "
+             "size=%.1f upem=%.0f ascentPx=%.1f descentPx=%.1f scalable=%d "
+             "glyphs=%ld",
+             romfsPath, actual,
+             (actual != nullptr && strcmp(actual, romfsPath) != 0) ? 1 : 0,
+             isNonTextFace(basenameOf(romfsPath)) ? 1 : 0,
+             (int)error, (int)sizeError, sizePx, em, ascent, descent,
              face != nullptr ? (face->face_flags & FT_FACE_FLAG_SCALABLE) ? 1 : 0 : 0,
              face != nullptr ? static_cast<long>(face->num_glyphs) : 0L);
     rr3::guestViewWideLog("glyph-face", 0, 0, details);

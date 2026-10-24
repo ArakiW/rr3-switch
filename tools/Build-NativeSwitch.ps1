@@ -51,19 +51,63 @@ foreach ($dependencyName in $dependencyNames) {
 # animation tracks in their original relative layout. The bootstrap shell uses
 # the original Latin faces immediately; the rehosted game receives the original
 # localization and .banim data unchanged once its content VFS is active.
-$fontAssets = @(
+#
+# THE GAME ASKS FOR FOURTEEN FACES BY NAME (measured from the guest's own
+# log), and the guest's Java measures the UI text with the face it asked
+# for. So the port has to measure it with the SAME face: a different face
+# has different per-glyph advances, and the laid-out paragraph stops being
+# the paragraph the guest asked for.
+#
+# The two Conduit faces are REQUIRED -- they are the port's universal
+# fallback for every face it does not have. The rest are copied when they
+# are staged, and their absence is REPORTED rather than fatal, because the
+# port then draws that text with the fallback, which is exactly what it did
+# before, and the guest log now says which face it really used.
+#
+# tools\stage_rr3_fonts.py puts the game's own faces in
+# analysis\rr3-ui-source\files\.depot (an EA asset area, excluded by
+# .gitignore); this script only copies them out of it.
+$requiredFontAssets = @(
     'ConduitITCPro-Regular.otf'
     'ConduitITCPro-Bold.otf'
+)
+$optionalFontAssets = @(
+    'ConduitITCPro-Medium.otf'
+    'ConduitITCPro-ExtraBold.otf'
+    'EurostileLTStd.otf'
     'EurostileLTStd-Bold.otf'
+    'EurostileLTStd-BoldEx2.otf'
+    'EurostileLTStd-BoldOblique.otf'
+    'EurostileLTStd-Demi.otf'
+    'EurostileLTStd-DemiOblique.otf'
+    'EurostileLTStd-Ex2.otf'
+    'HelveticaNeueBold.ttf'
+    'LCD.ttf'
+    'minion_pro_italic.otf'
+    'myriadp0.otf'
 )
 $fontDestination = Join-Path $romfsRoot 'ui'
 New-Item -ItemType Directory -Force -Path $fontDestination | Out-Null
-foreach ($assetName in $fontAssets) {
+foreach ($assetName in $requiredFontAssets) {
     $assetSource = Join-Path $originalDepotRoot $assetName
     if (-not (Test-Path $assetSource -PathType Leaf)) {
         throw "Missing original UI font: $assetSource"
     }
     Copy-Item -LiteralPath $assetSource -Destination (Join-Path $fontDestination $assetName) -Force
+}
+$missingOptionalFonts = @()
+foreach ($assetName in $optionalFontAssets) {
+    $assetSource = Join-Path $originalDepotRoot $assetName
+    if (-not (Test-Path $assetSource -PathType Leaf)) {
+        $missingOptionalFonts += $assetName
+        continue
+    }
+    Copy-Item -LiteralPath $assetSource -Destination (Join-Path $fontDestination $assetName) -Force
+}
+if ($missingOptionalFonts.Count -gt 0) {
+    Write-Host ("font     : {0} of the game's own faces are NOT staged, so text that asks for them will be drawn with the Conduit fallback: {1}" -f `
+        $missingOptionalFonts.Count, ($missingOptionalFonts -join ', '))
+    Write-Host ("           stage them with: python tools\stage_rr3_fonts.py <data-pack.zip>")
 }
 $bootstrapChineseFont = Join-Path $fontDestination 'NotoSansCJKsc-RR3Bootstrap.otf'
 $bootstrapFontLicense = Join-Path $romfsRoot 'licenses\Noto-CJK-OFL.txt'
