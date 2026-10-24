@@ -26,6 +26,16 @@ def main() -> None:
     assert "kBtnY = 3" in source
     assert "kAxisLThumbX = 0" in source
     assert "kAxisRTrigger = 5" in source
+    # ZR IS ALSO THE THROTTLE. The guest's own profile binds the accelerator
+    # to "button 0 (A) | axis 5 (RT) | button 7 (R2)", and the port maps ZR
+    # onto button 7 -- which is what the profile's name says. But MEASURED,
+    # button 7 does not accelerate: with only button 7 held the guest draws
+    # its own "hold the brake to reverse" message, which is the guest saying
+    # the car is NOT moving (archive 20261024-135257-eden-thr-btnR2; the
+    # same run with button 0 injected has no such message). So on a real
+    # Switch the right trigger would be dead, and it is the accelerator's
+    # natural home. ZR therefore also drives the guest's button 0.
+    assert "HidNpadButton_A | HidNpadButton_ZR" in source
     # Frame loop must pump input and keep EGL when workers live.
     assert "pumpGuestControllerInput" in probe
     assert "connectGuestController" in probe

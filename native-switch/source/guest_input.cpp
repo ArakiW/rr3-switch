@@ -458,9 +458,27 @@ void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
         emitAxis(jniEnvironment, activityObject, deviceId, scripted.rightTrigger,
                  kAxisRTrigger, &g_lastRt);
     } else {
+    // ZR IS THE RIGHT TRIGGER, AND IT IS ALSO THE THROTTLE.
+    //
+    // The guest's own profile binds the accelerator to "button 0 (A) |
+    // axis 5 (RT) | button 7 (R2)", and the port maps the Switch's ZR onto
+    // button 7 -- which is what the profile's name says. But MEASURED, it
+    // does not accelerate: with only button 7 held the guest draws its own
+    // "hold the brake to reverse" message, which is the guest saying the
+    // car is NOT moving. (Archive 20261024-135257-eden-thr-btnR2: the
+    // port injected 0x80, the guest's own controller held button 7, and
+    // the guest's own message said the car was standing still. The same
+    // run with button 0 injected has no such message.)
+    //
+    // So on a real Switch the right trigger would be DEAD, which is no
+    // good for a racing game: the trigger is where the throttle belongs.
+    // ZR therefore also drives the guest's button 0, the accelerator that
+    // is measured to work. The button 7 press is left alone: the profile
+    // calls it the accelerator too, and it does no harm.
     static constexpr uint64_t kFaceMasks[] = {
-        HidNpadButton_A, HidNpadButton_B, HidNpadButton_X, HidNpadButton_Y,
-        HidNpadButton_L, HidNpadButton_R, HidNpadButton_ZL, HidNpadButton_ZR,
+        HidNpadButton_A | HidNpadButton_ZR, HidNpadButton_B, HidNpadButton_X,
+        HidNpadButton_Y, HidNpadButton_L, HidNpadButton_R, HidNpadButton_ZL,
+        HidNpadButton_ZR,
     };
     static constexpr int kFaceOrdinals[] = {
         kBtnA, kBtnB, kBtnX, kBtnY, kBtnL1, kBtnR1, kBtnL2, kBtnR2,
