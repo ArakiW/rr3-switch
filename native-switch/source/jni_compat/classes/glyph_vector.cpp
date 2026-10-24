@@ -687,7 +687,25 @@ struct RenderState {
     bool hasLayout;
 };
 
-constexpr size_t kStateCount = 24;
+// THE TABLE HAS TO COVER EVERY LIVE GlyphVector.
+//
+// The port's fake-object pool (jni_bridge.cpp, kFakeObjectSlots = 512) hands
+// out one handle per live Java object, and one run of the guest created 516
+// of them (the pool logged 4 recycles) -- so at most 516 GlyphVector states
+// can be alive at the same time.
+//
+// This table used to hold 24, which is SMALLER than the number of objects
+// the guest keeps alive. The layout that init() measured was therefore
+// thrown away before createTexture() could rasterise it: the guest called
+// createTexture 4045 times in that run and only 140 of them produced a
+// texture. The other 3905 returned 0, and every paragraph they carried was
+// invisible on screen -- the empty description bubble under the career card
+// was one of them.
+//
+// The size is twice the pool on purpose. The pool recycles its slots, so a
+// handle can come back around while a state for it is still in the table;
+// the table must never be the thing that runs out of room first.
+constexpr size_t kStateCount = 1024;
 RenderState g_states[kStateCount];
 
 RenderState* stateFor(uintptr_t object) {
@@ -712,18 +730,22 @@ RenderState* acquireState(uintptr_t object) {
         }
     }
     if (slot == nullptr) {
-        // Every slot is busy: reuse the first one. The guest draws each
-        // paragraph inside its own frame, so the oldest slot is the one that
-        // has been waiting longest.
+        // Every slot is busy. With kStateCount at twice the object pool's
+        // slot count this cannot happen for a guest that lives inside the
+        // pool, so this is the safety net: reuse a slot and CLEAR its
+        // layout, because a stale layout paired with a fresh text would
+        // rasterise the wrong glyphs.
         slot = &g_states[0];
         free(slot->text);
-        slot->text = nullptr;
-        slot->textLen = 0;
     }
     slot->inUse = true;
     slot->object = object;
     slot->text = nullptr;
     slot->textLen = 0;
+    // The layout belongs to the text that was just measured. Clearing it
+    // here means a slot that is handed out again can never carry the
+    // previous object's layout into a new raster.
+    slot->hasLayout = false;
     slot->sizePx = 48.f;
     slot->widthScale = 1.f;
     slot->bold = false;
@@ -740,13 +762,24 @@ RenderState* acquireState(uintptr_t object) {
 // the difference is not visible in a screenshot.
 void noteFace(const char* romfsPath, FT_Face face, FT_Error error, float sizePx,
               FT_Error sizeError) {
-    static char lastKey[96] = {0};
+    // The dedup key has to be kept PER (path, size), not as one global "last
+    // key". uploadTexture() reports the requested face and the CJK fallback
+    // in turn, so a single global key alternates for ever and the dedup never
+    // fires: one run logged 50,064 of these lines for 4,045 createTexture()
+    // calls, which is most of a 60 MB log.
+    static char seenKeys[8][96] = {{0}};
+    static size_t seenCount = 0;
     char key[96];
     snprintf(key, sizeof(key), "%s|%.1f", romfsPath, sizePx);
-    if (strcmp(lastKey, key) == 0) {
-        return;
+    for (size_t i = 0; i < seenCount; ++i) {
+        if (strcmp(seenKeys[i], key) == 0) {
+            return;
+        }
     }
-    snprintf(lastKey, sizeof(lastKey), "%s", key);
+    if (seenCount < 8) {
+        snprintf(seenKeys[seenCount], sizeof(seenKeys[seenCount]), "%s", key);
+        ++seenCount;
+    }
     const float em = face != nullptr && face->size != nullptr
                          ? static_cast<float>(face->units_per_EM)
                          : 0.f;
@@ -1164,6 +1197,64 @@ void renderText(uintptr_t self, uintptr_t fontHandle, const char* text,
     noteGlyphVector(paragraph ? "initWithParagraph" : "init", facade, textLen, request.sizePx, text);
 }
 
+// WHY A createTexture() CALL REFUSED TO MAKE A TEXTURE.
+//
+// "The paragraph is invisible on screen" and "the paragraph was never
+// rasterised" are different bugs, and the difference is not visible in a
+// screenshot. The port used to answer 0 with nothing said, so 3905 failed
+// calls looked exactly like 3905 calls that had nothing to say.
+//
+// Each reason is counted, and the first time it happens -- and then every
+// 64th time -- it is logged with the running count, so a run that fails
+// thousands of times does not write thousands of lines.
+enum TexFail {
+    kTexFailNoFacade = 0,
+    kTexFailNoState,
+    kTexFailNoLayout,
+    kTexFailNoText,
+    kTexFailNoLibrary,
+    kTexFailNoFace,
+    kTexFailBadSize,
+    kTexFailNoCoverage,
+    kTexFailNoTexels,
+    kTexFailNoGlTexture,
+    kTexFailCount,
+};
+
+const char* texFailName(int reason) {
+    switch (reason) {
+        case kTexFailNoFacade: return "no-facade";
+        case kTexFailNoState: return "no-state";
+        case kTexFailNoLayout: return "no-layout";
+        case kTexFailNoText: return "no-text";
+        case kTexFailNoLibrary: return "no-library";
+        case kTexFailNoFace: return "no-face";
+        case kTexFailBadSize: return "bad-size";
+        case kTexFailNoCoverage: return "no-coverage-buffer";
+        case kTexFailNoTexels: return "no-texel-buffer";
+        case kTexFailNoGlTexture: return "glGenTextures-failed";
+        default: return "unknown";
+    }
+}
+
+unsigned g_texFailCounts[kTexFailCount] = {0};
+bool g_texFailSeen[kTexFailCount] = {0};
+
+void noteTextureFailure(int reason, const char* detail) {
+    if (reason < 0 || reason >= kTexFailCount) {
+        return;
+    }
+    const unsigned count = ++g_texFailCounts[reason];
+    if (g_texFailSeen[reason] && (count % 64u) != 0u) {
+        return;
+    }
+    g_texFailSeen[reason] = true;
+    char text[384];
+    snprintf(text, sizeof(text), "reason=%s count=%u %s", texFailName(reason), count,
+             detail != nullptr ? detail : "");
+    rr3::guestViewWideLog("glyph-tex-fail", 0, 0, text);
+}
+
 // Rasterises the measured layout and uploads it as a GL texture.
 //
 // This is the Java's createTexture(): a power-of-two texture holding the
@@ -1175,17 +1266,31 @@ void renderText(uintptr_t self, uintptr_t fontHandle, const char* text,
 bool uploadTexture(uintptr_t self) {
     GlyphVectorFacade* facade = facadeFor(self);
     if (facade == nullptr) {
+        noteTextureFailure(kTexFailNoFacade, "the object has no GlyphVector facade");
         return false;
     }
     RenderState* state = stateFor(self);
-    if (state == nullptr || !state->hasLayout || state->text == nullptr) {
+    if (state == nullptr) {
+        noteTextureFailure(kTexFailNoState,
+                           "no state for this object: the layout was evicted");
+        return false;
+    }
+    if (!state->hasLayout) {
+        noteTextureFailure(kTexFailNoLayout,
+                           "the state has no layout: init() never measured this one");
+        return false;
+    }
+    if (state->text == nullptr) {
+        noteTextureFailure(kTexFailNoText, "the measured text was not kept");
         return false;
     }
     if (g_library == nullptr) {
+        noteTextureFailure(kTexFailNoLibrary, "FreeType is not loaded");
         return false;
     }
     FT_Face face = openFaceFor(state->fontPath, state->bold);
     if (face == nullptr) {
+        noteTextureFailure(kTexFailNoFace, state->fontPath);
         return false;
     }
     {
@@ -1202,12 +1307,17 @@ bool uploadTexture(uintptr_t self) {
     const int textureWidth = plan.textureWidth;
     const int textureHeight = plan.textureHeight;
     if (textureWidth <= 0 || textureHeight <= 0) {
+        char detail[128];
+        snprintf(detail, sizeof(detail), "planned texture=%dx%d",
+                 textureWidth, textureHeight);
+        noteTextureFailure(kTexFailBadSize, detail);
         return false;
     }
     uint8_t* coverage =
         growBuffer(g_coverage, g_coverageCapacity,
                    static_cast<size_t>(textureWidth) * static_cast<size_t>(textureHeight));
     if (coverage == nullptr) {
+        noteTextureFailure(kTexFailNoCoverage, "the coverage buffer could not grow");
         return false;
     }
     if (plan.paragraph) {
@@ -1238,6 +1348,7 @@ bool uploadTexture(uintptr_t self) {
     ::glGenTextures(1, &texture);
     if (texture == 0) {
         facade->texId = -1;
+        noteTextureFailure(kTexFailNoGlTexture, "glGenTextures returned 0");
         return false;
     }
     uint8_t* texels =
@@ -1246,6 +1357,7 @@ bool uploadTexture(uintptr_t self) {
     if (texels == nullptr) {
         ::glDeleteTextures(1, &texture);
         facade->texId = -1;
+        noteTextureFailure(kTexFailNoTexels, "the RGBA texel buffer could not grow");
         return false;
     }
     const size_t pixels =
