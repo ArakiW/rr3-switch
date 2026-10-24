@@ -178,6 +178,47 @@ bool connectGuestController(void* jniEnvironment, void* activityObject,
     }
     auto newString = reinterpret_cast<void* (*)(void*, const char*)>(table[167]);
     void* name = newString(jniEnvironment, "Nintendo Switch Pro Controller");
+    // The description below is NOT the key the guest's profile matcher uses.
+    // Measured, not guessed:
+    //
+    //  * The guest keys a joystick profile on the device DESCRIPTION, and the
+    //    sections it looks for are the names in the guest's own
+    //    files/.depot/joystick_config.txt.
+    //  * The guest logs the description it matched on, and it logs it EMPTY:
+    //      "Cannot find description for device:  using default:
+    //       [Android Gamepad Extended]"
+    //    (seen in every archive under .build/eden-runs, e.g.
+    //     20261024-134104-eden-thr-btnA).
+    //  * Passing a description that IS a section of that file
+    //    ("vendor:3727 product:3") changes nothing: the same empty
+    //    description and the same fallback profile are logged
+    //    (archive 20261024-142544-eden-desc-axis5).
+    //  * The reason is in the guest's own code: ControllerConnectedJNI
+    //    (libRealRacing3.so, ELF 0x12aa450) creates the joystick manager
+    //    first (0x12aa4dc) and only afterwards hands the name and the
+    //    description to the controller (setDeviceInfo, 0x12aa514). The
+    //    profile is chosen during the creation, from the manager's own
+    //    device description, so the description this port passes arrives
+    //    too late to influence it.
+    //
+    // So the fallback profile is the one that is in force, and it is a
+    // complete gamepad profile:
+    //
+    //   [Android Gamepad Extended]
+    //     accel  = button 0 (A) | axis 5 (RT) | button 7 (R2)
+    //     brake  = button 2 (X) | axis 4 (LT) | button 6 (L2)
+    //     steering = axis 0, steering_left/right = button 8/9
+    //
+    // and the throttle that drives the car is BUTTON 0 (the A button),
+    // measured in 20261024-134104-eden-thr-btnA: with button 0 held the
+    // guest's own frames show the car accelerating down the front straight
+    // with the exhaust flame lit, and with button 7 (R2) alone the guest
+    // draws its own "hold the brake to reverse" message at frame 1991
+    // (20261024-135257-eden-thr-btnR2), i.e. the car had stopped.
+    //
+    // The port therefore keeps its own description: there is no profile for
+    // it to select, and the fallback profile already binds every control the
+    // port can deliver.
     void* desc = newString(jniEnvironment, "switch-joycon-pair");
     constexpr int kAllButtonFlags =
         1 | 2 | 4 | 8 | 16 | 32 | 64 | 128 | 256 | 512;
