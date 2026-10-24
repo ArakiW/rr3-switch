@@ -142,7 +142,27 @@ Write-Host ("card     : {0} files, {1:N0} bytes on the SD card before the run" -
 
 foreach ($marker in $markers) {
     if (Test-Path $marker -PathType Leaf) {
-        Move-Item -LiteralPath $marker -Destination (Join-Path $stash (Split-Path $marker -Leaf)) -Force
+        # The emulator may still hold the previous run's log open for a moment
+        # after it exits, and a Move-Item that loses that race kills the whole
+        # run before it starts. Measured 2026-10-24: the harness died with
+        # "The process cannot access the file because it is being used by
+        # another process" on the guest-view log, and the run never happened.
+        # So the move is retried a bounded number of times.
+        $moved = $false
+        for ($attempt = 0; $attempt -lt 10 -and -not $moved; $attempt++) {
+            try {
+                Move-Item -LiteralPath $marker -Destination (Join-Path $stash (Split-Path $marker -Leaf)) -Force -ErrorAction Stop
+                $moved = $true
+            }
+            catch {
+                if ($attempt -eq 9) {
+                    Write-Host ("warn    : could not move {0} aside ({1}); it will be overwritten by this run" -f (Split-Path $marker -Leaf), $_.Exception.Message)
+                }
+                else {
+                    Start-Sleep -Seconds 2
+                }
+            }
+        }
     }
 }
 
