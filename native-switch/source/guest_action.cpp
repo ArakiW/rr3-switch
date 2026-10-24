@@ -98,20 +98,69 @@ bool isAllowed(const char* name) {
 // GUEST'S HEAP, so reading it needs the readability check the other probes
 // use: a plain dereference of a stale pointer is a fault, and a diagnostic
 // that can fault the run it is measuring is worse than no diagnostic.
+//
+// THE PLAUSIBILITY CHECK COMES FIRST, AND IT IS NOT OPTIONAL. Measured
+// 2026-10-25: this module called svcQueryMemory with a wild address
+// (0x369B98C5D0, a value read out of a name entry the guest had not
+// finished building) and Eden's kernel service handler faulted on it --
+// the port died at frame 7, before the front end was even up. The crash
+// address was inside libnx's svcSendSyncRequest, and the port's own
+// sampler recorded it: "pc_img=host-nro pc_off=0x58b70c".
+//
+// The other probes in this project get the order right: the plausibility
+// gate first, and only then the kernel query. The guest's address space
+// tops out well below 2^47, so an address outside that range is an
+// INTEGER that was mistaken for a pointer, and asking the kernel about it
+// is how the port dies.
+constexpr uintptr_t kPlausibleLo = 0x10000ULL;
+constexpr uintptr_t kPlausibleHi = 0x0000800000000000ULL;
+
+bool pointerPlausible(uintptr_t address) {
+    return address >= kPlausibleLo && address < kPlausibleHi;
+}
+
 bool guestReadable(uintptr_t address) {
-    if (address == 0) {
+    if (!pointerPlausible(address)) {
         return false;
+    }
+    // THE PAGE CACHE. A long name's characters are read one at a time (a
+    // bulk copy could cross into an unmapped page), and each character would
+    // otherwise cost a kernel query. Sixteen entries is enough for the few
+    // pages a name spans.
+    //
+    // The cache is keyed on the PAGE, not on the address, so a name that
+    // crosses a page boundary costs two queries and not one per character.
+    static uintptr_t s_page[16] = {0};
+    static bool s_readable[16] = {false};
+    static bool s_valid[16] = {false};
+    constexpr uintptr_t kPageMask = ~static_cast<uintptr_t>(0xFFF);
+    const uintptr_t page = address & kPageMask;
+    int freeSlot = -1;
+    for (int i = 0; i < 16; ++i) {
+        if (s_valid[i] && s_page[i] == page) {
+            return s_readable[i];
+        }
+        if (freeSlot < 0 && !s_valid[i]) {
+            freeSlot = i;
+        }
     }
     MemoryInfo info{};
     u32 pageInfo = 0;
-    if (R_FAILED(svcQueryMemory(&info, &pageInfo, static_cast<u64>(address)))) {
-        return false;
-    }
-    return (info.perm & Perm_R) != 0;
+    const bool readable =
+        !R_FAILED(svcQueryMemory(&info, &pageInfo, static_cast<u64>(address))) &&
+        (info.perm & Perm_R) != 0;
+    const int slot = (freeSlot >= 0) ? freeSlot : 0;
+    s_page[slot] = page;
+    s_readable[slot] = readable;
+    s_valid[slot] = true;
+    return readable;
 }
 
 bool readGuestBytes(uintptr_t address, void* out, size_t bytes) {
     if (address == 0 || out == nullptr || bytes == 0) {
+        return false;
+    }
+    if (!pointerPlausible(address)) {
         return false;
     }
     if (!guestImageContains(address, bytes)) {
@@ -172,7 +221,12 @@ bool readActionName(uintptr_t bias, uint64_t index, char* out,
         }
         chars = entry + 1;
     }
-    if (length + 1 > outCapacity) {
+    // THE LENGTH IS CAPPED WITHOUT OVERFLOW. The guest's length is a u64, and
+    // the obvious test -- "length + 1 > outCapacity" -- overflows for a length
+    // of 0xffffffffffffffff: the sum becomes 0, the test is false, and the
+    // loop below walks 2^64 bytes. The comparison is written so that it
+    // cannot.
+    if (length >= outCapacity) {
         length = outCapacity - 1;
     }
     for (uint64_t i = 0; i < length; ++i) {
@@ -193,6 +247,14 @@ bool readActionName(uintptr_t bias, uint64_t index, char* out,
 // Finds a command's index by NAME in the guest's own name table.
 bool findActionIndex(uintptr_t bias, const char* name, uint64_t* outIndex) {
     if (name == nullptr || outIndex == nullptr) {
+        return false;
+    }
+    // THE TABLE HAS TO BE BUILT FIRST. The guest fills the table during its
+    // own start-up, and until it does every entry is zero. Reading the
+    // FIRST entry's flag byte is therefore the cheap test for "the table
+    // exists", and it saves walking 317 entries on every attempt.
+    uint8_t first = 0;
+    if (!readGuestBytes(bias + kActionNameTableVa, &first, 1) || first == 0) {
         return false;
     }
     char candidate[128];
@@ -216,6 +278,7 @@ namespace {
 struct PendingAction {
     char name[128];
     unsigned long long atFrame{};
+    unsigned attempts{};
     bool done{};
     bool refused{};
 };
@@ -225,7 +288,14 @@ constexpr size_t kMaxPendingActions = 8;
 PendingAction g_pending[kMaxPendingActions];
 size_t g_pendingCount = 0;
 bool g_confRead = false;
+unsigned g_confAttempts = 0;
+bool g_allDoneLogged = false;
 unsigned long long g_lastAttemptFrame = 0;
+
+// Defined below; the conf reader needs it to report a file it could not
+// open, which is the only thing that says "the pump is doing nothing".
+void logAction(const char* phase, unsigned long long ordinal,
+               const char* details);
 
 // How often the pending list is retried. The name table only exists once
 // the guest has built it, so the first attempts are expected to fail; a
@@ -233,11 +303,27 @@ unsigned long long g_lastAttemptFrame = 0;
 constexpr unsigned long long kAttemptPeriodFrames = 60ULL;
 
 void readActionConf() {
-    g_confRead = true;
     std::FILE* file = std::fopen(kActionConfPath, "rb");
     if (file == nullptr) {
+        // NOT READ YET, SO NOT "read". The control file lives on the SD
+        // card, and the card is not necessarily there on the first frame the
+        // pump runs. The first version of this set the "read" flag before it
+        // opened the file, so a card that was not mounted yet left the pump
+        // permanently empty -- and it said nothing, because there was no
+        // line to say it with. The flag is now set only when the file was
+        // actually opened, and the attempt is logged either way.
+        g_confAttempts++;
+        if (g_confAttempts == 1U || g_confAttempts == 20U) {
+            char details[192];
+            std::snprintf(details, sizeof(details),
+                          "conf=%s open=0 attempts=%u pending=%zu "
+                          "reason=the-control-file-is-not-readable-yet",
+                          kActionConfPath, g_confAttempts, g_pendingCount);
+            logAction("guest-action", 108, details);
+        }
         return;
     }
+    g_confRead = true;
     char line[256];
     while (std::fgets(line, sizeof(line), file) != nullptr) {
         char* hash = std::strchr(line, '#');
@@ -339,6 +425,20 @@ void pumpGuestActions(unsigned long long frame) {
         }
         uint64_t index = 0;
         if (!findActionIndex(bias, entry.name, &index)) {
+            // A COMMAND THAT IS NEVER FOUND IS REPORTED, NOT SWALLOWED. The
+            // name table only exists once the guest has built it, so the first
+            // attempts are expected to fail; after a while, a name that is
+            // still missing is a fact about the guest, and a silent retry
+            // would hide it.
+            ++entry.attempts;
+            if (entry.attempts == 20U) {
+                char details[192];
+                std::snprintf(details, sizeof(details),
+                              "name=\"%.120s\" found=0 attempts=%u "
+                              "reason=not-in-the-guest-name-table",
+                              entry.name, entry.attempts);
+                logAction("guest-action", 110 + static_cast<unsigned>(i), details);
+            }
             allDone = false;
             continue;
         }
@@ -381,7 +481,8 @@ void pumpGuestActions(unsigned long long frame) {
         std::snprintf(after, sizeof(after), "%s calling=1 called=1", before);
         logAction("guest-action", 110 + static_cast<unsigned>(i), after);
     }
-    if (allDone) {
+    if (allDone && !g_allDoneLogged) {
+        g_allDoneLogged = true;
         char details[96];
         std::snprintf(details, sizeof(details), "pending=%zu all-done=1",
                       g_pendingCount);

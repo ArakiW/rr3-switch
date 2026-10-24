@@ -399,6 +399,16 @@ void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
     // card, and the hardware path stands down for it -- so the two never
     // inject in the same frame.
     pumpGuestTouchHardware(jniEnvironment, activityObject);
+    // The guest's OWN action commands run here, and for the same reason the
+    // input is pumped here: this is the frame-loop thread, just before the
+    // guest's render call, so the guest's state is consistent and the call
+    // is in the same place the port already calls into the guest.
+    //
+    // It is BEFORE the controller's early-out on purpose. A command is
+    // about the GAME, not about the controller, and a command that waits
+    // for a controller to be connected is a command that never runs in a
+    // run where the port is driving the input itself.
+    pumpGuestActions(g_frameCounter);
     if (!g_ready || jniEnvironment == nullptr || padOpaque == nullptr) {
         return;
     }
@@ -484,12 +494,6 @@ void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
     static constexpr int kFaceOrdinals[] = {
         kBtnA, kBtnB, kBtnX, kBtnY, kBtnL1, kBtnR1, kBtnL2, kBtnR2,
     };
-    // The guest's OWN action commands run here, and for the same reason the
-    // input is pumped here: this is the frame-loop thread, just before the
-    // guest's render call, so the guest's state is consistent and the call
-    // is in the same place the port already calls into the guest.
-    pumpGuestActions(g_frameCounter);
-
     // The closed loop's overrides are folded into the held mask BEFORE any
     // button is pushed, so the guest sees exactly one state per frame.
     uint64_t effective = held;
