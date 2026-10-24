@@ -430,7 +430,20 @@ $summary = [ordered]@{
     pixelsTotal         = 0
     pixelBins           = ''
     msEventMapScreen    = 0   # "EventMapScreen"
-    msMainMenuLiteral   = 0   # "MainMenu"    (WEAK -- see the note above)
+    # THE RACE MARKERS. These come from the GUEST'S OWN log, and they are the
+    # only reliable way to tell "the guest is in a race" from "the guest is
+    # showing a 3-D attract scene of a race" -- which look identical in a
+    # framebuffer capture and which have already been confused once.
+    #
+    # The port's own front-end probe field `guiclass` CANNOT do this: it reads
+    # a screen-manager member that is written once in the constructor, and it
+    # reads exactly the same value in a race (164 samples) and out of one
+    # (102 samples). It is a live-looking number that carries no information
+    # about the visible screen, so it is not used as a criterion here.
+    msStartLights       = 0   # "StartLightsScreen"  (the race's start sequence)
+    msRaceScreen        = 0   # "InGameScreen"      (the race itself)
+    msRaceHud           = 0   # "Reload HUD planes" (the race HUD was built)
+    msRaceObjective     = 0   # the race-only objective text
     msAstFilesOnCard    = 0   # *.ast on the card: the physical proof the .ast round trip works
     # The last front-end gate reading, verbatim. This is THE measurement that says
     # which of the three gates in the guest's front-end entry (0xa679a0) is
@@ -567,7 +580,12 @@ if ($guestLogArchived -eq 'archived') {
     #   msStat22         -- did the guest hit a path the port could not resolve?
     #   msTwosquare      -- did the guest ask for the front-end menu layout?
     #   msEventMapScreen -- did the guest ever name the front-end screen?
-    #   msMainMenuLiteral-- WEAK, kept only so the change in it stays visible.
+    #   msRaceScreen    -- did the guest reach the race screen?  This is the
+    #                       "in a race" criterion.  The port's own
+    #                       `guiclass` probe field CANNOT answer it: it reads
+    #                       a screen-manager member written once in the
+    #                       constructor, and it reads the same value in a
+    #                       race and out of one, so it is not used here.
     $summary.msLoadComplete    = [regex]::Matches($guestText, 'Total load time to end of load').Count
     $summary.msMd5Mismatch     = [regex]::Matches($guestText, "didn't match its MD5").Count
     $summary.msAssetComplete   = [regex]::Matches($guestText, 'ASSET COMPLETE').Count
@@ -595,7 +613,19 @@ if ($guestLogArchived -eq 'archived') {
     $summary.msMainMenuLayouts = [regex]::Matches(
         $guestText, 'gui/processed/main_menu/').Count
     $summary.msEventMapScreen  = [regex]::Matches($guestText, 'EventMapScreen').Count
-    $summary.msMainMenuLiteral = [regex]::Matches($guestText, 'MainMenu').Count
+    # The race markers. A race screen, the start lights and the race HUD are
+    # three INDEPENDENT facts, and the objective text is a fourth: it is
+    # localised Chinese, so it only appears when the localisation pipeline
+    # works, which makes it a good cross-check on the other three.
+    $summary.msStartLights = [regex]::Matches($guestText, 'StartLightsScreen').Count
+    $summary.msRaceScreen  = [regex]::Matches($guestText, 'InGameScreen').Count
+    $summary.msRaceHud     = [regex]::Matches($guestText, 'Reload HUD planes').Count
+    # The race-only objective text is CHINESE, so it is written as \u escapes:
+    # PowerShell 5.1 reads a BOM-less file as ANSI, and a literal Chinese
+    # string in the source both breaks the parser and stops matching at
+    # runtime. The escapes are pure ASCII and still match the guest's text.
+    # U+5B8C U+6210 U+4E00 U+5708 = the guest's "complete a lap" objective.
+    $summary.msRaceObjective = [regex]::Matches($guestText, '\u5B8C\u6210\u4E00\u5708').Count
     # The last front-end gate line and the last loading-state line, verbatim.
     # "ctrl=ok" is the probe's own positive control; "ctrl=fail" invalidates
     # the whole line, so the line has to be read together with its control.
@@ -698,8 +728,11 @@ $runSummaryPath = Join-Path $archive 'run-summary.txt'
     ('  .ast files on the card   {0}   (want > 0 when assets were downloaded)' -f $summary.msAstFilesOnCard)
     ('  front-end layout opened  {0}   ("gui/processed/main_menu/main_menu_twosquare.gui" in the PORT trace -- want > 0 for the main menu panel)' -f $summary.msTwosquare)
     ('  main menu layouts open   {0}   (gui/processed/main_menu/ -- want > 0 once the front end is up)' -f $summary.msMainMenuLayouts)
-    ('  EventMapScreen           {0}   (want > 0 for the menu)' -f $summary.msEventMapScreen)
-    ('  "MainMenu" literal       {0}   (WEAK instrument, see the note in this script)' -f $summary.msMainMenuLiteral)
+    ('  EventMapScreen           {0}   (want > 0 for the front end)' -f $summary.msEventMapScreen)
+    ('  start lights             {0}   (StartLightsScreen -- the race start sequence)' -f $summary.msStartLights)
+    ('  race screen              {0}   (InGameScreen -- the race itself; want > 0 to be IN a race)' -f $summary.msRaceScreen)
+    ('  race HUD built           {0}   ("Reload HUD planes")' -f $summary.msRaceHud)
+    ('  race objective text      {0}   (the race-only localised objective; also proves the text pipeline)' -f $summary.msRaceObjective)
     ''
     'front-end gate (last reading; ctrl=ok is the probe positive control)'
     ('  {0}' -f $summary.feGateLast)
