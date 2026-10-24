@@ -1,5 +1,6 @@
 #include "rr3/guest_view_trace.hpp"
 
+#include "rr3/gfx_text_probe.hpp"
 #include "rr3/guest_frame_probe.hpp"
 #include "rr3/guest_teardown_repair.hpp"
 #include "rr3/recovery_guard.hpp"
@@ -964,6 +965,9 @@ void guestViewTracedGlUseProgram(GLuint program) {
             guestViewWideLog("useProgram", program, g_glStats.useProgram);
         }
     }
+    // The text probe follows the selected program so it can report every
+    // draw the HUD's own 2D program makes.
+    gfxTextProbeUseProgram(program);
     ::glUseProgram(program);
 }
 
@@ -1088,6 +1092,10 @@ void guestViewTracedGlVertexAttribPointer(GLuint index, GLint size, GLenum type,
     if (g_glStatsEnabled) {
         ++g_glStats.vertexAttribPointer;
     }
+    // The guest submits CLIENT-SIDE vertex arrays: this pointer is the
+    // address of the guest's own memory, and it is the only place the
+    // vertices of a quad can be read from. The text probe needs it.
+    gfxTextProbeVertexAttribPointer(index, size, type, normalized, stride, pointer);
     ::glVertexAttribPointer(index, size, type, normalized, stride, pointer);
 }
 

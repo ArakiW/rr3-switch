@@ -1124,6 +1124,10 @@ extern "C" void __wrap_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
     gfxNoteDrawArrays();
     gfxTextProbeDraw(mode, first, count);
     __real_glDrawArrays(mode, first, count);
+    // The text probe reads the quad's own screen rectangle back out of the
+    // framebuffer, and that has to happen AFTER the draw: a readback taken
+    // before it would only show the background the quad was drawn over.
+    gfxTextProbeDrawFinished();
 }
 
 extern "C" void __wrap_glDrawElements(GLenum mode, GLsizei count, GLenum type,
@@ -1134,7 +1138,9 @@ extern "C" void __wrap_glDrawElements(GLenum mode, GLsizei count, GLenum type,
         return;
     }
     gfxNoteDrawElements();
+    gfxTextProbeDrawElements(mode, count, type, indices);
     __real_glDrawElements(mode, count, type, indices);
+    gfxTextProbeDrawFinished();
 }
 
 // ---- string-only names with real behaviour ---------------------------------
