@@ -281,6 +281,24 @@ struct ConfState {
     // satisfied (measured: mgr0c = 0 and *(G+0x47c) = 4). Off by default:
     // with the switch off the port answers FALSE for every remote-config
     // boolean, which is what it has always done.
+    //
+    // MEASURED 2026-10-24, AND IT IS NOT A WORKING LEVER YET: with
+    // rookiehub=1 the hub still does not open, because THE GUEST NEVER ASKS.
+    // The guest's own native map (the one 0x1382ce4 looks up first) already
+    // holds "Rookie_Enable", so 0x1382d40 skips the JNI query entirely and
+    // sets +8 = 0 at 0x1382d3c. In one measured run the guest asked
+    // GetBooleanValueFromRemoteConfig for six DIFFERENT keys
+    // (override_client_unlock_levels 10162 times, enable_mtx_tile,
+    // enable_dynamic_ads, enable_optimized_logic, enable_experimental_logic,
+    // enable_event_logs_android) and never once for enable_rookie.
+    //
+    // So this switch answers a question the guest is not asking. It is kept
+    // because it is the correct implementation of the JNI contract and costs
+    // nothing, but it is NOT a way to open the hub. The hub's root is chosen
+    // by the predicate at 0x13833cc, and the thing that decides the predicate
+    // is the guest's own Remote Config map, which the host does not feed.
+    // See the note at jni_bridge.cpp's GetStringValueFromRemoteConfig: the
+    // guest's config parse failure is internal to the guest.
     bool rookieHub = false;
     // "ccsynth=1" -- install the host's synthetic Cloudcell object. Default is
     // 0, which LETS THE GUEST BUILD ITS OWN. The guest's constructor
