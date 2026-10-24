@@ -1,6 +1,7 @@
 #include "rr3/guest_input.hpp"
 
 #include "rr3/elf_preflight.hpp"
+#include "rr3/guest_input_doors.hpp"
 #include "rr3/guest_touch.hpp"
 #include "rr3/guest_touch_hw.hpp"
 #include "rr3/recovery_guard.hpp"
@@ -60,6 +61,22 @@ bool g_lastFace[8] = {};
 bool g_lastDpad[4] = {};
 bool g_lastMeta[3] = {};
 
+// What the port last handed to the guest, in the guest's own numbering.
+//
+// This is the instrument's left-hand side: it says what the guest was TOLD,
+// so the read-back of the guest's own storage can be compared against it. Only
+// values that were actually pushed are recorded, so "pushed" and "the guest
+// holds" mean the same thing when they agree.
+GuestPushedInput g_pushed = {};
+// The port's own frame counter. The frame loop pumps input once per
+// iteration, just before the guest's render call, so this tracks the guest's
+// frame number to within one.
+unsigned long long g_frameCounter = 0;
+// The last button state pushed per guest ordinal, for the scripted pad. The
+// physical path keeps its own per-button state in g_lastFace/g_lastDpad/
+// g_lastMeta, which are libnx masks; this one is a guest ordinal.
+bool g_lastOrdinal[15] = {};
+
 void** jniTable(void* env) {
     return static_cast<void**>(*static_cast<void**>(env));
 }
@@ -73,6 +90,33 @@ void emitButton(void* env, void* self, int id, uint64_t held, uint64_t mask,
     *last = now;
     if (g_setButton != nullptr) {
         g_setButton(env, self, id, now ? 1 : 0, ordinal);
+        if (now) {
+            g_pushed.buttons |= 1u << ordinal;
+        } else {
+            g_pushed.buttons &= ~(1u << ordinal);
+        }
+        ++g_pushed.pushes;
+    }
+}
+
+// One button, named by the guest's ControllerButtons ordinal. The scripted
+// pad speaks ordinals (that is the guest's own numbering and the bit index
+// in the script's mask), while the physical path speaks libnx masks, so the
+// two meet here.
+void emitOrdinalButton(void* env, void* self, int id, int ordinal, bool pressed,
+                       bool* last) {
+    if (pressed == *last) {
+        return;
+    }
+    *last = pressed;
+    if (g_setButton != nullptr) {
+        g_setButton(env, self, id, pressed ? 1 : 0, ordinal);
+        if (pressed) {
+            g_pushed.buttons |= 1u << ordinal;
+        } else {
+            g_pushed.buttons &= ~(1u << ordinal);
+        }
+        ++g_pushed.pushes;
     }
 }
 
@@ -84,6 +128,8 @@ void emitAxis(void* env, void* self, int id, float value, int axis,
     *last = value;
     if (g_setJoystick != nullptr) {
         g_setJoystick(env, self, id, value, axis);
+        g_pushed.axes[axis] = value;
+        ++g_pushed.pushes;
     }
 }
 
@@ -164,6 +210,34 @@ void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
     auto* pad = static_cast<PadState*>(padOpaque);
     const uint64_t held = padGetButtons(pad);
 
+    // The scripted pad. It exists because a real controller cannot be
+    // reproduced inside an emulator, and the experiment needs the steering
+    // input to be exactly the same in every run. With no control file on the
+    // card this is off and the physical path below is untouched.
+    VirtualPadState scripted{};
+    const bool scriptedActive = virtualPadForFrame(g_frameCounter, &scripted);
+
+    if (scriptedActive) {
+        // The script drives the guest. The physical pad is ignored entirely
+        // while it is active, so the two can never fight over one button.
+        for (int i = 0; i < 15; ++i) {
+            const bool pressed = (scripted.buttons >> i) & 1u;
+            emitOrdinalButton(jniEnvironment, activityObject, deviceId, i,
+                              pressed, &g_lastOrdinal[i]);
+        }
+        emitAxis(jniEnvironment, activityObject, deviceId, scripted.leftX,
+                 kAxisLThumbX, &g_lastLx);
+        emitAxis(jniEnvironment, activityObject, deviceId, scripted.leftY,
+                 kAxisLThumbY, &g_lastLy);
+        emitAxis(jniEnvironment, activityObject, deviceId, scripted.rightX,
+                 kAxisRThumbX, &g_lastRx);
+        emitAxis(jniEnvironment, activityObject, deviceId, scripted.rightY,
+                 kAxisRThumbY, &g_lastRy);
+        emitAxis(jniEnvironment, activityObject, deviceId, scripted.leftTrigger,
+                 kAxisLTrigger, &g_lastLt);
+        emitAxis(jniEnvironment, activityObject, deviceId, scripted.rightTrigger,
+                 kAxisRTrigger, &g_lastRt);
+    } else {
     static constexpr uint64_t kFaceMasks[] = {
         HidNpadButton_A, HidNpadButton_B, HidNpadButton_X, HidNpadButton_Y,
         HidNpadButton_L, HidNpadButton_R, HidNpadButton_ZL, HidNpadButton_ZR,
@@ -222,6 +296,13 @@ void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
     emitAxis(jniEnvironment, activityObject, deviceId,
              (held & HidNpadButton_ZR) != 0 ? 1.0f : 0.0f, kAxisRTrigger,
              &g_lastRt);
+    }
+
+    ++g_frameCounter;
+    // The read-back of the guest's own gamepad state. It is rate limited on
+    // the far side, so calling it every frame costs one cheap check.
+    probeGuestInputDoors(g_frameCounter, &g_pushed,
+                          reinterpret_cast<uintptr_t>(g_setJoystick));
 }
 
 } // namespace rr3
