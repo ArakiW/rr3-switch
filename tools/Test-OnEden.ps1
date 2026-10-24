@@ -731,8 +731,8 @@ $runSummaryPath = Join-Path $archive 'run-summary.txt'
     ('  EventMapScreen           {0}   (want > 0 for the front end)' -f $summary.msEventMapScreen)
     ('  start lights             {0}   (StartLightsScreen -- the race start sequence)' -f $summary.msStartLights)
     ('  race screen              {0}   (InGameScreen -- the race itself; want > 0 to be IN a race)' -f $summary.msRaceScreen)
-    ('  race HUD built           {0}   ("Reload HUD planes")' -f $summary.msRaceHud)
-    ('  race objective text      {0}   (the race-only localised objective; also proves the text pipeline)' -f $summary.msRaceObjective)
+    ('  race marker: HUD string  {0}   ("Reload HUD planes" -- the guest RENDERS this debug string during a race; it is a race marker, NOT evidence that the HUD was built)' -f $summary.msRaceHud)
+    ('  race marker: objective   {0}   (the localised objective string in the guest log; a race marker, and a cross-check that the text pipeline works)' -f $summary.msRaceObjective)
     ''
     'front-end gate (last reading; ctrl=ok is the probe positive control)'
     ('  {0}' -f $summary.feGateLast)
