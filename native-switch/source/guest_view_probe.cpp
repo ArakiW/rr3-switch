@@ -8370,9 +8370,27 @@ void* frameLoopDriver(void* opaque) {
         // The first capture keeps the old "LATE" label so that archives
         // before and after this change can be compared on the same label.
         if (!gfxNullActive()) {
+            // THE SCHEDULE IS DENSE WHERE THE EXPERIMENT IS.
+            //
+            // It used to be: 30, 120, 300, 600, 1000, 1200, 1350, 1500,
+            // 1650, 3000, 7000, 11000, ... -- dense early, sparse later,
+            // and it is a ONE-SHOT list, so a run that ends at 6600 frames
+            // never gets past 3000. That is exactly the region the touch
+            // script works in (the clicks run from frame 1400 to 4400), so
+            // the pictures that would show whether a click did anything
+            // were never taken.
+            //
+            // The PNG encode costs about eight seconds under a software
+            // renderer, so the captures also SLOW THE GUEST DOWN; a capture
+            // every 150 frames is the compromise that still puts a picture
+            // within a couple of seconds after every click.
             static const unsigned kSchedule[] = {
-                30u, 120u, 300u, 600u, 1000u, 1200u, 1350u, 1500u, 1650u,
-                3000u, 7000u, 11000u, 15000u, 19000u, 23000u
+                30u, 120u, 300u, 600u, 1000u, 1200u,
+                1350u, 1500u, 1650u, 1800u, 1950u, 2100u, 2250u, 2400u,
+                2550u, 2700u, 2850u, 3000u, 3150u, 3300u, 3450u, 3600u,
+                3750u, 3900u, 4050u, 4200u, 4350u, 4500u, 4650u, 4800u,
+                4950u, 5100u, 5250u, 5400u, 5550u, 5700u, 5850u, 6000u,
+                6150u, 6300u, 6450u, 6600u, 6750u, 6900u
             };
             static unsigned s_index = 0;
             if (s_index < (sizeof(kSchedule) / sizeof(kSchedule[0])) &&
