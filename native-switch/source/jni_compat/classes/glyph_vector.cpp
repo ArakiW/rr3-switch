@@ -669,6 +669,19 @@ struct RenderPlan {
     size_t usedLines;
 };
 
+// The six float metrics and the line count the guest reads back after
+// init()/createTexture(). They describe ONE measurement, so they travel with
+// the raster that measurement produced.
+struct PublishedMetrics {
+    float offsetX;
+    float offsetY;
+    float boundsW;
+    float boundsH;
+    float pixelBoundsW;
+    float pixelBoundsH;
+    int32_t numLines;
+};
+
 struct RenderState {
     bool inUse;
     uintptr_t object;
@@ -684,6 +697,11 @@ struct RenderState {
     // things alive between the init call and the createTexture call.
     Layout layout;
     RenderPlan plan;
+    // The metrics as they were MEASURED for this text. The guest reads them
+    // back when it draws the texture, so they have to be published with the
+    // raster, not with whatever measurement happened to be last on the
+    // handle.
+    PublishedMetrics published;
     bool hasLayout;
 };
 
@@ -751,6 +769,23 @@ RenderState* acquireState(uintptr_t object) {
     slot->bold = false;
     slot->fontPath[0] = '\0';
     return slot;
+}
+
+// Drops the render state of one object handle, if it has one. The render
+// state is keyed by the same address as the facade, and the fake-object pool
+// hands a recycled address to a different GlyphVector, so the previous
+// occupant's text and layout must not survive the new one: a createTexture()
+// that arrives before the new object's own init() would otherwise upload the
+// previous occupant's raster under this object's metrics.
+void discardState(uintptr_t object) {
+    RenderState* state = stateFor(object);
+    if (state == nullptr) {
+        return;
+    }
+    free(state->text);
+    state->text = nullptr;
+    state->textLen = 0;
+    state->hasLayout = false;
 }
 
 // The instrument.
@@ -1183,6 +1218,15 @@ void renderText(uintptr_t self, uintptr_t fontHandle, const char* text,
         state->plan.textureWidth = textureWidth;
         state->plan.textureHeight = textureHeight;
         state->plan.usedLines = usedLines;
+        // The metrics the guest will read back describe the text THIS state
+        // rasterises, so they are kept with it.
+        state->published.offsetX = facade->offsetX;
+        state->published.offsetY = facade->offsetY;
+        state->published.boundsW = facade->boundsW;
+        state->published.boundsH = facade->boundsH;
+        state->published.pixelBoundsW = facade->pixelBoundsW;
+        state->published.pixelBoundsH = facade->pixelBoundsH;
+        state->published.numLines = facade->numLines;
     }
 
     // The Java's init() does NOT create the texture: createTexture() does,
@@ -1419,6 +1463,19 @@ bool uploadTexture(uintptr_t self) {
     facade->texId = static_cast<int32_t>(texture);
     facade->texWidth = textureWidth;
     facade->texHeight = textureHeight;
+    // The metrics the guest reads back when it draws the texture MUST describe
+    // the texture it is drawing: the guest turns pixelBoundsH into the source
+    // rectangle (v = pixelBoundsH/texHeight*16384), so a stale height makes the
+    // guest sample the top slice of the raster and the glyphs come out cut
+    // in half. They are published from the state that produced the raster, so
+    // they can never be another string's.
+    facade->offsetX = state->published.offsetX;
+    facade->offsetY = state->published.offsetY;
+    facade->boundsW = state->published.boundsW;
+    facade->boundsH = state->published.boundsH;
+    facade->pixelBoundsW = state->published.pixelBoundsW;
+    facade->pixelBoundsH = state->published.pixelBoundsH;
+    facade->numLines = state->published.numLines;
     // Tell the text-draw probe which texture is the label texture, so it can
     // tell the label's draw apart from the game's other 40,000 draws.
     rr3::gfxTextProbeNoteTexture(texture, textureWidth, textureHeight);
@@ -1546,6 +1603,7 @@ bool onNewObject(uintptr_t classHandle, uintptr_t object) {
     if (!isGlyphVectorClass(classHandle)) {
         return false;
     }
+    discardState(object);
     GlyphVectorFacade* facade = reinterpret_cast<GlyphVectorFacade*>(object);
     memset(facade, 0, sizeof(*facade));
     facade->magic = kGlyphVectorMagic;
