@@ -165,6 +165,64 @@ def mirror_track_data_halves(volume_stage: Path) -> tuple[int, int]:
     return copied, copied_bytes
 
 
+# The Tutorial track's per-track asset list, under the name the guest asks for.
+#
+# MEASURED 2026-10-25, archive 20261025-183814-eden-f1e: the guest asks for
+#   rr3core:/files/.depot/asset_list_Tutorial.txt
+# and, when that misses,
+#   rr3core:/files/apk/res/asset_list_Tutorial.txt
+# and then says, in its own words:
+#   CC: AssetManager::LoadAssetList() : Asset List not found - asset_list_Tutorial.txt
+#
+# EA's package ships that list SPLIT BY QUALITY and under a different name:
+#   files/apk/res/asset_list_track_tutorial_common.txt   (3 rows)
+#   files/apk/res/asset_list_track_tutorial_high.txt     (2 rows)
+#   files/apk/res/asset_list_track_tutorial_low.txt      (2 rows)
+# The seven rows are disjoint and are exactly the list the game ends up with on
+# a card (the card's own .depot/asset_list_track_tutorial.txt is those same
+# seven rows), so the merged file is the list -- not a new one, and not a guess
+# about what the track needs.
+#
+# The guest LOGS a missing list and CARRIES ON, so this is not a crash; it is a
+# hole in what the guest is able to load for the Tutorial track.
+TUTORIAL_ASSET_LIST_SOURCES = (
+    "asset_list_track_tutorial_common.txt",
+    "asset_list_track_tutorial_high.txt",
+    "asset_list_track_tutorial_low.txt",
+)
+TUTORIAL_ASSET_LIST_TARGET = "asset_list_Tutorial.txt"
+
+
+def merge_tutorial_asset_list(volume_stage: Path) -> tuple[int, int]:
+    """Write the Tutorial track's asset list under the name the guest asks for.
+
+    Returns (files written, bytes written). An existing target is never
+    overwritten: a card that already ships the list keeps it.
+    """
+    res = volume_stage / "files" / "apk" / "res"
+    depot = volume_stage / "files" / ".depot"
+    target = depot / TUTORIAL_ASSET_LIST_TARGET
+    if target.exists():
+        return 0, 0
+    rows: list[str] = []
+    for name in TUTORIAL_ASSET_LIST_SOURCES:
+        source = res / name
+        if not source.is_file():
+            continue
+        for line in source.read_text(encoding="utf-8", errors="replace").splitlines():
+            stripped = line.strip()
+            if stripped and stripped not in rows:
+                rows.append(stripped)
+    if not rows:
+        return 0, 0
+    depot.mkdir(parents=True, exist_ok=True)
+    # Written as bytes so the line ending is LF on every host: the asset list
+    # is a tab-separated format the guest parses line by line.
+    target.write_bytes(("\n".join(rows) + "\n").encode("utf-8"))
+    print(f"  + {TUTORIAL_ASSET_LIST_TARGET} ({len(rows)} rows)", flush=True)
+    return 1, target.stat().st_size
+
+
 def build_volume(builder: Path, staging: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     completed = subprocess.run(
@@ -270,6 +328,13 @@ def main() -> int:
                           f"processed/ ({mirrored_bytes} bytes)", flush=True)
                     count += mirrored
                     source_bytes += mirrored_bytes
+                if volume == "core":
+                    merged, merged_bytes = merge_tutorial_asset_list(volume_stage)
+                    if merged:
+                        print(f"[{volume}] wrote the merged Tutorial asset list "
+                              f"({merged_bytes} bytes)", flush=True)
+                    count += merged
+                    source_bytes += merged_bytes
                 destination = data_output / f"{volume}.romfs"
                 print(f"[{volume}] building {destination.name}", flush=True)
                 build_volume(builder, volume_stage, destination)
