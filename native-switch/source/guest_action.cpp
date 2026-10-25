@@ -435,7 +435,17 @@ struct PendingAction {
     bool refused{};
 };
 
-constexpr size_t kMaxPendingActions = 8;
+// THE COMMAND TABLE.
+//
+// It used to hold EIGHT commands, and a ninth line in the control file was
+// skipped SILENTLY. Two runs were wasted on that: the control file had
+// eleven commands, the log said "pending=8", and the four commands that
+// were supposed to start a race never ran.
+//
+// A command table is a table, not a queue: the control file is read ONCE,
+// so a command that does not fit is lost for the whole run. Thirty-two is
+// more than any experiment has needed, and the table is BSS.
+constexpr size_t kMaxPendingActions = 32;
 
 PendingAction g_pending[kMaxPendingActions];
 size_t g_pendingCount = 0;
@@ -508,7 +518,23 @@ void readActionConf() {
             }
             *end = '\0';
         }
-        if (name[0] == '\0' || g_pendingCount >= kMaxPendingActions) {
+        if (name[0] == '\0') {
+            continue;
+        }
+        // A COMMAND THAT DOES NOT FIT IS REPORTED, NOT DROPPED. The table
+        // used to hold eight commands and the ninth line was skipped
+        // SILENTLY, so a control file with eleven commands ran the first
+        // eight and the last three never happened -- and the log said
+        // "pending=8" as if that were the whole file. A command that is
+        // dropped without a word is indistinguishable from a command that
+        // was never written.
+        if (g_pendingCount >= kMaxPendingActions) {
+            char details[256];
+            std::snprintf(details, sizeof(details),
+                          "name=\"%.120s\" dropped=1 reason=the-command-table-is-full "
+                          "(%u commands)",
+                          name, static_cast<unsigned>(kMaxPendingActions));
+            logAction("guest-action", 107, details);
             continue;
         }
         PendingAction& entry = g_pending[g_pendingCount++];
