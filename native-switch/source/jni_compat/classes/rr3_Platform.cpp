@@ -236,22 +236,36 @@ static jboolean platform_delete_directory(JNIEnv *, jclass, jstring) { return JN
 
 /* /proc/meminfo MemTotal in MB.
  *
- * It used to report 1024, on the reasoning that the engine "uses this only to
- * pick texture budgets" and that the R36S (the Switch's low-memory model)
- * has 1 GB. MEASURED 2026-10-25 (archive 20261025-155851-eden-f1a): with
- * that figure the guest REFUSED TO LOAD A TRACK -- it put up its own dialog,
- * "可用内存不足，无法加载赛道。正在返回主菜单..." ("not enough available
- * memory to load the track"), and returned to the main menu. The whole
- * path to a race worked (daily reward -> event picker -> quest page ->
- * car select -> start race) and died at exactly this read.
+ * IMPORTANT: THE GUEST DOES NOT READ THIS ONE.
  *
- * The port's target is a console with 16 GB, and the real /proc/meminfo of
- * such a machine reports far more than 1 GB, so the 1 GB figure was never
- * the device's answer either. 4096 MB is used here: it is four times the
- * old value, it clears any "at least 2 GB" content gate, and it stays well
- * under the real console's figure so that the texture tier the engine picks
- * does not jump to the top tier. */
-static jint platform_get_total_memory(JNIEnv *, jclass) { return 4096; }
+ * This function is registered as a ManagedMethod, but the guest's own
+ * int-returning static call (JNI slot 130, jniCallStaticIntMethodV) is
+ * answered by jni_bridge.cpp's platformIntForMethod(), which has its own
+ * case for "getTotalMemory" and returns before any managed method is
+ * consulted. MEASURED 2026-10-25, archive 20261025-162550-eden-f1b: the
+ * guest printed "Available memory: 2146435072Mb", which is exactly
+ * platformIntForMethod()'s 2047 * 1024 * 1024, not the 1024 that used to
+ * be written here.
+ *
+ * The guest's OTHER two memory getters are longs (JNI slot 133,
+ * CallStaticLongMethodV), and that slot is not wired at all, so
+ * getAppMemoryFree() and getAppMemoryUsage() reach the guest as 0. The
+ * guest only uses them for telemetry.
+ *
+ * The guest's ONE memory-driven decision is in its device-tier code: it
+ * compares getTotalMemory() against 601 MB and forces the graphics/texture
+ * tier down to 0 if the value is below that. platformIntForMethod()'s
+ * value is far above it, so the tier is never forced down -- and that is
+ * why the value there is deliberately absurd. Lowering it towards a
+ * "realistic" number is a RISK, not a fix: the same read also sizes the
+ * font atlas pages.
+ *
+ * The "insufficient memory to load the track" dialog that stopped the
+ * race is NOT a memory-budget refusal. It is the track-load-failure
+ * popup: the guest could not find the track's collision file. See
+ * guest_filesystem.cpp and the asset notes in the project status.
+ */
+static jint platform_get_total_memory(JNIEnv *, jclass) { return 1024; }
 
 /*
  * exitApp() is only reached from the negative button of an alert - which this
@@ -320,15 +334,18 @@ static jlong platform_get_app_install_time(JNIEnv *, jclass) { return 0; }
  * numbers are a floor, not a measurement, and are marked as such here rather
  * than dressed up as one.
  *
- * MEASURED 2026-10-25 (archive 20261025-155851-eden-f1a): the 512 MB free
- * figure was NOT optimistic enough. The guest compared its available memory
- * against the memory a track needs and refused to load one ("可用内存不足，
- * 无法加载赛道。正在返回主菜单..."). The error text says AVAILABLE memory,
- * and this is the available-memory read, so this is the number that has to
- * move. 4 GB is what a console with 16 GB can honestly spare for a game, and
- * it is four times the old floor.
+ * Like platform_get_total_memory above, these are NOT what the guest reads:
+ * the guest's getters are longs (JNI slot 133, CallStaticLongMethodV), that
+ * slot is not wired, and the guest therefore sees 0 for both. The guest
+ * only uses them for telemetry, so nothing gates on them -- MEASURED
+ * 2026-10-25, archive 20261025-162550-eden-f1b, the guest's own log line
+ * says "Available memory: 2146435072Mb", which is the int path's value.
+ *
+ * The "insufficient memory to load the track" dialog that stopped the race
+ * is NOT a memory-budget refusal: it is the track-load-failure popup, and
+ * the thing it reported was a missing collision file.
  */
-static jlong platform_get_app_memory_free(JNIEnv *, jclass) { return 4096LL * 1024 * 1024; }
+static jlong platform_get_app_memory_free(JNIEnv *, jclass) { return 512LL * 1024 * 1024; }
 static jlong platform_get_app_memory_usage(JNIEnv *, jclass) { return 128LL * 1024 * 1024; }
 static void platform_memory_probe(JNIEnv *, jclass) {}
 

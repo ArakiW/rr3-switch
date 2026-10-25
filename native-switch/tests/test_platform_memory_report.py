@@ -1,48 +1,56 @@
 #!/usr/bin/env python3
-"""The memory the port reports to the guest, checked against the guest binary.
+"""The memory the guest actually reads, and where it comes from.
 
 WHAT THIS PINS
----------------
-The guest asks the platform how much memory it has, and it ACTS on the
-answer: when the figure is too small it refuses to load a track and puts up
-its own dialog ("not enough available memory to load the track", in the
-Chinese build "可用内存不足，无法加载赛道。正在返回主菜单...") and returns to
-the main menu.
+--------------
+The guest asks the platform how much memory it has.  It is not a cosmetic
+question: in its device-tier code the guest compares getTotalMemory()
+against 601 MB and forces the graphics/texture tier down to 0 when the value
+is below that.  (Guest .text: the comparison is `cmp w19,#0x259` right after
+the getTotalMemory() call, and the value is logged as "Available memory:
+%dMb".)  A second read, in the font-atlas code, compares against 513 MB.
 
-MEASURED 2026-10-25, archive 20261025-155851-eden-f1a: the port reported
-1 GB total / 512 MB free (the Switch's low-memory model, the R36S, has 1 GB),
-and the whole path to a race worked -- daily reward, event picker, quest
-page, car select, start race -- and died at exactly this read.  The track
-never loaded, so there was no lap to count.
+So the port's answer has to be ABOVE 601, and this test pins that.
 
-So the memory report is not a cosmetic constant.  It is an INPUT to the
-guest's behaviour, and this test pins it at a floor that is above the
-guest's content gate and well below the real console's figure.
+WHERE THE ANSWER COMES FROM -- AND WHERE IT DOES NOT
+------------------------------------------------------
+The port has TWO places that could answer a Platform memory getter:
 
-WHY THE FLOORS ARE WHERE THEY ARE
-----------------------------------
-* total >= 2048 MB.  The guest's content tiers are gated on the device's
-  memory class, and 1 GB is the class that cannot load a track.  The
-  console this port targets has 16 GB, so a value of 4096 MB is both
-  honest and conservative.
-* free >= 1 GB.  The error text says AVAILABLE memory, so the available
-  figure is the one the track check reads; the old value was exactly 512 MB,
-  which is the size of the thing it refused.
-* usage < free.  A usage figure above the free figure would make the two
-  readings contradictory, and the guest takes the smaller of the two.
+  1. native-switch/source/jni_compat/classes/rr3_Platform.cpp registers
+     platform_get_total_memory / platform_get_app_memory_free /
+     platform_get_app_memory_usage as MANAGED METHODS;
+  2. native-switch/source/jni_bridge.cpp has platformIntForMethod(), which
+     answers the guest's int-returning static call (JNI slot 130,
+     jniCallStaticIntMethodV) BY NAME and never consults the managed
+     method table for a name it recognises.
 
-THE TEST ALSO PINS THAT THE GUEST CONSUMES THESE NUMBERS
----------------------------------------------------------
-The guest binary holds the Java method-name literals "getTotalMemory" and
-"getAppMemoryFree"; its native code looks those names up and calls back into
-Java to read the values.  Without that, the port's answers would be
-decoration, and the test would be pinning a constant that nothing reads.
+The guest's getTotalMemory() is an int, so it is answered by (2).
+MEASURED 2026-10-25, archive 20261025-162550-eden-f1b: the guest printed
+"Available memory: 2146435072Mb", which is exactly platformIntForMethod()'s
+`2047 * 1024 * 1024` -- and NOT the value written in rr3_Platform.cpp.  The
+numbers in rr3_Platform.cpp are therefore not what the guest reads, and a
+change to them changes nothing; the comment there says so.
 
-AND IT PINS THE REASON
-----------------------
-The measurement is named in the source comment, so the next reader who sees
-a memory number in a port and thinks "the smaller the better" finds why it
-is the other way round.
+The guest's getAppMemoryFree() and getAppMemoryUsage() are longs (JNI slot
+133, CallStaticLongMethodV).  That slot is NOT wired in the port's JNI
+table, so the guest sees 0 for both.  The guest uses them for telemetry
+only -- there is no comparison anywhere in the image with either of them on
+the right-hand side -- so nothing gates on them, and this test does not
+pretend otherwise.
+
+WHY THE VALUE IS DELIBERATELY ABSURD
+------------------------------------
+The same read also sizes the font atlas pages, so LOWERING it towards a
+"realistic" number is a risk, not a fix.  The value is kept far above both
+thresholds, and the tier is never forced down.
+
+WHAT ELSE THIS CHECKS
+---------------------
+That the guest binary really holds the two Java method-name literals the
+native side calls back into ("getTotalMemory", "getAppMemoryFree"), so the
+port's answers are not decoration; and that rr3_Platform.cpp carries the
+note saying which path the guest actually uses -- otherwise the next
+reader edits the wrong number.
 """
 
 from __future__ import annotations
@@ -53,103 +61,83 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PROJECT = ROOT.parent
-SOURCE = ROOT / "source" / "jni_compat" / "classes" / "rr3_Platform.cpp"
+BRIDGE = ROOT / "source" / "jni_bridge.cpp"
+PLATFORM = ROOT / "source" / "jni_compat" / "classes" / "rr3_Platform.cpp"
 SO = PROJECT / "reverse" / "native" / "arm64" / "libRealRacing3.so"
 
-# The floors the measurement forces.  See the module docstring.
-MIN_TOTAL_MB = 2048
-MIN_FREE_BYTES = 1024 * 1024 * 1024
+# The guest's own thresholds, in MB. From the guest's .text (cmp w19,#0x259
+# and cmp w22,#0x201); see the module docstring.
+GUEST_TIER_FLOOR_MB = 601
+GUEST_FONT_FLOOR_MB = 513
 
-# The archive that measured the refusal.
-MEASURED_ARCHIVE = "20261025-155851-eden-f1a"
-
-# The guest's own Java method names, as literals in the guest binary.
 GUEST_METHOD_NAMES = (b"getTotalMemory", b"getAppMemoryFree")
 
 
-def return_expression(source: str, function: str) -> str:
-    """The body of `return <expr>;` in the given static function."""
+def case_value(source: str, function: str, name: str) -> int:
+    """The integer a `if (rawEquals(name, "<name>")) return <expr>;` returns."""
     pattern = re.compile(
-        r"static\s+\w+\s+" + re.escape(function) + r"\s*\([^)]*\)\s*\{\s*return\s+([^;]+);"
+        r'rawEquals\(name,\s*"' + re.escape(name) + r'"\)\s*\)\s*return\s+([^;]+);'
     )
     match = pattern.search(source)
     assert match is not None, (
-        f"{SOURCE.name} has no 'static ... {function}(...) {{ return ...; }}' to read"
+        f"{function}() has no case for {name!r}; the guest's memory read "
+        f"would fall through to 0"
     )
-    return match.group(1).strip()
-
-
-def evaluate(expression: str) -> int:
-    """Evaluate the arithmetic the port uses for these constants.
-
-    The expressions are literals and multiplications of literals ("4096",
-    "4096LL * 1024 * 1024").  Anything else is a change in the port's
-    vocabulary that this test must not silently accept.
-    """
-    normalised = expression.replace("LL", "").replace("ULL", "")
-    if not re.fullmatch(r"[0-9+\-*/() ]+", normalised):
+    expression = match.group(1).strip().replace("LL", "").replace("ULL", "")
+    if not re.fullmatch(r"[0-9+\-*/() ]+", expression):
         raise AssertionError(
-            f"the memory constant is not a plain arithmetic expression: {expression!r}"
+            f"the value for {name!r} is not a plain arithmetic expression: {expression!r}"
         )
-    return int(eval(normalised, {"__builtins__": {}}, {}))  # noqa: S307
+    return int(eval(expression, {"__builtins__": {}}, {}))  # noqa: S307
 
 
 def main() -> int:
-    source = SOURCE.read_text(encoding="utf-8")
+    bridge = BRIDGE.read_text(encoding="utf-8")
 
-    total_mb = evaluate(return_expression(source, "platform_get_total_memory"))
-    free_bytes = evaluate(return_expression(source, "platform_get_app_memory_free"))
-    usage_bytes = evaluate(return_expression(source, "platform_get_app_memory_usage"))
-
-    print(f"total memory reported to the guest : {total_mb} MB")
-    print(f"available memory reported to guest : {free_bytes} bytes "
-          f"({free_bytes // (1024 * 1024)} MB)")
-    print(f"used memory reported to the guest  : {usage_bytes} bytes "
-          f"({usage_bytes // (1024 * 1024)} MB)")
-
-    assert total_mb >= MIN_TOTAL_MB, (
-        f"the port reports {total_mb} MB of total memory; the guest refuses to "
-        f"load a track below {MIN_TOTAL_MB} MB (measured in archive "
-        f"{MEASURED_ARCHIVE})"
+    total_mb = case_value(bridge, "platformIntForMethod", "getTotalMemory")
+    print(f"getTotalMemory() the guest sees : {total_mb} (the guest compares "
+          f"it against {GUEST_TIER_FLOOR_MB} MB)")
+    assert total_mb >= GUEST_TIER_FLOOR_MB, (
+        f"platformIntForMethod() answers getTotalMemory() with {total_mb}, "
+        f"which is below the guest's {GUEST_TIER_FLOOR_MB} MB tier threshold: "
+        f"the guest would force the graphics/texture tier down to 0"
     )
-    assert free_bytes >= MIN_FREE_BYTES, (
-        f"the port reports {free_bytes} bytes of available memory; the guest "
-        f"refuses to load a track below {MIN_FREE_BYTES} bytes (measured in "
-        f"archive {MEASURED_ARCHIVE})"
-    )
-    assert usage_bytes < free_bytes, (
-        f"the port reports {usage_bytes} bytes used and {free_bytes} bytes "
-        f"free; the used figure must be below the free figure or the two "
-        f"readings contradict each other"
-    )
-    assert usage_bytes < total_mb * 1024 * 1024, (
-        f"the port reports {usage_bytes} bytes used, which is more than the "
-        f"{total_mb} MB of total memory it also reports"
+    assert total_mb >= GUEST_FONT_FLOOR_MB, (
+        f"platformIntForMethod() answers getTotalMemory() with {total_mb}, "
+        f"which is below the guest's {GUEST_FONT_FLOOR_MB} MB font-atlas "
+        f"threshold"
     )
 
-    # The guest really reads these two numbers.
+    # The guest's own log must be able to show this number, which is the
+    # cheapest way for the next run to confirm which path answered.
+    assert "Available memory" in Path(SO).read_bytes().decode("latin-1"), (
+        "the guest binary no longer holds the 'Available memory: %dMb' string; "
+        "the read this test pins may have moved"
+    )
+
+    # The two names the native side calls back into must exist in the guest.
     so = SO.read_bytes()
     for name in GUEST_METHOD_NAMES:
         assert name in so, (
             f"the guest binary does not hold the literal {name!r}; the port's "
-            f"memory report would then be decoration"
+            f"memory answers would be decoration"
         )
 
-    # The measurement is recorded where the numbers are, so the reason for
-    # them cannot be lost.
-    assert MEASURED_ARCHIVE in source, (
-        f"{SOURCE.name} does not name the archive ({MEASURED_ARCHIVE}) that "
-        f"measured the refusal; the reason for these numbers has to live "
-        f"next to them"
+    # The managed-method copy of these getters is not the path the guest
+    # uses, and the file has to say so.
+    platform = PLATFORM.read_text(encoding="utf-8")
+    assert "DOES NOT READ THIS ONE" in platform or "NOT what the guest reads" in platform, (
+        f"{PLATFORM.name} does not say that the guest does not read these "
+        f"functions; the next reader would edit the wrong number"
     )
-    assert "available" in source.lower() or "可用" in source, (
-        f"{SOURCE.name} does not say which of the two figures the guest's "
-        f"content gate reads"
+    assert "20261025-162550-eden-f1b" in platform, (
+        f"{PLATFORM.name} does not name the archive that measured which path "
+        f"answers the guest"
     )
 
-    print(f"PASS: the memory the port reports to the guest is above the gate "
-          f"that made it refuse to load a track ({total_mb} MB total, "
-          f"{free_bytes // (1024 * 1024)} MB available)")
+    print(f"PASS: the guest's memory read is answered by platformIntForMethod() "
+          f"({total_mb}), far above the {GUEST_TIER_FLOOR_MB} MB tier threshold, "
+          f"and the managed-method copy says it is not the path")
     return 0
 
 
