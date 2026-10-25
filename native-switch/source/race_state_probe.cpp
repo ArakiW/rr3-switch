@@ -77,6 +77,7 @@
 #include "rr3/race_state_probe.hpp"
 
 #include "rr3/elf_preflight.hpp"
+#include "rr3/race_metrics_probe.hpp"
 #include "rr3/recovery_guard.hpp"
 
 #include <switch.h>
@@ -1352,6 +1353,14 @@ void pumpRaceStateProbe(unsigned long long frame) {
         appendGuestBootLine(kGuestViewLogPath, "race-raw", 102, 0, raw);
     }
 
+    // THE VALUE STORE. The slots above are DESCRIPTORS, not numbers: the
+    // member's id lives there and the number lives in the guest's global
+    // member value store. The value-store probe reads it out with a pure
+    // read (no guest call, so nothing in the guest is mutated) and logs it
+    // as "race-metrics". It is pumped here, next to the rest of the race
+    // state, so it sees the same object the rest of this file sees.
+    pumpRaceMetricsProbe(frame);
+
     updateDrive(frame, g_sample);
 
     if (frame >= g_lastLogFrame + 30ULL) {
@@ -1362,6 +1371,52 @@ void pumpRaceStateProbe(unsigned long long frame) {
 
 const RaceStateSample& raceStateSample() {
     return g_sample;
+}
+
+// A SAFE read of one 64-bit word of guest memory.
+//
+// This is the safe-read path this file has always used -- the plausibility
+// gate, then the guest-image check, then svcQueryMemory, then the read --
+// exposed so that another probe reads guest memory through exactly the same
+// door instead of through a second, subtly different one. A diagnostic that
+// can fault the run it is measuring is worse than no diagnostic.
+bool raceStateReadWord(uintptr_t address, uint64_t* out) {
+    return readWord(address, out);
+}
+
+// The live RuleSet_RaceMetrics object, resolved the way this file resolves
+// it: the CGlobal -> the GameMode pointer -> the GameMode's ruleset map ->
+// the node whose value is a RuleSet_RaceMetrics.
+//
+// It is resolved ON DEMAND rather than served from the probe's own cache,
+// because a new race allocates a NEW object and a cached pointer would still
+// point at the previous one. The value-store probe (source/race_metrics_probe
+// .cpp) uses this instead of re-deriving the chain: the chain is the guest's
+// own bookkeeping, and one implementation of it is one thing to keep correct.
+uintptr_t raceStateResolveRuleSetRaceMetrics() {
+    const uintptr_t bias = resolveMainImageLoadBias();
+    if (bias == 0) {
+        return 0;
+    }
+    const uintptr_t g = cGlobalObject();
+    if (g == 0) {
+        return 0;
+    }
+    // The same candidate offsets discover() tries, and the same order.
+    for (int i = 0; i < kGameModeCandidateCount; ++i) {
+        uint64_t pointer = 0;
+        if (!readWord(g + kGameModeCandidateOffsets[i], &pointer) || pointer == 0) {
+            continue;
+        }
+        uintptr_t ruleSet = 0;
+        uintptr_t metrics = 0;
+        if (!followGameMode(bias, static_cast<uintptr_t>(pointer), &ruleSet,
+                            &metrics)) {
+            continue;
+        }
+        return ruleSet;
+    }
+    return 0;
 }
 
 bool raceStateProgress(unsigned long long frame, float* rate, double* progress,

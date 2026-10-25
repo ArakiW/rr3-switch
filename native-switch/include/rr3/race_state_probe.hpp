@@ -112,6 +112,24 @@ void pumpRaceStateProbe(unsigned long long frame);
 // The most recent sample. Never null.
 const RaceStateSample& raceStateSample();
 
+// A SAFE read of one 64-bit word of guest memory.
+//
+// This is the probe's own safe-read path -- the plausibility gate, then the
+// guest-image check, then svcQueryMemory, then the read -- exposed so that
+// another diagnostic reads guest memory through exactly the same door
+// instead of through a second, subtly different one. False when the address
+// cannot be read; the port must never read guest memory any other way.
+bool raceStateReadWord(uintptr_t address, uint64_t* out);
+
+// The live RuleSet_RaceMetrics object, resolved the way this probe resolves
+// it (the CGlobal -> the GameMode -> the ruleset map -> the node whose value
+// is a RuleSet_RaceMetrics). 0 when the chain does not lead there yet.
+//
+// It is resolved ON DEMAND rather than served from the probe's own cache,
+// because a new race allocates a NEW object. The value-store probe
+// (source/race_metrics_probe.cpp) reads the member values out of it.
+uintptr_t raceStateResolveRuleSetRaceMetrics();
+
 // The progress rate of the active metrics object, in units per frame, and the
 // progress value itself. The steering uses this.
 bool raceStateProgress(unsigned long long frame, float* rate, double* progress,
