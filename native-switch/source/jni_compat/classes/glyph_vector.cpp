@@ -37,9 +37,14 @@
 // FreeType face's ascender/descender, rounded up, as the ascent and descent,
 // and a line box of ascent+descent. Android rounds the same values and adds
 // the face's leading, which FreeType reports as (height - ascender +
-// descender); the difference is at most one pixel per line. The wrap points
-// are the spaces (Android also breaks after some punctuation); a word longer
-// than the wrap width is broken between characters, as Android does.
+// descender); the difference is at most one pixel per line.
+//
+// The BREAK POINTS are the ones Android's StaticLayout makes: UAX #14, as
+// implemented by ICU's line break iterator. A run of Han, kana or Hangul
+// breaks BETWEEN ITS CHARACTERS, because those scripts have no spaces; a
+// Latin word does not break inside; a line may not start with closing
+// punctuation and may not end with opening punctuation. The breaker lives in
+// rr3/glyph_wrap.hpp, so the port and the host self-test run the same code.
 //
 // NOT IMPLEMENTED: the ellipsis variants. breakStyle 3/4/5 (truncate head /
 // tail / middle) and 6 (word wrap + truncate) clip the text at the height
@@ -60,6 +65,7 @@
 #include "../../eap_port/trace_adapter.h"
 #include "../../../include/rr3/guest_view_trace.hpp"
 #include "../../../include/rr3/gfx_text_probe.hpp"
+#include "../../../include/rr3/glyph_wrap.hpp"
 #include "../jni.h"
 #include "../jni_internals.h"
 #include "glyph_vector.h"
@@ -459,6 +465,9 @@ void layoutParagraph(const char* text, size_t len, FT_Face face,
 
     // Pass 1: measure every codepoint once.
     static Item items[kMaxItems];
+    // The same measurement, in the shape the shared breaker wants. It is a
+    // separate array so the breaker stays free of the port's byte offsets.
+    static rr3::glyphwrap::Item wrapItems[kMaxItems];
     size_t itemCount = 0;
 
     size_t at = 0;
@@ -480,91 +489,36 @@ void layoutParagraph(const char* text, size_t len, FT_Face face,
         item.advance = advance * widthScale;
         item.isSpace = (codepoint == ' ' || codepoint == '\t' ||
                          codepoint == '\n' || codepoint == '\r');
+        rr3::glyphwrap::Item& wrapItem = wrapItems[itemCount];
+        wrapItem.codepoint = codepoint;
+        wrapItem.advance = item.advance;
+        wrapItem.isSpace = item.isSpace;
         ++itemCount;
         at += used;
     }
 
     // Pass 2: break the items into lines.
-    size_t lineStart = 0;
-    size_t contentEnd = 0;
-    float contentWidth = 0.f;
-    float pendingSpace = 0.f;
-    size_t i = 0;
-    auto emitLine = [&](size_t end, float width) {
-        if (out->lineCount >= kMaxLines) {
-            return;
-        }
-        Line& line = out->lines[out->lineCount];
-        line.start = lineStart;
-        line.end = end;
-        line.width = width;
+    //
+    // THE BREAKER IS rr3::glyphwrap::breakLines, the same code the host
+    // self-test runs against the game's own font. It breaks where Android's
+    // StaticLayout breaks: between the characters of a CJK run, at the
+    // spaces of a Latin text, and never before a closing punctuation mark.
+    rr3::glyphwrap::Line segments[kMaxLines];
+    const size_t segmentCount = rr3::glyphwrap::breakLines(
+        wrapItems, itemCount, wrapWidth, wrap, segments, kMaxLines);
+    for (size_t s = 0; s < segmentCount; ++s) {
+        Line& line = out->lines[s];
+        const size_t first = segments[s].first;
+        const size_t end = segments[s].end;
+        line.start = first < itemCount ? items[first].byteOffset : len;
+        line.end = end > first
+                       ? items[end - 1].byteOffset + items[end - 1].byteLength
+                       : line.start;
+        line.width = segments[s].width;
         line.left = 0.f;
         line.hasInk = false;
-        ++out->lineCount;
-    };
-
-    while (i < itemCount) {
-        if (items[i].isSpace) {
-            if (items[i].codepoint == '\n' || items[i].codepoint == '\r') {
-                // A hard break ends the line where it is.
-                emitLine(contentEnd, contentWidth);
-                lineStart = items[i].byteOffset + items[i].byteLength;
-                contentEnd = lineStart;
-                contentWidth = 0.f;
-                pendingSpace = 0.f;
-                ++i;
-                continue;
-            }
-            pendingSpace += items[i].advance;
-            ++i;
-            continue;
-        }
-
-        // One word: the run of codepoints up to the next space.
-        const size_t wordStart = i;
-        float wordWidth = 0.f;
-        while (i < itemCount && !items[i].isSpace) {
-            wordWidth += items[i].advance;
-            ++i;
-        }
-        const size_t wordEnd = i;
-
-        if (wrap && contentWidth > 0.f &&
-            contentWidth + pendingSpace + wordWidth > wrapWidth) {
-            emitLine(contentEnd, contentWidth);
-            lineStart = items[wordStart].byteOffset;
-            contentWidth = 0.f;
-            pendingSpace = 0.f;
-        }
-
-        if (wrap && contentWidth == 0.f && wordWidth > wrapWidth) {
-            // A single word wider than the paragraph: break it between
-            // characters, the way StaticLayout does.
-            float chunk = 0.f;
-            size_t chunkStart = wordStart;
-            for (size_t k = wordStart; k < wordEnd; ++k) {
-                if (chunk > 0.f && chunk + items[k].advance > wrapWidth) {
-                    lineStart = items[chunkStart].byteOffset;
-                    emitLine(items[k].byteOffset, chunk);
-                    chunkStart = k;
-                    chunk = 0.f;
-                }
-                chunk += items[k].advance;
-            }
-            lineStart = items[chunkStart].byteOffset;
-            contentEnd = items[wordEnd - 1].byteOffset + items[wordEnd - 1].byteLength;
-            contentWidth = chunk;
-            pendingSpace = 0.f;
-            continue;
-        }
-
-        contentWidth += pendingSpace + wordWidth;
-        contentEnd = items[wordEnd - 1].byteOffset + items[wordEnd - 1].byteLength;
-        pendingSpace = 0.f;
     }
-    if (contentEnd > lineStart || out->lineCount == 0) {
-        emitLine(contentEnd, contentWidth);
-    }
+    out->lineCount = segmentCount;
 
     // Pass 3: the ink box of every line, relative to that line's baseline.
     for (size_t l = 0; l < out->lineCount; ++l) {
@@ -1027,6 +981,93 @@ void noteGlyphVector(const char* what, const GlyphVectorFacade* facade,
     rr3::guestViewWideLog("glyph-vector", 0, 0, details);
 }
 
+// THE PARAGRAPH'S LAYOUT ARGUMENTS.
+//
+// WHY THIS LINE EXISTS
+// --------------------
+// GlyphVector.initWithParagraph(Font, String, float, float, int, int) carries
+// four numbers that decide the whole layout: the wrap width, the height
+// limit, the break style and the alignment. NONE of them was in the log.
+//
+// The consequence was concrete. A Chinese paragraph in the career page's
+// speech bubble was laid out far wider than the bubble, and the run could
+// not say WHY, because the log did not say what wrap width the guest had
+// asked for -- the only number that decides the answer. The wrap width
+// reaches the port through the JNI variadic block (the guest promotes both
+// floats to double itself, at guest 0x12a77dc "fcvt d0, s0" and "fcvt d1,
+// s1", and the port narrows them back at jni_bridge.cpp's decodeGuestVarArgs),
+// so the number IS available; it simply was never printed.
+//
+// This line prints it. `wrap` is the guest's wrap width, `maxH` the height
+// limit, `break` the break style and `align` the alignment, exactly as the
+// guest passed them. `wrapping` says whether the port turned wrapping on at
+// all (a width that is not positive, or that is at or above
+// kMaxWrapWidth, turns it OFF), `lines` is how many lines came out, and
+// `boundsW`/`boundsH` are the box the guest will draw.
+//
+// WHAT IS LOGGED AND WHAT IS NOT
+// ------------------------------
+// EVERY initWithParagraph is logged, because this line is the only place the
+// guest's wrap width can come from. A run makes about 14,000 of them, so
+// there is a cap: past it the line is only written for a paragraph whose
+// text is not ASCII, because that is the case under investigation and it is
+// rare. The cap is reported when it is reached, so a reader can tell a
+// missing line from a logger that stopped.
+constexpr size_t kParagraphLogCap = 32768;
+
+void noteParagraph(float wrapWidth, float maxHeight, int breakStyle,
+                   int alignment, bool wrapping, size_t layoutLines, size_t usedLines,
+                   float boundsW, float boundsH, float sizePx, float widthScale,
+                   size_t textLen, const char* text) {
+    bool nonAscii = false;
+    if (text != nullptr) {
+        for (size_t i = 0; text[i] != '\0' && i < 64; ++i) {
+            if (static_cast<unsigned char>(text[i]) >= 0x80) {
+                nonAscii = true;
+                break;
+            }
+        }
+    }
+
+    static size_t logged = 0;
+    if (logged >= kParagraphLogCap) {
+        if (!nonAscii) {
+            return;
+        }
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            char cap[128];
+            snprintf(cap, sizeof(cap),
+                     "cap=%u reason=paragraph_log_budget_spent only_non_ascii_is_logged",
+                     static_cast<unsigned>(kParagraphLogCap));
+            rr3::guestViewWideLog("glyph-para", 0, 0, cap);
+        }
+    }
+    ++logged;
+
+    char preview[96];
+    preview[0] = '\0';
+    if (text != nullptr) {
+        size_t n = 0;
+        while (n < 60 && text[n] != '\0' && text[n] != '\n') {
+            preview[n] = text[n];
+            ++n;
+        }
+        preview[n] = '\0';
+    }
+    char details[384];
+    snprintf(details, sizeof(details),
+             "method=initWithParagraph wrap=%.1f maxH=%.1f break=%d align=%d "
+             "wrapping=%d lines=%u layoutLines=%u size=%.1f widthScale=%.1f "
+             "textLen=%u boundsW=%.1f boundsH=%.1f text=\"%s\"",
+             wrapWidth, maxHeight, breakStyle, alignment, wrapping ? 1 : 0,
+             static_cast<unsigned>(usedLines), static_cast<unsigned>(layoutLines),
+             sizePx, widthScale, static_cast<unsigned>(textLen), boundsW, boundsH,
+             preview);
+    rr3::guestViewWideLog("glyph-para", 0, 0, details);
+}
+
 // ---------------------------------------------------------------------------
 // The four methods
 // ---------------------------------------------------------------------------
@@ -1239,6 +1280,16 @@ void renderText(uintptr_t self, uintptr_t fontHandle, const char* text,
 
     mutexUnlock(&g_glyphMutex);
     noteGlyphVector(paragraph ? "initWithParagraph" : "init", facade, textLen, request.sizePx, text);
+    if (paragraph) {
+        // The guest's own layout arguments, and what came out of them. This
+        // is the line that says whether the wrap width the guest asked for
+        // is the wrap width the port laid out with.
+        noteParagraph(wrapWidth, maxHeight, breakStyle, alignment,
+                      wrapWidth > 0.f && wrapWidth < kMaxWrapWidth,
+                      layout.lineCount, static_cast<size_t>(facade->numLines),
+                      facade->boundsW, facade->boundsH, request.sizePx,
+                      request.widthScale, textLen, text);
+    }
 }
 
 // WHY A createTexture() CALL REFUSED TO MAKE A TEXTURE.
