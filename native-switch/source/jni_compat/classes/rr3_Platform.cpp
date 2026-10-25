@@ -234,10 +234,24 @@ static void platform_set_crashlytics_string(JNIEnv *, jclass, jstring, jstring) 
  * stale download staging directories. */
 static jboolean platform_delete_directory(JNIEnv *, jclass, jstring) { return JNI_TRUE; }
 
-/* /proc/meminfo MemTotal in MB. The R36S has 1 GB; the engine uses this only to
- * pick texture budgets, and reporting the real figure is better than 0, which
- * some of those comparisons treat as "unknown, assume the smallest tier". */
-static jint platform_get_total_memory(JNIEnv *, jclass) { return 1024; }
+/* /proc/meminfo MemTotal in MB.
+ *
+ * It used to report 1024, on the reasoning that the engine "uses this only to
+ * pick texture budgets" and that the R36S (the Switch's low-memory model)
+ * has 1 GB. MEASURED 2026-10-25 (archive 20261025-155851-eden-f1a): with
+ * that figure the guest REFUSED TO LOAD A TRACK -- it put up its own dialog,
+ * "可用内存不足，无法加载赛道。正在返回主菜单..." ("not enough available
+ * memory to load the track"), and returned to the main menu. The whole
+ * path to a race worked (daily reward -> event picker -> quest page ->
+ * car select -> start race) and died at exactly this read.
+ *
+ * The port's target is a console with 16 GB, and the real /proc/meminfo of
+ * such a machine reports far more than 1 GB, so the 1 GB figure was never
+ * the device's answer either. 4096 MB is used here: it is four times the
+ * old value, it clears any "at least 2 GB" content gate, and it stays well
+ * under the real console's figure so that the texture tier the engine picks
+ * does not jump to the top tier. */
+static jint platform_get_total_memory(JNIEnv *, jclass) { return 4096; }
 
 /*
  * exitApp() is only reached from the negative button of an alert - which this
@@ -305,8 +319,16 @@ static jlong platform_get_app_install_time(JNIEnv *, jclass) { return 0; }
  * report plenty and it behaves as it would on the 1 GB device this is. The
  * numbers are a floor, not a measurement, and are marked as such here rather
  * than dressed up as one.
+ *
+ * MEASURED 2026-10-25 (archive 20261025-155851-eden-f1a): the 512 MB free
+ * figure was NOT optimistic enough. The guest compared its available memory
+ * against the memory a track needs and refused to load one ("可用内存不足，
+ * 无法加载赛道。正在返回主菜单..."). The error text says AVAILABLE memory,
+ * and this is the available-memory read, so this is the number that has to
+ * move. 4 GB is what a console with 16 GB can honestly spare for a game, and
+ * it is four times the old floor.
  */
-static jlong platform_get_app_memory_free(JNIEnv *, jclass) { return 512LL * 1024 * 1024; }
+static jlong platform_get_app_memory_free(JNIEnv *, jclass) { return 4096LL * 1024 * 1024; }
 static jlong platform_get_app_memory_usage(JNIEnv *, jclass) { return 128LL * 1024 * 1024; }
 static void platform_memory_probe(JNIEnv *, jclass) {}
 

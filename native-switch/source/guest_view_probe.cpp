@@ -8384,18 +8384,39 @@ void* frameLoopDriver(void* opaque) {
             // renderer, so the captures also SLOW THE GUEST DOWN; a capture
             // every 150 frames is the compromise that still puts a picture
             // within a couple of seconds after every click.
-            static const unsigned kSchedule[] = {
-                30u, 120u, 300u, 600u, 1000u, 1200u,
-                1350u, 1500u, 1650u, 1800u, 1950u, 2100u, 2250u, 2400u,
-                2550u, 2700u, 2850u, 3000u, 3150u, 3300u, 3450u, 3600u,
-                3750u, 3900u, 4050u, 4200u, 4350u, 4500u, 4650u, 4800u,
-                4950u, 5100u, 5250u, 5400u, 5550u, 5700u, 5850u, 6000u,
-                6150u, 6300u, 6450u, 6600u, 6750u, 6900u
-            };
+            //
+            // IT IS COMPUTED, NOT WRITTEN OUT, AND THAT IS THE POINT.
+            //
+            // The written-out list stopped at frame 6900. The touch script,
+            // however, was still working at frame 9645 (the click that opened
+            // the F1 Academy quest page) and the race was reached at frame
+            // 13051 -- so the run produced 45 pictures and then went BLIND
+            // exactly where the experiment needed to look. A run that cannot
+            // see the frame it has to explain is a blind run, and "the
+            // instrument did not cover the interesting part" reads exactly
+            // like "the thing did not happen".
+            //
+            // The first five frames keep their historical values so that
+            // archives before and after this change can be compared on the
+            // same labels, and from frame 1200 the capture is every 200
+            // frames out to 12000 -- which covers the whole front end, the
+            // daily reward, the event picker, the quest page, the car select
+            // screen and the race itself.
+            static const unsigned kScheduleHead[] = { 30u, 120u, 300u, 600u, 1000u };
+            constexpr unsigned kScheduleFrom = 1200u;
+            constexpr unsigned kScheduleStep = 200u;
+            constexpr unsigned kScheduleLast = 12000u;
             static unsigned s_index = 0;
-            if (s_index < (sizeof(kSchedule) / sizeof(kSchedule[0])) &&
-                frames >= kSchedule[s_index]) {
-                const unsigned at = kSchedule[s_index];
+            unsigned wanted = 0u;
+            if (s_index < (sizeof(kScheduleHead) / sizeof(kScheduleHead[0]))) {
+                wanted = kScheduleHead[s_index];
+            } else {
+                wanted = kScheduleFrom +
+                         (s_index - (sizeof(kScheduleHead) / sizeof(kScheduleHead[0]))) *
+                             kScheduleStep;
+            }
+            if (wanted <= kScheduleLast && frames >= wanted) {
+                const unsigned at = wanted;
                 ++s_index;
                 // The frame-3000 capture keeps the old "LATE" label so that
                 // archives before and after this change can be compared on
