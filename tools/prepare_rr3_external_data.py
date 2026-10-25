@@ -88,6 +88,83 @@ def extract_volume(archive: zipfile.ZipFile, infos: list[zipfile.ZipInfo],
     return len(selected), total
 
 
+# The track data the guest's loader looks for under "processed/".
+#
+# MEASURED 2026-10-25, archives 20261025-162550-eden-f1b and
+# 20261025-165527-eden-f1c: loading a race, the guest asks for the track's
+# files under "Tracks/<Track>/processed/" -- the collision ("<name>.fmc"),
+# the spline ("<name>.spline"), the AI racing line ("<name>.rr_ai") and the
+# minimap ("<name>_minimap.m3g") -- while EA's package keeps that same set
+# under the VARIANT directory ("circuit", "gp", "indy", ...). The guest's
+# own asset list names the variant spelling, so the guest downloads the
+# files there and then cannot find them where its loader looks.
+#
+# The symptom is not "a file is missing" but a refusal: the guest logged
+# "Failed to load track spline", "Need to regenerate start_spline as it is
+# missing" and "Need to regenerate start_spline but it can only be done on
+# Win32", and gave up on the race. The dialog it then shows says "not
+# enough memory to load the track", which is why this took three runs to
+# find: the message names a resource class, not the thing that is missing.
+#
+# WHICH OF THEM ARE FATAL, MEASURED IN THE SAME RUN:
+#   .fmc     fatal -- "Failed to load collision file" aborts the load;
+#   .spline  fatal -- the guest would have to regenerate it, and says it can
+#                    only do that on Win32;
+#   .rr_ai   not fatal -- the guest logs "Unable to load track ai data" and
+#                    carries on with "Using default AI values for ...";
+#   the minimap and the .pvs and the .lights files are not fatal either.
+# The three cheap ones are mirrored as well, because they are kilobytes and
+# they save a run each; the .pvs files (2-4 MB each) are NOT mirrored: the
+# tracks volume is already 1.91 GiB against a 2 GiB build_romfs limit.
+#
+# An existing file is never overwritten, so a track that ships a real
+# processed/ tree (Brands_Hatch and Tutorial do) keeps it.
+TRACK_DATA_SUFFIXES = (".fmc", ".spline", ".rr_ai")
+TRACK_DATA_MINIMAP_SUFFIX = "_minimap.m3g"
+TRACK_DATA_SKIP_DIRS = {"processed", "resources"}
+
+
+def is_track_data_file(name: str) -> bool:
+    """True for the files the guest's track loader needs under processed/.
+
+    The minimap is matched by its own name suffix and not by its extension:
+    the extension would also match "<name>_variation.m3g", which is a VISUAL
+    asset that belongs in processed/high/ and must not be copied.
+    """
+    return name.endswith(TRACK_DATA_SUFFIXES) or name.endswith(TRACK_DATA_MINIMAP_SUFFIX)
+
+
+def mirror_track_data_halves(volume_stage: Path) -> tuple[int, int]:
+    """Copy each track's data half into its processed/ directory."""
+    tracks_root = volume_stage / "files" / ".depot" / "Tracks"
+    if not tracks_root.is_dir():
+        return 0, 0
+    copied = 0
+    copied_bytes = 0
+    for track in sorted(tracks_root.iterdir()):
+        if not track.is_dir():
+            continue
+        processed = track / "processed"
+        for variant in sorted(track.iterdir()):
+            if not variant.is_dir() or variant.name in TRACK_DATA_SKIP_DIRS:
+                continue
+            for source in sorted(variant.rglob("*")):
+                if not source.is_file():
+                    continue
+                if not is_track_data_file(source.name):
+                    continue
+                relative = source.relative_to(variant)
+                destination = processed / relative
+                if destination.exists():
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+                copied += 1
+                copied_bytes += destination.stat().st_size
+                print(f"  + {track.name}/processed/{relative}", flush=True)
+    return copied, copied_bytes
+
+
 def build_volume(builder: Path, staging: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     completed = subprocess.run(
@@ -187,6 +264,12 @@ def main() -> int:
                 volume_stage = staging / volume
                 volume_stage.mkdir(parents=True)
                 count, source_bytes = extract_volume(archive, infos, volume, volume_stage)
+                if volume == "tracks":
+                    mirrored, mirrored_bytes = mirror_track_data_halves(volume_stage)
+                    print(f"[{volume}] mirrored {mirrored} track data file(s) into "
+                          f"processed/ ({mirrored_bytes} bytes)", flush=True)
+                    count += mirrored
+                    source_bytes += mirrored_bytes
                 destination = data_output / f"{volume}.romfs"
                 print(f"[{volume}] building {destination.name}", flush=True)
                 build_volume(builder, volume_stage, destination)
