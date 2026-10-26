@@ -124,6 +124,66 @@ TRACK_DATA_MINIMAP_SUFFIX = "_minimap.m3g"
 TRACK_DATA_SKIP_DIRS = {"processed", "resources"}
 
 
+# The 480x320 copy of the GUI tree, mirrored from 960x640.
+#
+# MEASURED 2026-10-25, archive 20261025-183814-eden-f1e and its disk-space
+# control 20261025-222948-eden-f1f: the guest logs 125 of
+#   "Failed to load image from atlas: 'button/standard.png'" and 15 of
+#   "'./avatars/ai_avatar_25.png'". Both are the SAME defect and both are
+# # decided by the guest's resolution chain, which the guest builds by
+#   enumerating gui_assets/ and keeps in readdir order (960x640, then 480x320;
+#   the guest's own "Res order:" line in the log says exactly that).
+#
+# For button the guest DOES find 960x640/button/sprites.android.atlas -- the
+# port's stat answers 1268 bytes for it -- and still does not take the sprite
+# from it, so the chain falls through to 480x320. There, EVERY candidate
+# misses: the volumes ship 16 files and 3 sprite atlases under
+# gui_assets/480x320/ (only events/ and splash/), against 3,929 files and
+# 1,928 atlases under 960x640/. The guest then tries the three atlas
+# spellings (sprites.android.atlas, sprites.ios.atlas, sprites.atlas) in
+# 480x320 and every one of them is ENOENT, so the image is lost.
+#
+# The "avatars" failures degrade further: the request becomes
+# "./avatars/ai_avatar_25.png", i.e. the guest gave up on the folder chain
+# entirely and fell back to a whole-tree name search.
+#
+# So the second link of the chain has to be a real tree, not a stub. Mirroring
+# 960x640 into 480x320 is additive: it cannot displace anything that already
+# works, and the guest takes the FIRST chain entry that yields the sprite.
+#
+# An existing file is never overwritten, so the 480x320 content EA really
+# ships (events/, splash/) keeps its own bytes.
+GUI_480_SOURCE = "960x640"
+GUI_480_TARGET = "480x320"
+
+
+def mirror_gui_assets_to_480x320(volume_stage: Path) -> tuple[int, int]:
+    """Copy the 960x640 GUI tree into 480x320, so the guest's second link in
+    its resolution chain is a complete tree and not a 16-file stub."""
+    gui_root = volume_stage / "files" / ".depot" / "gui_assets"
+    source_root = gui_root / GUI_480_SOURCE
+    target_root = gui_root / GUI_480_TARGET
+    if not source_root.is_dir():
+        return 0, 0
+    copied = 0
+    copied_bytes = 0
+    for source in sorted(source_root.rglob("*")):
+        if not source.is_file():
+            continue
+        relative = source.relative_to(source_root)
+        destination = target_root / relative
+        if destination.exists():
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        copied += 1
+        copied_bytes += destination.stat().st_size
+    print(f"  mirrored {copied} file(s) from {GUI_480_SOURCE}/ into "
+          f"{GUI_480_TARGET}/ ({copied_bytes / 1024**2:.1f} MiB)", flush=True)
+    return copied, copied_bytes
+
+
+
 def is_track_data_file(name: str) -> bool:
     """True for the files the guest's track loader needs under processed/.
 
@@ -326,6 +386,10 @@ def main() -> int:
                     mirrored, mirrored_bytes = mirror_track_data_halves(volume_stage)
                     print(f"[{volume}] mirrored {mirrored} track data file(s) into "
                           f"processed/ ({mirrored_bytes} bytes)", flush=True)
+                    count += mirrored
+                    source_bytes += mirrored_bytes
+                if volume == "gui-sd":
+                    mirrored, mirrored_bytes = mirror_gui_assets_to_480x320(volume_stage)
                     count += mirrored
                     source_bytes += mirrored_bytes
                 if volume == "core":
