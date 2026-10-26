@@ -24,6 +24,12 @@
 #include <vector>
 
 namespace rr3 {
+// A forward declaration for the SHARED OVERRIDE SET: the ONE set the base-list
+// rewrite, the per-category gui list rewrite, the completed gui-assets
+// manifest, the census, the inventory and the digest audit all read, so none
+// of them can disagree about a path they all name. Its definition sits next
+// to resolveAssetLocalFile(), the resolver it uses.
+const std::vector<std::pair<std::string, std::string>>& sharedAssetOverrides();
 namespace {
 
 constexpr const char* kDataBase = "sdmc:/switch/rr3-native-rehost/data";
@@ -2485,8 +2491,12 @@ void appendOverrideWithBothSpellings(
     out.emplace_back(std::string("/") + other, digest);
 }
 
-void collectAssetOverrides(std::vector<std::pair<std::string, std::string>>& out) {
+void collectAssetOverrides(std::vector<std::pair<std::string, std::string>>& out,
+                           unsigned* unresolvedOut = nullptr) {
     out.clear();
+    if (unresolvedOut != nullptr) {
+        *unresolvedOut = 0;
+    }
     std::vector<std::string> requested;
     std::FILE* file = std::fopen(kAssetPathFile, "rb");
     if (file == nullptr) {
@@ -2526,6 +2536,9 @@ void collectAssetOverrides(std::vector<std::pair<std::string, std::string>>& out
         unsigned long long size = 0;
         if (!resolveAssetLocalFile(path.c_str(), source, sizeof(source), digest,
                                   &size)) {
+            if (unresolvedOut != nullptr) {
+                ++*unresolvedOut;
+            }
             continue;
         }
         appendOverrideWithBothSpellings(out, path, std::string(digest));
@@ -2535,7 +2548,8 @@ void collectAssetOverrides(std::vector<std::pair<std::string, std::string>>& out
 }
 // A forward declaration: the definition sits next to the base-list rewrite,
 // where the recorded-path file is in scope.
-void collectAssetOverrides(std::vector<std::pair<std::string, std::string>>& out);
+void collectAssetOverrides(std::vector<std::pair<std::string, std::string>>& out,
+                           unsigned* unresolvedOut);
 
 // Build the completed manifest and write it to the card. Returns true when
 // the completed file exists and can be served.
@@ -2648,8 +2662,11 @@ bool buildCompletedGuiAssetsManifest() {
     // serves differently change, and they change to the digest of the file
     // the port really serves there.
     {
-        std::vector<std::pair<std::string, std::string>> overrides;
-        collectAssetOverrides(overrides);
+        // THE SHARED OVERRIDE SET -- the same set the base list and the
+        // per-category gui list are rewritten from, so the manifest and the
+        // lists publish ONE digest for a path they all name.
+        const std::vector<std::pair<std::string, std::string>>& overrides =
+            sharedAssetOverrides();
         if (!overrides.empty()) {
             const auto byPath = [](const std::pair<std::string, std::string>& entry,
                                   const std::string& path) {
@@ -3032,9 +3049,9 @@ bool isConsistentBaseListPath(const char* guestPath) {
 //   digest for the asset, the merge keeps the entry, and the compare has a
 //   digest to compare against.
 //
-//   The override set is collectAssetOverrides() -- the same function the
-//   completed gui-assets manifest uses, reading the same recorded-path file
-//   the base list's own pass reads -- so the two lists are rewritten from ONE
+//   The override set is the SHARED one (sharedAssetOverrides()) -- the same
+//   set the completed gui-assets manifest, the base list's own pass, the
+//   census and the inventory use -- so the two lists are rewritten from ONE
 //   set by construction and cannot disagree about a path they both name.
 // ---------------------------------------------------------------------------
 
@@ -4619,6 +4636,257 @@ bool resolveAssetLocalFile(const char* assetPath, char* outPath, size_t outPathS
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// THE SHARED OVERRIDE SET: EVERY ATLAS PATH THE LISTS NAME.
+//
+// WHY IT EXISTS.
+//
+//   MEASURED 2026-10-25, archive 20261025-222948-eden-f1f: the guest made ZERO
+//   filesystem requests for the "button" and "avatars" atlases and 24 for
+//   "common"/"events", and it answered "Failed to load image from atlas:
+//   '<sprite>'" for every sprite in the two atlases that never opened.
+//
+//   The cause is neither a missing file nor a broken resolver. It is the
+//   DIGEST the lists publish. The guest validates every asset against the md5
+//   the asset lists name, and for EVERY "/gui_assets/<res>/**/
+//   sprites.android.atlas" path the shipped list publishes EA's own revision
+//   while the port serves the data pack's. The guest's check fails, the asset
+//   is dropped from its registry, and the file is NEVER OPENED.
+//
+//   "common" is the ONE folder that works, and it is the one folder that
+//   happened to be inside the old override set -- the 69 paths the guest
+//   happened to download. The override set was too narrow, and the failures
+//   live in everything it did not cover.
+//
+// ONE SET, BUILT ONCE PER BOOT.
+//
+//   Every consumer -- the base-list rewrite, the per-category GUI list
+//   rewrite, the completed gui-assets manifest, the census, the inventory and
+//   the digest audit -- reads THIS set. Five separate builds would cost five
+//   times the hashing and could disagree about a digest; one build cannot.
+//
+// THE DIGEST COMES FROM THE SHARED CANDIDATE RULE.
+//
+//   resolveAssetLocalFile() is the MANIFEST SIDE of rr3::asset's shared
+//   selection: it builds the candidates with rr3::asset::buildCandidates()
+//   and picks one with rr3::asset::selectCandidate() -- the very functions
+//   the pack endpoint uses, from the very header (rr3_asset_candidates.hpp).
+//   The endpoint's side is selectCandidate() with the digest the guest asked
+//   for; the manifest's side is selectCandidate() with no expected digest,
+//   which takes the FIRST CANDIDATE THAT EXISTS. The endpoint's tie-breaker
+//   then finds that very candidate when the guest asks for the digest the
+//   manifest published, so the bytes the guest receives are the bytes the
+//   digest describes.
+//
+//   That also keeps the two fallbacks the shared header already handles: the
+//   guest's own download cache ("<path>.ast", for BOTH spellings) and the
+//   NEAREST LOWER RESOLUTION (a 2048x1536 path answered from the 960x640
+//   tree). A path the port can only serve at a lower resolution publishes
+//   THAT file's digest, which is correct: the shipped digest names bytes the
+//   port never sends.
+//
+// THE SCOPE: THE ATLASES ONLY.
+//
+//   The atlases are the proven failure mode. The textures (.pvr.z) mostly
+//   match already, and every entry of every list would cost a resolve and a
+//   hash: the base list names 40,862 entries and the whole set is 9.394 GB,
+//   which is 210-420 SECONDS of boot. The atlas set is 4,289 paths and
+//   2.68 MB -- affordable -- and it is the set the guest's failures are in.
+//
+// THE COST IS LOGGED.
+//
+//   considered / resolved / bytes / ms, so the next round's log proves it.
+// ---------------------------------------------------------------------------
+
+// THE ATLAS LEAF: the sprite atlas file the guest validates.
+constexpr const char kAtlasLeaf[] = "sprites.android.atlas";
+
+// TRUE when the path names a sprite atlas in the gui_assets tree.
+//
+// WHOLE SEGMENT, NOT A SUFFIX: the leaf is "sprites.android.atlas", so the
+// path has to END with it AND carry a separator in front of it.
+bool isGuiAtlasAssetPath(const char* path) {
+    if (path == nullptr) {
+        return false;
+    }
+    const size_t leafLength = sizeof(kAtlasLeaf) - 1u;
+    const size_t length = std::strlen(path);
+    if (length <= leafLength) {
+        return false;
+    }
+    if (std::strcmp(path + (length - leafLength), kAtlasLeaf) != 0) {
+        return false;
+    }
+    if (path[length - leafLength - 1u] != '/') {
+        return false;
+    }
+    return std::strncmp(path, "/gui_assets/", 12) == 0;
+}
+
+// THE ATLAS PATHS ONE ASSET LIST NAMES.
+//
+// The list is read through the port's own resolver, so the paths are the ones
+// the port serves, and the list is the FIXED TABLE the guest merges, so every
+// path the guest can look up is covered. The volumes are NOT walked: the
+// lists are the table.
+void collectAtlasPathsFromList(const char* guestPath, std::vector<std::string>& out) {
+    if (guestPath == nullptr) {
+        return;
+    }
+    Resolution resolution{};
+    if (!resolvePath(guestPath, false, resolution)) {
+        return;
+    }
+    std::string text;
+    const int rc = withReadFallback(
+        resolution, guestPath,
+        [&text](const char* candidate) -> int {
+            // THE BULK PATH FIRST. The base list is 4,212,795 B, and libnx's
+            // ordinary read path asks the FS service for the whole size in one
+            // request, is refused, and falls back to 4 KiB pieces -- ~1029
+            // service round trips for one file.
+            std::FILE* file = nullptr;
+            if (!bulkOpenFile(candidate, "rb", &file)) {
+                file = std::fopen(candidate, "rb");
+            }
+            if (file == nullptr) {
+                return -1;
+            }
+            if (std::fseek(file, 0, SEEK_END) != 0) {
+                std::fclose(file);
+                return -1;
+            }
+            const long size = std::ftell(file);
+            if (size < 0 || std::fseek(file, 0, SEEK_SET) != 0) {
+                std::fclose(file);
+                return -1;
+            }
+            text.assign(static_cast<size_t>(size), '\0');
+            const size_t got = (size > 0)
+                ? std::fread(&text[0], 1, static_cast<size_t>(size), file)
+                : 0u;
+            std::fclose(file);
+            if (got != static_cast<size_t>(size)) {
+                text.clear();
+                return -1;
+            }
+            return 0;
+        });
+    if (rc != 0) {
+        return;
+    }
+    // THE LINES. The path is the FIRST field; the md5 and the size fields that
+    // follow it are NOT read here -- the digest comes from the resolver, not
+    // from the list. A line without a tab is a header (the base list's first
+    // line is a binary header) and names no asset.
+    size_t position = 0;
+    while (position < text.size()) {
+        const size_t end = text.find('\n', position);
+        const size_t lineEnd = (end == std::string::npos) ? text.size() : end;
+        size_t tab = text.find('\t', position);
+        if (tab == std::string::npos || tab > lineEnd) {
+            tab = lineEnd;
+        }
+        if (tab > position) {
+            const std::string path = text.substr(position, tab - position);
+            if (isGuiAtlasAssetPath(path.c_str())) {
+                out.push_back(path);
+            }
+        }
+        position = (end == std::string::npos) ? text.size() : end + 1;
+    }
+}
+
+// WHAT THE SHARED OVERRIDE SET COST, AND WHAT IT COVERED.
+struct OverrideSetStats {
+    // The paths the guest has downloaded -- the set this port already had.
+    unsigned recordedPaths{0};
+    unsigned recordedUnresolved{0};
+    // The atlas paths the two lists name, and the ones the resolver answered.
+    unsigned atlasConsidered{0};
+    unsigned atlasResolved{0};
+    unsigned long long atlasBytes{0};
+    unsigned long long elapsedMs{0};
+};
+
+std::vector<std::pair<std::string, std::string>> gSharedOverrides;
+OverrideSetStats gSharedOverrideStats{};
+bool gSharedOverridesBuilt = false;
+
+// THE OVERRIDE SET EVERY CONSUMER SEES.
+//
+// Built ONCE per boot and shared, so the base-list rewrite, the per-category
+// GUI list rewrite, the completed gui-assets manifest, the census, the
+// inventory and the digest audit cannot disagree about a path they all name.
+const std::vector<std::pair<std::string, std::string>>& sharedAssetOverrides() {
+    if (gSharedOverridesBuilt) {
+        return gSharedOverrides;
+    }
+    // The flag is set BEFORE the work, so a re-entrant call cannot build the
+    // set twice; the set is complete when this returns.
+    gSharedOverridesBuilt = true;
+    const uint64_t startTick = armGetSystemTick();
+    const uint64_t tickFreq = armGetSystemTickFreq();
+
+    // 1. THE PATHS THE GUEST HAS DOWNLOADED -- the set this port already had.
+    std::vector<std::pair<std::string, std::string>> overrides;
+    collectAssetOverrides(overrides, &gSharedOverrideStats.recordedUnresolved);
+    gSharedOverrideStats.recordedPaths = overrides.size();
+
+    // 2. THE ATLAS PATHS THE LISTS NAME.
+    std::vector<std::string> atlas;
+    collectAtlasPathsFromList(kBaseListGuestPath, atlas);
+    collectAtlasPathsFromList(kGuiBaseListGuestPath, atlas);
+    // DEDUPLICATE BEFORE RESOLVING: the two lists name many of the same
+    // atlases, so the same file would otherwise be resolved and hashed twice.
+    std::sort(atlas.begin(), atlas.end());
+    atlas.erase(std::unique(atlas.begin(), atlas.end()), atlas.end());
+    gSharedOverrideStats.atlasConsidered = atlas.size();
+
+    // 3. RESOLVE THEM, ONE AT A TIME, WITH THE SHARED CANDIDATE RULE.
+    for (const std::string& path : atlas) {
+        char source[0x600]{};
+        char digest[33]{};
+        unsigned long long size = 0;
+        if (!resolveAssetLocalFile(path.c_str(), source, sizeof(source), digest,
+                                   &size)) {
+            // THE PORT CANNOT SERVE THIS ONE. The list keeps the shipped
+            // digest for it, which is the honest answer: there are no bytes
+            // here to describe.
+            continue;
+        }
+        ++gSharedOverrideStats.atlasResolved;
+        gSharedOverrideStats.atlasBytes += size;
+        // BOTH SPELLINGS: the guest asks for "assets_<res>/..." and the lists
+        // say "gui_assets/<res>/...", and the override set is keyed by the
+        // path STRING.
+        appendOverrideWithBothSpellings(overrides, path, std::string(digest));
+    }
+    // 4. SORTED AND UNIQUE, so every consumer can look an entry up with a
+    //    binary search and so the cache key is a function of the SET.
+    std::sort(overrides.begin(), overrides.end());
+    overrides.erase(std::unique(overrides.begin(), overrides.end()), overrides.end());
+    gSharedOverrides.swap(overrides);
+
+    gSharedOverrideStats.elapsedMs = (armGetSystemTick() - startTick) * 1000ULL /
+                                     (tickFreq != 0 ? tickFreq : 1);
+    // 5. THE COST, ON THE RECORD.
+    char diag[768];
+    std::snprintf(diag, sizeof(diag),
+                  "recorded=%u recorded_unresolved=%u atlas_considered=%u "
+                  "atlas_resolved=%u atlas_bytes=%llu ms=%llu total=%zu",
+                  gSharedOverrideStats.recordedPaths,
+                  gSharedOverrideStats.recordedUnresolved,
+                  gSharedOverrideStats.atlasConsidered,
+                  gSharedOverrideStats.atlasResolved,
+                  (unsigned long long)gSharedOverrideStats.atlasBytes,
+                  (unsigned long long)gSharedOverrideStats.elapsedMs,
+                  gSharedOverrides.size());
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "asset-override-set", 0, 0, diag);
+    return gSharedOverrides;
+}
+
 // The asset list the guest checks its downloads against -- its leaf name,
 // its guest path and the card path of the rewritten copy are declared above
 // withReadFallback, which is where the copy is served from.
@@ -5163,9 +5431,10 @@ void auditAssetDigestInvariant() {
     const uint64_t tickFreq = armGetSystemTickFreq();
 
     // 1. THE PUBLISHED DIGESTS: the override set the base list and the
-    //    per-category gui list are rewritten from.
-    std::vector<std::pair<std::string, std::string>> published;
-    collectAssetOverrides(published);
+    //    per-category gui list are rewritten from. It is the SHARED set, so
+    //    this audit and those rewrites cannot disagree about a path.
+    const std::vector<std::pair<std::string, std::string>>& published =
+        sharedAssetOverrides();
 
     // 2. EACH ONE.
     unsigned checked = 0;
@@ -5298,11 +5567,12 @@ bool buildConsistentBaseList(unsigned* rewrittenOut, unsigned* unresolvedOut) {
     const uint64_t startTick = armGetSystemTick();
     const uint64_t tickFreq = armGetSystemTickFreq();
 
-    // 1. THE ASSET PATHS the guest has downloaded, with the digest of the
-    //    bytes the port serves for each of them.
+    // 1. THE OVERRIDE SET -- THE SHARED SET, BUILT ONCE PER BOOT.
     //
-    //    The digest comes from the SAME resolver the pack endpoint uses, so
-    //    the two sides cannot disagree about which file backs a path.
+    //    It is the recorded-download set this list has always been rewritten
+    //    from, PLUS every atlas path the shipped lists name. The digest comes
+    //    from the SAME resolver the pack endpoint uses, so the two sides
+    //    cannot disagree about which file backs a path.
     //
     //    THE PATHS ARE DEDUPLICATED BEFORE THEY ARE RESOLVED. The card's
     //    asset_paths.txt is APPENDED to on every download, so it carries
@@ -5311,60 +5581,21 @@ bool buildConsistentBaseList(unsigned* rewrittenOut, unsigned* unresolvedOut) {
     //    hashing the same file 1,388 times -- the pass cost 2,709 ms on
     //    Eden (archive 20261022-023023-eden-md5ship-r6) and the guest was
     //    waiting for it on the boot path. The distinct set is 30x smaller.
-    std::vector<std::string> requested;
-    {
-        std::FILE* file = std::fopen(kAssetPathFile, "rb");
-        if (file != nullptr) {
-            char line[1024];
-            while (std::fgets(line, sizeof(line), file) != nullptr) {
-                std::string path = line;
-                while (!path.empty() &&
-                       (path.back() == '\n' || path.back() == '\r')) {
-                    path.pop_back();
-                }
-                // The path is normalised here as well as where it is
-                // written: a list written by an older build can carry the
-                // doubled separator, and a key that misses the manifest is
-                // a rewrite that does not happen.
-                size_t begin = 0;
-                while (begin < path.size() && path[begin] == '/') {
-                    ++begin;
-                }
-                if (begin >= path.size()) {
-                    continue;
-                }
-                path = "/" + path.substr(begin);
-                if (path[0] != '/') {
-                    continue;
-                }
-                requested.push_back(path);
-            }
-            std::fclose(file);
-        }
-    }
-    std::sort(requested.begin(), requested.end());
-    requested.erase(std::unique(requested.begin(), requested.end()), requested.end());
+    //
+    //    THE SAME SET THE PER-CATEGORY GUI LIST, THE COMPLETED MANIFEST, THE
+    //    CENSUS, THE INVENTORY AND THE AUDIT USE, so none of them can
+    //    disagree about a path they all name.
     const uint64_t overridesTick = armGetSystemTick();
-    std::vector<std::pair<std::string, std::string>> overrides;
-    for (const std::string& path : requested) {
-        char source[0x600]{};
-        char digest[33]{};
-        unsigned long long size = 0;
-        if (!resolveAssetLocalFile(path.c_str(), source, sizeof(source),
-                                   digest, &size)) {
-            if (unresolvedOut != nullptr) {
-                ++*unresolvedOut;
-            }
-            continue;
-        }
-        appendOverrideWithBothSpellings(overrides, path, std::string(digest));
-    }
+    const std::vector<std::pair<std::string, std::string>>& overrides =
+        sharedAssetOverrides();
     const uint64_t overridesMs = (armGetSystemTick() - overridesTick) * 1000ULL /
                                  (tickFreq != 0 ? tickFreq : 1);
-    // Sorted, so the rewrite can look an entry up with a binary search
-    // instead of scanning the map for every one of the 40,862 entries.
-    std::sort(overrides.begin(), overrides.end());
-    overrides.erase(std::unique(overrides.begin(), overrides.end()), overrides.end());
+    if (unresolvedOut != nullptr) {
+        *unresolvedOut = gSharedOverrideStats.recordedUnresolved;
+    }
+    // The shared set is already sorted and duplicate-free, so the rewrite can
+    // look an entry up with a binary search instead of scanning the map for
+    // every one of the 40,862 entries.
 
     // 1b. THE CACHE KEY: a digest of the OVERRIDE SET.
     //
@@ -5376,6 +5607,15 @@ bool buildConsistentBaseList(unsigned* rewrittenOut, unsigned* unresolvedOut) {
     //
     // The key is the digest of the sorted "path\tdigest" lines, so a change
     // in EITHER the paths or the bytes behind them invalidates it.
+    //
+    // THE EXTENDED COVERAGE IS INSIDE THIS KEY. The key is computed over
+    // EVERY entry of the shared override set, and that set now carries the
+    // atlas paths the shipped lists name as well as the recorded-download
+    // paths. So a card that still holds the OLD rewrite -- the one built from
+    // 69 paths, with "entries=40862 rewritten=14 kept=40848" -- holds the
+    // OLD key, the key does not match, and the list is rewritten from the
+    // extended set instead of being served stale. A card that is NOT wiped
+    // therefore gets the fix on the very next boot.
     //
     // MEASURED 2026-10-22, archive 20261022-023023-eden-md5ship-r6: the pass
     // cost 2,709 ms of the guest's boot. The guest is on the critical path
@@ -5618,11 +5858,27 @@ struct ListScan {
     unsigned rewritten{0};
     unsigned kept{0};
     unsigned disagree{0};
+    // THE ATLAS ENTRIES, COUNTED SEPARATELY.
+    //
+    // The atlas entries are the ones the guest actually failed on, and a
+    // census that reported only a TOTAL could not tell "the scanner looked at
+    // the atlas entries and they agree" from "the scanner never looked at
+    // them". That distinction is the whole point: the census stayed green
+    // over 40,848 kept entries while 125 atlases were never opened.
+    unsigned atlasEntries{0};
+    unsigned atlasRewritten{0};
+    unsigned atlasDisagree{0};
     char firstRewritten[256]{};
     char firstKept[256]{};
     char firstDisagree[256]{};
     char disagreePublished[40]{};
     char disagreePort[40]{};
+    // THE ATLAS CONTROL: one atlas entry the override set covers, the digest
+    // the list publishes for it and the digest the port serves for it. The
+    // pair is what a positive control compares, and it can be checked.
+    char atlasSample[256]{};
+    char atlasSamplePublished[40]{};
+    char atlasSamplePort[40]{};
 };
 
 // THE DIGEST COLUMN OF ONE LINE, WITHOUT ITS TRAILING CARRIAGE RETURN.
@@ -5690,6 +5946,12 @@ void scanAssetList(const std::string& text,
         }
         const std::string path = line.substr(0, tab);
         ++out.entries;
+        // THE ATLAS ENTRIES ARE COUNTED ON THEIR OWN, so a census can prove
+        // it looked at the paths the guest failed on.
+        const bool atlas = isGuiAtlasAssetPath(path.c_str());
+        if (atlas) {
+            ++out.atlasEntries;
+        }
         auto it = std::lower_bound(overrides.begin(), overrides.end(), path, byPath);
         if (it == overrides.end() || it->first != path) {
             ++out.kept;
@@ -5699,6 +5961,9 @@ void scanAssetList(const std::string& text,
             continue;
         }
         ++out.rewritten;
+        if (atlas) {
+            ++out.atlasRewritten;
+        }
         if (out.firstRewritten[0] == '\0') {
             std::snprintf(out.firstRewritten, sizeof(out.firstRewritten), "%s",
                           path.c_str());
@@ -5706,6 +5971,9 @@ void scanAssetList(const std::string& text,
         const std::string published = digestFieldOf(line, tab);
         if (!digestsEqual(published, it->second)) {
             ++out.disagree;
+            if (atlas) {
+                ++out.atlasDisagree;
+            }
             if (out.firstDisagree[0] == '\0') {
                 std::snprintf(out.firstDisagree, sizeof(out.firstDisagree), "%s",
                               path.c_str());
@@ -5714,6 +5982,17 @@ void scanAssetList(const std::string& text,
                 std::snprintf(out.disagreePort, sizeof(out.disagreePort), "%s",
                               it->second.c_str());
             }
+        }
+        else if (atlas && out.atlasSample[0] == '\0') {
+            // THE ATLAS CONTROL SAMPLE: an atlas entry the override set
+            // covers AND the list publishes correctly. The control compares
+            // this pair, so it is a pair that was really observed.
+            std::snprintf(out.atlasSample, sizeof(out.atlasSample), "%s",
+                          path.c_str());
+            std::snprintf(out.atlasSamplePublished,
+                          sizeof(out.atlasSamplePublished), "%s", published.c_str());
+            std::snprintf(out.atlasSamplePort, sizeof(out.atlasSamplePort), "%s",
+                          it->second.c_str());
         }
     }
 }
@@ -5837,11 +6116,11 @@ void writeGuiBaseListCacheKey(const char* key) {
 // Rewrite the per-category GUI asset list so that every entry the guest has
 // ACTUALLY asked for describes the bytes the port serves.
 //
-// THE SAME OVERRIDE SET AS THE BASE LIST. collectAssetOverrides() reads the
-// same recorded-path file, resolves every recorded path with the same
-// resolver and expands each into both spellings, so the per-category list and
-// the base list are rewritten from ONE set and publish the SAME digest for a
-// path they both name.
+// THE SAME OVERRIDE SET AS THE BASE LIST. The shared set (sharedAssetOverrides())
+// holds the recorded-download paths AND every atlas path the shipped lists
+// name, each resolved with the same resolver and expanded into both
+// spellings, so the per-category list and the base list are rewritten from ONE
+// set and publish the SAME digest for a path they both name.
 //
 // THE SAME EXACT-PATH LOOKUP. An entry is rewritten only when the list names
 // a path the override set holds, under that path's EXACT spelling. The
@@ -5863,8 +6142,13 @@ bool buildConsistentGuiBaseList(unsigned* rewrittenOut, unsigned* keptOut) {
     const uint64_t tickFreq = armGetSystemTickFreq();
 
     // 1. THE OVERRIDE SET -- THE SAME SET THE BASE LIST IS REWRITTEN WITH.
-    std::vector<std::pair<std::string, std::string>> overrides;
-    collectAssetOverrides(overrides);
+    //
+    // It is the SHARED set: the recorded-download paths plus every atlas path
+    // the shipped lists name, each with the digest of the bytes the port
+    // serves for it. One set, so the two lists are rewritten from ONE table
+    // and publish the SAME digest for a path they both name.
+    const std::vector<std::pair<std::string, std::string>>& overrides =
+        sharedAssetOverrides();
 
     // 2. THE CACHE KEY: the digest of the OVERRIDE SET.
     //
@@ -5872,6 +6156,11 @@ bool buildConsistentGuiBaseList(unsigned* rewrittenOut, unsigned* keptOut) {
     // never changes -- it is inside a read-only volume) and the override
     // set. So when the override set is unchanged, the rewritten list on the
     // card is already correct and the pass can be skipped.
+    //
+    // THE KEY IS A FUNCTION OF THE WHOLE SET, so the extended coverage
+    // CHANGES IT: a card that still holds the OLD rewrite has the OLD key,
+    // the key does not match, and the list is rewritten from the extended set
+    // instead of being served stale.
     char overrideKey[33]{};
     {
         Md5 md5;
@@ -6235,8 +6524,8 @@ bool scanServedAssetList(
 // reports is what the GUEST gets, not what the factory shipped.
 // ---------------------------------------------------------------------------
 void censusAssetListDigests() {
-    std::vector<std::pair<std::string, std::string>> overrides;
-    collectAssetOverrides(overrides);
+    const std::vector<std::pair<std::string, std::string>>& overrides =
+        sharedAssetOverrides();
 
     struct CensusTarget {
         const char* label;
@@ -6272,12 +6561,15 @@ void censusAssetListDigests() {
             guiScan = scan;
             guiSeen = true;
         }
-        char diag[1400];
+        char diag[1700];
         std::snprintf(diag, sizeof(diag),
                       "list=%s path=%s served=%s read=1 entries=%u rewritten=%u "
-                      "kept=%u disagree=%u overrides=%zu control=%s",
+                      "kept=%u disagree=%u atlas_entries=%u atlas_rewritten=%u "
+                      "atlas_disagree=%u overrides=%zu control=%s",
                       target.label, target.path, served, scan.entries,
-                      scan.rewritten, scan.kept, scan.disagree, overrides.size(),
+                      scan.rewritten, scan.kept, scan.disagree,
+                      scan.atlasEntries, scan.atlasRewritten, scan.atlasDisagree,
+                      overrides.size(),
                       target.controlled
                           ? ((scan.disagree == 0) ? "MUST_AGREE-OK" : "MUST_AGREE-BROKEN")
                           : "REPORT");
@@ -6318,16 +6610,68 @@ void censusAssetListDigests() {
     else {
         status = "OK";
     }
-    char control[900];
+    char control[1200];
     std::snprintf(control, sizeof(control),
                   "status=%s overrides=%zu control_agreements=%u "
-                  "control_disagreements=%u",
+                  "control_disagreements=%u atlas_agreements=%u "
+                  "atlas_disagreements=%u",
                   status, overrides.size(),
                   (guiScan.rewritten > guiScan.disagree)
                       ? guiScan.rewritten - guiScan.disagree : 0u,
-                  guiScan.disagree);
+                  guiScan.disagree,
+                  (guiScan.atlasRewritten > guiScan.atlasDisagree)
+                      ? guiScan.atlasRewritten - guiScan.atlasDisagree : 0u,
+                  guiScan.atlasDisagree);
     appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                         "assetlist-census-control", 0, 0, control);
+
+    // THE ATLAS CONTROL, on its own line.
+    //
+    // The census above counts every entry the override set covers, and it
+    // stayed green over 40,848 kept entries while 125 atlases were never
+    // opened. So the ATLAS entries are counted on their own, and ONE of them
+    // is checked BY NAME: the digest the list publishes for it, the digest
+    // the port serves for it, and the SAME comparison with one hex digit
+    // changed, which MUST disagree.
+    //
+    // A count of ZERO atlas entries means the scanner did not look at the
+    // paths the guest failed on -- not that they agree.
+    {
+        const char* atlasStatus = "NO-ATLAS-SAMPLE";
+        int agree = -1;
+        int detect = -1;
+        if (guiScan.atlasSample[0] != '\0') {
+            agree = digestsEqual(guiScan.atlasSamplePublished,
+                                 guiScan.atlasSamplePort) ? 1 : 0;
+            // THE DETECT CONTROL: the same comparison with ONE hex digit of
+            // the published digest changed. It MUST report a disagreement: a
+            // checker that agrees with a deliberately wrong digest cannot
+            // report anything, and then "0 disagreements" would mean nothing.
+            char corrupted[40];
+            std::snprintf(corrupted, sizeof(corrupted), "%s",
+                          guiScan.atlasSamplePublished);
+            if (corrupted[0] != '\0') {
+                corrupted[0] = (corrupted[0] == '0') ? '1' : '0';
+            }
+            detect = digestsEqual(corrupted, guiScan.atlasSamplePort) ? 1 : 0;
+            atlasStatus = (agree == 1 && detect == 0) ? "OK" : "BROKEN";
+        }
+        else if (guiScan.atlasEntries == 0) {
+            atlasStatus = "NO-ATLAS-ENTRIES";
+        }
+        char atlasDiag[1200];
+        std::snprintf(atlasDiag, sizeof(atlasDiag),
+                      "status=%s atlas_entries=%u atlas_rewritten=%u "
+                      "atlas_disagree=%u sample=%s published=%.40s port=%.40s "
+                      "agree=%d detect=%d",
+                      atlasStatus, guiScan.atlasEntries, guiScan.atlasRewritten,
+                      guiScan.atlasDisagree,
+                      (guiScan.atlasSample[0] != '\0') ? guiScan.atlasSample : "none",
+                      guiScan.atlasSamplePublished, guiScan.atlasSamplePort,
+                      agree, detect);
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "assetlist-census-atlas", 0, 0, atlasDiag);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6349,8 +6693,8 @@ void censusAssetListDigests() {
 // the same file are two scanners, and that is visible in the log.
 // ---------------------------------------------------------------------------
 void censusAssetListInventory() {
-    std::vector<std::pair<std::string, std::string>> overrides;
-    collectAssetOverrides(overrides);
+    const std::vector<std::pair<std::string, std::string>>& overrides =
+        sharedAssetOverrides();
 
     Resolution resolution{};
     if (!resolvePath("files/apk/res", false, resolution)) {
