@@ -30,6 +30,17 @@ namespace rr3 {
 // of them can disagree about a path they all name. Its definition sits next
 // to resolveAssetLocalFile(), the resolver it uses.
 const std::vector<std::pair<std::string, std::string>>& sharedAssetOverrides();
+
+// The rewritten copy of every asset list the port serves: leaf name -> the
+// path on the card. Sorted by leaf, so a lookup is a binary search. Filled by
+// buildRewrittenAssetLists() at boot; see the note on that function for why
+// EVERY list the port serves has to be rewritten, not just the base one.
+std::vector<std::pair<std::string, std::string>> gRewrittenLists;
+
+// The path of the rewritten copy of the list the guest asks for, or nullptr
+// when the port has no rewritten copy of it.
+const char* rewrittenListPath(const char* guestPath);
+
 namespace {
 
 constexpr const char* kDataBase = "sdmc:/switch/rr3-native-rehost/data";
@@ -3280,6 +3291,17 @@ int withReadFallback(const Resolution& resolution, const char* guestPath,
             consistent = gConsistentGuiList.served;
             guiList = true;
         }
+        else {
+            // EVERY OTHER ASSET LIST, rewritten from the SAME override set, so
+            // that no two lists the guest merges can publish two digests for
+            // one path. See buildRewrittenAssetLists() for why this is the
+            // difference between the front end opening and the guest
+            // drowning in "didn't match its MD5".
+            const char* rewritten = rewrittenListPath(guestPath);
+            if (rewritten != nullptr) {
+                consistent = rewritten;
+            }
+        }
         if (consistent != nullptr) {
             ++attempts;
             const int rc = attempt(consistent);
@@ -4723,13 +4745,17 @@ bool isGuiAtlasAssetPath(const char* path) {
     return std::strncmp(path, "/gui_assets/", 12) == 0;
 }
 
-// THE ATLAS PATHS ONE ASSET LIST NAMES.
+// THE PATHS ONE ASSET LIST NAMES.
 //
 // The list is read through the port's own resolver, so the paths are the ones
 // the port serves, and the list is the FIXED TABLE the guest merges, so every
 // path the guest can look up is covered. The volumes are NOT walked: the
 // lists are the table.
-void collectAtlasPathsFromList(const char* guestPath, std::vector<std::string>& out) {
+//
+// `atlasOnly` selects the sprite-atlas paths; with it off, EVERY path the
+// list names is collected, which is what the verbatim-list census needs.
+void collectPathsFromList(const char* guestPath, std::vector<std::string>& out,
+                          bool atlasOnly, std::string* textOut = nullptr) {
     if (guestPath == nullptr) {
         return;
     }
@@ -4775,6 +4801,9 @@ void collectAtlasPathsFromList(const char* guestPath, std::vector<std::string>& 
     if (rc != 0) {
         return;
     }
+    if (textOut != nullptr) {
+        *textOut = text;
+    }
     // THE LINES. The path is the FIRST field; the md5 and the size fields that
     // follow it are NOT read here -- the digest comes from the resolver, not
     // from the list. A line without a tab is a header (the base list's first
@@ -4789,12 +4818,292 @@ void collectAtlasPathsFromList(const char* guestPath, std::vector<std::string>& 
         }
         if (tab > position) {
             const std::string path = text.substr(position, tab - position);
-            if (isGuiAtlasAssetPath(path.c_str())) {
+            if (!atlasOnly || isGuiAtlasAssetPath(path.c_str())) {
                 out.push_back(path);
             }
         }
         position = (end == std::string::npos) ? text.size() : end + 1;
     }
+}
+
+// TRUE when the path names a sprite atlas, under EITHER spelling.
+//
+// The guest's lists say "gui_assets/<res>/..." and the guest asks for
+// "assets_<res>/..."; a conflict between two lists is a conflict on the path
+// STRING, so both spellings have to be recognised.
+bool isAtlasLeafPath(const char* path) {
+    if (path == nullptr) {
+        return false;
+    }
+    const size_t leafLength = sizeof(kAtlasLeaf) - 1u;
+    const size_t length = std::strlen(path);
+    if (length <= leafLength) {
+        return false;
+    }
+    return std::strcmp(path + (length - leafLength), kAtlasLeaf) == 0 &&
+           path[length - leafLength - 1u] == '/';
+}
+
+// THE ATLAS PATHS THE VERBATIM LISTS NAME.
+//
+// WHY THIS EXISTS.
+//
+//   The guest merges the big base list with every per-category list it
+//   downloads. A path named by two lists with TWO DIFFERENT digests is
+//   DROPPED by the merge, and the asset then never reaches the guest's
+//   registry at all.
+//
+//   The port rewrites four lists (the base list, the per-category GUI list,
+//   the completed gui-assets manifest and the update list) and serves the
+//   rest VERBATIM out of the volume, with EA's own digests. So an override -
+//   which replaces a digest with the port's own - is only safe for a path
+//   that NO verbatim list names. Otherwise the rewritten list says the
+//   port's digest, the verbatim list says EA's, the merge drops the entry,
+//   and the guest then asks for an asset whose digest the port cannot
+//   produce.
+//
+//   MEASURED 2026-10-26, archive 20261026-230107-eden-f1g: 85 paths were
+//   dropped that way. The run logged 839 md5 mismatches, the front end never
+//   opened, and Eden exited on its own at 559 s. The four rounds before it
+//   (f1c, f1d, f1e, f1f) reached the race with 0 md5 mismatches.
+//
+// The enumeration is over the LIST TABLE, not a volume walk: the lists are
+// what the guest merges. Only the atlas paths are collected, because those
+// are the only paths the override set can touch.
+void collectVerbatimListGuestPaths(std::vector<std::string>& out) {
+    // The lists the port rewrites. A path one of these names is safe to
+    // override, because the rewrite replaces the digest there too.
+    static const char* kRewritten[] = {
+        "asset_list_base.txtCache.txt",
+        "asset_list_base_gui_assets.txt",
+        "asset_list_gui_assets_core.txt",
+        "asset_list_updates.txt",
+    };
+    static const char* kDirs[] = {"files/apk/res", "files/.depot"};
+    for (const char* dir : kDirs) {
+        Resolution resolution{};
+        if (!resolvePath(dir, false, resolution)) {
+            continue;
+        }
+        DIR* handle = ::opendir(resolution.primary);
+        if (handle == nullptr && errno == ENOENT && resolution.fallback[0] != '\0') {
+            handle = ::opendir(resolution.fallback);
+        }
+        if (handle == nullptr) {
+            continue;
+        }
+        for (;;) {
+            struct dirent* entry = ::readdir(handle);
+            if (entry == nullptr) {
+                break;
+            }
+            const char* leaf = entry->d_name;
+            if (leaf[0] == '.' || std::strstr(leaf, "asset_list") == nullptr) {
+                continue;
+            }
+            bool rewritten = false;
+            for (const char* known : kRewritten) {
+                if (std::strcmp(leaf, known) == 0) {
+                    rewritten = true;
+                    break;
+                }
+            }
+            if (rewritten) {
+                continue;
+            }
+            char guestPath[0x600]{};
+            std::snprintf(guestPath, sizeof(guestPath), "%s/%s", dir, leaf);
+            out.push_back(guestPath);
+        }
+        ::closedir(handle);
+    }
+    // The caller wants the LISTS themselves, not their contents: each one is
+    // rewritten from the shared override set, so the lists agree.
+}
+
+// ---------------------------------------------------------------------------
+// EVERY ASSET LIST THE PORT SERVES, REWRITTEN FROM THE ONE OVERRIDE SET.
+//
+// WHY THIS EXISTS.
+//
+//   The guest merges the big base list with the per-category lists it
+//   downloads, and it validates every asset against the digest ONE of those
+//   lists publishes. The port rewrites four of them (the base list, the
+//   per-category GUI list, the completed gui-assets manifest and the update
+//   list) so that they publish the digest of the bytes the port serves; the
+//   other ~220 it serves VERBATIM, with EA's own digests.
+//
+//   MEASURED 2026-10-26, archives 20261026-230107-eden-f1g and
+//   20261026-233247-eden-f1h: with the base list rewritten and the rest not,
+//   the two sides published different digests for one path, the guest's merge
+//   dropped the entry, and the guest asked for an asset whose digest the port
+//   could not produce: 839 and then 844 "didn't match its MD5" messages, the
+//   front end never opened, and Eden exited on its own.
+//
+//   So EVERY list the port serves is rewritten from the SAME override set.
+//   One set, every list, and then no two lists can publish two digests for
+//   one path.
+//
+// WHERE THE REWRITTEN COPIES GO.
+//
+//   On the card, beside the ones the port already keeps there, with an "rr3-"
+//   prefix, so a rewritten copy can never collide with a shipped name or with
+//   the other rewritten lists. A card that is wiped loses them with the cache
+//   and the next boot rebuilds them.
+// ---------------------------------------------------------------------------
+constexpr const char* kRewrittenListDir = "sdmc:/switch/rr3-native-rehost/cache/";
+
+void buildRewrittenAssetLists() {
+    const uint64_t startTick = armGetSystemTick();
+    const uint64_t tickFreq = armGetSystemTickFreq();
+    const std::vector<std::pair<std::string, std::string>>& overrides =
+        sharedAssetOverrides();
+    const auto byPath = [](const std::pair<std::string, std::string>& entry,
+                           const std::string& path) {
+        return entry.first < path;
+    };
+
+    std::vector<std::string> lists;
+    collectVerbatimListGuestPaths(lists);
+
+    unsigned touched = 0;
+    unsigned written = 0;
+    unsigned entries = 0;
+    unsigned atlasEntries = 0;
+    unsigned long long bytes = 0;
+    for (const std::string& guestPath : lists) {
+        std::string text;
+        std::vector<std::string> paths;
+        collectPathsFromList(guestPath.c_str(), paths, false, &text);
+        if (text.empty()) {
+            continue;
+        }
+        // DOES THIS LIST NAME ANYTHING THE OVERRIDE SET COVERS? A list that
+        // names nothing the set covers keeps the shipped digest everywhere,
+        // so it needs no copy and costs no space.
+        bool touches = false;
+        for (const std::string& path : paths) {
+            auto it = std::lower_bound(overrides.begin(), overrides.end(),
+                                       path, byPath);
+            if (it != overrides.end() && it->first == path) {
+                touches = true;
+                break;
+            }
+        }
+        if (!touches) {
+            continue;
+        }
+        ++touched;
+
+        // REWRITE THE MD5 COLUMN, AND ONLY THAT COLUMN. The path text, the
+        // order, the count and the field layout are preserved exactly.
+        std::string out;
+        out.reserve(text.size() + 64u);
+        size_t position = 0;
+        unsigned changed = 0;
+        while (position < text.size()) {
+            const size_t end = text.find('\n', position);
+            const size_t lineEnd = (end == std::string::npos) ? text.size() : end;
+            const std::string line = text.substr(position, lineEnd - position);
+            const size_t tab = line.find('\t');
+            if (tab == std::string::npos) {
+                out.append(line);
+            } else {
+                const std::string path = line.substr(0, tab);
+                const size_t next = line.find('\t', tab + 1);
+                const std::string rest =
+                    (next == std::string::npos) ? std::string() : line.substr(next);
+                auto it = std::lower_bound(overrides.begin(), overrides.end(),
+                                           path, byPath);
+                if (it != overrides.end() && it->first == path) {
+                    out.append(path);
+                    out.push_back('\t');
+                    out.append(it->second);
+                    out.append(rest);
+                    ++changed;
+                    ++entries;
+                    if (isGuiAtlasAssetPath(path.c_str())) {
+                        ++atlasEntries;
+                    }
+                } else {
+                    out.append(line);
+                }
+            }
+            if (end == std::string::npos) {
+                break;
+            }
+            out.push_back('\n');
+            position = end + 1;
+        }
+        if (changed == 0) {
+            continue;
+        }
+
+        const char* leaf = guestPath.c_str();
+        const size_t slash = guestPath.find_last_of('/');
+        leaf = (slash == std::string::npos) ? guestPath.c_str()
+                                            : guestPath.c_str() + slash + 1;
+        char tempPath[0x600]{};
+        char finalPath[0x600]{};
+        std::snprintf(tempPath, sizeof(tempPath), "%srr3-%s.tmp",
+                      kRewrittenListDir, leaf);
+        std::snprintf(finalPath, sizeof(finalPath), "%srr3-%s",
+                      kRewrittenListDir, leaf);
+        // THROUGH A TEMPORARY FILE, so a card that is pulled mid-write never
+        // shows the guest a half list.
+        std::FILE* file = std::fopen(tempPath, "wb");
+        if (file == nullptr) {
+            continue;
+        }
+        const size_t put = std::fwrite(out.data(), 1, out.size(), file);
+        const bool ok = (put == out.size()) && (std::fclose(file) == 0);
+        if (!ok) {
+            std::remove(tempPath);
+            continue;
+        }
+        std::remove(finalPath);
+        if (std::rename(tempPath, finalPath) != 0) {
+            std::remove(tempPath);
+            continue;
+        }
+        ++written;
+        bytes += out.size();
+        gRewrittenLists.emplace_back(leaf, finalPath);
+    }
+    std::sort(gRewrittenLists.begin(), gRewrittenLists.end());
+    const uint64_t elapsedMs = (armGetSystemTick() - startTick) * 1000ULL /
+                               (tickFreq != 0 ? tickFreq : 1);
+    char diag[768];
+    std::snprintf(diag, sizeof(diag),
+                  "lists_touched=%u lists_written=%u entries_rewritten=%u "
+                  "atlas_entries=%u bytes=%llu ms=%llu overrides=%zu",
+                  touched, written, entries, atlasEntries,
+                  (unsigned long long)bytes, (unsigned long long)elapsedMs,
+                  overrides.size());
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "assetlist-rewrite-all", 0, 0, diag);
+}
+
+// THE REWRITTEN COPY OF THE LIST THE GUEST ASKS FOR, OR nullptr.
+const char* rewrittenListPath(const char* guestPath) {
+    if (guestPath == nullptr || gRewrittenLists.empty()) {
+        return nullptr;
+    }
+    const char* leaf = std::strrchr(guestPath, '/');
+    leaf = (leaf != nullptr) ? leaf + 1 : guestPath;
+    if (leaf[0] == '\0') {
+        return nullptr;
+    }
+    const auto byLeaf = [](const std::pair<std::string, std::string>& entry,
+                           const char* name) {
+        return entry.first < name;
+    };
+    auto it = std::lower_bound(gRewrittenLists.begin(), gRewrittenLists.end(),
+                               leaf, byLeaf);
+    if (it == gRewrittenLists.end() || it->first != leaf) {
+        return nullptr;
+    }
+    return it->second.c_str();
 }
 
 // WHAT THE SHARED OVERRIDE SET COST, AND WHAT IT COVERED.
@@ -4805,6 +5114,10 @@ struct OverrideSetStats {
     // The atlas paths the two lists name, and the ones the resolver answered.
     unsigned atlasConsidered{0};
     unsigned atlasResolved{0};
+    // The atlas paths a VERBATIM list also names, and which are therefore left
+    // alone: overriding their digest would make two lists disagree and the
+    // guest's merge would drop the entry.
+    unsigned atlasExcluded{0};
     unsigned long long atlasBytes{0};
     unsigned long long elapsedMs{0};
 };
@@ -4835,13 +5148,33 @@ const std::vector<std::pair<std::string, std::string>>& sharedAssetOverrides() {
 
     // 2. THE ATLAS PATHS THE LISTS NAME.
     std::vector<std::string> atlas;
-    collectAtlasPathsFromList(kBaseListGuestPath, atlas);
-    collectAtlasPathsFromList(kGuiBaseListGuestPath, atlas);
+    collectPathsFromList(kBaseListGuestPath, atlas, true);
+    collectPathsFromList(kGuiBaseListGuestPath, atlas, true);
     // DEDUPLICATE BEFORE RESOLVING: the two lists name many of the same
     // atlases, so the same file would otherwise be resolved and hashed twice.
     std::sort(atlas.begin(), atlas.end());
     atlas.erase(std::unique(atlas.begin(), atlas.end()), atlas.end());
     gSharedOverrideStats.atlasConsidered = atlas.size();
+
+    // 2b. THE OVERRIDE SET COVERS EVERY ATLAS PATH, AND EVERY LIST THE PORT
+    //     SERVES IS REWRITTEN FROM THIS ONE SET.
+    //
+    // Leaving a path out of the set is NOT the fix. MEASURED 2026-10-26,
+    // archive 20261026-230107-eden-f1h: with the paths a verbatim list also
+    // names left out (atlas_considered=4289, atlas_excluded=2974,
+    // atlas_resolved=1315), the base list fell back to EA's digest for those
+    // paths while the per-category list the guest also reads still carried
+    // EA's digest - and the guest compared the bytes it received against the
+    // digest of the OTHER list. 844 md5 mismatches, the front end never
+    // opened, and the run ended with Eden exiting on its own.
+    //
+    // The guest reads the per-category lists through the ordinary file path
+    // (fopen-other: served=rr3core:/files/apk/res/asset_list_quest_*.txt), so
+    // the port serves them VERBATIM unless it rewrites them. The rewrite is
+    // what makes the lists agree: ONE set, applied to EVERY list, and then no
+    // two lists can publish two digests for one path.
+    //
+    // See buildRewrittenAssetLists() for the other half.
 
     // 3. RESOLVE THEM, ONE AT A TIME, WITH THE SHARED CANDIDATE RULE.
     for (const std::string& path : atlas) {
@@ -4874,10 +5207,11 @@ const std::vector<std::pair<std::string, std::string>>& sharedAssetOverrides() {
     char diag[768];
     std::snprintf(diag, sizeof(diag),
                   "recorded=%u recorded_unresolved=%u atlas_considered=%u "
-                  "atlas_resolved=%u atlas_bytes=%llu ms=%llu total=%zu",
+                  "atlas_excluded=%u atlas_resolved=%u atlas_bytes=%llu ms=%llu total=%zu",
                   gSharedOverrideStats.recordedPaths,
                   gSharedOverrideStats.recordedUnresolved,
                   gSharedOverrideStats.atlasConsidered,
+                  gSharedOverrideStats.atlasExcluded,
                   gSharedOverrideStats.atlasResolved,
                   (unsigned long long)gSharedOverrideStats.atlasBytes,
                   (unsigned long long)gSharedOverrideStats.elapsedMs,
@@ -7072,6 +7406,19 @@ ExternalDataStatus mountExternalData() {
         unsigned kept = 0;
         buildConsistentGuiBaseList(&rewritten, &kept);
     }
+    // EVERY OTHER ASSET LIST THE PORT SERVES, rewritten from the same set.
+    //
+    // The guest merges the base list with ~220 per-category lists it reads
+    // through the ordinary file path, and it validates every asset against
+    // the digest one of those lists publishes. Rewriting the base list alone
+    // makes the two sides disagree: MEASURED 2026-10-26, archives
+    // 20261026-230107-eden-f1g and 20261026-233247-eden-f1h, 839 and then
+    // 844 "didn't match its MD5" messages, the front end never opened, and
+    // Eden exited on its own.
+    //
+    // One set, every list: then no two lists can publish two digests for one
+    // path, and the guest's merge cannot drop an entry.
+    buildRewrittenAssetLists();
     // THE DIGEST CENSUS: does any list the guest reads still publish a
     // digest the port does not serve?
     //
