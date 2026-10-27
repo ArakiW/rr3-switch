@@ -113,7 +113,21 @@ New-Item -ItemType Directory -Force -Path $archiveRoot | Out-Null
 # So the stash is pruned at the START of every run, before the emulator
 # starts: everything older than the newest few runs is removed. The newest
 # few are kept so that a run can still be compared with its predecessors.
-$keepStaleRuns = 3
+#
+# 2026-10-28: THREE WAS TOO MANY.  The stash holds the PREVIOUS run's
+# guest-view.log, and that log is 120 MB after a full 1500 s run (the f1l
+# archive measured 120,627,550 bytes).  Three stashes are therefore ~360 MB
+# of card that the archive in .build\eden-runs\<tag>\ ALREADY has a copy of.
+#
+# That matters because Eden's SD is a 12 GiB saw-tooth (see the free-space
+# report below): the volumes and the .depot tree already use 11.25 GiB, and
+# the guest's own space check refuses to start when the computed free space
+# is short.  A run that dies of "no diskspace" at frame 18 reads exactly
+# like a port regression, and it is this harness's own leak.
+#
+# ONE stash is enough: it is the safety net for "the run before this one",
+# and everything older is in the archive.
+$keepStaleRuns = 1
 $staleDirectories = @(Get-ChildItem $sdmcSwitch -Directory -Filter '_stale_*' -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending)
 if ($staleDirectories.Count -gt $keepStaleRuns) {
@@ -139,6 +153,31 @@ $cardBytesBefore = ($cardFilesBefore | Measure-Object -Property Length -Sum).Sum
 if ($null -eq $cardBytesBefore) { $cardBytesBefore = 0 }
 Write-Host ("card     : {0} files, {1:N0} bytes on the SD card before the run" -f `
     $cardFilesBefore.Count, $cardBytesBefore)
+
+# THE CARD'S FREE SPACE, AS EDEN COMPUTES IT.
+#
+# Eden's SD is NOT a fixed-capacity FAT32 image.  It is a directory on the
+# host, and Eden REPORTS a free space of "4 GiB minus the used space modulo
+# 4 GiB", with a total of 12 GiB (three 4 GiB steps).  The free space is
+# therefore a SAW-TOOTH: it falls towards zero every time the used space
+# crosses a 4 GiB multiple, and the guest's own space check reads that
+# number and refuses to start when it is short.
+#
+# MEASURED 2026-10-28 (archive 20261027-180028-eden-f1m): a run that froze
+# at t=29 s with errno=12 (ENOSPC) in the port's own log.  The card was
+# carrying 250 MB of this harness' litter (three stashes plus the logs) on
+# top of 11.25 GiB of content.  Freeing the litter -- and keeping one
+# stash instead of three -- is the whole fix.
+$edenCardTotal = [uint64]3 * 4GB
+$edenStep = [uint64]4GB
+$edenUsed = [uint64]$cardBytesBefore
+$edenFree = $edenStep - ($edenUsed % $edenStep)
+$edenFreeText = if ($edenUsed -ge $edenCardTotal) { '0 (the card is past its 12 GiB total)' } else { $edenFree }
+Write-Host ("cardfree : {0:N0} bytes of Eden's reported free space (used {1:N0} of {2:N0}, saw-tooth of 4 GiB)" -f `
+    $edenFree, $edenUsed, $edenCardTotal)
+if ($edenFree -lt 256MB) {
+    Write-Warning ("cardfree : only {0:N0} bytes free -- the guest will refuse to start and the port will see ENOSPC. Run tools\Deploy-RR3Volumes.ps1 -CleanLitter -RemoveStale -Apply and retry." -f $edenFree)
+}
 
 foreach ($marker in $markers) {
     if (Test-Path $marker -PathType Leaf) {
