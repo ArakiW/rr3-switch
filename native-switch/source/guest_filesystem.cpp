@@ -1053,6 +1053,51 @@ void applyVolumeFirstAssetOrder(Resolution& resolution, const char* contentRelat
     if (std::strchr(leaf, '.') == nullptr) {
         return;
     }
+    // A ".ast" IS NOT AN ASSET -- IT IS THE GUEST'S OWN DOWNLOAD CACHE -- AND
+    // THE SPELLING ALIAS BELOW MUST NOT TOUCH IT.
+    //
+    // MEASURED 2026-10-27, archive 20261027-121931-eden-f1j. The guest asked
+    // for
+    //     /assets_480x320/events/map/featured/weekly_events/
+    //         lexus_is_f350_catalunya/sprites_0.rgb.pvr.z
+    // with want_md5=d367c6f1b923e6551f2692bfa58b05bd, and the card holds
+    // exactly ONE file for it -- the download cache, at
+    //     <app root>/.depot/assets_480x320/.../sprites_0.rgb.pvr.z.ast
+    // (65,102 B, md5 d367c6f1..., i.e. exactly the digest the guest asked
+    // for).
+    //
+    // The endpoint could not answer it: "answered=0 reason=no-known-answer-shape
+    // detail=no-local-file" with all FIVE candidates tried, and the guest's own
+    // 60 "fopen-fail" lines for that path. The cause is NOT a missing file --
+    // it is this alias, followed by the ".ast" rule in resolvePath().
+    //
+    // The alias moves the primary to the volume's "gui_assets/<res>" spelling,
+    // so the card path derived from it afterwards is
+    //     <app root>/.depot/gui_assets/480x320/.../sprites_0.rgb.pvr.z.ast
+    // which NO card has; and the fallback -- which WAS the card's
+    // "assets_480x320" copy, the one that exists -- is then wiped by the
+    // ".ast" rule ("a .ast has exactly one home"). The file that exists became
+    // unreachable from BOTH ".ast" candidates at once, because both of them
+    // collapse onto the same rewritten primary.
+    //
+    // WHY THE ALIAS IS WRONG FOR A ".ast". The alias exists because the
+    // volume's "gui_assets/<res>" copy is the COMPLETE revision while the
+    // card's "assets_<res>" copy is the game's STALE INSTALLED revision of the
+    // same logical asset, and the volume's copy has to win. A download cache
+    // has no volume copy at all -- the seven volumes ship no ".ast" -- so there
+    // is no revision to reconcile, and the swap can only move the request off
+    // the one file that exists.
+    //
+    // The endpoint's candidate list already tries BOTH spellings of the cache
+    // (rule 5 of rr3_asset_candidates.hpp), so the guest's own download cache
+    // stays reachable under either name. What this restores is the property
+    // the shared selection depends on: ONE candidate names ONE file, so the
+    // digest gate can choose between the two instead of seeing the same first
+    // file twice.
+    const size_t leafLength = std::strlen(leaf);
+    if (leafLength > 4 && std::strcmp(leaf + leafLength - 4, ".ast") == 0) {
+        return;
+    }
     // The card's relative tail: the volume's "files/.depot/" prefix dropped.
     const char* tail = contentRelative;
     const char* prefix = "files/.depot/";
@@ -7515,6 +7560,7 @@ uint64_t guestFilesystemSelfTest() {
     // 960x640 atlas (24,689 B, 165 image entries, against the volume's
     // 39,199 B, 248 entries) and it is the only copy of the live weekly-event
     // assets, which no volume ships.
+    bool spellingsMeet = false;
     if (resolvePath(".depot/gui_assets/960x640/probe.bin", false, value) &&
         startsWith(value.primary, "rr3gui1:/files/.depot/gui_assets/960x640/") &&
         startsWith(value.fallback, "sdmc:/switch/rr3-native-rehost/.depot/assets_960x640/")) {
@@ -7523,8 +7569,40 @@ uint64_t guestFilesystemSelfTest() {
             // THE SAME FILE, from the other spelling.
             startsWith(alias.primary, "rr3gui1:/files/.depot/gui_assets/960x640/") &&
             startsWith(alias.fallback, "sdmc:/switch/rr3-native-rehost/.depot/assets_960x640/")) {
-            bits |= 4;
+            spellingsMeet = true;
         }
+    }
+    // AND A ".ast" -- THE GUEST'S OWN DOWNLOAD CACHE -- IS NOT ALIASED AT ALL.
+    //
+    // The alias above exists because the volume's "gui_assets/<res>" copy is the
+    // COMPLETE revision and the card's "assets_<res>" copy is the game's STALE
+    // INSTALLED revision of the same logical asset. A download cache has no
+    // volume copy at all -- the seven volumes ship no ".ast" -- so there is no
+    // revision to reconcile and the swap can only move the request off the one
+    // file that exists.
+    //
+    // MEASURED 2026-10-27, archive 20261027-121931-eden-f1j: the card's ONLY
+    // ".ast" is
+    //     <app root>/.depot/assets_480x320/events/map/featured/weekly_events/
+    //         lexus_is_f350_catalunya/sprites_0.rgb.pvr.z.ast
+    // (65,102 B, md5 d367c6f1b923e6551f2692bfa58b05bd -- the very digest the
+    // guest asked for on the wire), and the endpoint could not answer it:
+    // "answered=0 reason=no-known-answer-shape detail=no-local-file", with all
+    // five candidates tried. The alias had moved the request to the
+    // "gui_assets/480x320" spelling, which no card has, and the ".ast" rule
+    // had then wiped the fallback -- the card's "assets_480x320" copy, the one
+    // that exists. Both ".ast" candidates collapsed onto the same dead path.
+    //
+    // So the cache must resolve to the CARD, under the spelling the guest
+    // named it with, and with no second candidate behind it.
+    Resolution cache{};
+    const bool cacheKeepsItsSpelling =
+        resolvePath(".depot/assets_960x640/probe.ast", false, cache) &&
+        std::strcmp(cache.primary,
+                    "sdmc:/switch/rr3-native-rehost/.depot/assets_960x640/probe.ast") == 0 &&
+        cache.fallback[0] == '\0';
+    if (spellingsMeet && cacheKeepsItsSpelling) {
+        bits |= 4;
     }
     value = {};
     if (resolvePath("Tracks/Menu/processed/menu_transition.banim", false, value) &&
