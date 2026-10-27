@@ -6613,3 +6613,139 @@ so an honest `ENOENT` lets it proceed to the plain name, which exists.
 Ruled out: truncation (0 corrupt `.z` across the volumes), route mismatch
 (`rr3veh0` is correct), missing descramble (the 4-byte skip *is* the
 de-containerisation).
+
+
+### FIXED (2026-10-27): the download cache, the first touch hop, and a card that ran out of room
+
+Three separate defects, one session. Each has its own control, and each one
+turned out to look like something else first.
+
+#### 1. The ".ast" was unreachable, so the guest's own download cache was a dead end (f1j -> f1k)
+
+```
+phase=cc-asset-req ... path=/assets_480x320/.../lexus_is_f350_catalunya/sprites_0.rgb.pvr.z
+  want_md5=d367c6f1b923e6551f2692bfa58b05bd answered=0 reason=no-known-answer-shape detail=no-local-file
+```
+
+All five candidates were tried and none answered. The file was ON THE CARD:
+`.depot/assets_480x320/events/map/featured/weekly_events/lexus_is_f350_catalunya/
+sprites_0.rgb.pvr.z.ast`, 65,102 B, md5 `d367c6f1...` -- exactly the digest the
+guest asked for. So this was never a missing file.
+
+Two rules that are each correct on their own were fighting:
+
+* `applyVolumeFirstAssetOrder()` moves an asset request to the volume's
+  `gui_assets/<res>` spelling, because that copy is the COMPLETE revision and the
+  card's `assets_<res>` copy is the game's STALE INSTALLED revision.
+* the ".ast" rule in `resolvePath()` then rewrites the primary to the card path
+  and CLEARS the fallback, because "a .ast has exactly one home".
+
+Together: the alias moved the request to a spelling no card has, and the
+fallback that pointed at the card's real copy was wiped. Both `.ast` candidates
+collapsed onto the same dead path, and the file that existed became unreachable.
+
+The fix: the download cache keeps its own spelling. A download cache has no
+volume copy at all -- the seven volumes ship no `.ast` -- so there is no
+revision to reconcile, and the swap could only move the request off the one file
+that exists. The candidate list already tries both spellings (rule 5 of
+`rr3_asset_candidates.hpp`), so nothing is lost, and ONE candidate now names
+ONE file, which is what lets the digest gate choose between the two.
+
+The self-test's bit 4 carries the guard ("the two spellings of one logical
+asset must meet at one file" AND "a download cache keeps its own spelling"),
+so a regression stops the guest at the boot gate instead of passing silently.
+
+MEASURED (f1k, archive 20261027-170602-eden-f1k):
+
+| | f1j | f1k |
+|---|---|---|
+| asset requests answered | 61 / 64 | **64 / 64** |
+| unanswered | 3 | **0** |
+| non-control fopen-fail | 60 | **0** |
+| guest "didn't match its MD5" | 12 | **0** |
+| list paths disagreeing | 0 / 8,629 | **0 / 8,633** |
+| Eden alive | 437 s (exited on its own) | **1203 s (the full run)** |
+| frames | 3,840 | **16,800** |
+
+Ruled out: a missing file (it is on the card, with the requested digest), a
+stale list (the base list is rewritten from the one override set, and the
+census says 8,633/8,633 agree), and the HTTP slot table (41 unanswered POSTs
+was the symptom of the missing answer, not its cause).
+
+#### 2. The touch path's first hop missed the button by 72 pixels (f1l)
+
+The guest never left the daily-rewards popup for a whole run. The touch script
+clicked (301, 223) for the calendar's COLLECT button; measured pixel by pixel
+off the guest's own framebuffer captures (orange mask r>230, 150<g<215, b<60)
+that button is at x 373..533, y 202..242 -- centre (453, 222). The click landed
+in the margin.
+
+The consequence was measured, not guessed: the calendar stayed up from frame 300
+to frame 4100; the popup opened at frame 4200 because hop 4 (335, 450) -- meant
+for the event picker -- landed on a calendar day instead; and hop 2's click on
+the popup's COLLECT bar had fired at frame 1900, before the popup existed.
+
+With hop 1 corrected, the guest walked the whole path in one run: daily-rewards
+calendar -> reward popup -> main menu -> event picker -> F1 Academy quest ->
+car select, with all six hops injected on time.
+
+The lesson worth keeping: a hand-measured coordinate is a claim, and the
+framebuffer is the truth. Measure the target out of the pixels before trusting
+a script that was measured on another build.
+
+#### 3. The card ran out of room, and the run that died of it looked like a code regression (f1m)
+
+```
+phase=assetlist-serve ... consistent=sdmc:/.../cache/asset_list_base.txtCache.txt rc=0 errno=12
+```
+
+The run froze at t=29 s with the port and the guest both stopped, and the
+emulator's own log ended there too. Nothing about it pointed at the code: the
+two rounds before it were byte-identical builds on the same card.
+
+Eden's SD is not a fixed-capacity FAT32 image. It is a directory on the host,
+and Eden REPORTS a free space of "4 GiB minus the used space modulo 4 GiB" over
+a 12 GiB total -- a SAW-TOOTH that falls towards zero whenever the used space
+crosses a 4 GiB multiple (the deploy script measured 1 free byte at
+12,884,901,887 in use). The card carries 11.25 GiB of content (seven volumes
+plus the downloaded .depot), and this harness' own litter -- three `_stale_*`
+stash directories holding the previous runs' 120 MB guest logs, plus the logs
+and crash dumps -- was 250,583,479 bytes on top of it.
+
+So: the stash keeps the newest ONE run instead of three (the archive in
+`.build/eden-runs/<tag>/` already has a copy of every one), and the harness
+prints the card's computed free space before the run and says what to do when
+it is short. The port's own `errno=12` is the fingerprint of this failure.
+
+#### 4. What is still open, and where it was measured
+
+* **The guest is in a race.** The track loads (Silverstone, `Total Levelloading:
+  18554`); the Tutorial track's two assets now serve with `md5_match=1` after
+  the override set learned them (the set is built from the paths the guest has
+  ALREADY downloaded, so the first attempt at a new asset class necessarily
+  fails and the next one succeeds -- a real flaw, and the fix is to cover the
+  paths the LISTS name).
+* **Three download errors remain** (`/events.dat`, `/vehicles/carrepairs.repairs`,
+  the 960x640 weekly-event atlas) and they are NOT pack-endpoint requests: the
+  endpoint answered 76 of 76, and the runtime read of the same files works
+  (`fopen-asset size=6418 served=.../carrepairs.repairs`). They take a different
+  path and are still to be traced.
+* **Two sprites are missing** (`common/manufacturer_logos/logo_ma_da.png`,
+  `logo__envo.png`). No atlas on the card and no list anywhere names them: the
+  game knows manufacturers (Envoi) that the data pack predates. A data gap, not
+  a port defect.
+* **The picture is soft because of the CONTENT TIER, not because of scaling.**
+  MEASURED (f1k): the engine loads `eds/AndroidHigh.plist`, and at runtime it
+  reads `gui_assets/960x640` 640 times and `gui_assets/480x320` 8 times, while
+  it draws into a 1280x720 viewport -- so the 2D UI is a 1.33x upscale. The HD
+  volume ships a complete `gui_assets/2048x1536` tree (the same 53
+  sub-folders) that the guest never picks, even though the port injects the
+  folder into the `gui_assets` listing so that it can see it. The tier is the
+  engine's own `eds/<tier>.plist` (AndroidLow / Mid / Mid2 / High / XtraHigh /
+  UltraWide) and which one it loads follows from the device identity the port
+  reports -- and the port reports 640x480 at 160 dpi, while `Platform.
+  getScreenWidth/Height` already answers 1280x720. That contradiction is the
+  next thing to fix, and the instrument for it is the `gui-assets-listing`
+  trace plus the `eds/*.plist` opens. Note that a real-time NEURAL upscaler is
+  neither needed nor possible here: the material is on the card, and the tier
+  is what leaves it unused.
