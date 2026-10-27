@@ -62,6 +62,32 @@
 # The frame numbers are left exactly as measured on f1a: with hop 1
 # actually landing, the calendar closes at ~1400, the popup is up for
 # hop 2 at 1900, and the rest of the path follows the same spacing.
+#
+# ---------------------------------------------------------------------------
+# ADDED 2026-10-27, after archive 20261027-170602-eden-f1k.
+#
+# HOP 7: THE "CONTINUE" THE GAME ASKS FOR AFTER THE TRACK LOADS.
+#
+# MEASURED on that run: the guest walked the whole path -- calendar, reward
+# popup, main menu, event picker, F1 Academy quest, car select -- and the
+# track load finished ("Total Levelloading: 18554", Silverstone).  Then the
+# game put a modal up in the middle of the screen: a cream panel with a
+# progress bar and a yellow "继续" (CONTINUE) button, with the guest's own
+# red glove sprite sitting ON that button.  The guest draws that glove on
+# the control it wants pressed, so the button is the thing to click.
+#
+# Measured off the framebuffer, the same way hop 1 was measured (yellow
+# mask r>225, g>215, b<90): the button is at x 687..1023, y 455..514, so
+# its centre is (855, 484).
+#
+# WHY FOUR FRAMES AND NOT ONE: the track load finishes when the assets
+# finish arriving, and that is not a fixed frame.  In that run the panel
+# was up at frame 8,400 (t=807 s) after the load began around frame 4,000.
+# A single guess would be a single point of failure, so the click is
+# repeated across the window the panel can plausibly appear in.  The button
+# is in the RIGHT half of the screen (x=855 > 640), which is NOT the
+# touch-steering half -- a click that lands after the race has started is
+# therefore harmless.
 at 1400 453 222 down
 at 1440 453 222 up
 at 1900 640 549 down
@@ -74,3 +100,11 @@ at 4800 913 500 down
 at 4840 913 500 up
 at 5500 1114 698 down
 at 5540 1114 698 up
+at 8600 855 484 down
+at 8640 855 484 up
+at 10200 855 484 down
+at 10240 855 484 up
+at 11800 855 484 down
+at 11840 855 484 up
+at 13400 855 484 down
+at 13440 855 484 up
