@@ -1,0 +1,38 @@
+# The guest's own commands, by name.
+#
+# NONE in this run.  The path to a race is now driven entirely by the touch
+# script (see rr3-touch.txt), which was measured end to end on 2026-10-25
+# (archive 20261025-161933-eden-f1a): daily reward -> event picker -> quest
+# page -> car select -> start race, and the last one of those made the guest
+# try to load a track.
+#
+# The variable under test in this run is the PORT'S MEMORY REPORT, so
+# nothing else is allowed to move: the guest's own commands are not called at
+# all.
+#
+# For the record, the commands that exist in the guest's runtime name table
+# and are NOT called here:
+#
+#   Character|Unlock All Tracks
+#   Career|Reload event data
+#   Career|Win all events
+#   Career|Win tapped event
+#   Assets|UPDATE EVENTS
+#   Career|Bypass Locked Series
+#   Soaks|START SOAK
+#   Soaks|QUEUE SOAK:RACE LOOP
+#   Soaks|QUEUE SOAK:RACE LOOP - fast forward
+#   TestRecorder|Time Trial
+#   Main Menu|Enter Deep Link
+#   Character|Unlock + Own Everything    (opens a MODAL confirm dialog)
+#   Debug Race Selector:                (needs the player to OWN a car)
+#   Store|Clear all daily rewards       (not in the port's allow list)
+#   Character|Unlock Everything         (not in the port's allow list)
+#   Career|Tutorial|Placeholder
+#   Character|Early Access|Reset / Enable / Disable
+#   Car|ALL ONE CAR / Car|Remove All Cars / Car|Upgrade all cars
+#
+# The port calls a command only if its name is in its own allow list
+# (native-switch/source/guest_action.cpp, kAllowedActions), so a command that
+# the guest has but the port does not allow is never called, and the port
+# logs that it refused.

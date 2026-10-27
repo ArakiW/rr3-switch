@@ -1,0 +1,76 @@
+# The path to a race, hop by hop.
+#
+# MEASURED 2026-10-25 (archive 20261025-161933-eden-f1a): every coordinate
+# below was read off a framebuffer capture or off the guest's own on-screen
+# text rectangle, and every hop was confirmed by the screen that followed it.
+#
+#  1. EVERY LOGIN opens the M$ DAILY REWARDS calendar.  Its orange
+#     "\u6536\u96c6" (COLLECT) word is at x 198..404, y 191..255.  Clicking
+#     it opens the popup in step 2.  (The rectangle comes from the guest's
+#     own text-quad record: screenX=198, screenY=191, w=206, h=64.)
+#  2. the "\u60a8\u7684\u6bcf\u65e5\u5956\u52b1" (YOUR DAILY REWARD) popup's
+#     orange COLLECT bar is x 396..884, y 525..573, and its label is at
+#     x 611..683, y 536..566.  The centre of the label is (647, 551); the
+#     point used here is (640, 549), which is inside the label.
+#  3. behind both of those is the main menu.  Its right-hand column is the
+#     daily race and its orange "\u8fdb\u5165\u6bd4\u8d5b" (ENTER THE RACE)
+#     label is at x 1113..1235, y 613..639.  Its centre is (1174, 626).
+#  4. the event picker ("\u9009\u62e9\u8d5b\u4e8b", CHOOSE EVENT) offers three
+#     daily-race cards; the first is "\u8d8a\u91ce\u8d5b" (OFF-ROAD), whose
+#     title is at x 250..420, y 415..480.  Its centre is (335, 450).
+#  5. the F1 Academy quest page ("\u901a\u5f80FORMULA 1\u00ae\u4e4b\u8def")
+#     ends in a "\u7ee7\u7eed" (CONTINUE) label at x 883..943, y 488..512.
+#     Its centre is (913, 500).  The guest lends the player a car here
+#     ("\u4f60\u501f\u5230\u4e86\u4e00\u8f86\u8f66\u3002").
+#  6. the car select screen's "\u5f00\u59cb\u6bd4\u8d5b" (START THE RACE) is
+#     the control at the bottom right, (1114, 698) -- the coordinate the
+#     20261024-102025-eden-race-door archive used, and the one that made the
+#     guest try to load a track in f1a.
+#
+# The hops are spaced so that each transition has time to settle, and so
+# that a framebuffer capture lands on both sides of each of them.
+#
+# Nothing else is clicked: a click in the left half of the screen is a
+# STEER in the race, and steering taps throw the car off the track.
+#
+# ---------------------------------------------------------------------------
+# FIXED 2026-10-27, after archive 20261027-172023-eden-f1k.
+#
+# HOP 1's X WAS WRONG, AND THE TOUCH LANDED 72 PIXELS TOO FAR LEFT.
+#
+# The framebuffer captures of that run were measured pixel by pixel (the
+# orange button mask: r>230, 150<g<215, b<60), and they say the calendar's
+# orange COLLECT button is at
+#     x 373..533, y 202..242      -> centre (453, 222)
+# and not at x 198..404.  Hop 1 clicked (301, 223): on the button's left
+# edge, in the margin.  The consequence was measured, not guessed:
+#
+#   frame   300 .. 4100   the CALENDAR, still up (the click missed)
+#   frame  4200 ..        the POPUP, opened by hop 4's (335, 450) -- a click
+#                         meant for the event picker, which landed on a
+#                         calendar day instead
+#   frame 12000           the POPUP, still up, with hop 2's click on its
+#                         COLLECT bar long gone (it fired at frame 1900,
+#                         before the popup existed)
+#
+# So the guest spent the whole run inside a modal it could not dismiss, and
+# never reached the main menu.  Every other coordinate in this file is
+# confirmed by the f1a archive, and hop 2's target was confirmed again in
+# f1k: the popup's COLLECT label sits under the guest's own red glove
+# sprite at (640, 549).
+#
+# The frame numbers are left exactly as measured on f1a: with hop 1
+# actually landing, the calendar closes at ~1400, the popup is up for
+# hop 2 at 1900, and the rest of the path follows the same spacing.
+at 1400 453 222 down
+at 1440 453 222 up
+at 1900 640 549 down
+at 1940 640 549 up
+at 3400 1174 626 down
+at 3440 1174 626 up
+at 4100 335 450 down
+at 4140 335 450 up
+at 4800 913 500 down
+at 4840 913 500 up
+at 5500 1114 698 down
+at 5540 1114 698 up

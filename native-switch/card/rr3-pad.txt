@@ -1,0 +1,24 @@
+# The throttle, for the moment the guest is in a race.
+#
+# The port's own measurement (archive 20261024-134104-eden-thr-btnA) is that
+# BUTTON 0 (the guest's BTN_A) is what actually accelerates the car: with
+# button 0 held the guest's own frames show the car accelerating down the
+# straight with the exhaust flame lit, and with button 7 (R2) alone the
+# guest draws its own "hold the brake to reverse" message, i.e. the car is
+# NOT moving (archive 20261024-135257-eden-thr-btnR2).
+#
+# The guest's own Android Gamepad Extended profile binds the accelerator to
+# "button 0 (A) | axis 5 (RT) | button 7 (R2)", so RT is sent as well.
+#
+# WHY IT STARTS LATE.  BTN_A is also "confirm" in a menu, and the f1a run
+# held it from frame 3000 while the front end was still up -- so a run that
+# starts the throttle before the race has begun presses whatever the menu
+# has focused. Here the throttle starts at frame 6000, which is AFTER the
+# start-race click at 5500 and after the track has had time to load, and
+# the touch script has already walked the whole path by then.
+#
+# The pad script is a STATE TIMELINE: the last line whose "at" frame is at or
+# before the current frame applies.  So the two lines below are HOLDS that
+# start at those frames and never end.
+[at 0] lx=0 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x000
+[at 6000] lx=0 ly=0 rx=0 ry=0 lt=0 rt=1.0 b=0x001

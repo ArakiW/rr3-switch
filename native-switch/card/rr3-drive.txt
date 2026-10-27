@@ -1,0 +1,33 @@
+# The closed-loop steering for the race-state probe.
+#
+# The port reads the guest's OWN race state out of guest memory (the
+# RuleSetModifier_RaceMetrics object) and steers on the guest's own progress
+# metric along the track's spline. See native-switch/source/race_state_probe.cpp.
+#
+# enable=1   the closed loop drives the steering axis, the throttle and the brake
+# probe=1    read the race state but do not steer (diagnostic only)
+# base=<f>   the initial steering magnitude, 0..1
+# sign=1|-1  the initial steering direction
+#
+# The loop flips the sign itself when the guest's progress rate goes NEGATIVE
+# (the car is travelling against the spline's direction, i.e. round the track
+# the wrong way), so sign is only the starting guess.
+#
+# ---------------------------------------------------------------------------
+# CHANGED 2026-10-27: probe=1 -> probe=0, so the loop DRIVES.
+#
+# "probe=1" was the right setting while the question was "can the port read
+# the guest's race state at all" -- and the answer was always no, because the
+# guest never got INTO a race: the touch path stalled on the daily-reward
+# modal (archive 20261027-172023-eden-f1k).
+#
+# probe=0 makes the loop drive.  It is INERT until the guest is in a race:
+# updateDrive() enables itself only when the metrics object was found AND a
+# progress value was seen (race_state_probe.cpp:1031), so it cannot move
+# anything in the front end, and it cannot change whether the guest reaches
+# the race.  That is why it is safe to change in the same run as the touch
+# fix: the two variables cannot interact.
+enable=1
+probe=0
+base=0.30
+sign=1

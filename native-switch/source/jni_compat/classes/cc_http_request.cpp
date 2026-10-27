@@ -1356,11 +1356,32 @@ static void http_init(JNIEnv *env, jobject self, jstring /*userAgent*/,
      * see the block comment on the asset endpoint above for the answer's
      * shape and for why the answer is not boxed.
      *
-     * The cap is 64 lines, and the measured run makes 60, so a normal run is
-     * traced in full. The counter is a COUNTER, not a cap on the truth: the
-     * "n=" field says how many arrived.
+     * The cap was 64 lines, and it was HIT in every run from 2026-10-22 on:
+     * the trace stopped at 64 requests, so the requests AFTER that one were
+     * invisible -- and the guest's OWN error lines ("ASSET DOWNLOAD ERROR!
+     * [MSG: Unhealthy Download Stream]") name the assets without saying
+     * whether the endpoint ever saw them.  That is the instrument's blind
+     * spot: "the endpoint answered every request" and "the endpoint answered
+     * the first 64 requests and stopped being asked" look identical.
+     *
+     * MEASURED 2026-10-27, archive 20261027-170602-eden-f1k: the trace shows
+     * 64 of 64 requests answered, and the guest still logged THREE download
+     * errors -- /events.dat, /vehicles/carrepairs.repairs and the 960x640
+     * weekly-event texture -- all of them BEYOND the cap, and both of the
+     * first two are on the card (events.dat 261,692 B, carrepairs.repairs
+     * 6,418 B).  The count "64/64 answered" therefore did not mean "every
+     * request was answered"; it meant "every request we were still writing
+     * down was answered".
+     *
+     * So the cap is 400 now, and the counter is still a COUNTER and not a cap
+     * on the truth: the "n=" field says how many arrived.
      */
     {
+        // How many "cc-asset-req" lines the endpoint writes.  Sized so that a
+        // whole run fits: the guest asks for more than 64 assets once the
+        // front end is up, and the requests past a cap are exactly the ones
+        // that fail without being on record.  See the note above.
+        constexpr unsigned kAssetReqLines = 400u;
         static unsigned s_assetReqLines = 0;
         static unsigned s_assetReqTotal = 0;
         ++s_assetReqTotal;
@@ -1440,7 +1461,7 @@ static void http_init(JNIEnv *env, jobject self, jstring /*userAgent*/,
                     /* NO LOCAL FILE. Nothing is invented for it: the
                      * guest takes its own error path for this asset. */
                     ++missing;
-                    if (s_assetReqLines < 64u) {
+                    if (s_assetReqLines < kAssetReqLines) {
                         ++s_assetReqLines;
                         char details[2048];
                         __builtin_snprintf(
@@ -1466,7 +1487,7 @@ static void http_init(JNIEnv *env, jobject self, jstring /*userAgent*/,
                 body.insert(body.end(), chosenBytes.begin(), chosenBytes.end());
                 ++served;
 
-                if (s_assetReqLines < 64u) {
+                if (s_assetReqLines < kAssetReqLines) {
                     ++s_assetReqLines;
                     const bool md5Matches =
                         (strcasecmp(chosenMd5, entry.md5) == 0);
@@ -1497,7 +1518,7 @@ static void http_init(JNIEnv *env, jobject self, jstring /*userAgent*/,
 
             if (served > 0u) {
                 queueAssetResponse(req, (uint64_t)req->callback, body);
-                if (s_assetReqLines < 64u) {
+                if (s_assetReqLines < kAssetReqLines) {
                     ++s_assetReqLines;
                     char details[320];
                     __builtin_snprintf(
@@ -1512,7 +1533,7 @@ static void http_init(JNIEnv *env, jobject self, jstring /*userAgent*/,
                                           details);
                 }
             } else if (parsed) {
-                if (s_assetReqLines < 64u) {
+                if (s_assetReqLines < kAssetReqLines) {
                     ++s_assetReqLines;
                     char details[320];
                     __builtin_snprintf(
@@ -1525,7 +1546,7 @@ static void http_init(JNIEnv *env, jobject self, jstring /*userAgent*/,
                                           (unsigned long long)s_assetReqTotal,
                                           details);
                 }
-            } else if (s_assetReqLines < 64u) {
+            } else if (s_assetReqLines < kAssetReqLines) {
                 ++s_assetReqLines;
                 char details[1024];
                 __builtin_snprintf(

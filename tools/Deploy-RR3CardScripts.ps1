@@ -1,0 +1,149 @@
+<#
+.SYNOPSIS
+    Deploy the guest's card-side CONTROL scripts onto an emulator's SD card.
+
+.DESCRIPTION
+    The port reads four control files from the card at
+    <card>\switch\rr3-native-rehost\:
+
+        rr3-touch.txt   the touch path: "at <frame> <x> <y> down|up"
+        rr3-drive.txt   the closed-loop steering: enable/probe/base/sign
+        rr3-pad.txt     the gamepad timeline: "[at <frame>] lx=.. rt=.. b=.."
+        rr3-action.txt  the guest's own named commands (currently none)
+
+    They are EXPERIMENT INPUTS, not environment: a run is only reproducible
+    if the inputs are on record with the result.  They live in the repository
+    under native-switch\card\ and this script puts them on the card, which is
+    the only supported way to write there (the host's own write policy refuses
+    a direct write outside the workspace).
+
+    The rules this script follows:
+
+      1. EDEN MUST NOT BE RUNNING.  rr3-touch.txt is APPEND-ONLY for the port:
+         the port reads the file's first 64 bytes as a signature and consumes
+         complete lines from the offset it has reached, so APPENDING is safe
+         while a run is live but REWRITING is not -- a changed signature makes
+         the port replay every event it has already delivered.  Between runs
+         the file may be replaced freely.  The gate is still here, because the
+         moment the file is rewritten mid-run is the moment the run's input
+         silently changes.
+      2. PREFLIGHT every source file exists and is non-empty.
+      3. COPY to a temporary name in the SAME directory, verify it there, then
+         move it over the target.
+      4. VERIFY length and sha256 of source and destination; any mismatch is a
+         non-zero exit code.
+
+    Nothing is written unless -Apply was passed.  The default run is a dry
+    run: it prints the plan and changes nothing.
+
+    EXIT CODES
+      0  success (dry run completed, or apply finished and verified)
+      1  preflight failed (a source file is missing or empty)
+      2  Eden is running (nothing was written)
+      3  a post-copy verification mismatch (source vs destination)
+      4  an apply step failed after the plan was approved
+
+.PARAMETER EmulatorRoot
+    Eden's installation directory.  Default: E:\Eden.
+
+.PARAMETER Apply
+    Write the files.  Without it the script only prints the plan.
+
+.EXAMPLE
+    .\Deploy-RR3CardScripts.ps1 -Apply
+#>
+[CmdletBinding()]
+param(
+    [string]$EmulatorRoot = 'E:\Eden',
+    [switch]$Apply
+)
+
+$ErrorActionPreference = 'Stop'
+$projectRoot = Split-Path -Parent $PSScriptRoot
+$sourceRoot = Join-Path $projectRoot 'native-switch\card'
+$appDir = Join-Path (Join-Path (Join-Path $EmulatorRoot 'user\sdmc') 'switch') 'rr3-native-rehost'
+
+$scripts = @('rr3-touch.txt', 'rr3-drive.txt', 'rr3-pad.txt', 'rr3-action.txt')
+
+Write-Host ("card     : {0}" -f $appDir)
+
+# --- 1. preflight ------------------------------------------------------------
+$plan = foreach ($name in $scripts) {
+    $source = Join-Path $sourceRoot $name
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+        Write-Host ("preflight: MISSING {0} in {1}" -f $name, $sourceRoot)
+        exit 1
+    }
+    $info = Get-Item -LiteralPath $source
+    if ($info.Length -eq 0) {
+        Write-Host ("preflight: EMPTY {0}" -f $name)
+        exit 1
+    }
+    [pscustomobject]@{
+        Name   = $name
+        Source = $source
+        Target = Join-Path $appDir $name
+        Bytes  = $info.Length
+        Sha256 = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
+    }
+}
+foreach ($entry in $plan) {
+    $state = 'absent'
+    if (Test-Path -LiteralPath $entry.Target -PathType Leaf) {
+        $state = 'present'
+    }
+    Write-Host ("plan     : {0,-16} {1,7} bytes  sha256={2}  target={3}" -f `
+        $entry.Name, $entry.Bytes, $entry.Sha256.Substring(0, 16), $state)
+}
+if (-not $Apply) {
+    Write-Host "dry run  : nothing written (pass -Apply to deploy)"
+    exit 0
+}
+
+# --- 2. the emulator must not be running -------------------------------------
+$running = @(Get-Process -Name 'eden' -ErrorAction SilentlyContinue)
+if ($running.Count -ne 0) {
+    Write-Host ("refused  : {0} Eden process(es) are running; the control files must not be rewritten mid-run" -f $running.Count)
+    exit 2
+}
+
+# --- 3. copy -----------------------------------------------------------------
+New-Item -ItemType Directory -Force -Path $appDir | Out-Null
+foreach ($entry in $plan) {
+    $temporary = "$($entry.Target).deploy-tmp"
+    try {
+        Copy-Item -LiteralPath $entry.Source -Destination $temporary -Force
+        $copied = Get-FileHash -LiteralPath $temporary -Algorithm SHA256
+        if ($copied.Hash -ne $entry.Sha256) {
+            Write-Host ("FAILED   : {0} did not survive the copy to {1}" -f $entry.Name, $temporary)
+            exit 4
+        }
+        Move-Item -LiteralPath $temporary -Destination $entry.Target -Force
+    }
+    catch {
+        Write-Host ("FAILED   : {0}: {1}" -f $entry.Name, $_.Exception.Message)
+        if (Test-Path -LiteralPath $temporary) {
+            Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+        }
+        exit 4
+    }
+}
+
+# --- 4. verify ---------------------------------------------------------------
+$bad = 0
+foreach ($entry in $plan) {
+    $written = Get-FileHash -LiteralPath $entry.Target -Algorithm SHA256
+    $size = (Get-Item -LiteralPath $entry.Target).Length
+    $ok = ($written.Hash -eq $entry.Sha256) -and ($size -eq $entry.Bytes)
+    if (-not $ok) {
+        $bad++
+    }
+    Write-Host ("verify   : {0,-16} {1,7} bytes  sha256={2}  {3}" -f `
+        $entry.Name, $size, $written.Hash.Substring(0, 16), $(if ($ok) { 'OK' } else { 'MISMATCH' }))
+}
+if ($bad -ne 0) {
+    Write-Host ("FAILED   : {0} file(s) do not match the source" -f $bad)
+    exit 3
+}
+Write-Host "deployed : 4 control scripts, 4/4 sha256 match"
+exit 0
