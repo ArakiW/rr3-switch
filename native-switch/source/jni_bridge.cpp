@@ -4247,7 +4247,7 @@ struct CloudcellHttpRequestSlot {
     uintptr_t object;
     uint64_t callback;
 };
-constexpr size_t kCloudcellHttpRequestSlots = 8;
+constexpr size_t kCloudcellHttpRequestSlots = 64;
 CloudcellHttpRequestSlot g_ccHttpSlots[kCloudcellHttpRequestSlots]{};
 
 // Which host table, if any, an address belongs to.
@@ -4631,6 +4631,7 @@ void jniCallVoidMethodV(uintptr_t env, uintptr_t object,
         const bool isHttpRequest = cloudcellClassIsHttpRequest(ccClass);
         const bool isInit = rawEquals(name, "init");
         const bool isPost = rawEquals(name, "post");
+        const bool isClose = rawEquals(name, "close");
         char detail[256];
         __builtin_snprintf(detail, sizeof(detail),
                            "entry=%s class=%s method=%s static=%d obj=%p args=%p",
@@ -4714,6 +4715,47 @@ void jniCallVoidMethodV(uintptr_t env, uintptr_t object,
                              static_cast<unsigned long long>(object),
                              callback != 0 ? "post has a callback"
                                            : "post has NO callback (init never seen)");
+        } else if (isHttpRequest && isClose) {
+            // THE SLOT IS RELEASED HERE, AND IT HAS TO BE.
+            //
+            // A slot is only needed between the init that captures the
+            // callback and the post that uses it. The guest closes the
+            // request object afterwards, and until it does, the slot stays
+            // bound to that object.
+            //
+            // MEASURED 2026-10-27, archive 20261027-120631-eden-f1i: the table
+            // had EIGHT slots, the guest captured all eight, and 41 of its
+            // posts then found no callback at all - "post has NO callback
+            // (init never seen)" - because a ninth init had no free slot to
+            // take. The unanswered post was the MTX product catalogue
+            // request, so the guest got an EMPTY catalogue, the SKU list it
+            // builds from it had null fields, and NimbleMTX::
+            // RefreshNimbleCatalog() dereferenced one of them: "Unmapped
+            // Read64 @ 0x28".
+            //
+            // The table was sized for a guest that makes a handful of
+            // requests. Fixing the asset digests made the guest download
+            // 309 asset lists instead of 220 and finish the whole download,
+            // so the request count went past the table and the failure
+            // appeared - it had been hiding behind the digest storm.
+            //
+            // Releasing the slot on close is the real fix (the table is a
+            // window, not a ledger); the table is also bigger now, so a
+            // guest that opens many requests at once still fits.
+            for (size_t i = 0; i < kCloudcellHttpRequestSlots; ++i) {
+                if (g_ccHttpSlots[i].object == object) {
+                    g_ccHttpSlots[i].object = 0;
+                    g_ccHttpSlots[i].callback = 0;
+                    char got[96];
+                    __builtin_snprintf(got, sizeof(got),
+                                       "slot-released slot=%d",
+                                       (int)(&g_ccHttpSlots[i] - g_ccHttpSlots));
+                    guestViewWideLog("cc-http-callback",
+                                     static_cast<unsigned long long>(object),
+                                     static_cast<unsigned long long>(methodId), got);
+                    break;
+                }
+            }
         }
     }
 
