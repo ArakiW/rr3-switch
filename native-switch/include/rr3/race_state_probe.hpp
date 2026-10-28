@@ -91,6 +91,9 @@ struct RaceMetricsSample {
     // 3 = total spline distance, 4 = top speed, 5 = total time).  A member
     // that is NOT in the mask kept its raw descriptor reading.
     uint32_t membersResolved{};
+    // Which of the six members the port proved BY NAME at runtime, from the
+    // guest's own descriptor (the name hash and len^hash it wrote there).
+    uint32_t membersIdentified{};
     // THE GUEST'S OWN PER-CAR STATE.
     //
     // The chain, each step proved by the guest's own code:

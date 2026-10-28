@@ -928,21 +928,44 @@ void fillMetrics(RaceMetricsSample* out, uintptr_t address) {
     //
     // A member that resolves replaces its descriptor reading; one that does
     // not keeps it, and the mask says which happened.
+    //
+    // THE GUEST'S OWN NAMES, AND A RUNTIME IDENTITY CHECK.
+    //
+    // Every member the port reads is listed with the name THE GUEST uses
+    // for it, the offset it lives at, and the ELF address that proves it
+    // (the metrics modifier registers its members in its constructor at
+    // ELF 0xb35a30, the registration calls at 0xb35a5c..0xb35ba0).  Nothing
+    // the port logs may be an inference.
+    //
+    // And the check is a MEASUREMENT, not a tautology.  The descriptor in
+    // the slot is (the rotating id, the NAME HASH, len ^ hash), so the
+    // name's LENGTH can be recovered from the guest's own bytes --
+    // len = hash ^ (len ^ hash) -- and compared with the length of the name
+    // the port believes is there.  A member that is NOT the one the port
+    // thinks it is cannot pass that test.
+    //
+    // THE LIMIT, STATED PLAINLY: two of the names are the same length
+    // ("m_nTotalLaps" and "m_nTotalTime", 12 characters each), so for those
+    // two the length does not discriminate; the guest's full name hash would
+    // settle it and is not implemented.
     struct MemberSlot {
         uintptr_t offset;
         uint32_t* raw;
         float* asFloat;
+        const char* name;
     };
     const MemberSlot slots[] = {
-        {kOffLapDistance, &out->lapDistance, &out->lapDistanceF},
-        {kOffTotalLaps, &out->totalLaps, &out->totalLapsF},
+        {kOffLapDistance, &out->lapDistance, &out->lapDistanceF, "m_nLapDistance"},
+        {kOffTotalLaps, &out->totalLaps, &out->totalLapsF, "m_nTotalLaps"},
         {kOffPreviousSpline, &out->previousSplineDistance,
-         &out->previousSplineDistanceF},
-        {kOffTotalSpline, &out->totalSplineDistance, &out->totalSplineDistanceF},
-        {kOffTopSpeed, &out->topSpeed, &out->topSpeedF},
-        {kOffTotalTime, &out->totalTime, &out->totalTimeF},
+         &out->previousSplineDistanceF, "m_nPreviousSplineDistance"},
+        {kOffTotalSpline, &out->totalSplineDistance, &out->totalSplineDistanceF,
+         "m_nTotalSplineDistanceTravelled"},
+        {kOffTopSpeed, &out->topSpeed, &out->topSpeedF, "m_nTopGameSpeed"},
+        {kOffTotalTime, &out->totalTime, &out->totalTimeF, "m_nTotalTime"},
     };
     out->membersResolved = 0;
+    out->membersIdentified = 0;
     for (size_t i = 0; i < sizeof(slots) / sizeof(slots[0]); ++i) {
         int32_t value = 0;
         if (!readMemberValue(address + slots[i].offset, &value, nullptr)) {
@@ -951,6 +974,18 @@ void fillMetrics(RaceMetricsSample* out, uintptr_t address) {
         *slots[i].raw = static_cast<uint32_t>(value);
         *slots[i].asFloat = static_cast<float>(value);
         out->membersResolved |= (1u << i);
+        // THE IDENTITY CHECK: the guest's own descriptor words.
+        uint32_t nameHash = 0;
+        uint32_t lenXorHash = 0;
+        if (readDword(address + slots[i].offset + 0x08ULL, &nameHash) &&
+            readDword(address + slots[i].offset + 0x10ULL, &lenXorHash)) {
+            const uint32_t recoveredLength = nameHash ^ lenXorHash;
+            const uint32_t expectedLength =
+                static_cast<uint32_t>(std::strlen(slots[i].name));
+            if (recoveredLength == expectedLength) {
+                out->membersIdentified |= (1u << i);
+            }
+        }
     }
     out->valid = true;
 }
@@ -1548,7 +1583,7 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             "totalF=%.3f speed=%u speedF=%.3f time=%u timeF=%.3f "
             "rate=%.6f prog=%.3f from_total=%d sawprog=%d "
             "car=0x%llx cnode=%u cprev=%u cpos=%d,%d,%d ctgt=%d,%d,%d "
-            "snode=%u sdist=%u tsok=%d perr=%.4f pur=%d "
+            "snode=%u sdist=%u tsok=%d perr=%.4f pur=%d ident=0x%llx "
             "drive=%d steer=%.3f mag=%.3f sign=%d best=%.6f flips=%d stalls=%d "
             "thr=%d brk=%d",
             frame, static_cast<unsigned long long>(g_cglobal),
@@ -1581,6 +1616,7 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             m.splineNode, m.splineDistance,
             m.trackStateAddress != 0 ? 1 : 0,
             static_cast<double>(g_drive.steerError), g_drive.pursuit ? 1 : 0,
+            static_cast<unsigned long long>(m.membersIdentified),
             g_drive.enabled ? 1 : 0, static_cast<double>(g_drive.steer),
             static_cast<double>(g_drive.magnitude), g_drive.sign,
             static_cast<double>(g_drive.bestRate), g_drive.flips, g_drive.stalls,
