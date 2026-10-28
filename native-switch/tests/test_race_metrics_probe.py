@@ -396,8 +396,13 @@ class SyntheticRegistry:
                 return (node_key, cell), None
             node_index = bucket_index(count, node_key)
             if node_index is not None and node_index != index:
-                return None, "the-key-is-not-in-the-table"
-        return None, "the-key-is-not-in-the-table"
+                # The guest stops the walk at the first node that belongs to
+                # another bucket.  This is a DIFFERENT failure from the chain
+                # simply running out, and the port used to report both as
+                # "the-key-is-not-in-the-table", which is what left the
+                # 2026-10-28 audit unable to attribute the failure.
+                return None, "the-node-is-in-another-bucket"
+        return None, "the-chain-ended"
 
     def lookup(self, member_id):
         key0 = (~(self.seed0 ^ member_id)) & MASK
@@ -512,8 +517,16 @@ def main() -> int:
 
     # The algorithm itself, spelled the way the port spells it, so the
     # control below cannot drift away from the shipped code.
-    assert "(count & (count - 1)) == 0" in store, (
-        "the port does not mask the key when the count is a power of two")
+    #
+    # The bucket dispatch is the GUEST's form, not the "power of two" form it
+    # used to be written in: the guest counts the bits of the count
+    # (ELF 0x99200c fmov w8,s0 / 0x992010 cmp x8,#2) and masks only when
+    # there are fewer than two of them.  The two forms agree for every count
+    # this port has seen, but the guest's is the one that decides, so the
+    # port now says the guest's.
+    assert "bits < 2" in store and "key & (count - 1)" in store, (
+        "the port does not mask the key when the count has fewer than two "
+        "bits set, the way the guest does")
     assert "key % count" in store, (
         "the port does not take the key modulo the count")
     assert "~(seed0 ^ id)" in store and "~(seed1 ^ id)" in store, (
@@ -581,8 +594,8 @@ def main() -> int:
     # THE NEGATIVE CONTROL: a member that was never inserted is NOT found.
     value, why = registry.lookup(0xDEADBEEF)
     assert value is None, "a member that was never inserted produced a value"
-    assert why == "the-key-is-not-in-the-table", (
-        f"the negative control did not say why: {why!r}")
+    assert why in ("the-chain-ended", "the-node-is-in-another-bucket"), (
+        f"the negative control did not say which way the walk failed: {why!r}")
 
     # The same header, compiled and run.
     host_output = run_host_selftest()

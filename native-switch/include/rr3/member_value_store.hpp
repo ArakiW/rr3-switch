@@ -15,6 +15,35 @@
 // and the VALUE lives in a global four-table hash registry: a .bss singleton
 // at link VA 0x1f97980, reached through the accessor 0xb5741c.
 //
+// WHAT THIS HEADER IMPLEMENTS, AND WHAT IT DOES NOT
+// --------------------------------------------------
+// MEASURED 2026-10-28 by an independent re-read of the guest binary (see
+// .build/race-metrics-audit.md):
+//
+//   * the registry really is at 0x1f97980 and the accessor really is
+//     0xb5741c (0xb5743c adrp / 0xb57440 add -> 0x1f97980).  Confirmed.
+//   * the registry holds FOUR seeds (reg+0x00/0x08/0x10/0x18) and FOUR
+//     tables (reg+0x20/+0x48/+0x70/+0x98, counts at +0x28/+0x50/+0x78/
+//     +0xa0).  This header reads TWO of them (seeds 0/1, tables 1/2).
+//   * the guest's own read (ELF 0x991d1c) takes the value as
+//     ~(cell1 ^ cell2) and then CHECKS it against tables 3 and 4:
+//     hash(cell3 ^ (cell1 ^ cell2)) == cell4 (0x991e10/0x991e18/0x991e50).
+//     If the check fails the guest MINTS A NEW ID and re-inserts the value
+//     (0x991e58), i.e. the value it just read is one the guest considers
+//     invalid.
+//
+// SO: the value this header returns is the guest's value FORMULA, applied to
+// two of the guest's four tables, with the guest's own integrity check NOT
+// performed.  That is a KNOWN LIMITATION, not a verified read, and it is
+// recorded here so the next reader does not mistake it for one.  A value
+// that passes the guest's check would need the guest's name-hash function
+// (ELF 0x15c3640) to be ported as well.
+//
+// ALSO NOTE: the "+0xc0" of this registry is its LOCK OBJECT, not an "id
+// map" (0x991cc0 bl 0x1c76fe4 locks, 0x991d00 bl 0x1c76fec unlocks).  The
+// earlier comment in race_state_probe.cpp called it an id map; it is not one,
+// and the id map and the value table are not the same thing.
+//
 // WHY THE SLOT CANNOT BE READ AS A NUMBER
 // ----------------------------------------
 // The accessor 0x991c8c does not merely read a member: it RE-KEYS it. It
@@ -125,13 +154,28 @@ struct Lookup {
     int32_t value{0};
 };
 
-// The guest's own bucket index (ELF 0x991fd8). The count decides: a power of
-// two is masked, anything else is a modulo.
+// The guest's own bucket index (ELF 0x991fd8).  The dispatch is by
+// POPCOUNT, not by "is it a power of two":
+//
+//     0x99200c  fmov w8, s0           ; popcount(count)
+//     0x992010  cmp  x8, #2
+//     0x992014  b.hs #0x992034        ; popcount >= 2 -> modulo
+//     0x99201c  sub  x9, x22, #1
+//     0x992020  and  x24, x9, x23     ; index = key & (count - 1)
+//     0x992040  udiv x9, x23, x22     ; index = key % count
+//
+// The two forms agree for every count this port has ever seen, but the
+// guest's form is the one that decides, so it is the one that is written
+// down here: a count of 1 is a mask (index 0) and a count of 3 is a modulo.
 inline bool bucketIndex(uint64_t count, uint64_t key, uint64_t* index) {
     if (count == 0 || index == nullptr) {
         return false;
     }
-    if ((count & (count - 1)) == 0) {
+    unsigned bits = 0;
+    for (uint64_t c = count; c != 0; c &= (c - 1)) {
+        ++bits;
+    }
+    if (bits < 2) {
         *index = key & (count - 1);
         return true;
     }
@@ -166,7 +210,11 @@ const char* findChainNode(Read& read, uint64_t buckets, uint64_t count,
     }
     for (int step = 0; step < kMaxChainSteps; ++step) {
         if (node == 0) {
-            return "the-key-is-not-in-the-table";
+            // The chain ran out.  This is a DIFFERENT failure from the one
+            // below and the port used to report both as the same string,
+            // which is what made the 2026-10-28 audit unable to say why a
+            // lookup failed.
+            return "the-chain-ended";
         }
         uint64_t nodeKey = 0;
         if (!read(node + kNodeKeyOff, &nodeKey)) {
@@ -188,10 +236,12 @@ const char* findChainNode(Read& read, uint64_t buckets, uint64_t count,
             return nullptr;
         }
         // The guest stops the walk at the first node that belongs to a
-        // DIFFERENT bucket, so the port stops there too.
+        // DIFFERENT bucket, so the port stops there too.  "Belongs to a
+        // different bucket" means: the index that THIS table's rule gives
+        // for the node's own key is not the index being walked.
         uint64_t nodeIndex = 0;
         if (bucketIndex(count, nodeKey, &nodeIndex) && nodeIndex != index) {
-            return "the-key-is-not-in-the-table";
+            return "the-node-is-in-another-bucket";
         }
         uint64_t next = 0;
         if (!read(node + kNodeNextOff, &next)) {

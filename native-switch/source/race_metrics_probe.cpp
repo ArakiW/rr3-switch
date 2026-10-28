@@ -77,9 +77,47 @@ namespace {
 //
 // (x19 is the RuleSet_RaceMetrics there, and the modifier lives inside it at
 // +0x40, so these are the RuleSet-relative offsets +0x60 and +0xa8.)
+//
+// WHICH SLOT THE GUEST READS IS NOT SETTLED, SO THE PROBE MEASURES IT
+// ---------------------------------------------------------------
+// MEASURED 2026-10-28 (independent re-read of the guest binary, see
+// .build/race-metrics-audit.md): the guest's OTHER consumer of the
+// "racemetrics" entry reads a member at
+//
+//     0xb35410  add  x0, x0, #0x50
+//     0xb35414  bl   0x991c8c
+//
+// but the BASE of that add is not established: the audit's chain says the map
+// value is the RuleSet (so +0x50 is modifier+0x10, which is the SECOND WORD
+// of the m_nLapDistance descriptor and not a slot at all), while the
+// modifier's own member slots are at modifier+0x08/+0x20/+0x38/+0x50/+0x68/
+// +0x88, i.e. RuleSet+0x48/+0x60/+0x78/+0x90/+0xa8/+0xc8.  Both readings are
+// arithmetically self-consistent and they name DIFFERENT members.
+//
+// A static reading cannot settle it, so the probe does not guess: it tries
+// EVERY plausible slot, does the lookup on each, and reports which one
+// actually produces a value.  That is the project's standing answer to "the
+// offset is not known": try them all and log each.
+//
+// The RuleSet-relative offsets below are the six modifier slots (the
+// modifier is at RuleSet+0x40) plus the raw +0x50 the guest's add names.
 constexpr uintptr_t kRuleSetRaceMetricsVptrElfVa = 0x1E4B378ULL;
 constexpr uintptr_t kRuleSetTotalLapsOff = 0x60ULL;
 constexpr uintptr_t kRuleSetTopSpeedOff = 0xA8ULL;
+
+// The candidate slots, in the order the probe tries them.  The first one
+// that yields a value wins; the log carries all of them either way.
+constexpr uintptr_t kMemberSlotCandidates[] = {
+    0x60ULL,  // modifier+0x20  m_nTotalLaps          (the telemetry function)
+    0x50ULL,  // what the guest's own add names
+    0x90ULL,  // modifier+0x50  m_nTotalSplineDistanceTravelled
+    0x48ULL,  // modifier+0x08  m_nLapDistance
+    0x78ULL,  // modifier+0x38  m_nPreviousSplineDistance
+    0xA8ULL,  // modifier+0x68  m_nTopGameSpeed
+    0xC8ULL,  // modifier+0x88  m_nTotalTime
+};
+constexpr int kMemberSlotCandidateCount =
+    static_cast<int>(sizeof(kMemberSlotCandidates) / sizeof(uintptr_t));
 
 // The cadence. The guest's own race-state line is written every 30 frames
 // (see source/race_state_probe.cpp), and this probe reads about twenty words
@@ -250,17 +288,65 @@ void pumpRaceMetricsProbe(unsigned long long frame) {
         return;
     }
 
-    // The two member ids, read FRESH. They are the rotating tokens the guest
-    // re-keys on every read of the member, so they are never cached.
+    // THE SCAN: every candidate slot is tried, the lookup is run on each, and
+    // the first one that produces a value wins.  The ids are read FRESH every
+    // sample -- they are the rotating tokens the guest re-keys on every read
+    // of the member, so they are never cached.
+    //
+    // The registry is in the guest's own image, so it is mapped for the whole
+    // run; the bucket arrays and the cells are on the guest's heap, so they go
+    // through the safe read's page check.
+    const uintptr_t registry = bias + member_value_store::kRegistryBssVa;
+    GuestReader read;
+    member_value_store::Lookup laps{};
+    member_value_store::Lookup topspeed{};
     uint64_t lapsId = 0;
-    if (!raceStateReadWord(ruleSet + kRuleSetTotalLapsOff, &lapsId)) {
-        sample.reason = "the-lap-descriptor-is-unreadable";
-        sample.lapsReason = sample.reason;
-        sample.topspeedReason = sample.reason;
-        g_sample = sample;
-        logRaceMetrics(frame, sample, nullptr, nullptr);
-        return;
+    const char* lapsWhy = "no-candidate-slot-produced-a-value";
+    uintptr_t lapsSlot = kRuleSetTotalLapsOff;
+
+    // One compact line per sample: "<slot>:<id>:<ok>:<value>" for each
+    // candidate, so the next round says WHICH slot the guest's own add names
+    // instead of this file having to guess.
+    char scan[512];
+    int scanWritten = 0;
+    scan[0] = '\0';
+    for (int i = 0; i < kMemberSlotCandidateCount; ++i) {
+        const uintptr_t slot = kMemberSlotCandidates[i];
+        uint64_t id = 0;
+        member_value_store::Lookup candidate{};
+        const char* why = nullptr;
+        if (raceStateReadWord(ruleSet + slot, &id)) {
+            why = member_value_store::lookup(read, registry, id, &candidate);
+        } else {
+            why = "the-descriptor-is-unreadable";
+        }
+        const int n = std::snprintf(
+            scan + scanWritten, sizeof(scan) - static_cast<size_t>(scanWritten),
+            "%s%llx:%llx:%d:%d", (i == 0) ? "" : ",",
+            static_cast<unsigned long long>(slot),
+            static_cast<unsigned long long>(id),
+            (why == nullptr) ? 1 : 0, candidate.value);
+        if (n > 0) {
+            scanWritten += n;
+        }
+        if (why == nullptr && !laps.ok) {
+            laps = candidate;
+            lapsWhy = nullptr;
+            lapsId = id;
+            lapsSlot = slot;
+        }
     }
+    {
+        char detail[640];
+        std::snprintf(detail, sizeof(detail),
+                      "rs=0x%llx slot=0x%llx id=0x%llx ok=%d value=%d cand=%s",
+                      static_cast<unsigned long long>(ruleSet),
+                      static_cast<unsigned long long>(lapsSlot),
+                      static_cast<unsigned long long>(lapsId),
+                      (lapsWhy == nullptr) ? 1 : 0, laps.value, scan);
+        appendGuestBootLine(kGuestViewLogPath, "race-metrics-scan", 0, 0, detail);
+    }
+
     uint64_t topspeedId = 0;
     if (!raceStateReadWord(ruleSet + kRuleSetTopSpeedOff, &topspeedId)) {
         sample.reason = "the-top-speed-descriptor-is-unreadable";
@@ -270,16 +356,6 @@ void pumpRaceMetricsProbe(unsigned long long frame) {
         logRaceMetrics(frame, sample, nullptr, nullptr);
         return;
     }
-
-    // The two lookups. The registry is in the guest's own image, so it is
-    // mapped for the whole run; the bucket arrays and the cells are on the
-    // guest's heap, so they go through the safe read's page check.
-    const uintptr_t registry = bias + member_value_store::kRegistryBssVa;
-    GuestReader read;
-    member_value_store::Lookup laps{};
-    member_value_store::Lookup topspeed{};
-    const char* lapsWhy =
-        member_value_store::lookup(read, registry, lapsId, &laps);
     const char* topspeedWhy =
         member_value_store::lookup(read, registry, topspeedId, &topspeed);
 

@@ -217,8 +217,14 @@ int main() {
                                           &missing);
     check(why != nullptr, "a member that was never inserted is not found");
     check(!missing.ok, "the missing member is not reported as a success");
-    check(why != nullptr && std::strcmp(why, "the-key-is-not-in-the-table") == 0,
-          "the missing member says why");
+    // The two ways a walk can fail are now DIFFERENT strings, because the
+    // 2026-10-28 audit could not tell them apart and that was the reason the
+    // failure stayed unattributed.  Which one this particular case hits
+    // depends on the synthetic table's layout, so the test accepts either.
+    check(why != nullptr &&
+              (std::strcmp(why, "the-chain-ended") == 0 ||
+               std::strcmp(why, "the-node-is-in-another-bucket") == 0),
+          "the missing member says which way the walk failed");
 
     // A negative value, because the member is an int32 and a lap count is
     // not the only thing that lives in the registry.
