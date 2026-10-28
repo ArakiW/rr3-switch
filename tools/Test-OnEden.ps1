@@ -274,6 +274,10 @@ if (Test-Path $edenLog -PathType Leaf) {
 }
 $deadline = (Get-Date).AddSeconds($Seconds)
 $lastSize = -1
+# The newest frame capture the port has written.  A guest that is not
+# rendering produces no new capture, which is how "blocked" is told apart
+# from "slow" (see the watchdog rule below).
+$lastFrameName = ''
 $stableTicks = 0
 # How long the guest-view log has been growing still, in seconds.
 $lastGrowthElapsed = 0
@@ -344,12 +348,43 @@ try {
         Write-Host ("t={0,4}s cpu={1,7:N1}s log={2,6}B  {3}" -f $elapsed, $live.CPU, $size, $stampLine)
         if ($size -eq $lastSize -and $size -gt 0) {
             $cpuDelta = $live.CPU - $lastCpu
-            if ($cpuDelta -ge $cpuAliveThreshold) {
-                # Quiet log, busy process.  The guest is ALIVE and just slow:
-                # a big view costs 3.15x the pixels and the boot has to load
-                # the HD atlases.  This tick does not count towards the limit.
+            # THE FRAME CAPTURES ARE THE LIVENESS INSTRUMENT.
+            #
+            # A quiet log with a busy CPU is NOT enough to call the guest
+            # alive: on 2026-10-29 the guest's main thread was parked in
+            # libnx send() waiting for a Cloudcell response that never came,
+            # the log froze at 1.5 MB and NOT ONE FRAME was rendered, and the
+            # emulator spun on the socket at a steady 0.5 core -- which this
+            # rule read as "alive".  The port writes a frame capture when it
+            # renders, so "no new capture" is the ground truth for "the guest
+            # is not drawing anything".
+            $newestFrame = $null
+            try {
+                $newestFrame = Get-ChildItem -LiteralPath $appDir -Filter 'frame-*.png' -File -ErrorAction SilentlyContinue |
+                    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            } catch { $newestFrame = $null }
+            $frameName = if ($newestFrame) { $newestFrame.Name } else { '' }
+            $frameAdvanced = ($frameName -ne $lastFrameName)
+            $lastFrameName = $frameName
+            if ($cpuDelta -ge $cpuAliveThreshold -and $frameAdvanced) {
+                # Quiet log, busy process, and it IS still drawing.  The guest
+                # is ALIVE and just slow: a big view costs 3.15x the pixels
+                # and the boot has to load the HD atlases.  This tick does not
+                # count towards the limit.
                 $stableTicks = 0
-                Write-Host ("        : log quiet but the CPU climbed {0:N1}s -- the guest is alive, not wedged" -f $cpuDelta)
+                Write-Host ("        : log quiet but the CPU climbed {0:N1}s and a new frame was captured -- the guest is alive, not wedged" -f $cpuDelta)
+            }
+            elseif ($cpuDelta -ge $cpuAliveThreshold) {
+                # Busy but NOT drawing: the guest is blocked on something that
+                # is not the renderer (a socket, most likely).  This counts.
+                $stableTicks++
+                Write-Host ("        : log quiet, CPU climbed {0:N1}s, but NO new frame was captured -- the guest is blocked, not slow" -f $cpuDelta)
+                if ($stableTicks -ge $stableTickLimit) {
+                    $stableFor = $elapsed - $lastGrowthElapsed
+                    $exitReason = "guest log stable for ${stableFor}s and no frame was captured: the guest is blocked, not slow"
+                    Write-Host ("        : ending the run -- the guest has been blocked for {0}s" -f $stableFor)
+                    break
+                }
             }
             else {
                 $stableTicks++
