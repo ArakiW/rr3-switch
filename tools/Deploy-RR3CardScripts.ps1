@@ -61,16 +61,37 @@
     on the 1280x720 layout, so a round that has to drive into a race needs
     that one; the picture the port ships needs the 2048x1152 one.)
 
+.PARAMETER TouchMode
+    "legacy" (the default) deploys the repository's rr3-touch.txt, whose
+    hops are pixel coordinates measured on the 1280x720 layout and anchored
+    to frame numbers.  "glove" deploys a COMMENTS-ONLY touch file instead:
+    the file is still there, so the port's touch control owns the touch
+    path, but it injects nothing until the host appends a line.  That is
+    what tools\follow_glove.py does -- it watches the guest's own red glove
+    cursor and appends a click where the guest wants to be pressed, which
+    is immune to both the view size and the timing.
+
+    The legacy script is timing-fragile: the hops are anchored to frame
+    numbers, so when the guest loads slower than the round that measured
+    them, every hop lands on the wrong widget and the guest never reaches
+    the race.  Measured 2026-10-29: q12 spent its whole round in the front
+    end for exactly this reason, while q10 and q11 with the same script
+    did reach the race.
+
 .EXAMPLE
     .\Deploy-RR3CardScripts.ps1 -Apply
 .EXAMPLE
     .\Deploy-RR3CardScripts.ps1 -ScreenView 1280x720 -Apply
+.EXAMPLE
+    .\Deploy-RR3CardScripts.ps1 -TouchMode glove -Apply
 #>
 [CmdletBinding()]
 param(
     [string]$EmulatorRoot = 'E:\Eden',
     [switch]$Apply,
-    [string]$ScreenView = ''
+    [string]$ScreenView = '',
+    [ValidateSet('legacy', 'glove')]
+    [string]$TouchMode = 'legacy'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -113,6 +134,38 @@ if ($ScreenView -ne '') {
     Write-Host ("screen  : -ScreenView {0} (the repository's rr3-screen.txt is NOT modified)" -f $ScreenView)
 }
 
+# --- the touch-mode override --------------------------------------------------
+#
+# "glove" deploys a COMMENTS-ONLY touch file.  The file is still on the card,
+# so the port's touch control owns the touch path, but it injects nothing
+# until the host appends a line -- which is what tools\follow_glove.py does.
+$touchOverrideFile = $null
+if ($TouchMode -eq 'glove') {
+    $scratchDir = Join-Path $projectRoot '.build'
+    New-Item -ItemType Directory -Force -Path $scratchDir | Out-Null
+    $touchOverrideFile = Join-Path $scratchDir 'rr3-touch-glove.txt'
+    $gloveText = @(
+        '# The touch path is driven by the GUEST''S OWN RED GLOVE CURSOR.'
+        '#'
+        '# This file is deliberately EMPTY of events: the port injects one line'
+        '# per line that is appended, and nothing is appended here.  The host'
+        '# runs tools\follow_glove.py, which watches the port''s own framebuffer'
+        '# captures, finds the glove -- the sprite the guest draws on the control'
+        '# it wants pressed -- and appends a click there.'
+        '#'
+        '# Why not the hard-coded hops of the legacy script: those are pixel'
+        '# coordinates measured on the 1280x720 layout AND anchored to frame'
+        '# numbers, so they break when the view size changes and when the guest'
+        '# loads slower than the round that measured them (2026-10-29: q12 spent'
+        '# its whole round in the front end for exactly that reason).'
+        '#'
+        '# The format the port parses: [at <frame>] <x> <y> <action> [pointerId]'
+    )
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllLines($touchOverrideFile, [string[]]$gloveText, $utf8NoBom)
+    Write-Host ("touch   : -TouchMode glove (a comments-only file; the host appends the clicks)")
+}
+
 Write-Host ("card     : {0}" -f $appDir)
 
 # --- 1. preflight ------------------------------------------------------------
@@ -120,6 +173,9 @@ $plan = foreach ($name in $scripts) {
     $source = Join-Path $sourceRoot $name
     if ($name -eq 'rr3-screen.txt' -and $null -ne $screenOverrideFile) {
         $source = $screenOverrideFile
+    }
+    if ($name -eq 'rr3-touch.txt' -and $null -ne $touchOverrideFile) {
+        $source = $touchOverrideFile
     }
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
         Write-Host ("preflight: MISSING {0} in {1}" -f $name, $sourceRoot)

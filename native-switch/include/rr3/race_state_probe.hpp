@@ -91,6 +91,14 @@ struct RaceMetricsSample {
     // 3 = total spline distance, 4 = top speed, 5 = total time).  A member
     // that is NOT in the mask kept its raw descriptor reading.
     uint32_t membersResolved{};
+    // THE GUEST'S OWN PER-CAR TRACK STATE: the distance along the spline and
+    // the distance ACROSS it.  A single scalar cannot tell "the road curves
+    // and I am not following it" apart from "I am off the road", so these two
+    // are what the autopilot needs; WHICH is which is not established yet, so
+    // both are reported raw next to the port's own spline distance.
+    uintptr_t trackStateAddress{};
+    uint32_t trackAlong{};
+    uint32_t trackAcross{};
     // The rate of change of the progress metric, in units per frame.
     double progressRate{};
     // The progress metric the rate was computed from.

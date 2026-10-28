@@ -816,6 +816,45 @@ uint32_t g_lastTotalLaps = 0xFFFFFFFFu;
 unsigned long long g_brakeUntilFrame = 0;
 unsigned long long g_lastFlipFrame = 0;
 
+// THE GUEST'S OWN PER-CAR TRACK STATE.
+//
+// The port could read how FAR the car had come along the spline, and that is
+// enough to notice a car that is not moving -- but not enough to steer it,
+// because one scalar cannot say "the road curves and I am not following it"
+// apart from "I am off the road".  The guest keeps BOTH, and the port can
+// reach them.
+//
+// The chain, each step proved by the guest's own code:
+//
+//   RuleSet_RaceMetrics + 0x20    the spline-node structure   (ELF 0xb35e60)
+//   +0x288                         the per-car track state    (ELF 0xb35ce8)
+//   +0x1a8 (int32), scale 1/32     one of the two distances  (ELF 0xb35cf4)
+//   +0x1c8 (int32), scale 1/4      the other                (ELF 0xb35cf0)
+//
+// WHICH is which is NOT established, and the two different scales are only
+// an inference, so BOTH are reported raw, next to the port's own spline
+// distance.  One race names them: the one that grows with the port's own
+// distance is the one along the track, and the other is the lateral term.
+//
+// The reads are the port's own safe reads (plausibility gate, guest-image
+// check, svcQueryMemory, read) and nothing here writes anything.
+void fillTrackOffsets(RaceMetricsSample* out) {
+    if (g_ruleSetRaceMetrics == 0) {
+        return;
+    }
+    uint64_t nodeStruct = 0;
+    if (!readWord(g_ruleSetRaceMetrics + 0x20ULL, &nodeStruct) || nodeStruct == 0) {
+        return;
+    }
+    uint64_t carState = 0;
+    if (!readWord(nodeStruct + 0x288ULL, &carState) || carState == 0) {
+        return;
+    }
+    out->trackStateAddress = static_cast<uintptr_t>(carState);
+    readDword(carState + 0x1a8ULL, &out->trackAlong);
+    readDword(carState + 0x1c8ULL, &out->trackAcross);
+}
+
 void fillMetrics(RaceMetricsSample* out, uintptr_t address) {
     out->address = address;
     // THE Vptr IS READ, NOT ASSUMED. The previous version was handed the
@@ -1408,6 +1447,7 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             "laps=%u lapF=%.3f lapd=%u lapdF=%.3f prev=%u total=%u "
             "totalF=%.3f speed=%u speedF=%.3f time=%u timeF=%.3f "
             "rate=%.6f prog=%.3f from_total=%d sawprog=%d "
+            "along=%u across=%u tsok=%d "
             "drive=%d steer=%.3f mag=%.3f sign=%d best=%.6f flips=%d stalls=%d "
             "thr=%d brk=%d",
             frame, static_cast<unsigned long long>(g_cglobal),
@@ -1434,6 +1474,8 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             m.progressRate, m.progress,
             m.progressFromTotal ? 1 : 0,
             g_sawProgress ? 1 : 0,
+            m.trackAlong, m.trackAcross,
+            m.trackStateAddress != 0 ? 1 : 0,
             g_drive.enabled ? 1 : 0, static_cast<double>(g_drive.steer),
             static_cast<double>(g_drive.magnitude), g_drive.sign,
             static_cast<double>(g_drive.bestRate), g_drive.flips, g_drive.stalls,
@@ -1541,6 +1583,7 @@ void pumpRaceStateProbe(unsigned long long frame) {
     if (g_metricsCount > 0) {
         RaceMetricsSample m{};
         fillMetrics(&m, g_metrics[0]);
+        fillTrackOffsets(&m);
         updateProgress(frame, &m);
         g_sample.metrics[0] = m;
         g_sample.metricsCount = 1;

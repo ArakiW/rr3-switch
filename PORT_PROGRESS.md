@@ -8065,3 +8065,81 @@ It is expected to MOVE during a race, and in q8 it never moved at all
 across 717 samples -- an independent confirmation that no lap event fired.
 The port reads it correctly (717/717 lookups `ok=1`, the guest's own
 checksum agreeing every time); the game has simply not awarded a lap yet.
+
+## 2026-10-29: the glove cursor, and the lateral distance the guest already keeps
+
+### 1. q12 was not a test of anything -- the touch script is timing-fragile
+
+q12 was meant to test base=0.05 with sign=-1.  It tested nothing: the guest
+never reached the race.  The run summary has `start lights 0` and `race
+screen 0`, while q10 and q11 with the SAME script had 7 and 10.  The hops in
+`rr3-touch.txt` are anchored to FRAME NUMBERS, so when the guest loads
+slower than the round that measured them, every hop lands on the wrong
+widget and the guest spends the whole round in the front end.
+
+**⇒ THE TOUCH SCRIPT IS THE FRAGILE PART, NOT THE PORT.**  And the fix is
+already in the guest: it draws a **red glove cursor on the control it wants
+pressed**, and it only draws it while it is waiting for that press.
+
+### 2. tools/follow_glove.py -- click where the glove is
+
+The guest's glove cursor is the answer to "where do I press", at any view
+size and at any moment.  The tool differences the port's own framebuffer
+captures (the PRESENTED screen, which is the coordinate space the touch
+file expects) and finds the glove: a colour mask cannot separate it from
+the red car behind it, but the glove ANIMATES, so it is the thing that MOVES
+between two frames of the same screen.
+
+No port change is needed: the touch control file is APPEND-ONLY and the
+port injects every new line exactly once (see
+`native-switch/include/rr3/guest_touch.hpp`), and the port's frame counter
+is the one the guest log's `phase=race-state ... f=` lines carry.
+
+**POSITIVE CONTROL** (the detector over the archived q9 frames): 17 of 33
+consecutive frame pairs carried a glove, every time at (756..779, 123..134).
+That is the same answer the earlier manual measurement gave (about (762,
+126)).
+
+`Deploy-RR3CardScripts.ps1 -TouchMode glove` deploys a COMMENTS-ONLY touch
+file: the file is on the card, so the port's touch control owns the touch
+path, but nothing is injected until the host appends a line.
+
+### 3. The lateral distance the guest ALREADY keeps
+
+The guest's own member registry contains `m_acrossAngle` -- and a sub-agent
+**overturned the premise that it is the lateral offset**: it is a hinge
+angle of a car body part (`CarBodyPart_Swinging`, the RTTI name), in
+DEGREES, integrated by a spring-damper (angular acceleration = torque /
+m_fMomentOfInertia, clamped to +-360), and its target is a HEADING error,
+not a distance.  Three independent proofs: the integrator's own arithmetic
+(ELF 0x157be30-0x157c094), the dot product with the node direction
+(0x157bfb4-0x157bfe8), and the member set itself (angle, momentum) x2 plus
+mass/length/inertia.
+
+**What the guest DOES keep, and the port can now read, is the pair of
+distances in the per-car track state.**  The chain, each step proved by the
+guest's own code:
+
+| step | offset | proving ELF address |
+|---|---|---|
+| RuleSet_RaceMetrics (the port already resolves it) | | vtable AP 0x1e4b378 |
+| the spline-node structure | `+0x20` | **0xb35e60** `str x0,[x19,#0x20]` |
+| the per-car track state | `*(that)+0x288` | **0xb35ce8** `ldr x8,[x8,#0x288]` |
+| distance A (int32, scale 1/32) | `+0x1a8` | **0xb35cf4** `scvtf s1,s1; fmul s1,s2,s1; fcvtzs w26,s1,#8` |
+| distance B (int32, scale 1/4) | `+0x1c8` | **0xb35cf0** `fcvtzs w27,s0` |
+
+WHICH is which is NOT established, and the two scales are only an
+inference, so both are now logged RAW next to the port's own spline
+distance: `along=`, `across=`, `tsok=`.  One race names them -- the one that
+grows with the port's own distance is the one along the track, and the
+other is the lateral term the autopilot has been missing for three rounds.
+
+The port reads them with its own safe reads and writes nothing.
+
+### 4. There is no current-speed member
+
+Scanned ALL 1091 `m_*` member strings: the only speed members are
+`m_nTopGameSpeed` (a MAXIMUM, useless as a speed), `m_fDollySpeed`,
+`m_fPedestalSpeed`, `m_nMinCarVelocitySwitchTime`, `m_Start_Vel` and
+`m_End_Vel`.  **No live speed is available**, which is why the stall
+detector has to work off distance.
