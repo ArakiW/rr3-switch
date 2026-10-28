@@ -65,43 +65,28 @@
 # and the port answers 1280x720 again.
 #
 # ---------------------------------------------------------------------------
-# THE ACTIVE CONFIGURATION: 16:9 at 2048x1152
+# THE ACTIVE CONFIGURATION: 1280x720 -- TEMPORARILY, FOR AN A/B
 #
-# MEASURED 2026-10-28, archive 20261028-165042-eden-q5, with the view at
-# 2048x1536 the guest's OWN log said:
+# WHY THIS FILE IS CURRENTLY AT THE OLD VALUE.  The HD tree and the HD
+# quality are PROVEN (q7, archive 20261028-211808-eden-q7): at
+# view=2048x1152 the guest reports "Res base: 2048x1152", puts
+# gui_assets/2048x1536 FIRST in its own Res order, and the atlas load
+# failures went 125 -> 0.
 #
-#   Res base: 2048x1536
-#   Res order:
-#   (2048.000000, 1536.000000) - 1.333333 - gui_assets/2048x1536/
-#   (960.000000, 640.000000) - 1.500000 - gui_assets/960x640/
-#   (480.000000, 320.000000) - 1.500000 - gui_assets/480x320/
+# What is still unmeasured is the LAP COUNTER, whose value store was fixed
+# in commit 05ab0ecd.  The touch script's pixel coordinates were measured on
+# the OLD 1280x720 layout, and at 2048x1152 the guest lays the front end out
+# differently (q7 sat on the full-screen event card and never reached a
+# race: msStartLights 0).  So the value store is measured on the layout the
+# script can drive: the 1280x720 one, which is exactly what q4 used.  That
+# makes the next run a clean A/B against q4 -- same layout, same script, the
+# only difference being the value-store fix.
 #
-# i.e. the 2048x1536 tree is FIRST and the 2D UI stopped failing to load
-# (125 "Failed to load image from atlas" -> 0, and the LocalStyles failures
-# are gone).
-#
-# The sort is NOT by aspect ratio.  The comparator inside the guest's
-# ImageResManager (ELF 0x10f9948) is an inlined fcmp/cset/csel on the
-# candidate's HEIGHT (node+0x14) and then its WIDTH (node+0x10), and the
-# third filter is gated on the ALLOW_RETINA setting, which is TRUE in the
-# runtime settings.  So the HD tree is the one with the largest height, and
-# the tree that wins is decided by the HEIGHT, not by how close its aspect
-# is to the screen's.
-#
-# THAT MATTERS BECAUSE IT LEAVES THE ASPECT RATIO FREE.  At a 16:9 view of
-# 2048x1152 the filter still keeps 2048x1536 (its width 2048 is not greater
-# than the screen's 2048), and 1536 is still the largest height in the
-# list, so the same HD tree is selected -- while the 3D scene is rendered
-# 16:9 and fills the screen with no pillarbox bars at all.
-#
-# 2048x1152 also fits the 1280x720 output exactly (1.78 vs 1.78), so the
-# present path is a plain downscale with nothing letterboxed.
-#
-# IF THIS TURNS OUT WRONG -- if the guest picks the 960x640 tree at 16:9 --
-# then the 4:3 view (2048x1536) is the configuration that gets the HD tree,
-# at the cost of two 160-pixel pillarbox bars.
+# To go back to the HD configuration, change the three lines below to
+# 2048x1152 and RE-MEASURE THE TOUCH SCRIPT against the new layout (the
+# guest's own red glove cursor is where it wants to be pressed).
 #
 # ---------------------------------------------------------------------------
-platform=2048x1152
-ui=2048x1152
-view=2048x1152
+platform=1280x720
+ui=1280x720
+view=1280x720
