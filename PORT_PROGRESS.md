@@ -7112,3 +7112,73 @@ known-absent / 0 unexpected.
   3D right.  Either way the touch coordinates have to be re-measured.
 * `gui/processed/LocalStyles_480x320.gui` is requested and does not exist in
   any of the seven volumes.
+
+### 11. q2: the CGlobal is confirmed, and the probe's GameMode slot is confirmed dead
+
+The scan and the slot watch went into round `q2` (1800 s).  The
+`gamemode-slots` line watches five slots once per sample, and it answers
+three questions that static analysis could not:
+
+```
+phase=gamemode-slots f=30  g=0x210f86bde0 A=0x0 B=0x0        C=0 D=0          E=0x210a6b68a0 eIsVptr=1
+phase=gamemode-slots f=60  g=0x210f86bde0 A=0x0 B=0x0        C=2 D=4294967295 E=0x210a6b68a0 eIsVptr=1
+... 100 of 105 samples:   g=0x210f86bde0 A=0x0 B=0x2120984280 C=3 D=4294967295 E=0x210a6b68a0 eIsVptr=1
+```
+
+**1. The port's CGlobal IS the guest's CGlobal.**  `eIsVptr=1` in every
+sample: the first word of the object the port calls `g` is a vtable address
+point in the guest's `.data.rel.ro`.  That is the check that says "this is the
+guest's object and not a coincidence", and it had never been made before.
+
+**2. The guest's own GameMode slot is dead, not merely misread.**
+`A = *(CGlobal+0x10d88)` is **0 in every single sample**.  The guest reads
+that slot itself (ELF 0xf152a4) and makes a vtable call through it, so the
+offset is right -- the guest simply does not keep a GameMode there while the
+front end is up.  It only stores one between creating it (0xb088fc) and
+destroying it (0x10af2e4), and the creation is conditional (0xb0895c `cbnz`).
+
+**3. The guest's own index says "no race".**  `D = *(uint32*)(CGlobal+0x10c78)`
+is `0xffffffff` (-1) for as long as the front end is up, and the accessor
+that uses it (0x1547e68: `ldrsw x8,[x0,#0x288]` / `cmn w8,#1`) returns 0
+for an index of -1.  So **the guest itself agrees that there is no GameMode
+to read** -- the probe is not being refused, there is nothing there.
+
+**4. The scan over the CGlobal's neighbourhood found nothing.**
+`gamemode-scan: vptrCands=0 tried=0 found=0x0 ctrlApplicable=0` -- not a
+single pointer in the 128 KB around the CGlobal has a vtable as its first
+word.  So the GameMode is not reachable from the CGlobal's own neighbourhood
+either, which is consistent with the audit's finding that the lap counter's
+holder is the first argument of ELF 0xf2b508 and that one of that
+function's two call sites passes a **stack** object.
+
+**5. The third candidate slot changes shape over the run.**
+`B = *(CGlobal+0x173f0)` was 0 in the first samples, and then became
+`0x2120984280` -- a live heap pointer -- for 100 of the 105 samples.  In f1n
+the same slot held a small integer (`2121177280`).  The guest uses this slot
+as a POINTER (it is fed to 0xc15fd8), so the small integer in f1n means the
+slot's contents are not stable, and the probe's third candidate was reading
+whatever happened to be there.
+
+### 12. What this changes about the plan
+
+* **The probe's "GameMode" concept is not where the guest keeps a race's
+  rulesets.**  The guest reaches them through an indexed accessor on a
+  holder, and the index is -1 whenever no race is running.
+* **The heap scan that was already there is aimed at the wrong regions.**
+  `findMetricsInHeap()` looks for the RuleSet_RaceMetrics vptr in up to
+  eight regions anchored on the CGlobal and its own pointers.  It has never
+  hit, and the reason is now visible: the race objects are not in the
+  CGlobal's region.
+* **The next probe to write is not a vptr search but a STRING search.**  The
+  map node's key is the inline std::string "racemetrics" (SSO), so the node
+  is a 10-byte pattern in the heap, and the node's value at +0x38 is the
+  RuleSet_RaceMetrics -- which the port can then check against the vptr it
+  already knows.  That reaches the object WITHOUT going through the
+  GameMode at all, which is the whole point: the GameMode is not on the path
+  the port can see.
+* **And the question the round also has to answer: how long is the race
+  actually?**  The `RuleSet_RaceMetrics` was found in exactly TWO samples
+  (frames 5580 and 5610) in f1n -- sixty frames -- and the guest's own
+  scene state was 2 or 3 in every sample.  If the guest is only "in a race"
+  for a second, then no probe sampling every thirty frames can watch a lap,
+  and the fix is to make the race LAST, not to make the probe quicker.
