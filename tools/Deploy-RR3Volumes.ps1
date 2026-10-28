@@ -450,7 +450,15 @@ $litterLogNames = @("$appFolderName.guest-view.log", "$appFolderName.teardown-re
 $litterLogFiles = @(Get-ChildItem -LiteralPath $CardSwitchDir -Force -File -ErrorAction SilentlyContinue |
     Where-Object { $litterLogNames -contains $_.Name })
 $litterCrashFiles = @(Get-ChildItem -LiteralPath $CardSwitchDir -Force -File -Filter "$appFolderName.crash-*.txt" -ErrorAction SilentlyContinue)
-$litterFiles = @($litterLogFiles) + @($litterCrashFiles)
+# THE FRAME CAPTURES ARE LITTER TOO.  The port writes one PNG per captured
+# frame into the app directory; a round writes hundreds of them and each one
+# is about 1.7 MB (measured 2026-10-28: 380 of them, 495 MB, against a card
+# whose free space is reported with a 4 GiB saw-tooth).  The run script
+# removes them once they are in the archive, but a round that was killed
+# leaves them behind, and then they are what pushes the NEXT round off the
+# end of the card.
+$litterFrameFiles = @(Get-ChildItem -LiteralPath $appDir -Filter 'frame-*.png' -File -ErrorAction SilentlyContinue)
+$litterFiles = @($litterLogFiles) + @($litterCrashFiles) + @($litterFrameFiles)
 
 $litterBytes = [long]0
 foreach ($d in $litterDirs) { $litterBytes += Get-TreeBytes $d.FullName }
@@ -458,8 +466,8 @@ foreach ($f in $litterFiles) { $litterBytes += [long]$f.Length }
 $litterCrashBytes = [long]0
 foreach ($f in $litterCrashFiles) { $litterCrashBytes += [long]$f.Length }
 
-Write-Host ("litter  : {0} stale director(ies), {1} log file(s), {2} crash file(s) -- {3:N0} bytes" -f `
-    $litterDirs.Count, $litterLogFiles.Count, $litterCrashFiles.Count, $litterBytes)
+Write-Host ("litter  : {0} stale director(ies), {1} log file(s), {2} crash file(s), {3} frame capture(s) -- {4:N0} bytes" -f `
+    $litterDirs.Count, $litterLogFiles.Count, $litterCrashFiles.Count, $litterFrameFiles.Count, $litterBytes)
 if (-not $CleanLitter) {
     Write-Host "litter  : NOT removed (-CleanLitter was not passed); the projection below keeps those bytes"
 }
@@ -468,15 +476,68 @@ if (-not $CleanLitter) {
 # A running emulator can hold a volume open. The rename over an open file
 # fails with a sharing violation, and a guest that reads a half-replaced set
 # of volumes produces failures that look like data corruption.
+# THE TEST IS THE LOCK, NOT THE PROCESS NAME.
+#
+# A running emulator can hold a volume open.  The rename over an open file
+# fails with a sharing violation, and a guest that reads a half-replaced set
+# of volumes produces failures that look like data corruption.  That is the
+# real precondition, and it is about FILES, not about processes.
+#
+# The old guard refused whenever ANY emulator was running, by name.  That is
+# a proxy for the real question, and a false one: the emulator the user
+# happens to have open (measured 2026-10-28: a Ryujinx under
+# E:\AI\WANGAN_SWITCH_STARTER\work\citron-run\ryujinx, on %APPDATA%\Citron)
+# does not hold a single byte of THIS card.  The guard therefore blocked the
+# cleanup this card needs, and the card's free space had fallen to 158 MB.
+#
+# So the guard asks the real question now: does any file this script is
+# about to write have an exclusive lock on it?  Eden stays an unconditional
+# refusal, because Eden's SD card IS this card.
+function Test-FileLocked([string]$path) {
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
+    $handle = $null
+    try {
+        $handle = [System.IO.File]::Open($path, [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        return $false
+    } catch [System.IO.IOException] {
+        return $true
+    } catch [System.UnauthorizedAccessException] {
+        return $true
+    } finally {
+        if ($null -ne $handle) { $handle.Close() }
+    }
+}
 $emulatorProcs = @(Get-Process -ErrorAction SilentlyContinue |
     Where-Object { $_.ProcessName -in @('eden', 'Ryujinx', 'yuzu') })
 if ($emulatorProcs.Count -gt 0) {
     $names = ($emulatorProcs | ForEach-Object { $_.ProcessName }) -join ', '
-    if ($Apply) {
-        Write-Host ("FATAL   : an emulator is running ({0}). Close it before deploying." -f $names) -ForegroundColor Red
-        exit $exitPreflight
+    $edenRunning = @($emulatorProcs | Where-Object { $_.ProcessName -eq 'eden' }).Count -gt 0
+    $lockTargets = @()
+    $lockTargets += (Join-Path $appDir "$appFolderName.nro")
+    foreach ($n in $expectedNames) { $lockTargets += (Join-Path $CardDataDir $n) }
+    $locked = @()
+    foreach ($t in $lockTargets) {
+        if (Test-FileLocked $t) { $locked += $t }
     }
-    Write-Host ("warn    : an emulator is running ({0}); deploying now would race it." -f $names)
+    if ($edenRunning) {
+        if ($Apply) {
+            Write-Host ("FATAL   : Eden is running ({0}). Close it before deploying." -f $names) -ForegroundColor Red
+            exit $exitPreflight
+        }
+        Write-Host ("warn    : Eden is running ({0}); deploying now would race it." -f $names)
+    }
+    elseif ($locked.Count -gt 0) {
+        if ($Apply) {
+            Write-Host ("FATAL   : {0} file(s) this script would write are locked by another process ({1})." -f $locked.Count, $names) -ForegroundColor Red
+            foreach ($l in $locked) { Write-Host ("          locked: {0}" -f $l) }
+            exit $exitPreflight
+        }
+        Write-Host ("warn    : {0} file(s) are locked by another process ({1})." -f $locked.Count, $names)
+    }
+    else {
+        Write-Host ("emulator: {0} is running but holds none of this card's files (a different SD card); continuing." -f $names)
+    }
 }
 
 # ============================================== 3. CAPACITY ACCOUNTING ======
@@ -783,6 +844,22 @@ if ($CleanLitter) {
     if ($litterCrashFiles.Count -gt 0) {
         Write-Host ("removed : {0} crash file(s) '{1}.crash-*.txt'  ({2:N0} bytes freed)" -f `
             $litterCrashFiles.Count, $appFolderName, $litterCrashBytes)
+    }
+    $litterFrameBytes = [long]0
+    $litterFrameRemoved = 0
+    foreach ($f in $litterFrameFiles) {
+        $target = Assert-Deletable $f.FullName
+        $litterFrameBytes += [long]$f.Length
+        try {
+            Remove-Item -LiteralPath $target -Force -ErrorAction Stop
+            $litterFrameRemoved++
+        } catch {
+            Write-Host ("warn    : could not remove {0}: {1}" -f $target, $_.Exception.Message)
+        }
+    }
+    if ($litterFrameFiles.Count -gt 0) {
+        Write-Host ("removed : {0} of {1} frame capture(s)  ({2:N0} bytes freed)" -f `
+            $litterFrameRemoved, $litterFrameFiles.Count, $litterFrameBytes)
     }
 }
 else {

@@ -646,7 +646,8 @@ bool looksLikePointer(uintptr_t bias, uint64_t word) {
 // store, and the guest's own accessor (ELF 0x991c8c) is what normally puts
 // it there -- but that accessor also RE-KEYS the member, so a probe must not
 // call it.  The pure read is include/rr3/member_value_store.hpp, and it
-// decodes the value the guest's way: ~(cell3 ^ cell1), out of tables 1 and 3.
+// decodes the value the guest's way: ~(cell1 ^ cell2), out of tables 1 and 2,
+// with tables 3 and 4 carrying the guest's own integrity check.
 //
 // The id is a ROTATING token: the guest re-keys the member every time it
 // reads one, so the id is read fresh here and never cached.  The guest's own

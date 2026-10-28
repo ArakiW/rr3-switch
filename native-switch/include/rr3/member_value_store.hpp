@@ -19,52 +19,72 @@
 // THE READ, DECODED FROM THE GUEST'S OWN CODE
 // -------------------------------------------
 // The guest's own read path is 0x991d1c (the value) and 0x991fd8 (the bucket
-// lookup).  With reg = the registry base and id = x20:
+// lookup).  With reg = the registry base (x21) and id = x20.
+//
+// THE LISTING IS IN ADDRESS ORDER, AND THAT ORDER IS THE WHO ARGUMENT.  The
+// eor at 0x991de4 sits BETWEEN table 2's cell load (0x991dcc) and table 3's
+// cell load (0x991e00), so x8 still holds table 2's cell when the eor runs.
+// An earlier reading of this same code listed the instructions OUT of address
+// order, took x8 for table 3's cell, and made the port compute
+// ~(cell1 ^ cell3); the address order says otherwise.
 //
 //     0x991d40  add  x19, x0, #0xc0     ; the registry's LOCK object
 //     0x991d54  bl   0x1c76fe4          ; lock
 //     0x991d58  ldr  x8, [x21]          ; seed0 = reg+0x00
 //     0x991d64  add  x0, x21, #0x20     ; TABLE 1
 //     0x991d6c  eon  x8, x8, x20        ; key0 = ~(seed0 ^ id)
-//     0x991d88  bl   0x991fd8           ; -> the node
+//     0x991d88  bl   0x991fd8           ; -> the node of table 1
 //     0x991d8c  ldr  x8, [x0, #0x18]    ; the node's value-cell pointer
-//     0x991d9c  ldr  x23, [x8]          ; cell1
+//     0x991d9c  ldr  x23, [x8]          ; cell1  (x23)
 //     0x991d90  ldr  x9, [x21, #8]      ; seed1 = reg+0x08
 //     0x991d94  add  x0, x21, #0x48     ; TABLE 2
 //     0x991da0  eon  x8, x9, x20        ; key1 = ~(seed1 ^ id)
-//     0x991db8  bl   0x991fd8           ; -> the node
-//     0x991dcc  ldr  x8, [x8]           ; cell2
+//     0x991db8  bl   0x991fd8           ; -> the node of table 2
+//     0x991dbc  ldr  x8, [x0, #0x18]    ; the node's value-cell pointer
+//     0x991dcc  ldr  x8, [x8]           ; cell2  (x8)
 //     0x991dc0  ldr  x9, [x21, #0x10]   ; seed2 = reg+0x10
 //     0x991dc4  add  x0, x21, #0x70     ; TABLE 3
 //     0x991dd0  eon  x9, x9, x20        ; key2 = ~(seed2 ^ id)
-//     0x991dec  bl   0x991fd8           ; -> the node
-//     0x991e00  ldr  x8, [x8]           ; cell3
-//     0x991de4  eor  x25, x8, x23       ; *** x25 = cell3 ^ cell1 ***
-//     0x991e10  eor  x8, x8, x25        ; cell2 ^ cell3 ^ cell1
+//     0x991de4  eor  x25, x8, x23       ; *** x25 = cell2 ^ cell1 ***
+//     0x991dec  bl   0x991fd8           ; -> the node of table 3
+//     0x991df0  ldr  x8, [x0, #0x18]    ; the node's value-cell pointer
+//     0x991e00  ldr  x8, [x8]           ; cell3  (x8)
+//     0x991df4  movk x2, ...            ; the FNV-1a basis 0xcbf29ce484222325
+//     0x991e10  eor  x8, x8, x25        ; cell3 ^ cell2 ^ cell1
+//     0x991e14  str  x8, [sp, #0x10]    ; the eight bytes that are hashed
 //     0x991e18  bl   0x15c3640          ; fnv1a64 of those 8 LE bytes
 //     0x991e1c  ldr  x8, [x21, #0x18]   ; seed3 = reg+0x18
+//     0x991e20  mov  x23, x0            ; the hash moves into x23
 //     0x991e24  add  x0, x21, #0x98     ; TABLE 4
 //     0x991e2c  eon  x8, x8, x20        ; key3 = ~(seed3 ^ id)
-//     0x991e44  bl   0x991fd8           ; -> the node
-//     0x991e4c  ldr  x8, [x8]           ; cell4
+//     0x991e44  bl   0x991fd8           ; -> the node of table 4
+//     0x991e48  ldr  x8, [x0, #0x18]    ; the node's value-cell pointer
+//     0x991e4c  ldr  x8, [x8]           ; cell4  (x8)
 //     0x991e50  cmp  x23, x8            ; the hash == cell4 ?
 //     0x991e54  b.eq #0x991e70          ; yes -> done
 //     0x991e58  bl   0x991eac            ; no -> mint a NEW id, re-insert
 //     0x991e74  bl   0x1c76fec          ; unlock
-//     0x991e88  mvn  x0, x25            ; *** THE VALUE = ~(cell3 ^ cell1) ***
+//     0x991e88  mvn  x0, x25            ; *** THE VALUE = ~(cell1 ^ cell2) ***
 //
-// THE VALUE IS MADE OF CELLS 1 AND 3, NOT 1 AND 2.  The port used to compute
-// ~(cell1 ^ cell2) -- the wrong pair -- and to look the member up in tables 1
-// and 2 only.  That is the bug the 2026-10-28 round found: the guest keeps
-// the value in table 1 and table 3, and the port was reading a table that
-// holds something else.
+// THE VALUE IS MADE OF CELLS 1 AND 2; TABLES 3 AND 4 ARE THE INTEGRITY
+// CHECK.  The port used to compute ~(cell1 ^ cell3) and to look the member up
+// in tables 1 and 3 -- the wrong pair -- which is the bug the 2026-10-28 round
+// found and fixed.
 //
-// TABLES 2 AND 4 ARE THE INTEGRITY CHECK, NOT THE VALUE.  The guest hashes
+// TABLES 3 AND 4 ARE THE INTEGRITY CHECK, NOT THE VALUE.  The guest hashes
 // cell1 ^ cell2 ^ cell3 and compares the result with the cell in table 4; if
 // they differ it MINTS A NEW ID and re-inserts the value (0x991e58), i.e.
 // the value it read is one it considers tampered with.  The port does NOT
 // re-key (that would mutate the guest), so it reports the value together
 // with whether the guest's own check would have passed.
+//
+// THE CHECK IS ALSO THE PORT'S PROOF.  When the port's four cells make
+// fnv1a64(cell1^cell2^cell3) == cell4, the guest's own checksum agrees, and
+// that is the strongest statement available about a pure read: the port and
+// the guest are looking at the same four cells.  The 2026-10-28 lap
+// measurement reported "lapsOk=1" and "lapsCheck=none" for the first time in
+// the port's history, and the value was re-derived by hand from the logged
+// cells.
 //
 // THE HASH IS FNV-1a 64-bit.  The guest's hash function (ELF 0x15c3640) is
 //
@@ -103,19 +123,25 @@
 // race_state_probe.cpp called it an id map; it is not one, and the id map and
 // the value table are not the same thing.
 //
-// The bucket lookup (0x991fd8) works like this:
+// The bucket lookup (0x991fd8) works like this, in address order:
 //
 //     0x991fec  ldr  x22, [x0, #8]     ; the bucket count, at table+8
-//     0x99200c  fmov w8, s0           ; popcount(count)
+//     0x991ffc  cbz  x22, #0x992030    ; no buckets -> not found
+//     0x992004  cnt  v0.8b, v0.8b      ; popcount of the count
 //     0x992010  cmp  x8, #2
 //     0x992014  b.hs #0x992034        ; popcount >= 2 -> modulo
+//     0x992018  ldr  x8, [x19]         ; the bucket array
 //     0x99201c  sub  x9, x22, #1
 //     0x992020  and  x24, x9, x23     ; index = key & (count - 1)
+//     0x992024  ldr  x20, [x8, x24, lsl #3] ; the chain head of that bucket
+//     ...
+//     0x992034  cmp  x23, x22          ; the modulo path
 //     0x992040  udiv x9, x23, x22
 //     0x992044  msub x24, x9, x22, x23 ; index = key % count
-//     0x992024  ldr  x20, [x8, x24, lsl #3] ; the chain head of that bucket
+//     0x99204c  ldr  x20, [x9, x24, lsl #3] ; the chain head of that bucket
 //
-// and the chain node is 32 bytes:
+// and the chain node is 32 bytes, which the guest's own INSERT path writes
+// out (0x9920a4 stp xzr, x23, [x0] and 0x9920a8 stp x8, xzr, [x0, #0x10]):
 //
 //     node+0x00  the next node
 //     node+0x08  the key
@@ -128,6 +154,29 @@
 //     0x992070  ldr  x20, [x20]                ; x20 = *buckets[index]
 //
 // so the slot holds the ADDRESS of a cell whose first word is the node.
+//
+// TWO INDEPENDENT PLACES IN THE GUEST SAY SO.  The lookup path above reads
+// node+0x08 and node+0x18 AFTER that extra indirection, so *buckets[index]
+// must be the node.  And the insert path agrees:
+//
+//     0x9920d4  ldr  x8, [x9, x24, lsl #3]    ; x8 = buckets[index]
+//     0x9920dc  ldr  x9, [x8]                 ; x9 = *buckets[index]
+//     0x9920e0  str  x9, [x20]               ; the NEW node's next
+//
+// the new node's next field has to become the OLD HEAD NODE, and only
+// *buckets[index] can be that.  If the slot held the node itself, [x8] would
+// be the old head's NEXT pointer and the chain would lose its head.
+//
+// THE SAME INSTRUCTION SERVES BOTH ROLES.  0x992070 is "slot -> node" on the
+// first turn of the walk and "node -> next node" on every turn after it,
+// which is why the extra indirection is easy to miss: it looks like the chain
+// step.
+//
+// ONE SMALL DIVERGENCE FROM THE GUEST, AND IT IS BENIGN.  The guest's found
+// condition is node+0x10 == key; the guest's node+0x08 is a fast path that
+// only decides whether to compare node+0x10.  This port accepts a match on
+// EITHER copy.  The guest's own insert path writes the same key into both,
+// so the two copies cannot disagree in a live guest.
 // Treating the slot as the node -- which is what this port used to do --
 // made every key read garbage and every lookup stop with
 // "the-node-is-in-another-bucket": the 2026-10-28 measurement, where seven

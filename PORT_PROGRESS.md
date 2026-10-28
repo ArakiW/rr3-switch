@@ -7608,3 +7608,181 @@ the player sees.
   not been observed coming out of a live run yet.
 * The touch script's coordinates are unchanged by this configuration, which
   is the first time that has been true of any change to the view size.
+
+## 2026-10-28 (night, part 3): the value store READS -- measured, and the picture is back on
+
+### 1. The A/B is done, and the value store went from 100% failure to 100% success
+
+q8 was the clean A/B against q4: the SAME 1280x720 layout, the SAME touch
+script, the only difference being the value-store fix in commit 05ab0ecd.
+Archive `20261028-213445-eden-q8`, wall 1208 s, 475,108 guest log lines.
+
+| | q4 (before the fix) | q8 (after the fix) |
+|---|---|---|
+| `race-metrics-scan` lines | 168 | **717** |
+| of those, `ok=1` | **0** | **717** |
+| `lapsWhy` | `the-node-is-in-another-bucket` | **`none`** (the guest's own check passed) |
+| the member id | one | **699 different ids**, all followed |
+
+`none` is the strongest statement available about a pure read: it is the
+GUEST's own checksum agreeing with the port.  The guest hashes
+`cell1 ^ cell2 ^ cell3` and compares the result with the cell in table 4; the
+port computes the same four cells and the same hash, and they matched on
+every single one of the 717 samples.
+
+The 699 different ids are the other half of the proof: the id in a slot is a
+ROTATING token (the guest's accessor re-keys the member on every read), so a
+port that cached an id would report a stale answer.  The port re-reads the
+id every sample and got 717 valid answers.
+
+**AND THE VALUE WAS RE-DERIVED BY HAND FROM THE LOG.**  One line:
+
+```
+lapsCell1=0x302fddb200f1a29c lapsCell2=0xcfd0224d00f1a29c  reported laps=-1
+```
+
+`cell1 ^ cell2 = 0xffffffff00000000`, `~that = 0xffffffff = -1`.  The port's
+answer is the guest's answer, computed twice by different routes.
+
+### 2. The read path was re-checked against the BYTES, not against the summary
+
+The previous entry's reasoning about the guest's read path was sound but its
+ADDRESSES were listed out of order, which is exactly what had produced the
+wrong formula in the first place.  Re-disassembled in address order
+(0x991d1c..0x991ea4, 0x991fd8..0x992228, 0x15c3640..0x15c366c):
+
+```
+0x991dcc  ldr  x8, [x8]      ; cell2   <- table 2's cell
+0x991de4  eor  x25, x8, x23  ; x25 = cell2 ^ cell1     (x8 is STILL cell2 here)
+0x991dec  bl   0x991fd8      ; table 3's lookup
+0x991e00  ldr  x8, [x8]      ; cell3   <- loaded AFTER the eor
+0x991e10  eor  x8, x8, x25   ; cell3 ^ cell2 ^ cell1
+0x991e18  bl   0x15c3640     ; fnv1a64 of those 8 LE bytes
+0x991e20  mov  x23, x0       ; the hash moves into x23
+0x991e4c  ldr  x8, [x8]      ; cell4
+0x991e50  cmp  x23, x8       ; the hash == cell4 ?
+0x991e88  mvn  x0, x25       ; THE VALUE = ~(cell1 ^ cell2)
+```
+
+The eor at 0x991de4 sits BETWEEN table 2's cell load (0x991dcc) and table
+3's cell load (0x991e00), so the value is `~(cell1 ^ cell2)` and tables 3
+and 4 carry the integrity check.  The FNV is the standard FNV-1a 64
+(`h = (h ^ byte) * 0x100000001b3`, basis 0xcbf29ce484222325), byte for byte
+what 0x15c3640 does.
+
+### 3. The bucket slot is not the node -- now proved in TWO places in the guest
+
+```
+lookup : 0x992024  ldr x20, [x8, x24, lsl #3]   ; x20 = buckets[index]
+         0x992070  ldr x20, [x20]                ; x20 = *buckets[index]
+insert : 0x9920d4  ldr x8,  [x9, x24, lsl #3]    ; x8 = buckets[index]
+         0x9920dc  ldr x9,  [x8]                 ; x9 = *buckets[index]
+         0x9920e0  str x9,  [x20]                ; the NEW node's next
+```
+
+The new node's next field has to become the OLD HEAD NODE, and only
+`*buckets[index]` can be that.  If the slot held the node itself, `[x8]`
+would be the old head's NEXT pointer and the chain would lose its head.  The
+slot therefore holds the ADDRESS of a cell whose first word is the node.
+The node layout is 32 bytes, written by the guest's own insert path:
++0x00 next, +0x08 key, +0x10 key again, +0x18 pointer to the value cell.
+
+The same instruction (0x992070) serves as "slot -> node" on the first turn
+of the walk and "node -> next" on every turn after it, which is why the
+extra indirection was easy to miss: it looks like the chain step.
+
+### 4. Which member is "Total Laps" -- the guest's own label code
+
+```
+0xb358cc  add  x0, x19, #0x60   ; &RuleSet->member
+0xb358d0  bl   0x991c8c         ; read it (the re-keying accessor)
+0xb358dc  adrp x8, #0x40d000    ; "Total Laps"
+0xb358e4  mov  w1, x0           ; the value, as an integer
+0xb358f0  b   0xb71164          ; set the label
+```
+
+So `RuleSet_RaceMetrics + 0x60` IS the member the game calls "Total Laps"
+(and +0xA8 is "Top Speed (km/h)", +0xC8 is "Average Speed (km/h)").  The
+port's slot table was already right.
+
+### 5. WHY THE LAP COUNTER IS STILL -1 -- and it is NOT a reading failure
+
+Two INDEPENDENT instruments read the same thing:
+
+* the value store: `laps=-1`, `lapsOk=1`, `lapsWhy=none`
+* the race-state probe, from a different path: `laps=4294967295`
+
+and the trajectory says why:
+
+```
+f=8190   total=105126  rate=3.28     flips=0
+f=9210   total=125841  rate=-0.05    flips=1
+f=9630   total=125841  rate=0.0      flips=1
+f=21630  total=125861  rate=0.0      flips=17
+f=27060  total=125869  rate=0.016    flips=24
+```
+
+The car drove 125,841 spline units and stopped dead, and the port's own
+autopilot reversed its steering direction 24 times without ever getting
+free (`bestRate` since the last flip: 0.000000).  The guest agrees that no
+lap was completed.  **So the remaining problem is a DRIVING problem, not a
+reading problem, and the value store is no longer on the critical path.**
+
+### 6. Two harness defects found and fixed while measuring this
+
+**(a) The captured frames were never taken off the card.**  The port writes
+one PNG per captured frame; a round writes hundreds and each one is about
+1.7 MB.  q8 left 380 of them on the card -- 495 MB -- and the run script
+only cleared them at the START of the NEXT round.  With the card's free
+space reported on a 4 GiB saw-tooth, that is what would have killed the
+next round: 158 MB free against a round that needs about 600 MB for its own
+frames and log.  The frames are now deleted from the card once they are in
+the archive, and the deploy script's litter set counts them too.
+
+**(b) The emulator guard asked the wrong question.**  It refused to deploy
+whenever ANY emulator was running, by NAME.  The emulator the user happens
+to have open (a Ryujinx under
+`E:\AI\WANGAN_SWITCH_STARTER\work\citron-run\ryujinx`, on
+`%APPDATA%\Citron`) holds not one byte of this card, so the guard was
+blocking the cleanup the card needed.  The guard now asks the real
+question -- does a file this script is about to write have an exclusive lock
+on it? -- and Eden stays an unconditional refusal, because Eden's SD card
+IS this card.  Both halves were measured:
+
+* positive control: an exclusive lock held on the card's NRO => the script
+  stops with `locked: ...\rr3-native-rehost.nro`
+* negative control: the user's own Ryujinx running, holding none of our
+  files => the script continues, frees 692,219,767 bytes and re-verifies all
+  8 volume hashes (0 mismatches)
+
+The card's free space went from 158 MB to 811 MB.
+
+### 7. The card goes back to the HD configuration
+
+The 1280x720 layout was only ever there to make the A/B against q4
+possible.  The picture the port is for is `view=2048x1152` (HD 2D tree,
+16:9 3D, full 1280x720 screen, no bars), so `rr3-screen.txt` is back to
+that, deployed and verified 5/5.
+
+**AND A STALE CLAIM IN THE PREVIOUS ENTRY IS CORRECTED HERE.**  That entry
+said the touch script's recorded pixel coordinates "still work unchanged" at
+2048x1152, "the first time that has been true of any change to the view
+size".  The measurement said otherwise: in q7 the script sat on the
+full-screen event card and never reached a race (`msStartLights 0`).  The
+coordinates are in the 1280x720 SCREEN space, but the guest lays its front
+end out differently at a 16:9 view, so the same pixel lands on a different
+widget.  The script has to be re-measured against the HD frames before an
+automated round can drive into a race again; the guest's own red glove
+cursor shows where it wants to be pressed (measured in the q7 frames at
+about (762, 138)).
+
+### 8. Still open
+
+* **The car has to complete a lap.**  Everything the port needs to READ is
+  proven; what is missing is a car that drives.  The port's autopilot steers
+  with a magnitude of 0.05 and can only flip its sign when the progress rate
+  goes negative, which cannot recover a car that is stopped against a
+  barrier.
+* **The touch script has to be re-measured for the HD layout**, or made
+  screen-driven (the port currently identifies only the base class
+  `N2cc9CloudcellE`, not the concrete screen).

@@ -462,6 +462,27 @@ if ($framePngs.Count -gt 0) {
         Copy-Item -LiteralPath $png.FullName -Destination (Join-Path $frameDir $png.Name) -Force
     }
     Write-Host ("frames  : {0} PNG(s) captured -> {1}" -f $framePngs.Count, $frameDir)
+    # AND THEN DELETE THEM FROM THE CARD.  A capture is 1.7 MB and a round
+    # writes hundreds of them, so a round's frames are the biggest thing on
+    # the card after the game data itself -- 495 MB for the 2026-10-28 q8
+    # round, against a card that reports its free space with a 4 GiB
+    # saw-tooth.  Leaving them there until the NEXT round starts is what
+    # makes the next round run out of space: the card had 158 MB free with
+    # q8's frames still on it, and a round needs about 600 MB for its own
+    # frames and log.  The frames are already in the archive, so the card
+    # copy is pure litter from here on.
+    $frameBytes = [long]0
+    $frameRemoved = 0
+    foreach ($png in $framePngs) {
+        $frameBytes += [long]$png.Length
+        try {
+            Remove-Item -LiteralPath $png.FullName -Force -ErrorAction Stop
+            $frameRemoved++
+        } catch {
+            Write-Host ("warn    : could not remove {0} from the card: {1}" -f $png.Name, $_.Exception.Message)
+        }
+    }
+    Write-Host ("frames  : {0} of {1} removed from the card, {2:N0} bytes freed" -f $frameRemoved, $framePngs.Count, $frameBytes)
 }
 $edenLog = Join-Path $edenRoot 'user\log\eden_log.txt'
 if ($EmulatorName -ne 'eden') {
