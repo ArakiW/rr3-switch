@@ -160,22 +160,47 @@ def follow(seconds: int, app_dir: str, touch_path: str, log_path: str) -> int:
     print("watching %s for the glove, clicking into %s" % (app_dir, touch_path))
     seen: tuple[str, str] | None = None
     clicks = 0
+    last_spot: tuple[int, int] | None = None
+    last_click = 0.0
     deadline = time.time() + seconds
     while time.time() < deadline:
         frames = sorted(
             glob.glob(os.path.join(app_dir, "frame-*.png")), key=os.path.getmtime
         )
+        spot = None
         if len(frames) >= 2:
             pair = (frames[-2], frames[-1])
             if pair != seen:
                 seen = pair
                 spot = find_glove(*pair)
                 if spot is not None:
-                    frame = port_frame_counter(log_path)
-                    x, y = spot
-                    append_touch(touch_path, frame, x, y)
-                    clicks += 1
-                    print("  glove at (%d, %d) at frame %d -> clicked" % (x, y, frame))
+                    last_spot = spot
+        # THE GLOVE DOES NOT ALWAYS MOVE.  The guest draws it on the control
+        # it wants pressed and then WAITS, and on a screen that does not
+        # change -- a car-select grid, a modal -- the difference between two
+        # captures is empty, so the difference-based detector finds nothing
+        # and the guest waits forever.  MEASURED 2026-10-29 (q17): the
+        # watcher clicked the glove in the garage 80 times, the screen then
+        # stopped changing, and the run ended with the guest still waiting
+        # for a press it had already been asked for.
+        #
+        # So the LAST KNOWN glove position is kept and pressed again while
+        # the screen stays still: the guest is still showing the glove, which
+        # means it is still asking for that press.
+        now = time.time()
+        if spot is not None:
+            frame = port_frame_counter(log_path)
+            append_touch(touch_path, frame, spot[0], spot[1])
+            clicks += 1
+            last_click = now
+            print("  glove at (%d, %d) at frame %d -> clicked" % (spot[0], spot[1], frame))
+        elif last_spot is not None and (now - last_click) >= 3.0:
+            frame = port_frame_counter(log_path)
+            append_touch(touch_path, frame, last_spot[0], last_spot[1])
+            clicks += 1
+            last_click = now
+            print("  screen still -> re-clicking the glove at (%d, %d) at frame %d"
+                  % (last_spot[0], last_spot[1], frame))
         time.sleep(4.0)
     print("followed for %d s, %d click(s) appended" % (seconds, clicks))
     return 0
