@@ -65,30 +65,43 @@
 # and the port answers 1280x720 again.
 #
 # ---------------------------------------------------------------------------
-# THE ACTIVE CONFIGURATION: "the game thinks it is on a 4:3 tablet"
+# THE ACTIVE CONFIGURATION: 16:9 at 2048x1152
 #
-# All three keys are 2048x1536, because that is a REAL configuration of this
-# game -- a 4:3 Android tablet -- and a configuration the guest's own layout
-# and its HD atlas tree were authored for.  Mixing the three (a 16:9 platform
-# with a 4:3 view) is not a configuration the game has ever seen, so there is
-# no reason to ship one.
+# MEASURED 2026-10-28, archive 20261028-165042-eden-q5, with the view at
+# 2048x1536 the guest's OWN log said:
 #
-# WHAT THE 4:3 VIEW COSTS, AND WHY IT IS STILL THE RIGHT CHOICE:
+#   Res base: 2048x1536
+#   Res order:
+#   (2048.000000, 1536.000000) - 1.333333 - gui_assets/2048x1536/
+#   (960.000000, 640.000000) - 1.500000 - gui_assets/960x640/
+#   (480.000000, 320.000000) - 1.500000 - gui_assets/480x320/
 #
-#   * The 3D scene is rendered 4:3 and the present path FITS it into the
-#     16:9 screen: 960x720 centred between two 160-pixel pillarbox bars.
-#     A circle stays a circle -- the old stretch-to-fill would not.
-#   * The 2D UI is drawn from the 2048x1536 HD atlas at 1:1 and then
-#     downscaled to the 960x720 content area.  That is a 2.1x DOWNSCALE of
-#     sharp source art, against the old 960x640 atlas blown up 1.33x.  The
-#     difference is the whole point of this file.
-#   * The touch script's pixel coordinates have to be re-measured: the
-#     content is no longer full-screen, it starts 160 pixels from the left.
-#     The port's touch mapping follows the content rectangle automatically
-#     (gfxPresentRect), but a script that taps at a recorded pixel has to
-#     aim at the button, not at the old position.
+# i.e. the 2048x1536 tree is FIRST and the 2D UI stopped failing to load
+# (125 "Failed to load image from atlas" -> 0, and the LocalStyles failures
+# are gone).
+#
+# The sort is NOT by aspect ratio.  The comparator inside the guest's
+# ImageResManager (ELF 0x10f9948) is an inlined fcmp/cset/csel on the
+# candidate's HEIGHT (node+0x14) and then its WIDTH (node+0x10), and the
+# third filter is gated on the ALLOW_RETINA setting, which is TRUE in the
+# runtime settings.  So the HD tree is the one with the largest height, and
+# the tree that wins is decided by the HEIGHT, not by how close its aspect
+# is to the screen's.
+#
+# THAT MATTERS BECAUSE IT LEAVES THE ASPECT RATIO FREE.  At a 16:9 view of
+# 2048x1152 the filter still keeps 2048x1536 (its width 2048 is not greater
+# than the screen's 2048), and 1536 is still the largest height in the
+# list, so the same HD tree is selected -- while the 3D scene is rendered
+# 16:9 and fills the screen with no pillarbox bars at all.
+#
+# 2048x1152 also fits the 1280x720 output exactly (1.78 vs 1.78), so the
+# present path is a plain downscale with nothing letterboxed.
+#
+# IF THIS TURNS OUT WRONG -- if the guest picks the 960x640 tree at 16:9 --
+# then the 4:3 view (2048x1536) is the configuration that gets the HD tree,
+# at the cost of two 160-pixel pillarbox bars.
 #
 # ---------------------------------------------------------------------------
-platform=2048x1536
-ui=2048x1536
-view=2048x1536
+platform=2048x1152
+ui=2048x1152
+view=2048x1152

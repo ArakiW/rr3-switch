@@ -8392,62 +8392,6 @@ void* frameLoopDriver(void* opaque) {
         //
         // The first capture keeps the old "LATE" label so that archives
         // before and after this change can be compared on the same label.
-        if (!gfxNullActive()) {
-            // THE SCHEDULE IS DENSE WHERE THE EXPERIMENT IS.
-            //
-            // It used to be: 30, 120, 300, 600, 1000, 1200, 1350, 1500,
-            // 1650, 3000, 7000, 11000, ... -- dense early, sparse later,
-            // and it is a ONE-SHOT list, so a run that ends at 6600 frames
-            // never gets past 3000. That is exactly the region the touch
-            // script works in (the clicks run from frame 1400 to 4400), so
-            // the pictures that would show whether a click did anything
-            // were never taken.
-            //
-            // The PNG encode costs about eight seconds under a software
-            // renderer, so the captures also SLOW THE GUEST DOWN; a capture
-            // every 150 frames is the compromise that still puts a picture
-            // within a couple of seconds after every click.
-            //
-            // IT IS COMPUTED, NOT WRITTEN OUT, AND THAT IS THE POINT.
-            //
-            // The written-out list stopped at frame 6900. The touch script,
-            // however, was still working at frame 9645 (the click that opened
-            // the F1 Academy quest page) and the race was reached at frame
-            // 13051 -- so the run produced 45 pictures and then went BLIND
-            // exactly where the experiment needed to look. A run that cannot
-            // see the frame it has to explain is a blind run, and "the
-            // instrument did not cover the interesting part" reads exactly
-            // like "the thing did not happen".
-            //
-            // The first five frames keep their historical values so that
-            // archives before and after this change can be compared on the
-            // same labels, and from frame 1200 the capture is every 200
-            // frames out to 12000 -- which covers the whole front end, the
-            // daily reward, the event picker, the quest page, the car select
-            // screen and the race itself.
-            static const unsigned kScheduleHead[] = { 30u, 120u, 300u, 600u, 1000u };
-            constexpr unsigned kScheduleFrom = 1200u;
-            constexpr unsigned kScheduleStep = 200u;
-            constexpr unsigned kScheduleLast = 12000u;
-            static unsigned s_index = 0;
-            unsigned wanted = 0u;
-            if (s_index < (sizeof(kScheduleHead) / sizeof(kScheduleHead[0]))) {
-                wanted = kScheduleHead[s_index];
-            } else {
-                wanted = kScheduleFrom +
-                         (s_index - (sizeof(kScheduleHead) / sizeof(kScheduleHead[0]))) *
-                             kScheduleStep;
-            }
-            if (wanted <= kScheduleLast && frames >= wanted) {
-                const unsigned at = wanted;
-                ++s_index;
-                // The frame-3000 capture keeps the old "LATE" label so that
-                // archives before and after this change can be compared on
-                // the same label; frame 30 keeps "EARLY" for the same reason.
-                readbackAndLog(at == 3000 ? "LATE" : (at == 30 ? "EARLY" : "CAP"),
-                               frames);
-            }
-        }
 
         if (renderTarget != 0 && frames == 30) {
             appendGuestBootLine(
@@ -8668,6 +8612,75 @@ void* frameLoopDriver(void* opaque) {
                     }
                 }
                 glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            }
+        }
+
+        // THE CAPTURE IS HERE, AFTER THE PRESENT, ON PURPOSE.
+        //
+        // The readback samples the CURRENTLY BOUND framebuffer.  Before the
+        // present that is the guest's own FBO, and with a 2048x1536 view a
+        // 1280x720 readback of it is a CROP of the guest's picture, not the
+        // picture on the screen.  A capture that cannot see the present path
+        // cannot answer "is the letterbox right?".
+        //
+        // After the blit the default framebuffer is bound and holds exactly
+        // what the player sees: the 4:3 content in the middle of the 16:9
+        // screen, with the pillarbox bars on both sides.
+
+        if (!gfxNullActive()) {
+            // THE SCHEDULE IS DENSE WHERE THE EXPERIMENT IS.
+            //
+            // It used to be: 30, 120, 300, 600, 1000, 1200, 1350, 1500,
+            // 1650, 3000, 7000, 11000, ... -- dense early, sparse later,
+            // and it is a ONE-SHOT list, so a run that ends at 6600 frames
+            // never gets past 3000. That is exactly the region the touch
+            // script works in (the clicks run from frame 1400 to 4400), so
+            // the pictures that would show whether a click did anything
+            // were never taken.
+            //
+            // The PNG encode costs about eight seconds under a software
+            // renderer, so the captures also SLOW THE GUEST DOWN; a capture
+            // every 150 frames is the compromise that still puts a picture
+            // within a couple of seconds after every click.
+            //
+            // IT IS COMPUTED, NOT WRITTEN OUT, AND THAT IS THE POINT.
+            //
+            // The written-out list stopped at frame 6900. The touch script,
+            // however, was still working at frame 9645 (the click that opened
+            // the F1 Academy quest page) and the race was reached at frame
+            // 13051 -- so the run produced 45 pictures and then went BLIND
+            // exactly where the experiment needed to look. A run that cannot
+            // see the frame it has to explain is a blind run, and "the
+            // instrument did not cover the interesting part" reads exactly
+            // like "the thing did not happen".
+            //
+            // The first five frames keep their historical values so that
+            // archives before and after this change can be compared on the
+            // same labels, and from frame 1200 the capture is every 200
+            // frames out to 12000 -- which covers the whole front end, the
+            // daily reward, the event picker, the quest page, the car select
+            // screen and the race itself.
+            static const unsigned kScheduleHead[] = { 30u, 120u, 300u, 600u, 1000u };
+            constexpr unsigned kScheduleFrom = 1200u;
+            constexpr unsigned kScheduleStep = 200u;
+            constexpr unsigned kScheduleLast = 12000u;
+            static unsigned s_index = 0;
+            unsigned wanted = 0u;
+            if (s_index < (sizeof(kScheduleHead) / sizeof(kScheduleHead[0]))) {
+                wanted = kScheduleHead[s_index];
+            } else {
+                wanted = kScheduleFrom +
+                         (s_index - (sizeof(kScheduleHead) / sizeof(kScheduleHead[0]))) *
+                             kScheduleStep;
+            }
+            if (wanted <= kScheduleLast && frames >= wanted) {
+                const unsigned at = wanted;
+                ++s_index;
+                // The frame-3000 capture keeps the old "LATE" label so that
+                // archives before and after this change can be compared on
+                // the same label; frame 30 keeps "EARLY" for the same reason.
+                readbackAndLog(at == 3000 ? "LATE" : (at == 30 ? "EARLY" : "CAP"),
+                               frames);
             }
         }
 

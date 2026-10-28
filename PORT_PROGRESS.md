@@ -7509,3 +7509,102 @@ Gates: build exit 0, Test-RR3Inputs exit 0, 29/29 python tests, cc symbols
   must not call it).  The port's own probe resolves the member id from the
   slot and then reads the global value store, which is what this fix
   repairs.
+
+## 2026-10-28 (night, part 2): 16:9 AND the HD tree -- the best of both
+
+### 1. The headline
+
+The picture is soft because the guest draws the 2D UI from a **960x640** atlas
+into a **1280x720** frame: a 1.33x upscale of every sprite and glyph.  The
+HD tree (`gui_assets/2048x1536`, 1.66 GB in `gui-hd.romfs`) is on the card
+all along; the guest's own filter (ELF 0x10f8ec8, `width <= screenW ||
+height <= screenH`) drops it against a 1280x720 screen.
+
+**The screen size is the only lever, and 16:9 is enough.**
+
+### 2. q6: the 4:3 view, and what the harness got wrong
+
+`view=2048x1536` (4:3), archive `20261028-170318-eden-q6`:
+
+* the guest reported `Res base: 2048x1536` and put
+  `gui_assets/2048x1536/` FIRST in its own `Res order:`;
+* `Failed to load image from atlas` went 125 -> 0 and the `LocalStyles`
+  failures disappeared;
+* the port served the real HD atlases out of `gui-hd.romfs` with
+  published == served digests, 240/240;
+* the run reached the main menu (Chinese UI, `Menu_Music.mp3`, 14880 frames
+  in 1207 s).
+
+The catch was the 4:3 view itself: the 3D scene is 4:3, so the present path
+has to letterbox it into 960x720 with two 160-pixel bars.
+
+### 3. q5: the run that was killed while it was working
+
+q5 was ended at 152 s with "guest log stable for 120s".  The guest had
+rendered 3 frames.  The naive reading is "the 4:3 view wedges the guest".
+
+**It does not.**  The harness's OWN discriminator -- the CPU series, "a spin
+shows as a steady climb and a deadlock collapses toward zero" -- says
+otherwise, and the numbers are unambiguous:
+
+| | q4 (1280x720) | q5 (2048x1536) |
+|---|---|---|
+| CPU delta per 10 s tick, steady state | 10.6 - 15.4 s | 6.3 - 7.1 s |
+| shape | steady climb | **steady climb** |
+
+q5's CPU went from 41.2 s at t=30 to 120.3 s at t=150 -- a steady 0.65 core.
+A deadlock collapses to zero.  **The guest was alive and booting a 3.15x
+larger view, and the harness killed it while it worked.**  The rule that
+ended the run never consulted the CPU series, even though the CPU series is
+the discriminator the script documents two lines above it.  Fixed: a quiet
+log only counts towards the limit when the CPU has stopped climbing.
+
+### 4. q7: 16:9 gets the HD tree too, and there is not a single black bar
+
+The guest's comparator inside `ImageResManager` (ELF 0x10f9948) is an inlined
+`fcmp`/`cset`/`csel` on the candidate's **HEIGHT** (node+0x14) and then its
+**WIDTH** (node+0x10) -- **not** on the aspect ratio -- and the third filter
+is gated on the `ALLOW_RETINA` setting, which is TRUE in the runtime
+settings.  So the winner is the candidate with the largest height, and the
+aspect ratio of the screen does not decide it.
+
+MEASURED, archive `20261028-170318-eden-q6` and the q7 run:
+
+```
+view=2048x1152  present=0,0 1280x720
+Res base: 2048x1152
+Res order:
+(2048.000000, 1536.000000) - 1.333333 - gui_assets/2048x1536/
+(960.000000, 640.000000) - 1.500000 - gui_assets/960x640/
+(480.000000, 320.000000) - 1.500000 - gui_assets/480x320/
+share) Current res: 2048, 1152
+```
+
+**The 2048x1536 tree is FIRST at a 16:9 view.**  And because 2048x1152 has
+the same aspect ratio as the 1280x720 output, the present path is a plain
+downscale: `present=0,0 1280x720`, no bars, no stretch, and the touch
+mapping falls back to the identity, so the touch script's recorded pixel
+coordinates still work unchanged.
+
+| | 1280x720 (old) | 2048x1536 (4:3) | **2048x1152 (16:9)** |
+|---|---|---|---|
+| 2D atlas | 960x640, 1.33x upscale | 2048x1536 HD | **2048x1536 HD** |
+| 3D aspect | 16:9 | 4:3 | **16:9** |
+| screen | full | two 160-px bars | **full** |
+| touch script | valid | needs re-measuring | **still valid** |
+
+### 5. The capture was looking at the wrong picture
+
+The q6 frames looked like a complete 16:9 menu with a cut-off element at the
+right edge.  They were not the screen: the readback samples the currently
+bound framebuffer, and before the present that is the GUEST'S OWN FBO, so a
+1280x720 readback of a 2048x1536 one is a CROP.  The capture now happens
+after the present blit, where the default framebuffer holds exactly what
+the player sees.
+
+### 6. Still open
+
+* The lap counter's value store is FIXED (see the previous entry) but has
+  not been observed coming out of a live run yet.
+* The touch script's coordinates are unchanged by this configuration, which
+  is the first time that has been true of any change to the view size.
