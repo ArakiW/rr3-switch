@@ -107,9 +107,15 @@ struct RaceMetricsSample {
     uintptr_t carAddress{};
     uint32_t carPrevNode{};
     uint32_t carNode{};
-    float carX{};
-    float carY{};
-    float carZ{};
+    // The car's WORLD POSITION and the point it is AIMING AT, both 32-bit
+    // integers in the guest's 1/256 metre unit.  The guest's own AI drives
+    // by this pair, so the port can drive by it too.
+    int32_t carX{};
+    int32_t carY{};
+    int32_t carZ{};
+    int32_t carTargetX{};
+    int32_t carTargetY{};
+    int32_t carTargetZ{};
     uintptr_t trackStateAddress{};
     uint32_t splineNode{};
     uint32_t splineDistance{};
@@ -188,6 +194,11 @@ struct RaceDriveState {
     int sign{1};
     float bestRate{};
     float rate{};
+    // The pure-pursuit controller's own numbers: the signed angle from the
+    // car's heading to the point it is aiming at, and whether it was in
+    // charge at all.
+    float steerError{};
+    bool pursuit{};
     int flips{};
     int stalls{};
     unsigned long long frames{};

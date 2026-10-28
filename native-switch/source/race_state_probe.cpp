@@ -720,6 +720,14 @@ struct DriveConfig {
     bool probeOnly{false};
     float base{0.30f};
     int sign{1};
+    // The pure-pursuit controller: the angle (in radians) that means "full
+    // lock", and the sign of the axis.  A POSITIVE axis 0 steers RIGHT
+    // (MEASURED: lx=+0.6 at the launch ended up on the right runoff,
+    // .build/rr3-pad-mirror.txt), and the world frame's handedness is the
+    // one thing here that is not measured, so the sign is a knob and one
+    // round settles it.
+    float steerGain{0.50f};
+    int steerSign{1};
 };
 
 DriveConfig g_driveConfig;
@@ -765,6 +773,16 @@ void readDriveConfig() {
             }
         } else if (std::strcmp(key, "sign") == 0) {
             g_driveConfig.sign = (std::strtol(value, nullptr, 10) < 0) ? -1 : 1;
+        } else if (std::strcmp(key, "steergain") == 0) {
+            g_driveConfig.steerGain = std::strtof(value, nullptr);
+            if (g_driveConfig.steerGain < 0.01f) {
+                g_driveConfig.steerGain = 0.01f;
+            }
+            if (g_driveConfig.steerGain > 3.0f) {
+                g_driveConfig.steerGain = 3.0f;
+            }
+        } else if (std::strcmp(key, "steersign") == 0) {
+            g_driveConfig.steerSign = (std::strtol(value, nullptr, 10) < 0) ? -1 : 1;
         }
     }
     std::fclose(file);
@@ -857,9 +875,18 @@ void fillCarState(RaceMetricsSample* out) {
     out->carAddress = static_cast<uintptr_t>(car);
     readDword(car + 0x20ULL, &out->carPrevNode);
     readDword(car + 0x24ULL, &out->carNode);
-    readFloat(car + 0x30ULL, &out->carX);
-    readFloat(car + 0x34ULL, &out->carY);
-    readFloat(car + 0x38ULL, &out->carZ);
+    // The world's position and the point the car is aiming at.  The guest
+    // copies them out of a 68-byte-per-record array (ELF 0xd05184: the base
+    // at x19+0x158, the index at x19+0x2c, the stride 0x44), and the
+    // registration function at 0xd052e0 reads them back from the same
+    // offsets: m_vPosition at +0x30/+0x34/+0x38 and m_vLastKnownTarget at
+    // +0x3c/+0x40/+0x44.  All 32-bit integers in 1/256 metre.
+    readDword(car + 0x30ULL, reinterpret_cast<uint32_t*>(&out->carX));
+    readDword(car + 0x34ULL, reinterpret_cast<uint32_t*>(&out->carY));
+    readDword(car + 0x38ULL, reinterpret_cast<uint32_t*>(&out->carZ));
+    readDword(car + 0x3cULL, reinterpret_cast<uint32_t*>(&out->carTargetX));
+    readDword(car + 0x40ULL, reinterpret_cast<uint32_t*>(&out->carTargetY));
+    readDword(car + 0x44ULL, reinterpret_cast<uint32_t*>(&out->carTargetZ));
     uint64_t carState = 0;
     if (!readWord(car + 0x288ULL, &carState) || carState == 0) {
         return;
@@ -1388,12 +1415,71 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
             g_drive.sweepDirection = 1;
         }
     }
+    // THE STEERING: PURE PURSUIT AT THE GUEST'S OWN TARGET POINT.
+    //
+    // One scalar -- the progress rate along the spline -- cannot say which
+    // way the track goes, so the controller's best strategy was always "go
+    // straight" and the car left the road at 491 m of a 7,056 m lap.  The
+    // guest keeps, on the car object, the car's WORLD POSITION
+    // (CAR+0x30/+0x34/+0x38) and the point it is AIMING AT
+    // (CAR+0x3c/+0x40/+0x44), both 32-bit integers in 1/256 metre, and the
+    // guest's own AI drives by exactly that pair.  So the port can drive by
+    // it too:
+    //
+    //   heading = the car's direction of travel, from the difference of two
+    //            position samples (this object carries no heading);
+    //   desired = the direction from the car to the target;
+    //   error   = the signed angle from the heading to the desired
+    //            direction;
+    //   axis    = clamp(error / steerGain, -1, +1).
+    //
+    // This is a pure-pursuit controller: it aims at the point the guest
+    // itself is aiming at, which is the racing line.
+    double steerError = 0.0;
+    bool pursuit = false;
+    {
+        static double s_lastX = 0.0;
+        static double s_lastY = 0.0;
+        static bool s_haveLast = false;
+        const double px = static_cast<double>(m.carX) / 256.0;
+        const double py = static_cast<double>(m.carY) / 256.0;
+        const double tx = static_cast<double>(m.carTargetX) / 256.0;
+        const double ty = static_cast<double>(m.carTargetY) / 256.0;
+        if (s_haveLast) {
+            const double hx = px - s_lastX;
+            const double hy = py - s_lastY;
+            const double dx = tx - px;
+            const double dy = ty - py;
+            const double hLen = std::sqrt(hx * hx + hy * hy);
+            const double dLen = std::sqrt(dx * dx + dy * dy);
+            // 0.05 m: below that the car is standing still or the target is
+            // on top of it, and the heading is noise.
+            if (hLen > 0.05 && dLen > 0.05) {
+                const double ax = hx / hLen;
+                const double ay = hy / hLen;
+                const double bx = dx / dLen;
+                const double by = dy / dLen;
+                const double cross = ax * by - ay * bx;
+                const double dot = ax * bx + ay * by;
+                steerError = std::atan2(cross, dot);
+                pursuit = true;
+            }
+        }
+        s_lastX = px;
+        s_lastY = py;
+        s_haveLast = true;
+    }
+    g_drive.steerError = static_cast<float>(steerError);
+    g_drive.pursuit = pursuit;
+
     g_drive.steer = static_cast<float>(g_drive.sign) * g_drive.magnitude;
     // WHILE REVERSING, HOLD A DECISIVE ANGLE THE OTHER WAY.  The car has
     // to come off the barrier pointing back down the track, and the swept
     // magnitude the servo is still hunting for is not a recovery angle.
     if (g_drive.brake) {
         g_drive.steer = -static_cast<float>(g_drive.sign) * kDriveRecoveryMagnitude;
+    } else if (pursuit) {
+        g_drive.steer = static_cast<float>(steerError / g_driveConfig.steerGain);
     }
     if (g_drive.steer > 1.0f) {
         g_drive.steer = 1.0f;
@@ -1461,8 +1547,8 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             "laps=%u lapF=%.3f lapd=%u lapdF=%.3f prev=%u total=%u "
             "totalF=%.3f speed=%u speedF=%.3f time=%u timeF=%.3f "
             "rate=%.6f prog=%.3f from_total=%d sawprog=%d "
-            "car=0x%llx cnode=%u cprev=%u cpos=%.1f,%.1f,%.1f "
-            "snode=%u sdist=%u tsok=%d "
+            "car=0x%llx cnode=%u cprev=%u cpos=%d,%d,%d ctgt=%d,%d,%d "
+            "snode=%u sdist=%u tsok=%d perr=%.4f pur=%d "
             "drive=%d steer=%.3f mag=%.3f sign=%d best=%.6f flips=%d stalls=%d "
             "thr=%d brk=%d",
             frame, static_cast<unsigned long long>(g_cglobal),
@@ -1490,10 +1576,11 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             m.progressFromTotal ? 1 : 0,
             g_sawProgress ? 1 : 0,
             static_cast<unsigned long long>(m.carAddress), m.carNode, m.carPrevNode,
-            static_cast<double>(m.carX), static_cast<double>(m.carY),
-            static_cast<double>(m.carZ),
+            m.carX, m.carY, m.carZ,
+            m.carTargetX, m.carTargetY, m.carTargetZ,
             m.splineNode, m.splineDistance,
             m.trackStateAddress != 0 ? 1 : 0,
+            static_cast<double>(g_drive.steerError), g_drive.pursuit ? 1 : 0,
             g_drive.enabled ? 1 : 0, static_cast<double>(g_drive.steer),
             static_cast<double>(g_drive.magnitude), g_drive.sign,
             static_cast<double>(g_drive.bestRate), g_drive.flips, g_drive.stalls,

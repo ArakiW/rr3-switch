@@ -20,6 +20,15 @@
 #
 # sign=1|-1  the initial steering direction
 #
+# steergain=<rad>   the pursuit controller's gain: the angle (in radians)
+#                   between the car's heading and the direction it is
+#                   aiming that means FULL LOCK.  0.50 rad = 28.6 degrees.
+# steersign=1|-1    the sign of the axis.  A POSITIVE axis 0 steers RIGHT
+#                   (MEASURED: lx=+0.6 at the launch ended up on the right
+#                   runoff, .build/rr3-pad-mirror.txt); the world frame's
+#                   handedness is the one thing here that is not measured,
+#                   so this is a knob and one round settles it.
+#
 # THE SIGN IS NOW -1, AND IT IS NOT A GUESS: IT IS MEASURED.
 #
 # The loop flips the sign itself when the guest's progress rate goes NEGATIVE
@@ -60,3 +69,5 @@ enable=1
 probe=0
 base=0.05
 sign=-1
+steergain=0.50
+steersign=1
