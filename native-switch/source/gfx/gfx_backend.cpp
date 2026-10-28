@@ -347,6 +347,136 @@ struct ConfState {
 };
 ConfState s_conf;
 
+// ---- the screen size the port reports (rr3-screen.txt) ----------------------
+//
+// A SEPARATE FILE, for the reason gfx_text_probe.cpp gives for its own file:
+// rr3-gfx.conf is read ONCE into a 4096-byte buffer and the card's copy is
+// already 4087 bytes long, so one more line there would be dropped in
+// silence -- the exact failure this project has already paid for once.
+//
+// AN ABSENT FILE MEANS "TODAY'S BEHAVIOUR".  That is the whole contract: a
+// run with no rr3-screen.txt is byte-for-byte the run that was measured
+// before, so this knob can never change a run that did not ask for it.
+//
+// WHY THE SCREEN SIZE IS A QUALITY KNOB AT ALL
+// --------------------------------------------
+// MEASURED 2026-10-28, archive 20261028-044415-eden-f1n (the guest's own log):
+//
+//   Searching for settings for device: AndroidHigh
+//   Loaded settings file: AndroidHigh.plist
+//   Res base: 1280x720
+//   Res order:
+//   (960.000000, 640.000000) - 1.500000 - gui_assets/960x640/
+//   (480.000000, 320.000000) - 1.500000 - gui_assets/480x320/
+//
+// The 2D UI is therefore drawn from a 960x640 atlas into a 1280x720 frame:
+// a 1.33x upscale, which is what "the picture is soft" is.  The HD volume
+// ships a complete gui_assets/2048x1536 tree and the guest never picks it.
+//
+// THE REASON IS THE GUEST'S OWN FILTER, not the port.  In the guest's
+// cc::ImageResManager (ELF 0x10f8cf8) every folder in the gui_assets listing
+// is parsed with sscanf("%ux%u") and then KEPT only if
+//
+//     0x10f8ec8  ldur w8, [x29, #-0x54]   ; the width
+//     0x10f8ecc  cmp  w8, w20             ; the SCREEN width
+//     0x10f8ed0  b.ls #0x10f8ee0         ; width <= screenW  -> keep
+//     0x10f8ed4  ldur w8, [x29, #-0x58]   ; the height
+//     0x10f8ed8  cmp  w8, w21             ; the SCREEN height
+//     0x10f8edc  b.hi  #0x10f8e8c        ; height > screenH  -> drop
+//
+// -- i.e. a folder survives iff width <= screenW OR height <= screenH.
+// 2048x1536 fails both against a 1280x720 screen (2048 > 1280 and
+// 1536 > 720) and is dropped before the sort, so the HD tree is never even a
+// candidate.  The port cannot change that from the filesystem side: the
+// folder is in the listing (measured: the port injects it, and the guest
+// lists it) and it is still dropped.
+//
+// THE SCREEN SIZE IS THE ONLY LEVER, and it is shared with the 3D: the same
+// w20/w21 are what the guest prints as "Res base" and what its screen manager
+// creates ("Adding screen: 0, (1280 x 720)").  So raising it makes the 3D
+// render target bigger too -- that is the cost, and it is why this is a
+// measured A/B and not a silent change.
+//
+// The file takes "platform=WxH" (Platform.getScreenWidth/Height) and
+// "ui=WxH" (CCUserInterfaceManager.getScreenWidth/Height).  Both default to
+// 0, which means "answer the constant this port has always answered".
+constexpr const char* kScreenConf = "sdmc:/switch/rr3-native-rehost/rr3-screen.txt";
+
+struct ScreenSizeState {
+    bool resolved = false;
+    int platformWidth = 0;
+    int platformHeight = 0;
+    int uiWidth = 0;
+    int uiHeight = 0;
+};
+ScreenSizeState s_screen;
+
+char* trimText(char* text);
+
+// Parses "WxH". Returns false for anything else, so a typo leaves the
+// default in place instead of answering a width of zero.
+bool parseScreenSize(const char* value, int* width, int* height) {
+    if (value == nullptr || width == nullptr || height == nullptr) {
+        return false;
+    }
+    char* end = nullptr;
+    const long w = std::strtol(value, &end, 10);
+    if (end == nullptr || *end != 'x' || w <= 0 || w > 8192) {
+        return false;
+    }
+    const char* rest = end + 1;
+    char* end2 = nullptr;
+    const long h = std::strtol(rest, &end2, 10);
+    if (end2 == nullptr || *end2 != '\0' || h <= 0 || h > 8192) {
+        return false;
+    }
+    *width = static_cast<int>(w);
+    *height = static_cast<int>(h);
+    return true;
+}
+
+void readScreenConf() {
+    s_screen = ScreenSizeState{};
+    s_screen.resolved = true;
+    std::FILE* file = std::fopen(kScreenConf, "rb");
+    if (file == nullptr) {
+        return;
+    }
+    char line[256];
+    while (std::fgets(line, sizeof(line), file) != nullptr) {
+        char* eq = std::strchr(line, '=');
+        if (eq == nullptr) {
+            continue;
+        }
+        *eq = '\0';
+        char* key = trimText(line);
+        char* value = trimText(eq + 1);
+        int width = 0;
+        int height = 0;
+        if (std::strcmp(key, "platform") == 0) {
+            if (parseScreenSize(value, &width, &height)) {
+                s_screen.platformWidth = width;
+                s_screen.platformHeight = height;
+            }
+        } else if (std::strcmp(key, "ui") == 0) {
+            if (parseScreenSize(value, &width, &height)) {
+                s_screen.uiWidth = width;
+                s_screen.uiHeight = height;
+            }
+        }
+    }
+    std::fclose(file);
+    // The run has to be able to say WHICH sizes it answered, or the log
+    // cannot tell "the override did not apply" from "the override applied and
+    // changed nothing".
+    char details[128];
+    std::snprintf(details, sizeof(details),
+                  "platform=%dx%d ui=%dx%d file=%s",
+                  s_screen.platformWidth, s_screen.platformHeight,
+                  s_screen.uiWidth, s_screen.uiHeight, kScreenConf);
+    writeLine("screen-override", 0, 0, details);
+}
+
 char* trimText(char* text) {
     while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n') {
         ++text;
@@ -911,6 +1041,38 @@ GpuIdProfile gfxGpuIdProfile() {
 bool gfxEarlyGlContext() {
     ensureResolved();
     return s_conf.earlyGlContext;
+}
+
+// The screen size the port reports to the guest, or 0 for "answer the
+// constant this port has always answered".  See the long note at
+// readScreenConf() for why the screen size is the only lever on the GUI
+// atlas resolution.
+int gfxScreenWidthOverride() {
+    if (!s_screen.resolved) {
+        readScreenConf();
+    }
+    return s_screen.platformWidth;
+}
+
+int gfxScreenHeightOverride() {
+    if (!s_screen.resolved) {
+        readScreenConf();
+    }
+    return s_screen.platformHeight;
+}
+
+int gfxUiScreenWidthOverride() {
+    if (!s_screen.resolved) {
+        readScreenConf();
+    }
+    return s_screen.uiWidth;
+}
+
+int gfxUiScreenHeightOverride() {
+    if (!s_screen.resolved) {
+        readScreenConf();
+    }
+    return s_screen.uiHeight;
 }
 
 const char* gfxCloudcellCompleteMode() {

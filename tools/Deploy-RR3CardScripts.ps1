@@ -10,6 +10,7 @@
         rr3-drive.txt   the closed-loop steering: enable/probe/base/sign
         rr3-pad.txt     the gamepad timeline: "[at <frame>] lx=.. rt=.. b=.."
         rr3-action.txt  the guest's own named commands (currently none)
+        rr3-screen.txt  the screen size the port reports to the guest
 
     They are EXPERIMENT INPUTS, not environment: a run is only reproducible
     if the inputs are on record with the result.  They live in the repository
@@ -63,7 +64,8 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $sourceRoot = Join-Path $projectRoot 'native-switch\card'
 $appDir = Join-Path (Join-Path (Join-Path $EmulatorRoot 'user\sdmc') 'switch') 'rr3-native-rehost'
 
-$scripts = @('rr3-touch.txt', 'rr3-drive.txt', 'rr3-pad.txt', 'rr3-action.txt')
+$scripts = @('rr3-touch.txt', 'rr3-drive.txt', 'rr3-pad.txt', 'rr3-action.txt',
+    'rr3-screen.txt')
 
 Write-Host ("card     : {0}" -f $appDir)
 
@@ -145,5 +147,5 @@ if ($bad -ne 0) {
     Write-Host ("FAILED   : {0} file(s) do not match the source" -f $bad)
     exit 3
 }
-Write-Host "deployed : 4 control scripts, 4/4 sha256 match"
+Write-Host ("deployed : {0} control scripts, {0}/{0} sha256 match" -f $plan.Count)
 exit 0

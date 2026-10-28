@@ -185,6 +185,18 @@ GpuIdProfile gfxGpuIdProfile();
 // 1. See ensureEarlyGuestGlContext() for why this is not optional.
 bool gfxEarlyGlContext();
 
+// The screen size the port reports to the guest, or 0 for "answer the
+// constant this port has always answered".  These come from the card's
+// rr3-screen.txt ("platform=WxH", "ui=WxH"); an absent file means the
+// historical behaviour.  The screen size is the ONLY lever on which GUI
+// atlas tree the guest picks, because the guest's own filter keeps a folder
+// only when width <= screenW OR height <= screenH -- see readScreenConf() in
+// source/gfx/gfx_backend.cpp for the measurement and the cost.
+int gfxScreenWidthOverride();
+int gfxScreenHeightOverride();
+int gfxUiScreenWidthOverride();
+int gfxUiScreenHeightOverride();
+
 const char* gfxCloudcellCompleteMode();
 
 // "mlstub=1": force menu-loader vtable slot 21 to the host stub even when the

@@ -1,0 +1,58 @@
+# The screen size the port reports to the guest.
+#
+# THE PORT READS THIS FILE AT sdmc:/switch/rr3-native-rehost/rr3-screen.txt.
+# An ABSENT file means "answer the constants this port has always answered",
+# so a run without this file is byte-for-byte the run that was measured
+# before.  Keys:
+#
+#   platform=WxH   Platform.getScreenWidth / getScreenHeight
+#   ui=WxH         CCUserInterfaceManager.getScreenWidth / getScreenHeight
+#
+# ---------------------------------------------------------------------------
+# WHY THIS FILE EXISTS
+#
+# MEASURED 2026-10-28, archive 20261028-044415-eden-f1n, the guest's own log:
+#
+#   Searching for settings for device: AndroidHigh
+#   Loaded settings file: AndroidHigh.plist
+#   Res base: 1280x720
+#   Res order:
+#   (960.000000, 640.000000) - 1.500000 - gui_assets/960x640/
+#   (480.000000, 320.000000) - 1.500000 - gui_assets/480x320/
+#
+# The 2D UI is drawn from a 960x640 atlas into a 1280x720 frame: a 1.33x
+# upscale.  That is what "the picture is soft" is.  The HD volume ships a
+# complete gui_assets/2048x1536 tree and the guest never picks it.
+#
+# THE REASON IS THE GUEST'S OWN FILTER, and it is not the filesystem.  In the
+# guest's cc::ImageResManager (ELF 0x10f8cf8) every folder in the gui_assets
+# listing is parsed with sscanf("%ux%u") and then kept only if
+#
+#     width <= screenW  OR  height <= screenH
+#
+# (ELF 0x10f8ec8-0x10f8edc).  2048x1536 fails both against a 1280x720
+# screen, so it is dropped BEFORE the sort and is never a candidate.  The
+# port already puts 2048x1536 into the listing (measured: the guest lists
+# it), and the guest still drops it -- so there is nothing to fix on the
+# filesystem side.
+#
+# The screen size is the ONLY lever, and it is shared with the 3D: the same
+# pair is what the guest prints as "Res base" and what its screen manager
+# creates ("Adding screen: 0, (1280 x 720)").  So a bigger screen is a
+# bigger 3D render target as well.  That is the cost, and it is why this is
+# a measured A/B rather than a silent change.
+#
+# ---------------------------------------------------------------------------
+# THE EXPERIMENT (2026-10-28)
+#
+# platform=2048x1152 is the value under test: 16:9 is preserved for the 3D,
+# and 2048 <= 2048 lets the 2048x1536 GUI tree past the filter.
+#
+# WHAT TO LOOK AT IN THE RUN'S LOG:
+#   * the guest's own "Res base: %dx%d" line -- did it follow?
+#   * the guest's own "Res order:" list -- does 2048x1536 appear in it now?
+#   * which gui_assets/<res>/ tree the guest actually OPENS.
+#
+# TO GO BACK: comment the line below out (or delete this file from the card)
+# and the port answers 1280x720 again.
+platform=2048x1152

@@ -2148,8 +2148,20 @@ int32_t platformIntForMethod(const char* name) {
     if (rawEquals(name, "getScreenOrientation")) return 2;
     if (rawEquals(name, "getAppMemoryUsage")) return 256 * 1024 * 1024;
     if (rawEquals(name, "getAppMemoryFree")) return 1536 * 1024 * 1024;
-    if (rawEquals(name, "getScreenWidth")) return 1280;
-    if (rawEquals(name, "getScreenHeight")) return 720;
+    // The screen size the port reports.  MEASURED 2026-10-28: the guest's own
+    // log prints "Res base: 1280x720", and that is the size its GUI atlas
+    // filter compares against -- so 2048x1536 is dropped before the sort and
+    // the HD tree on the card is never a candidate.  rr3-screen.txt can
+    // override it; absent that file this is the value this port has always
+    // answered.  See rr3/gfx_backend.hpp.
+    if (rawEquals(name, "getScreenWidth")) {
+        const int override = gfxScreenWidthOverride();
+        return override > 0 ? override : 1280;
+    }
+    if (rawEquals(name, "getScreenHeight")) {
+        const int override = gfxScreenHeightOverride();
+        return override > 0 ? override : 720;
+    }
     if (rawEquals(name, "getScreenDPI")) return 160;
     // Platform.getScreenSize(): Configuration.screenLayout & 15.
     // 3 == Configuration.SCREENLAYOUT_SIZE_LARGE (matches getScreenSizeName).

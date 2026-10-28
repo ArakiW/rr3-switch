@@ -287,9 +287,20 @@ using UimWebFailFn = void (*)(JNIEnv *, jobject, jlong, jlong);
 static void uim_ctor(JNIEnv *, jobject self, jclass) { new (self) CCUserInterfaceManager(); }
 
 /* Java returns widthPixels / GetScreenScale(); this port's surface is the
- * kWidth/kHeight pair in src/main.cpp. */
-static jint uim_screen_width(JNIEnv *, jobject) { return 640; }
-static jint uim_screen_height(JNIEnv *, jobject) { return 480; }
+ * kWidth/kHeight pair in src/main.cpp.
+ *
+ * rr3-screen.txt can override the answer ("ui=WxH"), because the guest's
+ * GUI atlas filter compares against the screen size it is told and drops any
+ * tree that is larger than it in BOTH dimensions.  See rr3/gfx_backend.hpp.
+ * Absent that file these are the values this port has always answered. */
+static jint uim_screen_width(JNIEnv *, jobject) {
+    const int override = rr3::gfxUiScreenWidthOverride();
+    return override > 0 ? override : 640;
+}
+static jint uim_screen_height(JNIEnv *, jobject) {
+    const int override = rr3::gfxUiScreenHeightOverride();
+    return override > 0 ? override : 480;
+}
 /* Java returns 2.0 only when DisplayMetrics.density > 1.0; a 640x480 panel is
  * density 1, so the engine must not be told to double its UI coordinates. */
 static jfloat uim_screen_scale(JNIEnv *, jobject) { return 1.0f; }

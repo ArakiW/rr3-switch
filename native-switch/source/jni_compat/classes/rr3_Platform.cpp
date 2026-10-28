@@ -6,6 +6,7 @@
 #include "../jni_internals.h"
 #include "cloudcell_defer.h"
 #include "cloudcell_natives.h"
+#include "rr3/gfx_backend.hpp"
 #include "../../eap_port/trace_adapter.h"
 
 /*
@@ -350,9 +351,21 @@ static jlong platform_get_app_memory_usage(JNIEnv *, jclass) { return 128LL * 10
 static void platform_memory_probe(JNIEnv *, jclass) {}
 
 /* The surface this port actually creates - kWidth/kHeight in src/main.cpp -
- * with a density-1 panel and no rotation. */
-static jint platform_get_screen_width(JNIEnv *, jclass) { return 640; }
-static jint platform_get_screen_height(JNIEnv *, jclass) { return 480; }
+ * with a density-1 panel and no rotation.
+ *
+ * rr3-screen.txt can override the answer ("platform=WxH"), because the
+ * guest's GUI atlas filter compares against the screen size it is told and
+ * drops any tree that is larger than it in BOTH dimensions.  See
+ * rr3/gfx_backend.hpp.  Absent that file these are the values this port has
+ * always answered. */
+static jint platform_get_screen_width(JNIEnv *, jclass) {
+    const int override = rr3::gfxScreenWidthOverride();
+    return override > 0 ? override : 640;
+}
+static jint platform_get_screen_height(JNIEnv *, jclass) {
+    const int override = rr3::gfxScreenHeightOverride();
+    return override > 0 ? override : 480;
+}
 static jint platform_get_screen_dpi(JNIEnv *, jclass) { return 160; }
 static jint platform_get_screen_rotation(JNIEnv *, jclass) { return 0; }
 
