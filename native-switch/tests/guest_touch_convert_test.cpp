@@ -16,6 +16,7 @@
 // every failure is printed with the file and line that made it.
 
 #include "rr3/guest_touch_convert.hpp"
+#include "rr3/gfx_backend.hpp"
 
 #include <cstdio>
 
@@ -367,6 +368,111 @@ void caseNoDoubleRelease() {
           "the lift carries the old finger's id");
 }
 
+// CASE 11: the present rectangle.
+//
+// The guest's view is FIT into the output and centred, so the guest's pixels
+// are never stretched: a 4:3 view on a 16:9 screen keeps its own ratio and
+// the leftover space stays black.  The present blit and the touch mapping
+// both use this rectangle, so its numbers are pinned here rather than left
+// in a comment.
+void casePresentRect() {
+    const rr3::GfxPresentRect wide = rr3::gfxFitRect(1280, 720, 1280, 720);
+    CHECK(wide.x == 0 && wide.y == 0,
+          "a 16:9 view on a 16:9 output starts at the origin");
+    CHECK(wide.width == 1280 && wide.height == 720,
+          "a 16:9 view on a 16:9 output fills it");
+
+    const rr3::GfxPresentRect tablet = rr3::gfxFitRect(1280, 720, 2048, 1536);
+    CHECK(tablet.width == 960 && tablet.height == 720,
+          "a 4:3 view on a 16:9 output is 960x720");
+    CHECK(tablet.x == 160 && tablet.y == 0,
+          "the 4:3 view is centred between two 160-pixel bars");
+
+    const rr3::GfxPresentRect other = rr3::gfxFitRect(1280, 720, 1024, 768);
+    CHECK(other.width == 960 && other.height == 720,
+          "a 4:3 view of another size fits the same way");
+    CHECK(other.x == 160, "the 4:3 view stays centred");
+
+    const rr3::GfxPresentRect degenerate =
+        rr3::gfxFitRect(0, 0, 2048, 1536);
+    CHECK(degenerate.width == 0 && degenerate.height == 0,
+          "a degenerate output does not divide by zero");
+}
+
+// CASE 12: a letterboxed view.
+//
+// The digitizer still reports the OUTPUT's pixels, but the guest's view is
+// shown in a rectangle of that output.  A tap on a bar is a tap on nothing,
+// and a tap inside the rectangle has to land on the button the player sees.
+void caseLetterboxedTouch() {
+    const rr3::GfxPresentRect rect = rr3::gfxFitRect(1280, 720, 2048, 1536);
+    TouchMapping mapping{1280, 720, 2048, 1536};
+    mapping.sourceX = rect.x;
+    mapping.sourceY = rect.y;
+    mapping.sourceRectWidth = rect.width;
+    mapping.sourceRectHeight = rect.height;
+
+    TouchGuestState guest{};
+    guest.down = false;
+
+    // The centre of the content rectangle: 640 of the 160..1120 strip.
+    TouchTracker tracker{};
+    TouchSample down[1];
+    down[0] = sample(640, 360, 0u, true, false);
+    TouchEvent events[kTouchEventCapacity];
+    const int produced = rr3PlanTouchFrame(down, 1, &tracker, guest, mapping,
+                                           false, events, kTouchEventCapacity);
+    CHECK(produced == 1 && events[0].action == TouchAction::Begin,
+          "a tap in the content rectangle presses");
+    CHECK(produced == 1 && events[0].x == 1024,
+          "the press lands on the guest's own x");
+    CHECK(produced == 1 && events[0].y == 768,
+          "the press lands on the guest's own y");
+
+    // A tap on the left bar presses nothing at all.
+    TouchTracker barTracker{};
+    TouchSample bar[1];
+    bar[0] = sample(80, 360, 0u, true, false);
+    TouchEvent barEvents[kTouchEventCapacity];
+    const int barProduced =
+        rr3PlanTouchFrame(bar, 1, &barTracker, guest, mapping, false,
+                          barEvents, kTouchEventCapacity);
+    CHECK(barProduced == 0, "a tap on a letterbox bar presses nothing");
+    CHECK(!barTracker.down, "a tap on a bar leaves no finger held");
+
+    // A finger that slides onto a bar is released: the guest must not keep a
+    // button held for a finger that is no longer on its screen.
+    TouchTracker slideTracker{};
+    TouchSample press[1];
+    press[0] = sample(640, 360, 0u, true, false);
+    TouchEvent pressEvents[kTouchEventCapacity];
+    rr3PlanTouchFrame(press, 1, &slideTracker, guest, mapping, false,
+                      pressEvents, kTouchEventCapacity);
+    TouchSample slide[1];
+    slide[0] = sample(80, 360, 0u, false, false);
+    TouchEvent slideEvents[kTouchEventCapacity];
+    const int slideProduced =
+        rr3PlanTouchFrame(slide, 1, &slideTracker, guest, mapping, false,
+                          slideEvents, kTouchEventCapacity);
+    CHECK(slideProduced == 1 && slideEvents[0].action == TouchAction::End,
+          "a finger that slides onto a bar is released");
+    CHECK(!slideTracker.down, "the tracker lets go of that finger");
+
+    // A point off the DIGITIZER keeps the historical answer: clamped into
+    // the view, not dropped.  "Off the physical screen" is not the same
+    // thing as "on a letterbox bar".
+    TouchTracker offTracker{};
+    TouchSample off[1];
+    off[0] = sample(9999, 9999, 0u, true, false);
+    TouchEvent offEvents[kTouchEventCapacity];
+    const int offProduced =
+        rr3PlanTouchFrame(off, 1, &offTracker, guest, mapping, false,
+                          offEvents, kTouchEventCapacity);
+    CHECK(offProduced == 1, "a point off the digitizer still presses");
+    CHECK(offTracker.x == 2047 && offTracker.y == 1535,
+          "a point off the digitizer is clamped into the view");
+}
+
 }  // namespace
 
 int main() {
@@ -384,6 +490,8 @@ int main() {
     caseSuspended();
     caseSecondFingerIgnored();
     caseNoDoubleRelease();
+    casePresentRect();
+    caseLetterboxedTouch();
 
     std::printf("%s: %d checks, %d failures\n", g_failures == 0 ? "PASS" : "FAIL",
                 g_checks, g_failures);

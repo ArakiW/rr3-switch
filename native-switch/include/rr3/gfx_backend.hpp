@@ -205,6 +205,75 @@ int gfxUiScreenHeightOverride();
 int gfxViewWidthOverride();
 int gfxViewHeightOverride();
 
+// The view size with the port's historical default applied.  1280x720 is what
+// this port has always told the guest, and an absent rr3-screen.txt must keep
+// meaning that.
+int gfxViewWidth();
+int gfxViewHeight();
+
+// The rectangle of the OUTPUT framebuffer in which the guest's view is
+// shown.
+//
+// The view is FIT into the output, never stretched into it: a view whose
+// aspect ratio differs from the screen's keeps its own ratio and the
+// leftover space stays black -- pillarbox bars for a 4:3 view on a 16:9
+// screen.  Stretching would put a 4:3 picture on a 16:9 screen and make
+// every circle an ellipse.
+//
+// This is the SINGLE source of truth for the present blit and the touch
+// mapping.  They have to agree: if the blit letterboxes and the touch
+// mapping does not, a tap lands somewhere other than where the player sees
+// the button.
+struct GfxPresentRect {
+    int x = 0;
+    int y = 0;
+    int width = 0;
+    int height = 0;
+};
+
+// Pure geometry: the rectangle of an `outputWidth x outputHeight` output in
+// which a `viewWidth x viewHeight` view is shown, FIT and centred.
+//
+// Inline in the header on purpose: this is the one piece of the present path
+// that can be proved without a screen, and a host test has to be able to
+// reach it.
+//
+// The rounding is done once, on the width, so the visible rectangle keeps the
+// view's aspect ratio as closely as a pixel grid allows: 720*2048/1536 is
+// exactly 960 for the 4:3 case and 720*1280/720 is exactly 1280 for the
+// 16:9 one.
+inline GfxPresentRect gfxFitRect(int outputWidth, int outputHeight,
+                                  int viewWidth, int viewHeight) {
+    GfxPresentRect rect{};
+    rect.width = outputWidth;
+    rect.height = outputHeight;
+    if (outputWidth <= 0 || outputHeight <= 0 ||
+        viewWidth <= 0 || viewHeight <= 0) {
+        return rect;
+    }
+    long long scaledWidth =
+        (static_cast<long long>(outputHeight) * viewWidth) / viewHeight;
+    long long scaledHeight = outputHeight;
+    if (scaledWidth > outputWidth) {
+        scaledWidth = outputWidth;
+        scaledHeight =
+            (static_cast<long long>(outputWidth) * viewHeight) / viewWidth;
+    }
+    if (scaledWidth < 1) {
+        scaledWidth = 1;
+    }
+    if (scaledHeight < 1) {
+        scaledHeight = 1;
+    }
+    rect.width = static_cast<int>(scaledWidth);
+    rect.height = static_cast<int>(scaledHeight);
+    rect.x = (outputWidth - rect.width) / 2;
+    rect.y = (outputHeight - rect.height) / 2;
+    return rect;
+}
+
+GfxPresentRect gfxPresentRect(int outputWidth, int outputHeight);
+
 const char* gfxCloudcellCompleteMode();
 
 // "mlstub=1": force menu-loader vtable slot 21 to the host stub even when the

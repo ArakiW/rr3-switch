@@ -97,7 +97,40 @@ struct TouchMapping {
     int sourceHeight;  // the digitizer's native height
     int viewWidth;     // the guest's view width
     int viewHeight;    // the guest's view height
+    // The rectangle of the DIGITIZER that actually shows the guest's view.
+    //
+    // The present path fits the view into the output and leaves bars when the
+    // two aspect ratios differ, so the digitizer's pixels are not all the
+    // guest's screen.  A tap on a bar is a tap on nothing, and a tap that
+    // lands inside the rectangle has to land on the button the player sees.
+    //
+    // A zero extent means "the whole digitizer", which is the identity and
+    // the historical behaviour.
+    int sourceX = 0;
+    int sourceY = 0;
+    int sourceRectWidth = 0;
+    int sourceRectHeight = 0;
 };
+
+// The rectangle of the digitizer that shows the guest's view, with the
+// "whole digitizer" default applied.
+inline int rr3TouchRectX(const TouchMapping& mapping) {
+    return mapping.sourceX;
+}
+
+inline int rr3TouchRectY(const TouchMapping& mapping) {
+    return mapping.sourceY;
+}
+
+inline int rr3TouchRectWidth(const TouchMapping& mapping) {
+    return mapping.sourceRectWidth > 0 ? mapping.sourceRectWidth
+                                       : mapping.sourceWidth;
+}
+
+inline int rr3TouchRectHeight(const TouchMapping& mapping) {
+    return mapping.sourceRectHeight > 0 ? mapping.sourceRectHeight
+                                        : mapping.sourceHeight;
+}
 
 // The maximum number of events one frame can produce: an End for the finger
 // that lifted, a Release for the guest's stale pointer, a Begin for the next
@@ -123,6 +156,53 @@ inline int rr3TouchMapAxis(int raw, int source, int view) {
         scaled = static_cast<long long>(view) - 1;
     }
     return static_cast<int>(scaled);
+}
+
+// One digitizer pixel -> one view pixel, through the rectangle that shows it.
+//
+// The origin is subtracted first, so a digitizer point outside the rectangle
+// maps to the edge of the view rather than to a wildly wrong place.
+inline int rr3TouchMapAxisRect(int raw, int origin, int extent, int view) {
+    if (extent <= 0 || view <= 0) {
+        return 0;
+    }
+    long long scaled =
+        (static_cast<long long>(raw - origin) * static_cast<long long>(view)) /
+        static_cast<long long>(extent);
+    if (scaled < 0) {
+        scaled = 0;
+    }
+    if (scaled > static_cast<long long>(view) - 1) {
+        scaled = static_cast<long long>(view) - 1;
+    }
+    return static_cast<int>(scaled);
+}
+
+// True when the digitizer point can reach the guest's view.
+//
+// Two different situations, two different answers:
+//
+//   * A point INSIDE the digitizer but OUTSIDE the rectangle that shows the
+//     view is on a letterbox bar.  It is on the screen, but it is not on the
+//     guest's screen, and it must not press anything.
+//   * A point OUTSIDE the digitizer itself is the "finger dragged off the
+//     physical screen" case.  That keeps the historical answer: it is
+//     CLAMPED into the view, not dropped.
+inline bool rr3TouchReachesView(const TouchMapping& mapping, int rawX,
+                                int rawY) {
+    const int width = rr3TouchRectWidth(mapping);
+    const int height = rr3TouchRectHeight(mapping);
+    if (width <= 0 || height <= 0) {
+        return false;
+    }
+    if (rawX < 0 || rawY < 0 ||
+        rawX >= mapping.sourceWidth || rawY >= mapping.sourceHeight) {
+        return true;
+    }
+    return rawX >= rr3TouchRectX(mapping) &&
+           rawX < rr3TouchRectX(mapping) + width &&
+           rawY >= rr3TouchRectY(mapping) &&
+           rawY < rr3TouchRectY(mapping) + height;
 }
 
 // Converts one frame of digitizer samples into the guest events it implies.
@@ -169,10 +249,14 @@ inline int rr3PlanTouchFrame(const TouchSample* samples, int sampleCount,
         }
     };
     const auto mapX = [&](int raw) {
-        return rr3TouchMapAxis(raw, mapping.sourceWidth, mapping.viewWidth);
+        return rr3TouchMapAxisRect(raw, rr3TouchRectX(mapping),
+                                   rr3TouchRectWidth(mapping),
+                                   mapping.viewWidth);
     };
     const auto mapY = [&](int raw) {
-        return rr3TouchMapAxis(raw, mapping.sourceHeight, mapping.viewHeight);
+        return rr3TouchMapAxisRect(raw, rr3TouchRectY(mapping),
+                                   rr3TouchRectHeight(mapping),
+                                   mapping.viewHeight);
     };
 
     // The sample of the finger being driven, if the digitizer still reports it.
@@ -216,6 +300,14 @@ inline int rr3PlanTouchFrame(const TouchSample* samples, int sampleCount,
             emit(TouchAction::End, tracker->pointerId, vx, vy, true);
             releasedPointerId = tracker->pointerId;
             tracker->down = false;
+        } else if (!rr3TouchReachesView(mapping, tracked->rawX, tracked->rawY)) {
+            // The finger left the area that shows the guest's view -- it slid
+            // onto a letterbox bar.  The guest must not keep a button held
+            // for a finger that is no longer on its screen.
+            emit(TouchAction::End, tracker->pointerId, tracker->x, tracker->y,
+                 true);
+            releasedPointerId = tracker->pointerId;
+            tracker->down = false;
         } else {
             const int vx = mapX(tracked->rawX);
             const int vy = mapY(tracked->rawY);
@@ -233,7 +325,8 @@ inline int rr3PlanTouchFrame(const TouchSample* samples, int sampleCount,
         // others wait.
         const TouchSample* pick = nullptr;
         for (int i = 0; i < sampleCount; ++i) {
-            if (!samples[i].end) {
+            if (!samples[i].end &&
+                rr3TouchReachesView(mapping, samples[i].rawX, samples[i].rawY)) {
                 pick = &samples[i];
                 break;
             }
@@ -246,7 +339,8 @@ inline int rr3PlanTouchFrame(const TouchSample* samples, int sampleCount,
             // and pressing it again would be a second press of a finger the
             // guest has just been told is gone.
             for (int i = 0; i < sampleCount; ++i) {
-                if (samples[i].start) {
+                if (samples[i].start &&
+                    rr3TouchReachesView(mapping, samples[i].rawX, samples[i].rawY)) {
                     pick = &samples[i];
                     break;
                 }

@@ -2510,11 +2510,17 @@ GuestViewProbe runGuestViewProbe(NWindow* window, const char* progressPath) {
     //
     // rr3-screen.txt's "view=WxH" changes it; absent that key this is the
     // 1280x720 the port has always said.
-    const int viewWidth = gfxViewWidthOverride() > 0 ? gfxViewWidthOverride() : 1280;
-    const int viewHeight = gfxViewHeightOverride() > 0 ? gfxViewHeightOverride() : 720;
+    const int viewWidth = gfxViewWidth();
+    const int viewHeight = gfxViewHeight();
     {
-        char detail[128];
-        std::snprintf(detail, sizeof(detail), "view=%dx%d", viewWidth, viewHeight);
+        // Where the view actually lands on the screen.  A letterboxed view
+        // and a stretched one look identical in this log and completely
+        // different on the screen, so the rectangle is part of the record.
+        const GfxPresentRect present = gfxPresentRect(1280, 720);
+        char detail[160];
+        std::snprintf(detail, sizeof(detail),
+                      "view=%dx%d present=%d,%d %dx%d", viewWidth, viewHeight,
+                      present.x, present.y, present.width, present.height);
         appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                             "view-size", 0, 0, detail);
     }
@@ -8616,15 +8622,51 @@ void* frameLoopDriver(void* opaque) {
                 // blit puts that on the device screen, so when the view is
                 // larger than the screen it is a DOWNSCALE -- which is also
                 // where the supersampling for the 3D scene comes from.
-                const int viewWidth =
-                    gfxViewWidthOverride() > 0 ? gfxViewWidthOverride() : 1280;
-                const int viewHeight =
-                    gfxViewHeightOverride() > 0 ? gfxViewHeightOverride() : 720;
+                // The view is FIT into the output, not stretched into it.  A
+                // view whose aspect ratio differs from the screen's keeps its
+                // own ratio and the leftover space stays black: a 4:3 view on
+                // a 16:9 screen becomes 960x720 centred between two
+                // pillarbox bars, and a circle stays a circle.  The SAME
+                // rectangle is what the touch mapping uses (gfxPresentRect),
+                // so a tap lands where the player sees the button.
+                //
+                // The bars have to be cleared or the previous frame's image
+                // shows through them.
+                //
+                // glClear is affected by the scissor test but NOT by the
+                // viewport, and a blit is clipped by the scissor test too,
+                // so the scissor test is turned off for the clear and the
+                // blit and then put back.  The guest's scissor BOX is never
+                // touched and its viewport is never touched at all: the
+                // viewport is context state, not framebuffer state, so
+                // changing it without putting it back would change how the
+                // guest renders into its own FBO on the next frame.
+                const int viewWidth = gfxViewWidth();
+                const int viewHeight = gfxViewHeight();
+                const GfxPresentRect target = gfxPresentRect(1280, 720);
+                const bool fullScreen =
+                    target.width == 1280 && target.height == 720;
                 const GLuint presentFbo = guestViewGlStats().lastBoundFramebuffer;
+                const GLboolean scissorTest = glIsEnabled(GL_SCISSOR_TEST);
+                GLfloat clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
                 glBindFramebuffer(kReadFramebuffer, presentFbo);
                 glBindFramebuffer(kDrawFramebuffer, 0);
-                blit(0, 0, viewWidth, viewHeight, 0, 0, 1280, 720,
-                     GL_COLOR_BUFFER_BIT, GL_LINEAR);
+                if (!fullScreen) {
+                    glDisable(GL_SCISSOR_TEST);
+                    glGetFloatv(GL_COLOR_CLEAR_VALUE, clearColor);
+                    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+                    glClear(GL_COLOR_BUFFER_BIT);
+                }
+                blit(0, 0, viewWidth, viewHeight,
+                     target.x, target.y, target.x + target.width,
+                     target.y + target.height, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+                if (!fullScreen) {
+                    glClearColor(clearColor[0], clearColor[1], clearColor[2],
+                                 clearColor[3]);
+                    if (scissorTest) {
+                        glEnable(GL_SCISSOR_TEST);
+                    }
+                }
                 glBindFramebuffer(GL_FRAMEBUFFER, 0);
             }
         }

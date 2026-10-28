@@ -1116,6 +1116,31 @@ int gfxViewHeightOverride() {
     return s_screen.viewHeight;
 }
 
+// The view size with the historical default applied.
+int gfxViewWidth() {
+    const int override = gfxViewWidthOverride();
+    return override > 0 ? override : 1280;
+}
+
+int gfxViewHeight() {
+    const int override = gfxViewHeightOverride();
+    return override > 0 ? override : 720;
+}
+
+// FIT, not FILL.
+//
+// The guest's view is scaled until it fits inside the output and the leftover
+// space is left as bars.  A 4:3 view on a 16:9 output becomes 960x720
+// centred in 1280x720; a 16:9 view on a 16:9 output is the whole screen and
+// changes nothing about the historical path.
+//
+// The geometry itself is the inline gfxFitRect() in the header, so a host
+// test can prove it without a screen.
+GfxPresentRect gfxPresentRect(int outputWidth, int outputHeight) {
+    return gfxFitRect(outputWidth, outputHeight, gfxViewWidth(),
+                      gfxViewHeight());
+}
+
 const char* gfxCloudcellCompleteMode() {
     ensureResolved();
     return s_conf.ccMode[0] != '\0' ? s_conf.ccMode : "off";

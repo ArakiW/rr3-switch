@@ -51,8 +51,8 @@
 # platform=2048x1152 -- MEASURED, NO EFFECT.  The port's own line proves the
 # override reached the guest ("screen-override ... platform=2048x1152") and
 # the guest's answer did not move ("Res base: 1280x720").  The Platform
-# screen is NOT where the guest's screen comes from.  Kept here because it
-# is the instrument that proved that.
+# screen is NOT where the guest's screen comes from.  The evidence is kept
+# here; the ACTIVE value below is no longer that experiment.
 #
 # view=2048x1536 -- the 4:3 view.  The 2D UI becomes exactly 1:1 (the HD
 # atlas IS 2048x1536), which is the sharpest possible; the 3D scene is
@@ -63,5 +63,32 @@
 #
 # TO GO BACK: comment the lines below out (or delete this file from the card)
 # and the port answers 1280x720 again.
-platform=2048x1152
+#
+# ---------------------------------------------------------------------------
+# THE ACTIVE CONFIGURATION: "the game thinks it is on a 4:3 tablet"
+#
+# All three keys are 2048x1536, because that is a REAL configuration of this
+# game -- a 4:3 Android tablet -- and a configuration the guest's own layout
+# and its HD atlas tree were authored for.  Mixing the three (a 16:9 platform
+# with a 4:3 view) is not a configuration the game has ever seen, so there is
+# no reason to ship one.
+#
+# WHAT THE 4:3 VIEW COSTS, AND WHY IT IS STILL THE RIGHT CHOICE:
+#
+#   * The 3D scene is rendered 4:3 and the present path FITS it into the
+#     16:9 screen: 960x720 centred between two 160-pixel pillarbox bars.
+#     A circle stays a circle -- the old stretch-to-fill would not.
+#   * The 2D UI is drawn from the 2048x1536 HD atlas at 1:1 and then
+#     downscaled to the 960x720 content area.  That is a 2.1x DOWNSCALE of
+#     sharp source art, against the old 960x640 atlas blown up 1.33x.  The
+#     difference is the whole point of this file.
+#   * The touch script's pixel coordinates have to be re-measured: the
+#     content is no longer full-screen, it starts 160 pixels from the left.
+#     The port's touch mapping follows the content rectangle automatically
+#     (gfxPresentRect), but a script that taps at a recorded pixel has to
+#     aim at the button, not at the old position.
+#
+# ---------------------------------------------------------------------------
+platform=2048x1536
+ui=2048x1536
 view=2048x1536

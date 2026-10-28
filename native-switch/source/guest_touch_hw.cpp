@@ -76,11 +76,19 @@ constexpr unsigned kSyntheticHoldFrames = 120;
 constexpr TouchMapping kTouchMapping{1280, 720, 1280, 720};
 
 TouchMapping touchMapping() {
-    const int viewWidth =
-        gfxViewWidthOverride() > 0 ? gfxViewWidthOverride() : 1280;
-    const int viewHeight =
-        gfxViewHeightOverride() > 0 ? gfxViewHeightOverride() : 720;
-    return TouchMapping{1280, 720, viewWidth, viewHeight};
+    // The digitizer still reports the OUTPUT screen's pixels, but the guest's
+    // view is shown in a RECTANGLE of that screen: the present path fits the
+    // view in and leaves bars when the two aspect ratios differ.  The
+    // mapping therefore carries the rectangle and not just the sizes -- a tap
+    // on a bar is a tap on nothing, and a tap inside the rectangle has to
+    // land on the button the player actually sees.
+    const GfxPresentRect rect = gfxPresentRect(1280, 720);
+    TouchMapping mapping{1280, 720, gfxViewWidth(), gfxViewHeight()};
+    mapping.sourceX = rect.x;
+    mapping.sourceY = rect.y;
+    mapping.sourceRectWidth = rect.width;
+    mapping.sourceRectHeight = rect.height;
+    return mapping;
 }
 
 // How often the digitizer's raw state is summarised in the log. The guest's
@@ -300,11 +308,13 @@ bool prepareGuestTouchHardware() {
     g_digitizerPresent = entries > 0;
     const TouchMapping mapping = touchMapping();
     std::snprintf(detail, sizeof(detail),
-                  "entries=%zu touches=%d present=%d mapping=%dx%d->%dx%d",
+                  "entries=%zu touches=%d present=%d mapping=%dx%d->%dx%d "
+                  "rect=%d,%d %dx%d",
                   entries, static_cast<int>(state.count),
                   g_digitizerPresent ? 1 : 0, mapping.sourceWidth,
                   mapping.sourceHeight, mapping.viewWidth,
-                  mapping.viewHeight);
+                  mapping.viewHeight, mapping.sourceX, mapping.sourceY,
+                  rr3TouchRectWidth(mapping), rr3TouchRectHeight(mapping));
     logTouchHw("touch-hw-armed", 957, detail);
 
     g_prepared = true;
