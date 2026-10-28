@@ -315,10 +315,11 @@ void pumpRaceMetricsProbe(unsigned long long frame) {
     const char* lapsWhy = "no-candidate-slot-produced-a-value";
     uintptr_t lapsSlot = kRuleSetTotalLapsOff;
 
-    // One compact line per sample: "<slot>:<id>:<ok>:<value>" for each
+    // One compact line per sample: "<slot>:<id>:<ok>:<value>:<why>" for each
     // candidate, so the next round says WHICH slot the guest's own add names
-    // instead of this file having to guess.
-    char scan[512];
+    // and WHY every lookup failed -- without that, a failure is a number the
+    // reader cannot act on.
+    char scan[768];
     int scanWritten = 0;
     scan[0] = '\0';
     for (int i = 0; i < kMemberSlotCandidateCount; ++i) {
@@ -333,10 +334,11 @@ void pumpRaceMetricsProbe(unsigned long long frame) {
         }
         const int n = std::snprintf(
             scan + scanWritten, sizeof(scan) - static_cast<size_t>(scanWritten),
-            "%s%llx:%llx:%d:%d", (i == 0) ? "" : ",",
+            "%s%llx:%llx:%d:%d:%s", (i == 0) ? "" : ",",
             static_cast<unsigned long long>(slot),
             static_cast<unsigned long long>(id),
-            (why == nullptr) ? 1 : 0, candidate.value);
+            (why == nullptr) ? 1 : 0, candidate.value,
+            (why != nullptr) ? why : "none");
         if (n > 0) {
             scanWritten += n;
         }
@@ -356,13 +358,52 @@ void pumpRaceMetricsProbe(unsigned long long frame) {
         }
     }
     {
-        char detail[640];
+        char detail[1024];
+        // THE REGISTRY ITSELF, so a reader can see whether the port is
+        // looking at the right structure: the four seeds and the four tables
+        // with their bucket counts.  A zero table pointer or a zero count
+        // would explain every failed lookup, and it has to be VISIBLE.
+        char reg[320];
+        uint64_t seeds[4] = {0, 0, 0, 0};
+        uint64_t tables[4] = {0, 0, 0, 0};
+        uint64_t counts[4] = {0, 0, 0, 0};
+        const uintptr_t seedOffsets[4] = {member_value_store::kSeed0Off,
+                                          member_value_store::kSeed1Off,
+                                          member_value_store::kSeed2Off,
+                                          member_value_store::kSeed3Off};
+        const uintptr_t tableOffsets[4] = {member_value_store::kTable1Off,
+                                           member_value_store::kTable2Off,
+                                           member_value_store::kTable3Off,
+                                           member_value_store::kTable4Off};
+        const uintptr_t countOffsets[4] = {member_value_store::kTable1CountOff,
+                                           member_value_store::kTable2CountOff,
+                                           member_value_store::kTable3CountOff,
+                                           member_value_store::kTable4CountOff};
+        for (int i = 0; i < 4; ++i) {
+            raceStateReadWord(registry + seedOffsets[i], &seeds[i]);
+            raceStateReadWord(registry + tableOffsets[i], &tables[i]);
+            raceStateReadWord(registry + countOffsets[i], &counts[i]);
+        }
+        std::snprintf(reg, sizeof(reg),
+                      "s=%llx,%llx,%llx,%llx t=%llx,%llx,%llx,%llx c=%llx,%llx,%llx,%llx",
+                      static_cast<unsigned long long>(seeds[0]),
+                      static_cast<unsigned long long>(seeds[1]),
+                      static_cast<unsigned long long>(seeds[2]),
+                      static_cast<unsigned long long>(seeds[3]),
+                      static_cast<unsigned long long>(tables[0]),
+                      static_cast<unsigned long long>(tables[1]),
+                      static_cast<unsigned long long>(tables[2]),
+                      static_cast<unsigned long long>(tables[3]),
+                      static_cast<unsigned long long>(counts[0]),
+                      static_cast<unsigned long long>(counts[1]),
+                      static_cast<unsigned long long>(counts[2]),
+                      static_cast<unsigned long long>(counts[3]));
         std::snprintf(detail, sizeof(detail),
-                      "rs=0x%llx slot=0x%llx id=0x%llx ok=%d value=%d cand=%s",
+                      "rs=0x%llx slot=0x%llx id=0x%llx ok=%d value=%d reg=%s cand=%s",
                       static_cast<unsigned long long>(ruleSet),
                       static_cast<unsigned long long>(lapsSlot),
                       static_cast<unsigned long long>(lapsId),
-                      (lapsWhy == nullptr) ? 1 : 0, laps.value, scan);
+                      (lapsWhy == nullptr) ? 1 : 0, laps.value, reg, scan);
         appendGuestBootLine(kGuestViewLogPath, "race-metrics-scan", 0, 0, detail);
     }
 
