@@ -8143,3 +8143,112 @@ Scanned ALL 1091 `m_*` member strings: the only speed members are
 `m_fPedestalSpeed`, `m_nMinCarVelocitySwitchTime`, `m_Start_Vel` and
 `m_End_Vel`.  **No live speed is available**, which is why the stall
 detector has to work off distance.
+
+## 2026-10-29: the guest was waiting for an answer nobody could deliver, and the lateral signal exists
+
+### 1. Two rounds froze, and the harness called them "alive"
+
+q13 and q15 both froze with the guest log at **1.5 MB and not one frame
+rendered**, while Eden's CPU climbed a steady 0.5-0.6 core.  The watchdog
+read that as "the guest is alive, not wedged" -- and the round then sat there
+for twenty minutes doing nothing.
+
+**THE FRAME CAPTURES ARE THE LIVENESS INSTRUMENT.**  The port writes one
+when it renders, so "no new capture" is the ground truth for "the guest is
+not drawing anything".  The watchdog now takes it into account: a quiet log
+with a rising CPU AND a new capture is a live but slow guest (the case the
+rule was written for), and a quiet log with a rising CPU and NO new capture
+is a BLOCKED guest, which now ends the round with that reason.
+
+### 2. WHY it was blocked: the answer was in a queue with no drain
+
+The guest's Cloudcell HTTP answers are DEFERRED: `http_post()` enqueues the
+work with `cloudcell_defer()` and something has to drain the queue later.
+The drain was the alert-pump host thread -- a raw libnx thread, so the OS
+schedules it whether or not the guest is making progress -- and it was
+started from `alertAnswerPositiveImpl()`, i.e. only once the guest had
+raised a DIALOG.
+
+**The guest's cloud sync happens BEFORE any dialog.**  So on a round where no
+alert comes first, the thread does not exist yet, the deferred answer to
+POST https://connect-dev-ss.cloudcell.com:443/CC_Sync.php sits in the queue
+with nobody to take it, and the guest waits for it forever.  MEASURED, and it
+is a clean difference:
+
+| round | outcome | "cloudcell_pump: site=alert-pump" lines |
+|---|---|---|
+| q11 | reached the race | **44** |
+| q13 | froze, 1.5 MB, no frames | **0** |
+| q15 | froze, 1.5 MB, no frames | **0** |
+
+Not one "alert-pump" line at all in the frozen rounds: the thread was never
+created.  The guest's own HTTP stack was never the problem.
+
+**THE FIX**: the pump is started at the PORT's startup (`startAlertPumpEarly()`
+in main.cpp), before the guest does anything.  Same thread, same 80 ms tick,
+same `cloudcell_pump()` call; only its starting point moves earlier, and
+earlier is exactly what this failure needs.
+
+**AND `nogo=1` WAS TRIED AND REJECTED.**  The card's own rr3-gfx.conf
+documents this symptom ("the guest's main thread is parked in libnx send()
+... with no socket stack there is nothing to block on"), and it did remove
+the hang -- but the next round then stalled on the loading screen with the
+guest alive and the log growing, so the block was somewhere else, as that
+file's own caveat warned.  It is back to 0.  The configuration now lives in
+the repository (tools/rr3-gfx.conf) and the deploy script installs it, so a
+round can be reproduced from the tree.
+
+### 3. THE LATERAL SIGNAL: the chain, and what the two numbers really are
+
+A sub-agent resolved the chain from the object the port ALREADY has, with
+three independent ELF sites and the port's own vtable value as the positive
+control:
+
+```
+base = RuleSet_RaceMetrics            <- the port resolves this today
+step 1: read word at base+0x20   -> CAR         ELF 0xb35c94 / 0xb35dd0
+step 2: read word at CAR+0x288   -> CAR_STATE   ELF 0xb35ce8 / 0xb35dd8
+final: CAR_STATE+0x1a8 = the SPLINE NODE INDEX  (int)
+       CAR_STATE+0x1c8 = the DISTANCE TRAVELLED  (int)
+```
+
+and the cross-checks are independent: the writer 0xc2d888
+(`ldr x8,[x0,#0x288]` then `str w4,[x8,#0x1a8]`), the projection helper
+`snapToClosestNode` 0xd05e44 (`ldr x9,[x8,#0x288]` then `ldr w9,[x9,#0x1a8]`),
+and 0xb29264/0xb29284.  The progress formula at 0xb35dac combines them as
+`[+0x60]*[+0x48] + node + travelled`, which is what says +0x1a8 is the node
+and +0x1c8 the distance.
+
+**⇒ THE PORT'S TWO NEW LOG FIELDS ARE THE NODE INDEX AND THE DISTANCE**,
+and they are logged raw, next to the port's own spline distance, so one
+race names them.
+
+### 4. `m_acrossAngle` is NOT the racing-line offset (the premise was wrong)
+
+The guest's own member registry names `m_acrossAngle`, and it is tempting to
+read that as "the angle across the racing line".  It is not: the class that
+registers it is **`CarBodyPart_Swinging`** (RTTI typeinfo 0x1eeb3b0, vtable
+address point 0x1eeb158, slot[3] = 0x157c2a8), i.e. a SWINGING CAR BODY
+PART, and its member set is a rigid body: `m_upAngle` (+0x1a8),
+`m_momentum` (+0x1ac), `m_acrossAngle` (+0x1b0), `m_fMass`, `m_fLength`,
+`m_fMomentOfInertia`, `m_distTravelled` (+0x1c8).  "across" is the ROLL
+axis, and the integrator (0x157be30-0x157c094) works in degrees: the limit
+is 360.0 (0x43b40000), the dead zone is 0.001, and the result is converted
+from radians with `*180.0/pi` (0x43340000 / 0x4049fdb).
+
+Three independent proofs: the integrator's own arithmetic, the member set,
+and the fact that the guest's `IsOnRacingLine` panel (0xc31960) is only an
+ImGui label that never touches +0x1b0.
+
+⇒ **THE RACING-LINE OFFSET IS NOT STORED; IT IS COMPUTED**, in the projection
+(snapToClosestNode 0xd05e24 / 0x9a7688).  But the inputs are reachable:
+the car's own debug object carries **CAR+0x24 = the current spline node**
+and **CAR+0x30/+0x34/+0x38 = the car's world position**, and the track's
+spline is in the volume (Tracks/<track>/...spline).  So the port can compute
+the lateral error and the heading error itself, and steer by them.
+
+⇒ **AND THERE IS NO LIVE SPEED ANYWHERE IN THE GUEST**: all 1091 `m_*`
+member names were scanned; the only speed members are `m_nTopGameSpeed` (a
+MAXIMUM), `m_fDollySpeed`, `m_fPedestalSpeed`, `m_nMinCarVelocitySwitchTime`,
+`m_Start_Vel` and `m_End_Vel`.  That is why the stall detector has to work
+off distance.
