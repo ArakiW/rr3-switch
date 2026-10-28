@@ -9,9 +9,27 @@
 # base=<f>   the initial steering magnitude, 0..1
 # sign=1|-1  the initial steering direction
 #
+# THE SIGN IS NOW -1, AND IT IS NOT A GUESS: IT IS MEASURED.
+#
 # The loop flips the sign itself when the guest's progress rate goes NEGATIVE
 # (the car is travelling against the spline's direction, i.e. round the track
-# the wrong way), so sign is only the starting guess.
+# the wrong way), so sign is only the starting guess.  The starting guess
+# WAS wrong for the circuit this script drives.
+#
+# MEASURED 2026-10-24, and the port's own archives (20261024-121056-eden-
+# race-steer2 and its mirror): on Spa-Francorchamps "the start straight bends
+# left and a car that does not steer runs straight off the right-hand edge",
+# and the run that launched with lx=+0.6 ended up on the RIGHT runoff.  So
+# a POSITIVE axis 0 steers RIGHT.
+#
+# The autopilot was running with sign=+1, i.e. steering RIGHT on a straight
+# that bends LEFT, and the port's own run summary showed the consequence:
+# the car's progress rate collapsed from 100.3 to 6.5 units/frame within
+# 60 m of the start and never recovered (archive 20261028-220443 was the HD
+# run; the driving measurement is the 2026-10-28 night race).
+#
+# So: sign=-1.  The loop can still flip it if the rate really does go
+# negative.
 #
 # ---------------------------------------------------------------------------
 # CHANGED 2026-10-27: probe=1 -> probe=0, so the loop DRIVES.
@@ -30,4 +48,4 @@
 enable=1
 probe=0
 base=0.30
-sign=1
+sign=-1

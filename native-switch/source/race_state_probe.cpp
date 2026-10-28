@@ -1161,7 +1161,18 @@ void updateProgress(unsigned long long frame, RaceMetricsSample* sample) {
         g_lastProgressValue = value;
     }
     // PROGRESS IS A DISTANCE, NOT A NUDGE.  See kProgressEpsilon.
-    if (value >= g_lastProgressValue + kProgressEpsilon) {
+    //
+    // AND WHILE THE RECOVERY IS REVERSING, THE REFERENCE FOLLOWS THE CAR
+    // DOWN.  The recovery deliberately drives the car backwards, so the
+    // distance it had made goes down with it; if the reference stayed up
+    // there, the car would have to regain every metre it lost before it
+    // counted as progress, the stall would fire again every 240 frames,
+    // and the car would reverse its way down the circuit for the rest of
+    // the race.  Measured 2026-10-28: the distance fell from 125,357 to
+    // 103,119 and the stall counter ran to 8.
+    if (g_drive.brake) {
+        g_lastProgressValue = value;
+    } else if (value >= g_lastProgressValue + kProgressEpsilon) {
         g_lastProgressValue = value;
         g_lastProgressFrame = frame;
         g_sawProgress = true;
@@ -1215,25 +1226,6 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
         g_drive.bestMagnitude = g_drive.magnitude;
     }
 
-    // A negative rate means the wrong way round: flip. The rate is a
-    // 120-frame window, so the flip needs a HYSTERESIS: without one the
-    // loop would flip on every window and oscillate.
-    //
-    // A TINY NEGATIVE RATE IS NOT "THE WRONG WAY ROUND".  A car grinding
-    // against a barrier jitters the telemetry by a unit or two, and the
-    // threshold here was -0.0001, so the port read that jitter as "the car
-    // is going backwards" and flipped the direction AROUND THE TRACK.
-    // Measured 2026-10-28: 24 sign flips in one race, while the car sat
-    // still -- the autopilot was steering a car that was not moving, in
-    // both directions in turn.
-    if (rate < -0.0001 && frame >= g_lastFlipFrame + 600ULL) {
-        g_drive.sign = -g_drive.sign;
-        g_lastFlipFrame = frame;
-        ++g_drive.flips;
-        g_drive.bestRate = 0.0f;
-        g_smoothedRate = 0.0;
-    }
-
     // A stall: no METRE of progress for a while (the threshold is in
     // updateProgress).  The recovery turns the wheel hard the other way,
     // which is what frees a car that is against a wall, and asks for the
@@ -1248,6 +1240,12 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
     // frame, so throttle+brake was just braking and the guest never
     // reversed at all.  The guest reverses only when the brake is held and
     // the throttle is let go.
+    //
+    // THE PROGRESS REFERENCE COMES DOWN WITH THE CAR.  The recovery backs
+    // the car off the barrier, so the distance it had made goes DOWN with
+    // it; updateProgress() keeps the reference in step with the car while
+    // the brake is held, so the stall does not fire again every 240 frames
+    // and reverse the car down the circuit for the rest of the race.
     if (g_lastProgressFrame != 0 &&
         frame - g_lastProgressFrame > 240ULL) {
         ++g_drive.stalls;
@@ -1257,6 +1255,34 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
     }
     g_drive.brake = (g_brakeUntilFrame != 0 && frame <= g_brakeUntilFrame);
     g_drive.throttle = !g_drive.brake;
+
+    // A negative rate means the wrong way round: flip. The rate is a
+    // 120-frame window, so the flip needs a HYSTERESIS: without one the
+    // loop would flip on every window and oscillate.
+    //
+    // A TINY NEGATIVE RATE IS NOT "THE WRONG WAY ROUND".  A car grinding
+    // against a barrier jitters the telemetry by a unit or two, and the
+    // threshold here was -0.0001, so the port read that jitter as "the car
+    // is going backwards" and flipped the direction AROUND THE TRACK.
+    // Measured 2026-10-28: 24 sign flips in one race, while the car sat
+    // still -- the autopilot was steering a car that was not moving, in
+    // both directions in turn.
+    //
+    // AND THE RECOVERY IS NOT "GOING THE WRONG WAY" EITHER.  The recovery
+    // reverses the car ON PURPOSE, so the distance falls and the rate goes
+    // negative -- that is the recovery working.  Measured 2026-10-28: the
+    // recovery reversed the car 30 m back down the track, that negative rate
+    // flipped the sign, and the controller then drove the wrong way round
+    // the circuit for the rest of the race (the distance fell from 125,357
+    // to 103,119 and the stall counter ran to 8).
+    if (rate < -0.0001 && !g_drive.brake &&
+        frame >= g_lastFlipFrame + 600ULL) {
+        g_drive.sign = -g_drive.sign;
+        g_lastFlipFrame = frame;
+        ++g_drive.flips;
+        g_drive.bestRate = 0.0f;
+        g_smoothedRate = 0.0;
+    }
 
     // THE MAGNITUDE SWEEP.
     //

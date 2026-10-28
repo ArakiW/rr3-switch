@@ -7912,3 +7912,98 @@ circuit's curvature, and NONE of the six members the port resolves carries a
 lateral term or a heading.  That read is the next piece of work, and the
 guest's own spline projection (the code behind "Spline Distance (metres)") is
 where to look.
+
+## 2026-10-28 (night, part 5): the four fixes measured, and the two that the measurement found
+
+### 1. q10: the four drive-loop fixes, all of them confirmed by the log
+
+Same 1280x720 layout, same touch script, same drive config as q8; the only
+difference is the drive loop.  Archive `20261028-223606-eden-q10`.
+
+| what q8 did | what q10 did |
+|---|---|
+| `mag` parked at 0.050 on **43.4 %** of the samples | **0 %** -- and the sweep now EXPLORES (0.300 .. 0.950) |
+| the guest's own axis 0 was **+-0.050** | up to **0.600** (the recovery's opposite lock) |
+| **24** sign flips while the car sat still | **0** spurious flips before the stall |
+| `stalls` stayed **0** for 18,270 stuck frames | **12**, and the recovery ran: **89 samples with the brake held and the throttle released** |
+| the car sat against the barrier for 555 s | the recovery fired and the car **reversed 30 m back down the track** |
+
+So the servo is alive, the stall detector fires, the throttle is really
+released, and the guest really reverses.  Four instrument-level facts, not
+inferences.
+
+### 2. And the measurement found TWO MORE defects, in the recovery itself
+
+The q10 log around the peak is the whole story:
+
+```
+f=18810  total=125,840  rate= 5.575  steer= 0.300  flips=0 stalls=0 1/0
+f=18900  total=125,842  rate= 0.392  steer= 0.300  flips=0 stalls=0 1/0
+f=19020  total=125,357  rate=-4.042  steer= 0.600  flips=1 stalls=1 0/1   <- the recovery starts
+f=19050  total=123,632  rate= 0.000  steer= 0.600  flips=1 stalls=1 0/1
+f=19080  total=120,562  rate= 0.000  steer= 0.600  flips=1 stalls=1 0/1
+```
+
+**(a) THE RECOVERY TRIGGERS THE "WRONG WAY ROUND" FLIP.**  The recovery
+reverses the car ON PURPOSE, so the distance falls and the rate goes
+negative -- that is the recovery working, not the car going the wrong way
+round.  The flip rule read it as the latter, the controller drove the wrong
+way round the circuit, and the distance fell from 125,357 to 103,119 with
+the stall counter running to 8.  **The sign is now not flipped while the
+brake is held.**
+
+**(b) THE STALL REPEATED, AND THE CAR REVERSED ITS WAY DOWN THE TRACK.**
+The progress reference stayed up at the pre-stall value, so after the
+recovery backed the car 30 m off the barrier the car had to regain every
+metre before it counted as progress; the stall fired again every 240 frames
+and reversed the car again.  **The reference now follows the car down
+while the brake is held.**
+
+### 3. The car reached the same place in both runs -- and the direction was wrong
+
+Both q8 and q10 stopped at **125,840 - 125,870 units = 491.6 m** of a
+7,056 m lap.  That is not a coincidence and not the track's length: the
+port's own measurement of 2026-10-24 says, of this circuit, "the start
+straight bends LEFT and a car that does not steer runs straight off the
+right-hand edge", and the run that launched with `lx=+0.6` ended up on the
+**RIGHT** runoff.  So a POSITIVE axis 0 steers RIGHT.
+
+**The autopilot was running with sign=+1 -- steering RIGHT on a straight
+that bends LEFT.**  That is the whole reason it left the road at 491 m, and
+the reason the rate collapsed from 100.3 to 6.5 within 60 m in q10.  The
+drive config's sign is now **-1**, and the comment in the file says why.
+
+### 4. What "Total Laps" is, from the guest's own code
+
+The member at `RuleSet_RaceMetrics+0x60` is written in one place besides
+the constructor: **`RuleSet_RaceMetrics::vfunc[7]` (ELF 0xb35f54)**, an
+event handler.
+
+```
+0xb35fb4  add  x0, x19, #0x60
+0xb35fc4  bl   0xb36448     ; the SATURATING ACCUMULATOR: value + delta, clamped at INT_MAX
+...
+0xb35fe4  bl   0x991d1c     ; read the current value
+0xb35fec  sub  w27, x24, #1  ; value - 1
+0xb3601c  mov  w8, #0x80000000
+0xb36024  csel w2, w24, w27, eq   ; keep INT_MIN as it is, otherwise value - 1
+0xb36030  bl   0x992518     ; insert the new value under a NEW id
+0xb3603c  bl   0x9926c4     ; supersede the old id
+0xb36044  str  x25, [x19, #0x60]  ; the slot gets the new id
+```
+
+So the member is a **counter**: +1 on one event, -1 on another, and the
+constructor (ELF 0xf71650) registers it with the value the ruleset supplied.
+**It is expected to MOVE during a race, and in q8 it never moved at all** --
+a second, independent confirmation that no lap event ever fired.
+
+### 5. Still open
+
+* **The car still cannot complete a lap**, and the reason is now precise:
+  a bang-bang controller on ONE scalar (the progress rate) cannot follow a
+  circuit's curvature, and NONE of the six members the port resolves
+  carries a lateral term or a heading.  The guest's own spline projection
+  -- the code behind "Spline Distance (metres)" -- is where the missing
+  signal lives, and that is the next piece of work.
+* The sign is now measured rather than guessed, so the next round tests one
+  hypothesis: that steering LEFT is what keeps the car on Spa's straight.
