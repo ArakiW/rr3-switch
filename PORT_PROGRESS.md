@@ -8007,3 +8007,61 @@ a second, independent confirmation that no lap event ever fired.
   signal lives, and that is the next piece of work.
 * The sign is now measured rather than guessed, so the next round tests one
   hypothesis: that steering LEFT is what keeps the car on Spa's straight.
+
+## 2026-10-28 (night, part 6): the direction was measured, and the floor was too big
+
+### 1. Three rounds, one conclusion
+
+| run | steering | peak distance | progress rate | stalls | laps |
+|---|---|---|---|---|---|
+| q8 | 0.050 (right) | 125,870 u = **491.6 m** | up to **129 u/frame** (49 km/h) | 0 (never fired) | -1 |
+| q10 | 0.300 (right) | 125,842 u = **491.6 m** | **6.5 u/frame** (5 km/h) | 12 | -1 |
+| q11 | 0.300 (left) | 84,018 u = 328.2 m | **6.5 u/frame** | 0 | -1 |
+
+**A CONSTANT 0.30 ANGLE IS WORSE THAN 0.05, NOT BETTER.**  A constant
+angle is a constant circle; the car scrubbed along at 5 km/h instead of
+driving at 49.  The floor of 0.30 that the 2026-10-28 fix introduced was
+wrong, and the log said so twice (q10 and q11, identical 6.5 units/frame
+with opposite signs).  The floor is now the CONFIGURED base again, and the
+drive config's base is **0.05**, with the reason written into the file.
+
+### 2. The direction is measured, not guessed
+
+The port's own measurement of 2026-10-24, of this circuit: "the start
+straight bends LEFT and a car that does not steer runs straight off the
+right-hand edge", and the run that launched with `lx=+0.6` ended up on the
+**RIGHT** runoff -- so a POSITIVE axis 0 steers RIGHT.  The autopilot was
+steering RIGHT on a straight that bends LEFT, which is why it left the road
+at 491 m.  `sign` is now **-1**.
+
+### 3. What the rate-only servo can and cannot do
+
+Three rounds say the same thing: with ONE scalar (the progress rate along
+the spline) the servo's best strategy is "go as straight as possible",
+because that is what maximises the rate, and a straight line leaves the
+road at the first corner.  The servo cannot learn to turn, because the
+signal it has cannot distinguish "the road curves and I am not following
+it" from "I am off the road and the road is straight".
+
+**The missing ingredient is a lateral signal, and the guest HAS one.**  The
+guest's own member registry names it: **`m_acrossAngle`** (a float at
+**+0x1b0** of a per-car physics-state object), with `m_upAngle` at
++0x1a8, `m_nCurrentNode` at +0x24, `m_nPrevNode` at +0x20 and `m_vPosition`
+at +0x30/+0x34/+0x38.  The guest even has an `IsOnRacingLine` debug panel
+(ELF 0xc31960) and a `TrackSegmentDesc::RenderImGui(R3Car const&, TrackSpline
+const&)`, and the projection itself is `snapToClosestNode` (ELF 0xd05e24,
+called from 0x9fbb18) with its writer at 0xc2d8dc.
+
+So the next piece of work is not a controller change: it is **reading
+`m_acrossAngle`**.  Until the port can see the lateral error, the autopilot
+can only go straight.
+
+### 4. The lap counter is READ, and that is settled
+
+`m_nTotalLaps` (`RuleSet_RaceMetrics+0x60`) is a counter written only by
+`RuleSet_RaceMetrics::vfunc[7]` (ELF 0xb35f54): +1 through the saturating
+accumulator 0xb36448, or a rewrite as `value-1` under a freshly minted id.
+It is expected to MOVE during a race, and in q8 it never moved at all
+across 717 samples -- an independent confirmation that no lap event fired.
+The port reads it correctly (717/717 lookups `ok=1`, the guest's own
+checksum agreeing every time); the game has simply not awarded a lap yet.

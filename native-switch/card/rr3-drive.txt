@@ -6,7 +6,18 @@
 #
 # enable=1   the closed loop drives the steering axis, the throttle and the brake
 # probe=1    read the race state but do not steer (diagnostic only)
-# base=<f>   the initial steering magnitude, 0..1
+# base=<f>   the initial steering magnitude, 0..1.  It is also the FLOOR:
+#             the servo never steers less than this, and it walks upwards
+#             from here when the progress rate improves.
+#
+# base=0.05, NOT 0.30.  The floor used to be raised to 0.30, and that was
+# WORSE, not better: a constant 0.30 angle is a constant tight circle, so
+# the car scrubbed along at 5 km/h (6.5 spline units per frame) instead of
+# driving at 49 km/h (129 units per frame).  Measured 2026-10-28, q10
+# (sign=+1) and q11 (sign=-1): both sat at 6.5 units/frame with the 0.30
+# floor, and q8 with a 0.05 magnitude reached 129.  The servo explores
+# upwards on its own; the floor only has to let the car go straight.
+#
 # sign=1|-1  the initial steering direction
 #
 # THE SIGN IS NOW -1, AND IT IS NOT A GUESS: IT IS MEASURED.
@@ -47,5 +58,5 @@
 # fix: the two variables cannot interact.
 enable=1
 probe=0
-base=0.30
+base=0.05
 sign=-1

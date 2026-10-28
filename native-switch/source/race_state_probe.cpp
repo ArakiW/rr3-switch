@@ -1313,14 +1313,23 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
             g_drive.magnitude = 0.95f;
             g_drive.sweepDirection = -1;
         }
-        // THE FLOOR IS A STEER, NOT A NUDGE.  It used to be 0.05, i.e. 5 %
-        // of the steering axis, which the guest received as ax[0] = +-0.050.
-        // A car that cannot turn runs straight into the first corner's
-        // barrier, which is exactly what happened.  The floor is now the
-        // configured base, so "never steer less than the configured base".
+        // THE FLOOR IS A STEER, NOT A NUDGE -- BUT NOT AROUND THE TRACK
+        // EITHER.  The floor used to be 0.05, i.e. 5 % of the steering axis,
+        // which the guest received as ax[0] = +-0.050; a car that cannot
+        // turn runs straight into the first corner's barrier.  It was then
+        // raised to 0.30, and THAT was worse: a constant 0.30 is a constant
+        // tight circle, so the car scrubbed along at 5 km/h instead of
+        // driving at 49.  Measured 2026-10-28 (q10 with sign=+1 and q11
+        // with sign=-1): the progress rate sat at 6.5 units/frame with a
+        // 0.30 angle, against 129 units/frame with a 0.05 one.
+        //
+        // So the floor is the CONFIGURED base: the config file decides how
+        // small the steering may get, and the servo explores upwards from
+        // there when the progress rate improves.  0.30 is only the fallback
+        // for a config that does not say.
         const float floorMagnitude =
-            (g_driveConfig.base > kDriveMagnitudeFloor) ? g_driveConfig.base
-                                                        : kDriveMagnitudeFloor;
+            (g_driveConfig.base > 0.0f) ? g_driveConfig.base
+                                         : kDriveMagnitudeFloor;
         if (g_drive.magnitude < floorMagnitude) {
             g_drive.magnitude = floorMagnitude;
             g_drive.sweepDirection = 1;
