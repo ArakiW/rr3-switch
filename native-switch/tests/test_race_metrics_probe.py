@@ -352,40 +352,91 @@ def to_int32(value):
 
 
 def bucket_index(count, key):
-    """The guest's own bucket index (ELF 0x991fd8)."""
+    """The guest's own bucket index (ELF 0x991fd8).
+
+    The guest dispatches on the POPCOUNT of the count (0x99200c / 0x992010),
+    not on "is it a power of two".
+    """
     if count == 0:
         return None
-    if (count & (count - 1)) == 0:
+    if bin(count).count("1") < 2:
         return key & (count - 1)
     return key % count
+
+
+FNV1A64_BASIS = 0xCBF29CE484222325
+FNV1A64_PRIME = 0x100000001B3
+
+
+def fnv1a64(data, basis=FNV1A64_BASIS):
+    """FNV-1a 64-bit, byte for byte what ELF 0x15c3640 does."""
+    h = basis
+    for byte in data:
+        h ^= byte
+        h = (h * FNV1A64_PRIME) & MASK
+    return h
+
+
+def guest_integrity_hash(cell1, cell2, cell3):
+    """The guest's own integrity hash (ELF 0x991e10 / 0x991e18).
+
+    The eight LITTLE-ENDIAN bytes of cell1 ^ cell2 ^ cell3, hashed with
+    FNV-1a 64-bit.
+    """
+    mixed = (cell1 ^ cell2 ^ cell3) & MASK
+    return fnv1a64(bytes([(mixed >> (i * 8)) & 0xFF for i in range(8)]))
 
 
 class SyntheticRegistry:
     """A registry that looks like the guest's.
 
-    The same seeds, the same two tables, the same chain nodes (a key and a
-    value cell each) and the same insert, which is the guest's own write
-    path (ELF 0x992518):
+    The same four seeds, the same four tables, the same chain nodes (a key
+    and a value cell each) and the same insert, which is the guest's own
+    write path (ELF 0x992518) read backwards from its read path
+    (ELF 0x991d1c):
 
         table 1 (key0 = ~(seed0 ^ id)) gets the cell  ~(minted ^ value)
-        table 2 (key1 = ~(seed1 ^ id)) gets the cell  minted
+        table 3 (key2 = ~(seed2 ^ id)) gets the cell  minted
+        table 2 (key1 = ~(seed1 ^ id)) gets a cell
+        table 4 (key3 = ~(seed3 ^ id)) gets the integrity hash
+
+    and the read path recovers  ~(cell3 ^ cell1)  ==  value.
+
+    THE VALUE IS MADE OF CELLS 1 AND 3.  The port used to compute
+    ~(cell1 ^ cell2) -- the wrong pair -- which is why every lookup failed.
     """
 
-    def __init__(self, seed0, seed1, count1, count2):
+    def __init__(self, seed0, seed1, count1, count2,
+                 seed2=0x0F1E2D3C4B5A6978, seed3=0x8877665544332211,
+                 count3=16, count4=7):
         self.seed0 = seed0
         self.seed1 = seed1
+        self.seed2 = seed2
+        self.seed3 = seed3
         self.count1 = count1
         self.count2 = count2
+        self.count3 = count3
+        self.count4 = count4
         self.table1 = [[] for _ in range(count1)]
         self.table2 = [[] for _ in range(count2)]
+        self.table3 = [[] for _ in range(count3)]
+        self.table4 = [[] for _ in range(count4)]
 
-    def insert(self, member_id, minted, value):
+    def insert(self, member_id, minted, value, break_integrity=False):
         key0 = (~(self.seed0 ^ member_id)) & MASK
         key1 = (~(self.seed1 ^ member_id)) & MASK
+        key2 = (~(self.seed2 ^ member_id)) & MASK
+        key3 = (~(self.seed3 ^ member_id)) & MASK
         cell1 = (~(minted ^ (value & MASK))) & MASK
         cell2 = minted & MASK
+        cell3 = minted & MASK
+        cell4 = guest_integrity_hash(cell1, cell2, cell3)
+        if break_integrity:
+            cell4 ^= 0x5A5A5A5A5A5A5A5A
         self.table1[bucket_index(self.count1, key0)].append((key0, cell1))
         self.table2[bucket_index(self.count2, key1)].append((key1, cell2))
+        self.table3[bucket_index(self.count3, key2)].append((key2, cell3))
+        self.table4[bucket_index(self.count4, key3)].append((key3, cell4))
 
     def find(self, table, count, key):
         index = bucket_index(count, key)
@@ -407,15 +458,27 @@ class SyntheticRegistry:
     def lookup(self, member_id):
         key0 = (~(self.seed0 ^ member_id)) & MASK
         key1 = (~(self.seed1 ^ member_id)) & MASK
+        key2 = (~(self.seed2 ^ member_id)) & MASK
+        key3 = (~(self.seed3 ^ member_id)) & MASK
+        # TABLES 1 AND 3 CARRY THE VALUE.  Tables 2 and 4 carry the integrity
+        # check (ELF 0x991de4 / 0x991e10 / 0x991e50).
         node1, why = self.find(self.table1, self.count1, key0)
         if why is not None:
-            return None, why
-        node2, why = self.find(self.table2, self.count2, key1)
+            return None, why, False
+        node3, why = self.find(self.table3, self.count3, key2)
         if why is not None:
-            return None, why
+            return None, why, False
         cell1 = node1[1]
-        cell2 = node2[1]
-        return to_int32((~(cell1 ^ cell2)) & MASK), None
+        cell3 = node3[1]
+        value = to_int32((~(cell3 ^ cell1)) & MASK)
+        node2, why2 = self.find(self.table2, self.count2, key1)
+        node4, why4 = self.find(self.table4, self.count4, key3)
+        verified = False
+        if why2 is None and why4 is None:
+            cell2 = node2[1]
+            cell4 = node4[1]
+            verified = guest_integrity_hash(cell1, cell2, cell3) == cell4
+        return value, None, verified
 
 
 def run_host_selftest():
@@ -504,10 +567,16 @@ def main() -> int:
         "the port's registry address does not match the guest's")
     assert source_constant(store, "kSeed0Off") == 0x00
     assert source_constant(store, "kSeed1Off") == 0x08
+    assert source_constant(store, "kSeed2Off") == 0x10
+    assert source_constant(store, "kSeed3Off") == 0x18
     assert source_constant(store, "kTable1Off") == 0x20
     assert source_constant(store, "kTable1CountOff") == 0x20 + count_offset
     assert source_constant(store, "kTable2Off") == 0x48
     assert source_constant(store, "kTable2CountOff") == 0x48 + count_offset
+    assert source_constant(store, "kTable3Off") == 0x70
+    assert source_constant(store, "kTable3CountOff") == 0x70 + count_offset
+    assert source_constant(store, "kTable4Off") == 0x98
+    assert source_constant(store, "kTable4CountOff") == 0x98 + count_offset
     assert source_constant(store, "kNodeNextOff") == 0x00
     assert source_constant(store, "kNodeKeyOff") == 0x08
     assert source_constant(store, "kNodeCellOff") == 0x18
@@ -531,8 +600,21 @@ def main() -> int:
         "the port does not take the key modulo the count")
     assert "~(seed0 ^ id)" in store and "~(seed1 ^ id)" in store, (
         "the port does not derive its keys as ~(seed ^ id)")
-    assert "cell1 ^ cell2" in store and "~mixed" in store, (
-        "the port does not decode the value as ~(cell1 ^ cell2)")
+    # THE VALUE IS MADE OF CELLS 1 AND 3.  The port used to compute
+    # ~(cell1 ^ cell2) -- the wrong pair -- which is why every lookup failed
+    # with "the key is not in the table".
+    assert "cell3 ^ cell1" in store and "~mixed" in store, (
+        "the port does not decode the value as ~(cell3 ^ cell1)")
+    assert "cell1 ^ cell2" not in store.split("decodeValue")[1][:400], (
+        "the port still decodes the value from cells 1 and 2")
+    # The guest's integrity check: FNV-1a 64-bit over the eight
+    # little-endian bytes of cell1 ^ cell2 ^ cell3, compared with cell4.
+    assert "kFnv1a64Basis = 0xcbf29ce484222325" in store, (
+        "the port does not use the guest's FNV-1a 64-bit basis")
+    assert "kFnv1a64Prime = 0x100000001b3" in store, (
+        "the port does not use the guest's FNV-1a 64-bit prime")
+    assert "cell1 ^ cell2 ^ cell3" in store, (
+        "the port does not compute the guest's integrity hash")
 
     # ---- 4. THE PROBE NEVER CALLS THE MUTATING ACCESSOR ------------------
     accessor = "%x" % GUEST_MEMBER_ACCESSOR
@@ -580,22 +662,33 @@ def main() -> int:
     registry = SyntheticRegistry(0x0123456789ABCDEF, 0xFEDCBA9876543210, 5, 8)
     laps_id = 0x1122334455667788
     registry.insert(laps_id, 0xAAAAAAAAAAAAAAAA, 3)
-    value, why = registry.lookup(laps_id)
+    value, why, verified = registry.lookup(laps_id)
     assert why is None and value == 3, (
         f"the positive control failed: value={value!r} why={why!r}")
+    assert verified, "the guest's integrity check passes on a fresh member"
 
     # A second member, and a negative value (the registry holds int32s).
     speed_id = 0x99AABBCCDDEEFF00
     registry.insert(speed_id, 0x5555555555555555, -2048)
-    value, why = registry.lookup(speed_id)
+    value, why, verified = registry.lookup(speed_id)
     assert why is None and value == -2048, (
         f"the negative-value control failed: value={value!r} why={why!r}")
 
     # THE NEGATIVE CONTROL: a member that was never inserted is NOT found.
-    value, why = registry.lookup(0xDEADBEEF)
+    value, why, _ = registry.lookup(0xDEADBEEF)
     assert value is None, "a member that was never inserted produced a value"
     assert why in ("the-chain-ended", "the-node-is-in-another-bucket"), (
         f"the negative control did not say which way the walk failed: {why!r}")
+
+    # A member whose integrity check does NOT hold: the guest would answer by
+    # minting a new id; the port cannot, so it reports the value AND says the
+    # check failed.
+    registry.insert(0x1111222233334444, 0x777788889999AAA0, 7,
+                    break_integrity=True)
+    value, why, verified = registry.lookup(0x1111222233334444)
+    assert why is None and value == 7, (
+        f"the broken-check control failed: value={value!r} why={why!r}")
+    assert not verified, "the broken integrity check is reported as failed"
 
     # The same header, compiled and run.
     host_output = run_host_selftest()

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 
 // ---------------------------------------------------------------------------
 // THE GUEST'S MEMBER VALUE STORE.
@@ -15,34 +16,66 @@
 // and the VALUE lives in a global four-table hash registry: a .bss singleton
 // at link VA 0x1f97980, reached through the accessor 0xb5741c.
 //
-// WHAT THIS HEADER IMPLEMENTS, AND WHAT IT DOES NOT
-// --------------------------------------------------
-// MEASURED 2026-10-28 by an independent re-read of the guest binary (see
-// .build/race-metrics-audit.md):
+// THE READ, DECODED FROM THE GUEST'S OWN CODE
+// -------------------------------------------
+// The guest's own read path is 0x991d1c (the value) and 0x991fd8 (the bucket
+// lookup).  With reg = the registry base and id = x20:
 //
-//   * the registry really is at 0x1f97980 and the accessor really is
-//     0xb5741c (0xb5743c adrp / 0xb57440 add -> 0x1f97980).  Confirmed.
-//   * the registry holds FOUR seeds (reg+0x00/0x08/0x10/0x18) and FOUR
-//     tables (reg+0x20/+0x48/+0x70/+0x98, counts at +0x28/+0x50/+0x78/
-//     +0xa0).  This header reads TWO of them (seeds 0/1, tables 1/2).
-//   * the guest's own read (ELF 0x991d1c) takes the value as
-//     ~(cell1 ^ cell2) and then CHECKS it against tables 3 and 4:
-//     hash(cell3 ^ (cell1 ^ cell2)) == cell4 (0x991e10/0x991e18/0x991e50).
-//     If the check fails the guest MINTS A NEW ID and re-inserts the value
-//     (0x991e58), i.e. the value it just read is one the guest considers
-//     invalid.
+//     0x991d40  add  x19, x0, #0xc0     ; the registry's LOCK object
+//     0x991d54  bl   0x1c76fe4          ; lock
+//     0x991d58  ldr  x8, [x21]          ; seed0 = reg+0x00
+//     0x991d64  add  x0, x21, #0x20     ; TABLE 1
+//     0x991d6c  eon  x8, x8, x20        ; key0 = ~(seed0 ^ id)
+//     0x991d88  bl   0x991fd8           ; -> the node
+//     0x991d8c  ldr  x8, [x0, #0x18]    ; the node's value-cell pointer
+//     0x991d9c  ldr  x23, [x8]          ; cell1
+//     0x991d90  ldr  x9, [x21, #8]      ; seed1 = reg+0x08
+//     0x991d94  add  x0, x21, #0x48     ; TABLE 2
+//     0x991da0  eon  x8, x9, x20        ; key1 = ~(seed1 ^ id)
+//     0x991db8  bl   0x991fd8           ; -> the node
+//     0x991dcc  ldr  x8, [x8]           ; cell2
+//     0x991dc0  ldr  x9, [x21, #0x10]   ; seed2 = reg+0x10
+//     0x991dc4  add  x0, x21, #0x70     ; TABLE 3
+//     0x991dd0  eon  x9, x9, x20        ; key2 = ~(seed2 ^ id)
+//     0x991dec  bl   0x991fd8           ; -> the node
+//     0x991e00  ldr  x8, [x8]           ; cell3
+//     0x991de4  eor  x25, x8, x23       ; *** x25 = cell3 ^ cell1 ***
+//     0x991e10  eor  x8, x8, x25        ; cell2 ^ cell3 ^ cell1
+//     0x991e18  bl   0x15c3640          ; fnv1a64 of those 8 LE bytes
+//     0x991e1c  ldr  x8, [x21, #0x18]   ; seed3 = reg+0x18
+//     0x991e24  add  x0, x21, #0x98     ; TABLE 4
+//     0x991e2c  eon  x8, x8, x20        ; key3 = ~(seed3 ^ id)
+//     0x991e44  bl   0x991fd8           ; -> the node
+//     0x991e4c  ldr  x8, [x8]           ; cell4
+//     0x991e50  cmp  x23, x8            ; the hash == cell4 ?
+//     0x991e54  b.eq #0x991e70          ; yes -> done
+//     0x991e58  bl   0x991eac            ; no -> mint a NEW id, re-insert
+//     0x991e74  bl   0x1c76fec          ; unlock
+//     0x991e88  mvn  x0, x25            ; *** THE VALUE = ~(cell3 ^ cell1) ***
 //
-// SO: the value this header returns is the guest's value FORMULA, applied to
-// two of the guest's four tables, with the guest's own integrity check NOT
-// performed.  That is a KNOWN LIMITATION, not a verified read, and it is
-// recorded here so the next reader does not mistake it for one.  A value
-// that passes the guest's check would need the guest's name-hash function
-// (ELF 0x15c3640) to be ported as well.
+// THE VALUE IS MADE OF CELLS 1 AND 3, NOT 1 AND 2.  The port used to compute
+// ~(cell1 ^ cell2) -- the wrong pair -- and to look the member up in tables 1
+// and 2 only.  That is the bug the 2026-10-28 round found: the guest keeps
+// the value in table 1 and table 3, and the port was reading a table that
+// holds something else.
 //
-// ALSO NOTE: the "+0xc0" of this registry is its LOCK OBJECT, not an "id
-// map" (0x991cc0 bl 0x1c76fe4 locks, 0x991d00 bl 0x1c76fec unlocks).  The
-// earlier comment in race_state_probe.cpp called it an id map; it is not one,
-// and the id map and the value table are not the same thing.
+// TABLES 2 AND 4 ARE THE INTEGRITY CHECK, NOT THE VALUE.  The guest hashes
+// cell1 ^ cell2 ^ cell3 and compares the result with the cell in table 4; if
+// they differ it MINTS A NEW ID and re-inserts the value (0x991e58), i.e.
+// the value it read is one it considers tampered with.  The port does NOT
+// re-key (that would mutate the guest), so it reports the value together
+// with whether the guest's own check would have passed.
+//
+// THE HASH IS FNV-1a 64-bit.  The guest's hash function (ELF 0x15c3640) is
+//
+//     0x15c3648  mov  x9, #0x1b3
+//     0x15c3650  movk x9, #0x100, lsl #32   ; the prime 0x100000001b3
+//     0x15c3654  ldrb w10, [x0], #1
+//     0x15c3658  eor  x10, x2, x10           ; h = h ^ byte
+//     0x15c3660  mul  x2, x10, x9            ; h = h * prime
+//
+// with the offset basis 0xcbf29ce484222325 built at 0x991df4-0x991e0c, which
+// is the standard FNV-1a 64-bit basis.  So the check is reproducible.
 //
 // WHY THE SLOT CANNOT BE READ AS A NUMBER
 // ----------------------------------------
@@ -62,34 +95,20 @@
 //
 // So the 64-bit word in the slot is a ROTATING TOKEN, never a stable handle,
 // and a probe that calls the accessor mutates the guest's state. This header
-// therefore implements the PURE READ (option B of the write-up): no guest call,
-// no mutation, and the id is read fresh every time.
+// therefore implements the PURE READ: no guest call, no mutation, and the id
+// is read fresh every time.
 //
-// THE READ, DECODED FROM THE GUEST'S OWN CODE
-// -------------------------------------------
-// The guest's own read path is 0x991d1c (the value) and 0x991fd8 (the bucket
-// lookup). With reg = the registry base:
-//
-//     0x991d58  ldr  x8, [x21]        ; seed0 = reg+0x00
-//     0x991d6c  eon  x8, x8, x20      ; key0 = ~(seed0 ^ id)
-//     0x991d64  add  x0, x21, #0x20   ; table 1
-//     0x991d88  bl   0x991fd8         ; -> the node
-//     0x991d8c  ldr  x8, [x0, #0x18]  ; the node's value-cell pointer
-//     0x991d9c  ldr  x23, [x8]        ; cell1
-//     0x991d90  ldr  x9, [x21, #8]    ; seed1 = reg+0x08
-//     0x991da0  eon  x8, x9, x20      ; key1 = ~(seed1 ^ id)
-//     0x991d94  add  x0, x21, #0x48   ; table 2
-//     0x991db8  bl   0x991fd8         ; -> the node
-//     0x991dcc  ldr  x8, [x8]         ; cell2
-//     0x991de4  eor  x25, x8, x23     ; cell1 ^ cell2
-//     0x991e88  mvn  x0, x25          ; the value = ~(cell1 ^ cell2)
+// ALSO NOTE: the "+0xc0" of this registry is its LOCK OBJECT, not an "id
+// map" (0x991d54 locks it, 0x991e74 unlocks it).  The earlier comment in
+// race_state_probe.cpp called it an id map; it is not one, and the id map and
+// the value table are not the same thing.
 //
 // The bucket lookup (0x991fd8) works like this:
 //
 //     0x991fec  ldr  x22, [x0, #8]     ; the bucket count, at table+8
 //     0x99200c  fmov w8, s0           ; popcount(count)
 //     0x992010  cmp  x8, #2
-//     0x992014  b.hs #0x992034        ; not a power of two -> modulo
+//     0x992014  b.hs #0x992034        ; popcount >= 2 -> modulo
 //     0x99201c  sub  x9, x22, #1
 //     0x992020  and  x24, x9, x23     ; index = key & (count - 1)
 //     0x992040  udiv x9, x23, x22
@@ -121,14 +140,20 @@ namespace member_value_store {
 // The registry, in the guest's .bss (a link-time VA; the runtime address is
 // bias + this).
 constexpr uintptr_t kRegistryBssVa = 0x1F97980ULL;
-// The two hash seeds the lookup keys are derived from.
-constexpr uintptr_t kSeed0Off = 0x00ULL;
-constexpr uintptr_t kSeed1Off = 0x08ULL;
-// The two tables the VALUE is read from: the bucket array and its count.
+// The four hash seeds, one per table.
+constexpr uintptr_t kSeed0Off = 0x00ULL;  // table 1
+constexpr uintptr_t kSeed1Off = 0x08ULL;  // table 2
+constexpr uintptr_t kSeed2Off = 0x10ULL;  // table 3
+constexpr uintptr_t kSeed3Off = 0x18ULL;  // table 4
+// The four tables: the bucket array and its count.
 constexpr uintptr_t kTable1Off = 0x20ULL;
 constexpr uintptr_t kTable1CountOff = 0x28ULL;
 constexpr uintptr_t kTable2Off = 0x48ULL;
 constexpr uintptr_t kTable2CountOff = 0x50ULL;
+constexpr uintptr_t kTable3Off = 0x70ULL;
+constexpr uintptr_t kTable3CountOff = 0x78ULL;
+constexpr uintptr_t kTable4Off = 0x98ULL;
+constexpr uintptr_t kTable4CountOff = 0xA0ULL;
 // The chain node.
 constexpr uintptr_t kNodeNextOff = 0x00ULL;
 constexpr uintptr_t kNodeKeyOff = 0x08ULL;
@@ -138,6 +163,10 @@ constexpr uintptr_t kNodeCellOff = 0x18ULL;
 // are short (a hash table with a load factor of 1.0); the bound only exists
 // so that a corrupt pointer cannot turn the probe into a hang.
 constexpr int kMaxChainSteps = 64;
+// FNV-1a 64-bit, the guest's own hash (ELF 0x15c3640) and the basis it is
+// called with (0x991df4-0x991e0c).
+constexpr uint64_t kFnv1a64Basis = 0xcbf29ce484222325ULL;
+constexpr uint64_t kFnv1a64Prime = 0x100000001b3ULL;
 
 // What one lookup found. Every piece of it is reported, so that a lookup
 // which goes wrong can be debugged from the log alone.
@@ -147,11 +176,23 @@ struct Lookup {
     uint64_t id{0};
     uint64_t key0{0};
     uint64_t key1{0};
+    uint64_t key2{0};
+    uint64_t key3{0};
     uint64_t node1{0};  // the chain node in table 1
     uint64_t node2{0};  // the chain node in table 2
+    uint64_t node3{0};  // the chain node in table 3
+    uint64_t node4{0};  // the chain node in table 4
     uint64_t cell1{0};  // the 8-byte cell in table 1
     uint64_t cell2{0};  // the 8-byte cell in table 2
+    uint64_t cell3{0};  // the 8-byte cell in table 3
+    uint64_t cell4{0};  // the 8-byte cell in table 4
     int32_t value{0};
+    // The guest's own integrity check: fnv1a64(cell1^cell2^cell3) == cell4.
+    // The guest re-keys the member when it fails; the port cannot (that would
+    // mutate the guest), so it reports the verdict instead.
+    bool checkRan{false};
+    bool verified{false};
+    const char* checkReason{nullptr};
 };
 
 // The guest's own bucket index (ELF 0x991fd8).  The dispatch is by
@@ -184,10 +225,34 @@ inline bool bucketIndex(uint64_t count, uint64_t key, uint64_t* index) {
 }
 
 // The guest's own decode (ELF 0x991de4 / 0x991e88): the value is the
-// complement of the exclusive-or of the two cells.
-inline int32_t decodeValue(uint64_t cell1, uint64_t cell2) {
-    const uint64_t mixed = cell1 ^ cell2;
+// complement of the exclusive-or of cell3 and cell1 -- NOT cell1 and cell2.
+inline int32_t decodeValue(uint64_t cell1, uint64_t cell3) {
+    const uint64_t mixed = cell3 ^ cell1;
     return static_cast<int32_t>(static_cast<uint32_t>(~mixed));
+}
+
+// FNV-1a 64-bit, byte for byte what ELF 0x15c3640 does.
+inline uint64_t fnv1a64(const uint8_t* data, size_t length, uint64_t basis) {
+    uint64_t hash = basis;
+    if (data == nullptr) {
+        return hash;
+    }
+    for (size_t i = 0; i < length; ++i) {
+        hash ^= static_cast<uint64_t>(data[i]);
+        hash *= kFnv1a64Prime;
+    }
+    return hash;
+}
+
+// The guest hashes the EIGHT LITTLE-ENDIAN BYTES of (cell1 ^ cell2 ^ cell3)
+// (ELF 0x991e10 stores the word at sp+0x10 and calls the hash with w1 = 8).
+inline uint64_t guestIntegrityHash(uint64_t cell1, uint64_t cell2, uint64_t cell3) {
+    const uint64_t mixed = cell1 ^ cell2 ^ cell3;
+    uint8_t bytes[8];
+    for (int i = 0; i < 8; ++i) {
+        bytes[i] = static_cast<uint8_t>((mixed >> (i * 8)) & 0xFF);
+    }
+    return fnv1a64(bytes, sizeof(bytes), kFnv1a64Basis);
 }
 
 // Walks ONE bucket chain the way the guest's own lookup helper does.
@@ -255,6 +320,22 @@ const char* findChainNode(Read& read, uint64_t buckets, uint64_t count,
     return "the-chain-is-too-long";
 }
 
+// Reads one table's cell: the node's value-cell pointer, then the cell.
+template <typename Read>
+const char* readCell(Read& read, uint64_t node, uint64_t* cellOut) {
+    uint64_t cellPointer = 0;
+    if (!read(node + kNodeCellOff, &cellPointer)) {
+        return "the-value-cell-is-unreadable";
+    }
+    if (cellPointer == 0) {
+        return "the-value-cell-is-null";
+    }
+    if (!read(cellPointer, cellOut)) {
+        return "the-value-is-unreadable";
+    }
+    return nullptr;
+}
+
 // The guest's own read path (ELF 0x991d1c), without the guest call.
 //
 // `read` is the port's safe read: it takes a guest address and gives back the
@@ -265,68 +346,81 @@ const char* lookup(Read& read, uintptr_t registry, uint64_t id, Lookup* out) {
         return "there-is-no-output";
     }
     out->id = id;
-    uint64_t seed0 = 0;
-    if (!read(registry + kSeed0Off, &seed0)) {
-        return "the-first-seed-is-unreadable";
-    }
-    uint64_t seed1 = 0;
-    if (!read(registry + kSeed1Off, &seed1)) {
-        return "the-second-seed-is-unreadable";
-    }
-    out->key0 = ~(seed0 ^ id);
-    out->key1 = ~(seed1 ^ id);
 
-    uint64_t buckets1 = 0;
-    uint64_t count1 = 0;
-    uint64_t buckets2 = 0;
-    uint64_t count2 = 0;
-    if (!read(registry + kTable1Off, &buckets1)) {
-        return "the-first-table-is-unreadable";
+    uint64_t seeds[4] = {0, 0, 0, 0};
+    const uintptr_t seedOffsets[4] = {kSeed0Off, kSeed1Off, kSeed2Off, kSeed3Off};
+    for (int i = 0; i < 4; ++i) {
+        if (!read(registry + seedOffsets[i], &seeds[i])) {
+            return "a-seed-is-unreadable";
+        }
     }
-    if (!read(registry + kTable1CountOff, &count1)) {
-        return "the-first-table-count-is-unreadable";
-    }
-    if (!read(registry + kTable2Off, &buckets2)) {
-        return "the-second-table-is-unreadable";
-    }
-    if (!read(registry + kTable2CountOff, &count2)) {
-        return "the-second-table-count-is-unreadable";
+    out->key0 = ~(seeds[0] ^ id);
+    out->key1 = ~(seeds[1] ^ id);
+    out->key2 = ~(seeds[2] ^ id);
+    out->key3 = ~(seeds[3] ^ id);
+
+    uint64_t buckets[4] = {0, 0, 0, 0};
+    uint64_t counts[4] = {0, 0, 0, 0};
+    const uintptr_t tableOffsets[4] = {kTable1Off, kTable2Off, kTable3Off, kTable4Off};
+    const uintptr_t countOffsets[4] = {kTable1CountOff, kTable2CountOff,
+                                       kTable3CountOff, kTable4CountOff};
+    for (int i = 0; i < 4; ++i) {
+        if (!read(registry + tableOffsets[i], &buckets[i])) {
+            return "a-table-is-unreadable";
+        }
+        if (!read(registry + countOffsets[i], &counts[i])) {
+            return "a-table-count-is-unreadable";
+        }
     }
 
+    // TABLE 1 and TABLE 3 carry the value.  Both walks have to succeed.
     uint64_t index1 = 0;
+    uint64_t index3 = 0;
+    const char* why = findChainNode(read, buckets[0], counts[0], out->key0,
+                                    &out->node1, &index1);
+    if (why != nullptr) {
+        return why;
+    }
+    why = findChainNode(read, buckets[2], counts[2], out->key2, &out->node3, &index3);
+    if (why != nullptr) {
+        return why;
+    }
+    why = readCell(read, out->node1, &out->cell1);
+    if (why != nullptr) {
+        return why;
+    }
+    why = readCell(read, out->node3, &out->cell3);
+    if (why != nullptr) {
+        return why;
+    }
+
+    out->value = decodeValue(out->cell1, out->cell3);
+
+    // TABLES 2 and 4 carry the integrity check.  They are best effort: the
+    // value is already read, and the guest would have re-keyed the member
+    // rather than refused to answer.
     uint64_t index2 = 0;
-    const char* why = findChainNode(read, buckets1, count1, out->key0,
-                                     &out->node1, &index1);
-    if (why != nullptr) {
-        return why;
+    uint64_t index4 = 0;
+    const char* why2 = findChainNode(read, buckets[1], counts[1], out->key1,
+                                     &out->node2, &index2);
+    const char* why4 = findChainNode(read, buckets[3], counts[3], out->key3,
+                                     &out->node4, &index4);
+    if (why2 == nullptr) {
+        why2 = readCell(read, out->node2, &out->cell2);
     }
-    why = findChainNode(read, buckets2, count2, out->key1, &out->node2, &index2);
-    if (why != nullptr) {
-        return why;
+    if (why4 == nullptr) {
+        why4 = readCell(read, out->node4, &out->cell4);
     }
-
-    uint64_t cellPointer1 = 0;
-    if (!read(out->node1 + kNodeCellOff, &cellPointer1)) {
-        return "the-first-value-cell-is-unreadable";
-    }
-    if (cellPointer1 == 0) {
-        return "the-first-value-cell-is-null";
-    }
-    if (!read(cellPointer1, &out->cell1)) {
-        return "the-first-value-is-unreadable";
-    }
-    uint64_t cellPointer2 = 0;
-    if (!read(out->node2 + kNodeCellOff, &cellPointer2)) {
-        return "the-second-value-cell-is-unreadable";
-    }
-    if (cellPointer2 == 0) {
-        return "the-second-value-cell-is-null";
-    }
-    if (!read(cellPointer2, &out->cell2)) {
-        return "the-second-value-is-unreadable";
+    out->checkRan = (why2 == nullptr) && (why4 == nullptr);
+    if (!out->checkRan) {
+        out->checkReason = (why2 != nullptr) ? why2 : why4;
+        out->verified = false;
+    } else {
+        out->verified =
+            (guestIntegrityHash(out->cell1, out->cell2, out->cell3) == out->cell4);
+        out->checkReason = out->verified ? "none" : "the-integrity-check-did-not-match";
     }
 
-    out->value = decodeValue(out->cell1, out->cell2);
     out->ok = true;
     return nullptr;
 }

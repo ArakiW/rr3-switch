@@ -195,6 +195,15 @@ void logRaceMetrics(unsigned long long frame, const RaceMetricsValueSample& samp
     const uint64_t speedCell1 = (topspeed != nullptr) ? topspeed->cell1 : 0;
     const uint64_t speedCell2 = (topspeed != nullptr) ? topspeed->cell2 : 0;
 
+    // The guest's own integrity check (fnv1a64(cell1^cell2^cell3) == cell4).
+    // The guest answers a failed check by minting a NEW id; the port cannot
+    // do that without mutating the guest, so it reports the verdict.
+    const int lapsVerified = (laps != nullptr && laps->verified) ? 1 : 0;
+    const int lapsCheckRan = (laps != nullptr && laps->checkRan) ? 1 : 0;
+    const char* lapsCheck = (laps != nullptr && laps->checkReason != nullptr)
+                                ? laps->checkReason
+                                : "none";
+
     char detail[1024];
     std::snprintf(
         detail, sizeof(detail),
@@ -203,6 +212,7 @@ void logRaceMetrics(unsigned long long frame, const RaceMetricsValueSample& samp
         "lapsOk=%d lapsWhy=%s lapsKey0=0x%llx lapsKey1=0x%llx "
         "lapsNode1=0x%llx lapsNode2=0x%llx lapsCell1=0x%llx lapsCell2=0x%llx "
         "topspeedOk=%d topspeedWhy=%s topspeedTelemetry=%d "
+        "lapsCheckRan=%d lapsVerified=%d lapsCheck=%s "
         "speedKey0=0x%llx speedKey1=0x%llx "
         "speedNode1=0x%llx speedNode2=0x%llx speedCell1=0x%llx speedCell2=0x%llx",
         frame, static_cast<unsigned long long>(sample.ruleSet),
@@ -222,6 +232,7 @@ void logRaceMetrics(unsigned long long frame, const RaceMetricsValueSample& samp
         (topspeed != nullptr && topspeed->ok) ? 1 : 0,
         sample.topspeedReason != nullptr ? sample.topspeedReason : "none",
         sample.topSpeedTelemetry,
+        lapsCheckRan, lapsVerified, lapsCheck,
         static_cast<unsigned long long>(speedKey0),
         static_cast<unsigned long long>(speedKey1),
         static_cast<unsigned long long>(speedNode1),
@@ -330,6 +341,14 @@ void pumpRaceMetricsProbe(unsigned long long frame) {
             scanWritten += n;
         }
         if (why == nullptr && !laps.ok) {
+            laps = candidate;
+            lapsWhy = nullptr;
+            lapsId = id;
+            lapsSlot = slot;
+        } else if (why == nullptr && candidate.verified && !laps.verified) {
+            // A candidate whose cells satisfy the guest's OWN integrity check
+            // is the right one; a candidate that merely produced a number is
+            // not enough, because a wrong slot can produce a wrong number.
             laps = candidate;
             lapsWhy = nullptr;
             lapsId = id;

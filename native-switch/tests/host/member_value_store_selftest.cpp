@@ -11,23 +11,35 @@
 // WHAT IT CHECKS
 // --------------
 // The port reads the guest's member values (m_nTotalLaps, m_nTopGameSpeed)
-// out of the guest's four-table registry, and the algorithm that does it is
+// out of the guest's FOUR-table registry, and the algorithm that does it is
 // in native-switch/include/rr3/member_value_store.hpp.
 //
 // This self-test builds a registry that looks like the guest's -- the same
-// seeds, the same bucket geometry, the same chain nodes, the same 8-byte
-// value cells -- inserts a member the way the guest's own write path
-// (ELF 0x992518) does, and reads it back with the port's lookup:
+// four seeds, the same bucket geometry, the same chain nodes, the same 8-byte
+// value cells -- inserts a member the way the guest's own write path does,
+// and reads it back with the port's lookup.
 //
-//     table 1 (key0 = ~(seed0 ^ id)) gets the cell  ~(minted ^ value)
-//     table 2 (key1 = ~(seed1 ^ id)) gets the cell  minted
-//     and the read path recovers  ~(cell1 ^ cell2)  ==  value.
+// THE FORMULA IS THE GUEST'S (ELF 0x991d1c):
+//
+//     value = ~(cell3 ^ cell1)
+//
+// cell1 comes from TABLE 1 (reg+0x20, seed reg+0x00) and cell3 from TABLE 3
+// (reg+0x70, seed reg+0x10).  The port used to compute ~(cell1 ^ cell2) --
+// the wrong pair of cells -- and to look the member up in tables 1 and 2
+// only; that is what kept every lookup failing.
+//
+// TABLES 2 and 4 carry the guest's integrity check:
+// fnv1a64(cell1 ^ cell2 ^ cell3) == cell4, with FNV-1a 64-bit over the
+// eight little-endian bytes.  The self-test inserts a cell4 that satisfies
+// it, so the check must PASS, and it also inserts a member whose cell4 does
+// NOT satisfy it, so the check must FAIL while the value still comes out.
 //
 //   THE POSITIVE CONTROL: the value that goes in is the value that comes out.
 //   THE NEGATIVE CONTROL: a member id that was never inserted is NOT found.
 //
-// Both bucket rules are exercised: table 1 has a count that is NOT a power of
-// two (the modulo path) and table 2 has one that is (the masked path).
+// All four bucket rules are exercised: table 1 has a count that is NOT a
+// power of two (the modulo path) and table 3 has one that is (the masked
+// path).
 //
 #include "rr3/member_value_store.hpp"
 
@@ -88,17 +100,24 @@ private:
     std::vector<uint8_t> data_;
 };
 
-// The registry, laid out the way the guest's is.
+// The registry, laid out the way the guest's is: four seeds at +0x00..+0x18
+// and four tables at +0x20/+0x48/+0x70/+0x98.
 struct Registry {
     static constexpr uintptr_t kBase = 0x10000000ULL;
     Arena arena{kBase};
     uintptr_t base{kBase};
     uint64_t seed0{0x0123456789ABCDEFULL};
     uint64_t seed1{0xFEDCBA9876543210ULL};
+    uint64_t seed2{0x0F1E2D3C4B5A6978ULL};
+    uint64_t seed3{0x8877665544332211ULL};
     uint64_t count1{5};  // NOT a power of two: the modulo path
     uint64_t count2{8};  // a power of two: the masked path
+    uint64_t count3{16}; // a power of two: the masked path
+    uint64_t count4{7};  // NOT a power of two: the modulo path
     uintptr_t buckets1{0};
     uintptr_t buckets2{0};
+    uintptr_t buckets3{0};
+    uintptr_t buckets4{0};
 };
 
 uint64_t indexFor(uint64_t count, uint64_t key) {
@@ -125,15 +144,35 @@ uintptr_t addNode(Registry& reg, uintptr_t buckets, uint64_t count, uint64_t key
     return node;
 }
 
-// The guest's own write path, for ONE member (ELF 0x992518).
+// The guest's own write path, for ONE member (ELF 0x992518), modelled on the
+// read path's inverse: the value lives in cells 1 and 3, and cells 2 and 4
+// carry the integrity check.
+//
+//     cell1 = ~(minted ^ value)      ; table 1
+//     cell3 = minted                  ; table 3
+//     => ~(cell3 ^ cell1) == value
+//
+// `breakIntegrity` writes a cell4 that does NOT match the hash, which is the
+// state the guest answers by minting a new id.
 void insertMember(Registry& reg, uint64_t memberId, uint64_t minted,
-                  int32_t value) {
+                  int32_t value, bool breakIntegrity = false) {
     const uint64_t key0 = ~(reg.seed0 ^ memberId);
     const uint64_t key1 = ~(reg.seed1 ^ memberId);
-    const uint64_t cell1 = ~(minted ^ static_cast<uint64_t>(static_cast<int64_t>(value)));
+    const uint64_t key2 = ~(reg.seed2 ^ memberId);
+    const uint64_t key3 = ~(reg.seed3 ^ memberId);
+    const uint64_t asU64 = static_cast<uint64_t>(static_cast<int64_t>(value));
+    const uint64_t cell1 = ~(minted ^ asU64);
     const uint64_t cell2 = minted;
+    const uint64_t cell3 = minted;
+    uint64_t cell4 =
+        rr3::member_value_store::guestIntegrityHash(cell1, cell2, cell3);
+    if (breakIntegrity) {
+        cell4 ^= 0x5A5A5A5A5A5A5A5AULL;
+    }
     addNode(reg, reg.buckets1, reg.count1, key0, cell1);
     addNode(reg, reg.buckets2, reg.count2, key1, cell2);
+    addNode(reg, reg.buckets3, reg.count3, key2, cell3);
+    addNode(reg, reg.buckets4, reg.count4, key3, cell4);
 }
 
 struct Reader {
@@ -144,19 +183,29 @@ struct Reader {
 };
 
 void build(Registry& reg) {
-    // The registry header comes FIRST: the seeds live at its +0x00 and
-    // +0x08, and the bucket arrays must not be laid over them.
-    reg.base = reg.arena.alloc(0x100);
+    // The registry header comes FIRST: the seeds live at its +0x00..+0x18,
+    // and the bucket arrays must not be laid over them.
+    reg.base = reg.arena.alloc(0x200);
     reg.buckets1 = reg.arena.alloc(8 * reg.count1);
     reg.buckets2 = reg.arena.alloc(8 * reg.count2);
+    reg.buckets3 = reg.arena.alloc(8 * reg.count3);
+    reg.buckets4 = reg.arena.alloc(8 * reg.count4);
     reg.arena.put(reg.base + rr3::member_value_store::kSeed0Off, reg.seed0);
     reg.arena.put(reg.base + rr3::member_value_store::kSeed1Off, reg.seed1);
+    reg.arena.put(reg.base + rr3::member_value_store::kSeed2Off, reg.seed2);
+    reg.arena.put(reg.base + rr3::member_value_store::kSeed3Off, reg.seed3);
     reg.arena.put(reg.base + rr3::member_value_store::kTable1Off, reg.buckets1);
     reg.arena.put(reg.base + rr3::member_value_store::kTable1CountOff,
                   reg.count1);
     reg.arena.put(reg.base + rr3::member_value_store::kTable2Off, reg.buckets2);
     reg.arena.put(reg.base + rr3::member_value_store::kTable2CountOff,
                   reg.count2);
+    reg.arena.put(reg.base + rr3::member_value_store::kTable3Off, reg.buckets3);
+    reg.arena.put(reg.base + rr3::member_value_store::kTable3CountOff,
+                  reg.count3);
+    reg.arena.put(reg.base + rr3::member_value_store::kTable4Off, reg.buckets4);
+    reg.arena.put(reg.base + rr3::member_value_store::kTable4CountOff,
+                  reg.count4);
 }
 
 }  // namespace
@@ -177,6 +226,8 @@ int main() {
     check(why == nullptr, "the inserted member is found");
     check(laps.ok, "the lookup reports success");
     check(laps.value == 3, "the lap count comes back as 3");
+    check(laps.checkRan, "the guest's integrity check ran");
+    check(laps.verified, "the guest's integrity check passes");
 
     // A second member, with a different value and a different id.
     const uint64_t speedId = 0x99AABBCCDDEEFF00ULL;
@@ -236,12 +287,34 @@ int main() {
     check(why == nullptr && negative.value == -2048,
           "a negative value comes back as it went in");
 
+    // A member whose integrity check does NOT hold: the guest would answer
+    // by minting a new id, the port cannot (that would mutate the guest), so
+    // the port reports the value AND says the check failed.
+    const uint64_t brokenId = 0x1111222233334444ULL;
+    insertMember(reg, brokenId, 0x777788889999AAA0ULL, 7, true);
+    Lookup broken{};
+    why = rr3::member_value_store::lookup(reader, reg.base, brokenId, &broken);
+    check(why == nullptr && broken.value == 7,
+          "a member with a broken integrity check still reads its value");
+    check(broken.checkRan && !broken.verified,
+          "the broken integrity check is reported as failed");
+
     // The key derivation, spelled out: the port's key is the complement of
     // the exclusive-or of the seed and the id.
     check(laps.key0 == ((~((reg.seed0 ^ lapsId))) & kMask),
           "the first key is ~(seed0 ^ id)");
     check(laps.key1 == ((~((reg.seed1 ^ lapsId))) & kMask),
           "the second key is ~(seed1 ^ id)");
+    check(laps.key2 == ((~((reg.seed2 ^ lapsId))) & kMask),
+          "the third key is ~(seed2 ^ id)");
+    check(laps.key3 == ((~((reg.seed3 ^ lapsId))) & kMask),
+          "the fourth key is ~(seed3 ^ id)");
+
+    // The FNV-1a basis and prime are the guest's, not a port choice.
+    check(rr3::member_value_store::kFnv1a64Basis == 0xcbf29ce484222325ULL,
+          "the FNV-1a 64-bit basis is the guest's");
+    check(rr3::member_value_store::kFnv1a64Prime == 0x100000001b3ULL,
+          "the FNV-1a 64-bit prime is the guest's");
 
     if (g_failures != 0) {
         std::printf("FAILED: %d case(s) did not hold\n", g_failures);
