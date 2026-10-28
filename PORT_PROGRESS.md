@@ -6749,3 +6749,239 @@ it is short. The port's own `errno=12` is the fingerprint of this failure.
   trace plus the `eds/*.plist` opens. Note that a real-time NEURAL upscaler is
   neither needed nor possible here: the material is on the card, and the tier
   is what leaves it unused.
+
+## 2026-10-28: why the picture is soft -- the real mechanism, two dead ends, and the one lever
+
+The user asked: **"能把画质AI高清化到原生720P吗，看着有点糊"** ("can you AI-upscale the
+quality to native 720P? it looks blurry").
+
+The answer is no on the AI part and yes on the substance, but not the way the
+round before assumed.  This entry records what was MEASURED, which two
+premises had to be thrown away, and where the one real lever is.
+
+### 1. What "blurry" actually is
+
+Not a scaling artefact and not a missing-super-resolution problem.  The guest's
+own log (archive `20261028-044415-eden-f1n`, the guest's own `guest-log-any`
+channel) says:
+
+```
+Searching for settings for device: AndroidHigh
+Loaded settings file: AndroidHigh.plist
+3DSceneScale = 1.000000 nScreenSize = 1280x720
+Adding screen: 0, (1280 x 720)
+Res base: 1280x720
+Res order:
+(960.000000, 640.000000) - 1.500000 - gui_assets/960x640/
+(480.000000, 320.000000) - 1.500000 - gui_assets/480x320/
+```
+
+* the **3D scene is already native** -- it renders into a 1280x720 viewport at
+  scale 1.0, so there is nothing to sharpen there;
+* the **2D UI is drawn from a 960x640 atlas into that 1280x720 frame**, i.e.
+  every sprite, icon and glyph is a 1.33x bilinear upscale.  That is the blur.
+
+And the material for a sharp UI is already on the card: the HD volume ships a
+complete `gui_assets/2048x1536` tree (same 53 sub-folders, `common/
+sprites.android.atlas` present) and the guest never picks it.
+
+**A neural upscaler is the wrong tool and is not wanted.**  The Switch has no
+NPU, an ESRGAN-class model costs hundreds of milliseconds per frame, and --
+decisively -- the missing detail is not missing: it is in the 2048x1536 tree
+that the guest is refusing to read.  A super-resolution model would *invent*
+detail that the data already has, at 60 frames per second, on hardware that
+cannot do it.
+
+### 2. Two dead ends, and why they are dead
+
+**(a) "Res order is empty" is a HISTORICAL state, not the bug.**  The empty
+list belongs to the archives from BEFORE the bionic-dirent fix of 2026-10-21
+(`20261021-165605-eden-assetalias` and its neighbours).  In the recent
+archives the list is `['960x640', '480x320']` every time.  Nothing to fix here,
+and changing the tier would not change it either.
+
+**(b) The tier is already the highest one the Android path can reach.**  The
+guest computes a small integer tier and turns it into a profile name:
+
+* `0x12b2970` writes "Android" and then appends the name from a five-entry
+  table at `0x1ec9868`.  The table is in `.data.rel.ro`, so the names come from
+  the `.rela.dyn` addends:
+
+  | tier | addend | string | profile |
+  |---|---|---|---|
+  | 0 | 0x40ce49 | `Low` | `eds/AndroidLow.plist` |
+  | 1 | 0x46cd9e | `Mid` | `eds/AndroidMid.plist` |
+  | 2 | 0x4755d8 | `Mid2` | `eds/AndroidMid2.plist` |
+  | 3 | 0x47afe7 | `High` | `eds/AndroidHigh.plist` |
+  | 4 | 0x496e4b | `XtraHigh` | `eds/AndroidXtraHigh.plist` |
+
+  (`0x12b29cc` handles tier >= 5 by logging "Unknown tier (%d) defaulting to
+  high" and answering `High`.)
+
+* the tier itself is set by `0xad53e4`, from a switch on a device hash, and
+  the values it can take on the Android path are {0,1,2,3}.  The run loads
+  `AndroidHigh.plist`, i.e. tier 3 -- **already the top**.  `AndroidXtraHigh`
+  is not reachable from this path.
+
+So "raise the tier" buys nothing, and neither does "fix the empty list".
+
+### 3. The real mechanism: the guest's own atlas filter
+
+`cc::ImageResManager` (ELF `0x10f8cf8`) enumerates `gui_assets/`, parses each
+folder name with `sscanf("%ux%u")` and keeps a candidate only if
+
+```
+0x10f8ec8  ldur w8, [x29, #-0x54]   ; the width
+0x10f8ecc  cmp  w8, w20             ; the SCREEN width
+0x10f8ed0  b.ls #0x10f8ee0         ; width  <= screenW  -> KEEP
+0x10f8ed4  ldur w8, [x29, #-0x58]   ; the height
+0x10f8ed8  cmp  w8, w21             ; the SCREEN height
+0x10f8edc  b.hi  #0x10f8e8c        ; height > screenH  -> DROP
+```
+
+i.e. **keep iff `width <= screenW || height <= screenH`**.  Against a
+1280x720 screen, 2048x1536 fails both tests (2048 > 1280 and 1536 > 720) and
+is dropped BEFORE the sort -- so it is never even a candidate.
+
+That is why the port's injection of the folder does not help: the guest DOES
+list it (measured, `gui-assets-listing`: `real=480x320 960x640
+injected=2048x1536` for the SD volume and `real=2048x1536 480x320 960x640`
+for the core volume) and drops it anyway.  **This is not a filesystem
+problem.**  The port cannot fix it from the filesystem side.
+
+The screen size is therefore the only lever -- and it is shared with the 3D,
+which is the cost.
+
+### 4. The q1 experiment: the Platform screen is NOT the lever (negative result)
+
+To find out WHICH of the port's several screen-size answers the guest reads,
+the port grew a runtime knob: the card file
+`sdmc:/switch/rr3-native-rehost/rr3-screen.txt` (`platform=WxH`, `ui=WxH`).
+An absent file means today's behaviour, so a run without the file is
+byte-for-byte the run that was measured before.
+
+Round `q1` (480 s) ran with `platform=2048x1152`.  The port's own log line
+proves the override reached the guest:
+
+```
+phase=screen-override ordinal=0 platform=2048x1152 ui=0x0 file=sdmc:/switch/rr3-native-rehost/rr3-screen.txt
+```
+
+and the guest's own log says it did not matter:
+
+```
+Adding screen: 0, (1280 x 720)
+Res base: 1280x720
+```
+
+So `Platform.getScreenWidth/Height` (both the `jni_bridge.cpp` path and the
+`rr3_Platform.cpp` ManagedMethod path) is NOT where the guest's screen size
+comes from.  The measurement was worth the round: it removes a candidate.
+
+### 5. Where the guest's screen size REALLY comes from
+
+**`native-switch/source/guest_view_probe.cpp:2505`:**
+
+```cpp
+reinterpret_cast<void (*)(void*, void*, int, int, int, int)>(changedTarget)(
+    jniEnvironment, activityObject, 1280, 720, 0, 0);
+```
+
+The port calls the guest's `onViewChangedJNI` with a hardcoded 1280x720, and
+the guest's screen manager builds its screen from exactly that ("Adding
+screen: 0, (1280 x 720)"), and so does the atlas filter ("Res base:
+1280x720").
+
+**And the machine for the bigger render ALREADY EXISTS.**  The present path in
+`guest_view_probe.cpp` (around line 8577) renders the guest into the guest's
+own framebuffer and then blits it into the default one:
+
+```cpp
+const GLuint presentFbo = guestViewGlStats().lastBoundFramebuffer;
+glBindFramebuffer(kReadFramebuffer, presentFbo);
+glBindFramebuffer(kDrawFramebuffer, 0);
+blit(0, 0, 1280, 720, 0, 0, 1280, 720, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+```
+
+So "render bigger, present smaller" is a change of NUMBERS in a path that
+already exists, not a new pipeline.  That is also why the 3D would get
+2x SSAA for free: a 2048x1152 render blitted down to 1280x720 is
+supersampling.
+
+### 6. The exact remaining change, site by site
+
+| # | file:line | what it is | what it becomes |
+|---|---|---|---|
+| 1 | `source/guest_view_probe.cpp:2505` | `onViewChangedJNI(..., 1280, 720, ...)` | the view size the knob asks for |
+| 2 | `source/guest_view_probe.cpp:8600` | the present blit, 1:1 `GL_NEAREST` | scaled blit, `GL_LINEAR`, from (viewW,viewH) to (1280,720) |
+| 3 | `source/gfx/gfx_egl.cpp:379` | `eglQuerySurface` answers 1280/720 | the view size |
+| 4 | `source/gfx/gfx_gles.cpp:972,977` | `GL_VIEWPORT` / `GL_SCISSOR_BOX` answer 1280/720 | the view size |
+| 5 | `source/guest_touch_hw.cpp:70` | `kTouchMapping{1280,720,1280,720}` | digitizer (1280x720) -> view (viewW,viewH) |
+| 6 | `source/guest_view_probe.cpp:8302,8346` | the PNG readback, 1280x720 | unchanged (it reads framebuffer 0, the scaled one) |
+
+The open design question is the ASPECT: the HD GUI tree is 2048x1536 (4:3)
+and the display is 16:9.  A 2048x1536 view makes the 2D UI exactly 1:1 and
+perfectly sharp, but the 3D becomes 4:3 and has to be letterboxed or cropped
+at the blit; a 2048x1152 view keeps the 3D correct but leaves the 4:3 atlas
+mismatched.  Whichever is chosen, the TOUCH COORDINATES ALL CHANGE and the
+touch script has to be re-measured from pixels (hop1..hop7), because the UI
+layout moves with the view size.
+
+### 7. A second, independent defect found while looking
+
+`gui/processed/LocalStyles_480x320.gui` and `gui/processed/LocalStyles.gui`
+both FAIL to load, three times each, and `LocalStyles_480x320.gui` is
+requested because the AndroidHigh profile declares
+`GUI_LAYOUT_EXTENSION = "_480x320"`.  **There is no `_480x320` file anywhere
+in the seven volumes** (measured: `romfs_ls.py --grep '_480x320'` returns
+nothing; the volumes ship `gui/processed/common/LocalStyles.gui` and
+per-series copies).  So the guest asks for a stylesheet that does not exist in
+this data, every time.  Whether that is what makes the UI look wrong (rather
+than merely soft) is not yet established; it is a separate item from the
+resolution work.
+
+### 8. What this round changed in the port
+
+* `native-switch/source/gfx/gfx_backend.cpp` -- reads `rr3-screen.txt` once and
+  answers the platform/UI screen sizes from it; logs one
+  `screen-override` line so a run can say which sizes it used.
+* `native-switch/include/rr3/gfx_backend.hpp` -- the four accessors.
+* `native-switch/source/jni_bridge.cpp` -- `Platform.getScreenWidth/Height`
+  consult the knob; absent the file the answers are unchanged (1280x720).
+* `native-switch/source/jni_compat/classes/rr3_Platform.cpp` -- the
+  ManagedMethod path consults the same knob.
+* `native-switch/source/jni_compat/classes/cc_services.cpp` -- the
+  `CCUserInterfaceManager` path consults the `ui=` key.
+* `native-switch/card/rr3-screen.txt` -- the experiment input, in the
+  repository with the measurement it exists for.
+* `tools/Deploy-RR3CardScripts.ps1` -- deploys it with the other four card
+  control scripts (5/5 sha256 verified).
+
+Gates after the change: build exit 0; `Test-RR3Inputs.ps1` exit 0; 29/29
+`native-switch/tests/test_*.py`; `check-cc-symbols.py` 38 resolved / 16
+known-absent / 0 unexpected.
+
+### 9. Still open
+
+* **The view-size change of section 6 is NOT done.**  It is specified site by
+  site above and it is the next piece of work; the aspect question has to be
+  answered first.
+* **The race-metrics probe still reads no values** (`race-metrics ok=0` in
+  both f1m2 and f1n; 844 of 846 samples "the object was not found" and 2
+  "the key is not in the table").  The guest IS in a race (start lights 7,
+  race screen 10, HUD marker 10 in f1n), so the closed loop has nothing to
+  steer on and no lap can be counted.  The `RuleSet_RaceMetrics` object was
+  found exactly twice, at frames 5580 and 5610, with a valid vptr -- so the
+  chain works sometimes and the question is why it stops working.
+* The three residual download errors and the two missing manufacturer sprites
+  are unchanged (see section 4 of the previous entry).
+
+### 10. q1's own numbers
+
+Round `q1` ran 490 s (480 s requested), 5,040 frames, and the front end came
+up normally: `EventMapScreen` 223, `main menu layouts open` 20, `front-end
+layout opened` 4, `md5 mismatch` 0, `download failed` 0, `stat(22)` 0,
+`pixels lit` 921600/921600.  So reporting a 2048x1152 platform screen did not
+break anything -- it simply did not move the guest's screen, which is the
+point of the round.  It is a shorter run than f1n and it never reached the
+race (`start lights` 0, `race screen` 0); it was not meant to.
