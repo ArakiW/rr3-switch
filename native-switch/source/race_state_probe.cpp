@@ -77,6 +77,7 @@
 #include "rr3/race_state_probe.hpp"
 
 #include "rr3/elf_preflight.hpp"
+#include "rr3/member_value_store.hpp"
 #include "rr3/race_metrics_probe.hpp"
 #include "rr3/recovery_guard.hpp"
 
@@ -638,6 +639,50 @@ bool looksLikePointer(uintptr_t bias, uint64_t word) {
     return true;
 }
 
+// ---- reading a member's VALUE ---------------------------------------------
+//
+// The slot holds a DESCRIPTOR, not a number: a 64-bit member id at +0x00 and
+// the name's hash after it.  The number lives in the guest's global value
+// store, and the guest's own accessor (ELF 0x991c8c) is what normally puts
+// it there -- but that accessor also RE-KEYS the member, so a probe must not
+// call it.  The pure read is include/rr3/member_value_store.hpp, and it
+// decodes the value the guest's way: ~(cell3 ^ cell1), out of tables 1 and 3.
+//
+// The id is a ROTATING token: the guest re-keys the member every time it
+// reads one, so the id is read fresh here and never cached.  The guest's own
+// accessor has the same race between the two reads, so a miss is retried
+// once before it is believed.
+struct ValueReader {
+    bool operator()(uintptr_t address, uint64_t* out) const {
+        return readWord(address, out);
+    }
+};
+
+bool readMemberValue(uintptr_t slotAddress, int32_t* value, uint64_t* idOut) {
+    const uintptr_t bias = resolveMainImageLoadBias();
+    if (bias == 0 || value == nullptr) {
+        return false;
+    }
+    const uintptr_t registry = bias + member_value_store::kRegistryBssVa;
+    ValueReader reader;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        uint64_t id = 0;
+        if (!readWord(slotAddress, &id) || id == 0) {
+            return false;
+        }
+        member_value_store::Lookup lookup{};
+        const char* why = member_value_store::lookup(reader, registry, id, &lookup);
+        if (why == nullptr) {
+            *value = lookup.value;
+            if (idOut != nullptr) {
+                *idOut = id;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 // ---- the numeric reading -------------------------------------------------
 //
 // The guest's member names say "m_n..." (an integer) but the guest stores
@@ -766,6 +811,38 @@ void fillMetrics(RaceMetricsSample* out, uintptr_t address) {
     readFloat(address + kOffTotalSpline, &out->totalSplineDistanceF);
     readFloat(address + kOffTopSpeed, &out->topSpeedF);
     readFloat(address + kOffTotalTime, &out->totalTimeF);
+
+    // THE VALUES, read out of the guest's value store.  The words above are
+    // the member DESCRIPTORS (rotating ids and name hashes), which is why
+    // they read as noise: the numbers the engine uses are elsewhere, and
+    // the probe has to ask the value store for them the way the guest does.
+    //
+    // A member that resolves replaces its descriptor reading; one that does
+    // not keeps it, and the mask says which happened.
+    struct MemberSlot {
+        uintptr_t offset;
+        uint32_t* raw;
+        float* asFloat;
+    };
+    const MemberSlot slots[] = {
+        {kOffLapDistance, &out->lapDistance, &out->lapDistanceF},
+        {kOffTotalLaps, &out->totalLaps, &out->totalLapsF},
+        {kOffPreviousSpline, &out->previousSplineDistance,
+         &out->previousSplineDistanceF},
+        {kOffTotalSpline, &out->totalSplineDistance, &out->totalSplineDistanceF},
+        {kOffTopSpeed, &out->topSpeed, &out->topSpeedF},
+        {kOffTotalTime, &out->totalTime, &out->totalTimeF},
+    };
+    out->membersResolved = 0;
+    for (size_t i = 0; i < sizeof(slots) / sizeof(slots[0]); ++i) {
+        int32_t value = 0;
+        if (!readMemberValue(address + slots[i].offset, &value, nullptr)) {
+            continue;
+        }
+        *slots[i].raw = static_cast<uint32_t>(value);
+        *slots[i].asFloat = static_cast<float>(value);
+        out->membersResolved |= (1u << i);
+    }
     out->valid = true;
 }
 
@@ -1207,6 +1284,7 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             "gm_base=%d gm_cand=%d cand=%s rs=0x%llx metrics=%d "
             "active=%d nodes=%d keyoff=%d heap=0x%llx+0x%llx "
             "cls=27RuleSetModifier_RaceMetrics m=0x%llx vptr_ok=%d "
+            "mres=0x%x "
             "laps=%u lapF=%.3f lapd=%u lapdF=%.3f prev=%u total=%u "
             "totalF=%.3f speed=%u speedF=%.3f time=%u timeF=%.3f "
             "rate=%.6f prog=%.3f from_total=%d sawprog=%d "
@@ -1225,6 +1303,7 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             static_cast<unsigned long long>(g_heapSize),
             static_cast<unsigned long long>(m.address),
             (m.vptr == bias + kRaceMetricsVptrElfVa) ? 1 : 0,
+            m.membersResolved,
             m.totalLaps, static_cast<double>(m.totalLapsF),
             m.lapDistance, static_cast<double>(m.lapDistanceF),
             m.previousSplineDistance, m.totalSplineDistance,

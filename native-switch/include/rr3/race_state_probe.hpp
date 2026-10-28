@@ -86,6 +86,11 @@ struct RaceMetricsSample {
     float totalSplineDistanceF{};
     float topSpeedF{};
     float totalTimeF{};
+    // Which of the six members were read out of the guest's value store
+    // (bit 0 = lap distance, 1 = total laps, 2 = previous spline distance,
+    // 3 = total spline distance, 4 = top speed, 5 = total time).  A member
+    // that is NOT in the mask kept its raw descriptor reading.
+    uint32_t membersResolved{};
     // The rate of change of the progress metric, in units per frame.
     double progressRate{};
     // The progress metric the rate was computed from.
