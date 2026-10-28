@@ -440,7 +440,18 @@ void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
 
     if (driving) {
         scripted.leftX = drive.steer;
-        scripted.buttons |= (1u << kBtnA);
+        // THE THROTTLE IS RELEASABLE.  The recovery has to reverse the car
+        // off a barrier, and the guest's own message is "hold the brake to
+        // reverse" -- which only reverses when the throttle is LET GO.
+        // Holding both was just braking, so the recovery could never free
+        // the car: measured on the guest's own controller state, button 0
+        // (the throttle) was down in every single frame of the 2026-10-28
+        // race and button 2 (the brake) was never pressed at all.
+        if (drive.throttle) {
+            scripted.buttons |= (1u << kBtnA);
+        } else {
+            scripted.buttons &= ~(1u << kBtnA);
+        }
         if (drive.brake) {
             scripted.buttons |= (1u << kBtnX);
         } else {

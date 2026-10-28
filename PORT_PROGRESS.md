@@ -7786,3 +7786,129 @@ about (762, 138)).
 * **The touch script has to be re-measured for the HD layout**, or made
   screen-driven (the port currently identifies only the base class
   `N2cc9CloudcellE`, not the concrete screen).
+
+## 2026-10-28 (night, part 4): the car could not turn -- four defects in the drive loop
+
+### 1. What the 2026-10-28 q8 race actually was
+
+The value store was fixed (the previous entry), the race started (the run
+summary says `start lights 7`, `race screen 10`, `race marker: HUD string 10`),
+and the guest's own race clock ran from 0 to 620,402 ms.  The car drove
+**491.68 m** of a **7,056 m** lap and then stopped dead.
+
+The unit is the guest's own: its HUD label "Spline Distance (metres)" at ELF
+0xb35814 multiplies `m_nTotalSplineDistanceTravelled` by 1/256, so
+`total = 125,870` is 491.68 m and `m_nLapDistance = 1,806,336` is
+**7,056.0 m exactly** -- the lap length, constant from the first sample of
+the race.  The track is **Spa-Francorchamps** (`Tracks/spa/...`).
+
+So the car reached **6.97 %** of the lap and ran out of road at the end of
+the start/finish straight.  It did not finish a lap, and the guest's own
+"Total Laps" member (`RuleSet+0x60`) never moved off `0xFFFFFFFF` -- which
+is the guest agreeing, independently of the port.
+
+### 2. FOUR defects, all measured
+
+The diagnosis was done twice, independently: once by me from the archived
+log, and once by a sub-agent that re-implemented `updateDrive()` and
+compared it with the log -- **713 of 713 samples match on steer, mag, sign
+and best, 0 mismatches**.  Both readings agree on the outcome; the
+sub-agent's mechanism is the sharper one.
+
+**(a) THE STEERING FLOOR WAS A NUDGE.**  The magnitude sweep's lower clamp
+was 0.05, i.e. **5 % of the steering axis**.  The guest's own controller
+state confirms it was really transmitted: `ax[0] = +-0.050` with button 0
+(the throttle) held down.  A car that cannot turn runs straight into the
+first corner's barrier.
+
+**(b) THE SERVO'S ANCHOR WAS NEVER SET.**  `g_drive.bestMagnitude` is
+zero-initialised, and the branch that would have assigned it
+(`if (rate > 0 && rate > bestRate)`) was **dead code**: `bestRate` was
+raised to the running maximum on EVERY frame, so at the sweep tick the
+comparison was always false.  The "step back to the best magnitude" branch
+therefore wrote **0** into the magnitude, and the 0.05 clamp pinned it there
+for the rest of the race.  Measured duty cycle: `mag == 0.050` on **43.4 %**
+of the samples, `|steer| <= 0.11` on **67.5 %**, and the autopilot never once
+asked for more than **41 %** of lock.
+
+**(c) "STUCK" WAS READ AS "GOING THE WRONG WAY".**  The sign (the direction
+AROUND THE track) flipped when the progress rate went below -0.0001.  A car
+grinding against a barrier jitters the telemetry by a unit or two, so the
+port read that jitter as "backwards" and reversed the direction around the
+circuit: **24 sign flips** in one race, while the car never moved.
+
+**(d) THE STALL DETECTOR COULD NOT FIRE, AND THE RECOVERY COULD NOT WORK.**
+`stalls` stayed **0** across 713 samples and 18,270 stuck frames, because the
+test was "did the value change AT ALL" and a jammed car jitters.  And even
+when it did fire, the recovery could not have freed the car: the port held
+the **throttle down in every frame**, so throttle+brake was just braking and
+the guest never reversed -- the guest's own message is "hold the brake to
+reverse", which only reverses when the throttle is let go.
+
+### 3. The fix (one file, four edits) plus the throttle
+
+* `bestMagnitude` is initialised with the configured base.
+* The running maximum is folded in **only at the sweep tick**, so the
+  branch that RECORDS a magnitude can fire at all.
+* The floor is the configured base (0.30), not 0.05: "never steer less than
+  the configured base".
+* Progress is a **DISTANCE**, not a nudge: the threshold is 256 units = one
+  metre in the guest's own 1/256 m units (one metre per 240 frames is half
+  a kilometre per hour), so a jammed car registers as a stall.
+* The recovery no longer flips the sign (a stuck car is not a wrong-way car),
+  holds the brake for 240 frames (~7.3 s; 45 frames is a tap), **releases
+  the throttle** so the guest can actually reverse, and holds the opposite
+  lock (0.60) while it does.
+* The race-state log gained `thr=` and `brk=`, so the next round can SEE
+  whether the recovery really let go of the throttle.
+
+### 4. What "Total Laps" is, from the guest's own code
+
+The member at `RuleSet_RaceMetrics+0x60` is written in exactly one place
+besides the constructor: **`RuleSet_RaceMetrics::vfunc[7]` (ELF 0xb35f54)**,
+an event handler.
+
+```
+0xb35fb4  add  x0, x19, #0x60
+0xb35fc4  bl   0xb36448     ; the SATURATING ACCUMULATOR: value + delta, clamped at INT_MAX
+...
+0xb35fdc  bl   0xb5741c     ; the registry
+0xb35fe0  ldr  x1, [x19, #0x60]
+0xb35fe4  bl   0x991d1c     ; read the current value
+0xb35fec  sub  w27, x24, #1  ; value - 1
+0xb3601c  mov  w8, #0x80000000
+0xb36024  csel w2, w24, w27, eq   ; keep INT_MIN as it is, otherwise value - 1
+0xb36030  bl   0x992518     ; insert the new value under a NEW id
+0xb3603c  bl   0x9926c4     ; supersede the old id
+0xb36044  str  x25, [x19, #0x60]  ; the slot gets the new id
+```
+
+So the member is a **counter**: +1 on one event, -1 on another, and the
+constructor (ELF 0xf71650) registers it with the value the ruleset supplied.
+**It is expected to MOVE during a race, and in q8 it never moved at all** --
+which is a second, independent confirmation that no lap event ever fired.
+
+### 5. The harness learned to choose the layout
+
+`tools/Deploy-RR3CardScripts.ps1 -ScreenView 1280x720|2048x1152` rewrites
+the three size lines of `rr3-screen.txt` on a COPY, so the repository's file
+(the HD one, which is what the port ships) is never modified and the layout
+under test is always a parameter rather than an uncommitted edit.  q10 is
+therefore a clean A/B against q8: same layout, same touch script, same
+drive config -- the only difference is the drive loop.
+
+### 6. What q10 has to show
+
+1. `mag=` must stop parking at 0.050 (it should span 0.30..0.95).
+2. `stalls=` must become non-zero the first time the car stops.
+3. The peak `total=` must exceed **125,870 units (491.68 m)**.
+4. The guest's own `ax[0]` in `phase=input-door` must show real values
+   (>= 0.30) and `btn[2]` must appear when the recovery runs.
+5. `laps=` must leave `0xFFFFFFFF`.
+
+If the peak still stalls near 491 m with a real steer, the controller needs
+the lateral-offset read: a bang-bang servo on one scalar cannot follow a
+circuit's curvature, and NONE of the six members the port resolves carries a
+lateral term or a heading.  That read is the next piece of work, and the
+guest's own spline projection (the code behind "Spline Distance (metres)") is
+where to look.

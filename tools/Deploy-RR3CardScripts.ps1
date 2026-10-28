@@ -50,13 +50,27 @@
 .PARAMETER Apply
     Write the files.  Without it the script only prints the plan.
 
+.PARAMETER ScreenView
+    Override the size the port reports to the guest, e.g. "2048x1152" or
+    "1280x720".  The three size lines of rr3-screen.txt (platform, ui and
+    view) are rewritten to this one size.  The card file in the repository
+    is the HD one, which is what the port ships; a measurement round that
+    needs the OLD layout uses this switch instead of editing the file by
+    hand, so the layout under test is always a parameter and never an
+    uncommitted edit.  (The touch script's pixel coordinates were measured
+    on the 1280x720 layout, so a round that has to drive into a race needs
+    that one; the picture the port ships needs the 2048x1152 one.)
+
 .EXAMPLE
     .\Deploy-RR3CardScripts.ps1 -Apply
+.EXAMPLE
+    .\Deploy-RR3CardScripts.ps1 -ScreenView 1280x720 -Apply
 #>
 [CmdletBinding()]
 param(
     [string]$EmulatorRoot = 'E:\Eden',
-    [switch]$Apply
+    [switch]$Apply,
+    [string]$ScreenView = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -67,11 +81,46 @@ $appDir = Join-Path (Join-Path (Join-Path $EmulatorRoot 'user\sdmc') 'switch') '
 $scripts = @('rr3-touch.txt', 'rr3-drive.txt', 'rr3-pad.txt', 'rr3-action.txt',
     'rr3-screen.txt')
 
+# --- the screen override ------------------------------------------------------
+#
+# When -ScreenView is given, rr3-screen.txt is deployed with its three size
+# lines rewritten.  The rewrite happens on a COPY inside the workspace, so
+# the repository's file is never touched and the hash in the plan is the hash
+# of what is actually written.
+$screenOverrideFile = $null
+if ($ScreenView -ne '') {
+    if ($ScreenView -notmatch '^\d+x\d+$') {
+        Write-Host ("refused  : -ScreenView '{0}' is not WIDTHxHEIGHT" -f $ScreenView)
+        exit 1
+    }
+    $original = Join-Path $sourceRoot 'rr3-screen.txt'
+    if (-not (Test-Path -LiteralPath $original -PathType Leaf)) {
+        Write-Host ("preflight: MISSING rr3-screen.txt in {0}" -f $sourceRoot)
+        exit 1
+    }
+    $scratchDir = Join-Path $projectRoot '.build'
+    New-Item -ItemType Directory -Force -Path $scratchDir | Out-Null
+    $screenOverrideFile = Join-Path $scratchDir ('rr3-screen-override-{0}.txt' -f ($ScreenView -replace '[^0-9x]', ''))
+    $rewritten = foreach ($line in (Get-Content -LiteralPath $original)) {
+        if ($line -match '^\s*(platform|ui|view)=') {
+            "{0}={1}" -f $Matches[1], $ScreenView
+        } else {
+            $line
+        }
+    }
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllLines($screenOverrideFile, [string[]]$rewritten, $utf8NoBom)
+    Write-Host ("screen  : -ScreenView {0} (the repository's rr3-screen.txt is NOT modified)" -f $ScreenView)
+}
+
 Write-Host ("card     : {0}" -f $appDir)
 
 # --- 1. preflight ------------------------------------------------------------
 $plan = foreach ($name in $scripts) {
     $source = Join-Path $sourceRoot $name
+    if ($name -eq 'rr3-screen.txt' -and $null -ne $screenOverrideFile) {
+        $source = $screenOverrideFile
+    }
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
         Write-Host ("preflight: MISSING {0} in {1}" -f $name, $sourceRoot)
         exit 1

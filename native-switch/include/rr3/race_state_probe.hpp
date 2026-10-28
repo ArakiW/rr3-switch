@@ -153,6 +153,12 @@ struct RaceDriveState {
     bool enabled{};
     bool discovered{};
     bool brake{};          // the recovery asks for the brake
+    // The throttle. FALSE only while the recovery reverses off a barrier:
+    // the guest's own message is "hold the brake to reverse", and it only
+    // reverses when the throttle is RELEASED -- the port used to hold the
+    // throttle down in every frame, so throttle+brake was just braking and
+    // the recovery could never back the car off anything.
+    bool throttle{true};
     float steer{};
     float magnitude{};
     float bestMagnitude{};

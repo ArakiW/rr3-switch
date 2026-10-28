@@ -784,6 +784,34 @@ double g_smoothedRate = 0.0;
 double g_windowValue = 0.0;
 unsigned long long g_windowFrame = 0;
 unsigned long long g_lastProgressFrame = 0;
+// THE PROGRESS REFERENCE, FOR THE THRESHOLD TEST.
+//
+// The old test was "did the value change AT ALL", and a car grinding
+// against a barrier jitters the spline distance by a unit or two, so the
+// port always believed it was moving.  Measured 2026-10-28 (archive
+// 20261028-213445-eden-q8): the car sat against a wall for 18,270 frames
+// and the stall counter never moved off 0, so the recovery that frees a
+// car from a wall was unreachable.
+//
+// The guest's distance unit is 1/256 metre -- its own HUD label
+// "Spline Distance (metres)" at ELF 0xb35814 multiplies the member by
+// 1/256 -- so 256 units is one metre, and one metre per 240 frames is half
+// a kilometre per hour.  Anything faster than that is progress.
+constexpr double kProgressEpsilon = 256.0;
+double g_lastProgressValue = 0.0;
+bool g_progressMetricIsTotal = true;
+// THE STEERING FLOOR AND THE RECOVERY ANGLE.
+//
+// The floor used to be 0.05, i.e. 5 % of the steering axis: measured on the
+// guest's own controller state as ax[0] = +-0.050, which is 1/12 of the
+// +-0.6 the port's own human-scale experiment used.  A car that cannot turn
+// runs straight into the first corner's barrier.  The recovery angle is the
+// same 0.6, held the OTHER way, while the car reverses.
+constexpr float kDriveMagnitudeFloor = 0.30f;
+constexpr float kDriveRecoveryMagnitude = 0.60f;
+// How long the recovery holds the brake: ~7.3 s at 30.35 ms/frame.  The old
+// value, 45 frames, is a TAP, and a tap does not reverse anything.
+constexpr unsigned long long kDriveRecoveryFrames = 240ULL;
 uint32_t g_lastTotalLaps = 0xFFFFFFFFu;
 unsigned long long g_brakeUntilFrame = 0;
 unsigned long long g_lastFlipFrame = 0;
@@ -1105,6 +1133,8 @@ void updateProgress(unsigned long long frame, RaceMetricsSample* sample) {
         g_haveProgressValue = true;
         g_progressFromTotal = true;
         g_lastProgressFrame = frame;
+        g_lastProgressValue = total;
+        g_progressMetricIsTotal = true;
         g_windowValue = total;
         g_windowFrame = frame;
         g_smoothedRate = 0.0;
@@ -1124,8 +1154,15 @@ void updateProgress(unsigned long long frame, RaceMetricsSample* sample) {
         g_progressFromTotal = false;
     }
     const double value = g_progressFromTotal ? total : lap;
-    const double delta = g_progressFromTotal ? deltaTotal : deltaLap;
-    if (delta != 0.0) {
+    // The live metric can switch, and the two members are not on the same
+    // scale, so the threshold's reference has to start again when it does.
+    if (g_progressFromTotal != g_progressMetricIsTotal) {
+        g_progressMetricIsTotal = g_progressFromTotal;
+        g_lastProgressValue = value;
+    }
+    // PROGRESS IS A DISTANCE, NOT A NUDGE.  See kProgressEpsilon.
+    if (value >= g_lastProgressValue + kProgressEpsilon) {
+        g_lastProgressValue = value;
         g_lastProgressFrame = frame;
         g_sawProgress = true;
     }
@@ -1151,10 +1188,14 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
     g_drive.discovered = sample.metricsFound;
     if (!g_drive.enabled) {
         g_drive.steer = 0.0f;
+        g_drive.brake = false;
+        g_drive.throttle = true;
         return;
     }
     if (sample.activeIndex < 0) {
         g_drive.steer = 0.0f;
+        g_drive.brake = false;
+        g_drive.throttle = true;
         return;
     }
     const RaceMetricsSample& m = sample.metrics[sample.activeIndex];
@@ -1164,11 +1205,27 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
     if (g_drive.magnitude <= 0.0f) {
         g_drive.magnitude = g_driveConfig.base;
         g_drive.sign = g_driveConfig.sign;
+        // THE SERVO'S ANCHOR.  Without it the "step back to the best
+        // magnitude" branch in the sweep below writes ZERO into the
+        // magnitude -- bestMagnitude is zero-initialised and the branch
+        // that would have assigned it was dead code -- and the floor pinned
+        // it there for the rest of the race.  Measured 2026-10-28: the
+        // steering axis sat at 5 % of lock for 43 % of the race and the car
+        // ran into the barrier 491 m into a 7,056 m lap.
+        g_drive.bestMagnitude = g_drive.magnitude;
     }
 
     // A negative rate means the wrong way round: flip. The rate is a
     // 120-frame window, so the flip needs a HYSTERESIS: without one the
     // loop would flip on every window and oscillate.
+    //
+    // A TINY NEGATIVE RATE IS NOT "THE WRONG WAY ROUND".  A car grinding
+    // against a barrier jitters the telemetry by a unit or two, and the
+    // threshold here was -0.0001, so the port read that jitter as "the car
+    // is going backwards" and flipped the direction AROUND THE TRACK.
+    // Measured 2026-10-28: 24 sign flips in one race, while the car sat
+    // still -- the autopilot was steering a car that was not moving, in
+    // both directions in turn.
     if (rate < -0.0001 && frame >= g_lastFlipFrame + 600ULL) {
         g_drive.sign = -g_drive.sign;
         g_lastFlipFrame = frame;
@@ -1177,23 +1234,29 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
         g_smoothedRate = 0.0;
     }
 
-    if (rate > g_drive.bestRate) {
-        g_drive.bestRate = static_cast<float>(rate);
-    }
-
-    // A stall: no progress for a while. The recovery turns the wheel hard
-    // the other way, which is what frees a car that is against a wall, and
-    // asks for the brake: the guest's own message ("hold the brake to
-    // reverse") says the brake is what backs the car off a wall.
+    // A stall: no METRE of progress for a while (the threshold is in
+    // updateProgress).  The recovery turns the wheel hard the other way,
+    // which is what frees a car that is against a wall, and asks for the
+    // brake: the guest's own message ("hold the brake to reverse") says the
+    // brake is what backs the car off a wall.
+    //
+    // THE SIGN IS NOT TOUCHED HERE.  The sign is the direction AROUND THE
+    // TRACK; a car stuck against a wall is not a car going the wrong way,
+    // and flipping it sends the car backwards around the circuit.
+    //
+    // THE THROTTLE IS RELEASED.  The port held the throttle down in every
+    // frame, so throttle+brake was just braking and the guest never
+    // reversed at all.  The guest reverses only when the brake is held and
+    // the throttle is let go.
     if (g_lastProgressFrame != 0 &&
         frame - g_lastProgressFrame > 240ULL) {
         ++g_drive.stalls;
-        g_drive.sign = -g_drive.sign;
         g_drive.bestRate = 0.0f;
         g_lastProgressFrame = frame;
-        g_brakeUntilFrame = frame + 45ULL;
+        g_brakeUntilFrame = frame + kDriveRecoveryFrames;
     }
     g_drive.brake = (g_brakeUntilFrame != 0 && frame <= g_brakeUntilFrame);
+    g_drive.throttle = !g_drive.brake;
 
     // THE MAGNITUDE SWEEP.
     //
@@ -1203,12 +1266,19 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
     // walks the magnitude up and down and remembers the best rate it has
     // seen; a rate that collapses well below the best means the sweep has
     // walked past the peak, so it steps back to the best and reverses.
+    //
+    // THE "BEST" IS ONLY COMPARED AT THE TICK.  The running maximum used to
+    // be folded in on EVERY frame (the `if (rate > g_drive.bestRate)` that
+    // used to sit above the stall test), which made the tick's own
+    // comparison -- "is this rate better than the best?" -- impossible to
+    // ever be true: bestRate was already the maximum, so the branch that
+    // RECORDS the magnitude was dead code and bestMagnitude stayed 0.
     if ((frame % 240ULL) == 0ULL) {
-        if (rate > 0.0 && rate > g_drive.bestRate) {
+        if (rate > g_drive.bestRate) {
             g_drive.bestRate = static_cast<float>(rate);
             g_drive.bestMagnitude = g_drive.magnitude;
         } else if (g_drive.bestRate > 0.0f &&
-                   rate < g_drive.bestRate * 0.7) {
+                   rate < g_drive.bestRate * 0.7f) {
             g_drive.magnitude = g_drive.bestMagnitude;
             g_drive.sweepDirection = -g_drive.sweepDirection;
         }
@@ -1217,12 +1287,26 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
             g_drive.magnitude = 0.95f;
             g_drive.sweepDirection = -1;
         }
-        if (g_drive.magnitude < 0.05f) {
-            g_drive.magnitude = 0.05f;
+        // THE FLOOR IS A STEER, NOT A NUDGE.  It used to be 0.05, i.e. 5 %
+        // of the steering axis, which the guest received as ax[0] = +-0.050.
+        // A car that cannot turn runs straight into the first corner's
+        // barrier, which is exactly what happened.  The floor is now the
+        // configured base, so "never steer less than the configured base".
+        const float floorMagnitude =
+            (g_driveConfig.base > kDriveMagnitudeFloor) ? g_driveConfig.base
+                                                        : kDriveMagnitudeFloor;
+        if (g_drive.magnitude < floorMagnitude) {
+            g_drive.magnitude = floorMagnitude;
             g_drive.sweepDirection = 1;
         }
     }
     g_drive.steer = static_cast<float>(g_drive.sign) * g_drive.magnitude;
+    // WHILE REVERSING, HOLD A DECISIVE ANGLE THE OTHER WAY.  The car has
+    // to come off the barrier pointing back down the track, and the swept
+    // magnitude the servo is still hunting for is not a recovery angle.
+    if (g_drive.brake) {
+        g_drive.steer = -static_cast<float>(g_drive.sign) * kDriveRecoveryMagnitude;
+    }
     if (g_drive.steer > 1.0f) {
         g_drive.steer = 1.0f;
     }
@@ -1289,7 +1373,8 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             "laps=%u lapF=%.3f lapd=%u lapdF=%.3f prev=%u total=%u "
             "totalF=%.3f speed=%u speedF=%.3f time=%u timeF=%.3f "
             "rate=%.6f prog=%.3f from_total=%d sawprog=%d "
-            "drive=%d steer=%.3f mag=%.3f sign=%d best=%.6f flips=%d stalls=%d",
+            "drive=%d steer=%.3f mag=%.3f sign=%d best=%.6f flips=%d stalls=%d "
+            "thr=%d brk=%d",
             frame, static_cast<unsigned long long>(g_cglobal),
             static_cast<unsigned long long>(sample.gameMode),
             sample.gameModeFound ? 1 : 0,
@@ -1316,7 +1401,8 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             g_sawProgress ? 1 : 0,
             g_drive.enabled ? 1 : 0, static_cast<double>(g_drive.steer),
             static_cast<double>(g_drive.magnitude), g_drive.sign,
-            static_cast<double>(g_drive.bestRate), g_drive.flips, g_drive.stalls);
+            static_cast<double>(g_drive.bestRate), g_drive.flips, g_drive.stalls,
+            g_drive.throttle ? 1 : 0, g_drive.brake ? 1 : 0);
     }
     appendGuestBootLine(kGuestViewLogPath, "race-state", 100, 0, detail);
     logGameModeSlots(frame);
