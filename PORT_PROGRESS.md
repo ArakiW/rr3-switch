@@ -6985,3 +6985,130 @@ layout opened` 4, `md5 mismatch` 0, `download failed` 0, `stat(22)` 0,
 break anything -- it simply did not move the guest's screen, which is the
 point of the round.  It is a shorter run than f1n and it never reached the
 race (`start lights` 0, `race screen` 0); it was not meant to.
+
+## 2026-10-28: the race-metrics probe -- an independent audit, two independent bugs
+
+The race-metrics probe reads no values.  In f1m2 and in f1n alike:
+`race-metrics ok=0`, 844 of 846 samples "the object was not found" and 2 "the
+key is not in the table".  The guest IS in a race in those rounds (f1n:
+start lights 7, race screen 10, HUD marker 10), so the closed loop has
+nothing to steer on and no lap can be counted.
+
+The probe was audited against the guest binary from scratch, without taking
+the probe's own comments for granted.  The full report is in
+`.build/race-metrics-audit.md` (a `.build` artefact, so not in the
+repository); this is the part that belongs in the log.
+
+### 1. The two failures are two INDEPENDENT bugs
+
+| failure | share | root cause |
+|---|---|---|
+| `the-race-metrics-object-was-not-found` | 844 / 846 | the probe looks for the GameMode in the wrong place |
+| `the-key-is-not-in-the-table` | 2 / 2 | the value store is implemented for HALF of the guest's structure |
+
+**They are not the same bug, and the 2/846 is not "the lookup nearly works".**
+Those two samples are the STABLE form of a lookup that is completely wrong:
+the key derivation may be off, or a table may have been thrown away.  The
+real measure of that bug is `ok=1` count, which is ZERO.
+
+### 2. The object: the probe looks in three places the guest does not use
+
+The probe's candidates are `CGlobal+{0x10D88, 0x1D88, 0x173F0}`.  The
+runtime log (1195/1204 lines in f1m2, 837/846 in f1n) says:
+
+```
+cand=0/0,0/0,2121177280/211006cd60
+```
+
+* `0x10D88` and `0x1D88` are **0 in every single line**;
+* `0x173F0` holds a 32-bit value that is **not a pointer**;
+* `0x1D88` is **never referenced anywhere in the guest binary**.  The old
+  comment called it "the mis-read where the 0x10000 was dropped" -- it is
+  not a mis-read, it is an invented candidate.
+
+The guest's own way to the GameMode is a different chain (0xf2bba8 /
+0xf2d100 / 0xf2d10c / 0xf2d118):
+
+```
+holder+0x18  ->  h
+h+0x5d8      ->  GameMode
+```
+
+which is the same map the probe walks (`GameMode+0x128`, the "racemetrics"
+entry) -- so the map offset, the node layout, the root offset, the key
+string and both vptr constants are ALL CORRECT (each re-verified
+independently, including the RTTI: `19RuleSet_RaceMetrics` -> vtable
+0x1e4b368 -> address point 0x1e4b378).  The failure happens EARLIER: the
+probe never got the right GameMode.
+
+### 3. The value store: two seeds and two tables, where the guest has four
+
+The guest's read (ELF `0x991d1c`) uses **four** seeds (registry +0x00/0x08/
+0x10/0x18) and **four** tables (+0x20/+0x48/+0x70/+0x98, counts at
++0x28/+0x50/+0x78/+0xa0).  The port's `member_value_store.hpp` reads two of
+them.
+
+What the port has right: the registry address (0x1f97980) and its accessor
+(0xb5741c); the key derivation `~(seed ^ id)`; the 32-byte chain node; and
+the value formula `~(cell1 ^ cell2)`.
+
+What the port does not have: the guest's own **integrity check**
+(0x991e10/0x991e18/0x991e50: `hash(cell3 ^ (cell1 ^ cell2)) == cell4`), and
+when the check fails the guest **mints a new id and re-inserts** the value
+(0x991e58).  A value read without that check is one the guest considers
+invalid.  The header now says so instead of implying otherwise.
+
+### 4. Which member slot -- measured, not argued
+
+The guest's telemetry function reads `this+0x60` and `this+0xa8`; its other
+consumer of the same map entry reads `x+0x50`.  The modifier sits inside the
+RuleSet at +0x40 and its own slots are at modifier+0x08/+0x20/+0x38/+0x50/
++0x68/+0x88, i.e. RuleSet+0x48/+0x60/+0x78/+0x90/+0xa8/+0xc8.  The two
+readings are both arithmetically self-consistent and they name different
+members, so **the code cannot settle it**.
+
+The probe therefore measures it: it tries all seven candidate slots, runs
+the lookup on each, and logs every one of them in a new `race-metrics-scan`
+line.  The next round says which slot the guest's own add names.
+
+### 5. Two failure reasons that were the same string
+
+`the-key-is-not-in-the-table` was returned both for "the chain ran out" and
+for "the guest's own stop condition (the node belongs to another bucket)".
+They are now `the-chain-ended` and `the-node-is-in-another-bucket`.  The
+audit could not attribute the failure because those two were
+indistinguishable in the log.
+
+The bucket dispatch is now written the way the guest writes it: the guest
+counts the bits of the count (0x99200c / 0x992010) and masks only when
+there are fewer than two, rather than the "is it a power of two" form the
+port used.  Same answer for every count this port has seen, but the
+guest's rule is the one that decides.
+
+### 6. What this round changed
+
+* `native-switch/include/rr3/member_value_store.hpp` -- the two reasons
+  split; the bucket dispatch aligned with the guest; the comment rewritten
+  to say what is implemented (2 of 4 tables, no integrity check) instead of
+  implying a verified read.
+* `native-switch/tests/host/member_value_store_selftest.cpp` and
+  `native-switch/tests/test_race_metrics_probe.py` -- the self-tests follow.
+* `native-switch/source/race_metrics_probe.cpp` -- the candidate-slot scan
+  and the `race-metrics-scan` line.
+
+Gates: build exit 0; `Test-RR3Inputs.ps1` exit 0; 29/29
+`native-switch/tests/test_*.py`; `check-cc-symbols.py` 38 resolved / 16
+known-absent / 0 unexpected.
+
+### 7. Still open
+
+* **The GameMode holder.**  The guest's chain is
+  `holder+0x18 -> h -> h+0x5d8 -> GameMode`, but where `holder` sits inside
+  the CGlobal is not yet established; that is the missing piece of the 844.
+* **The guest's name-hash function** (ELF 0x15c3640) has to be ported before
+  the integrity check of section 3 can be performed.
+* **The aspect question of the quality work** (the 2026-10-28 entry above):
+  4:3 at 2048x1536 makes the 2D UI exactly 1:1, 16:9 at 2048x1152 keeps the
+  3D right.  Either way the touch coordinates have to be re-measured.
+* `gui/processed/LocalStyles_480x320.gui` is requested and does not exist in
+  any of the seven volumes.
