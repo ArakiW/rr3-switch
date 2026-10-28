@@ -7182,3 +7182,81 @@ whatever happened to be there.
   scene state was 2 or 3 in every sample.  If the guest is only "in a race"
   for a second, then no probe sampling every thirty frames can watch a lap,
   and the fix is to make the race LAST, not to make the probe quicker.
+
+### 13. The value store was reading the wrong PAIR of cells
+
+The audit said the value store "implements 2 of the guest's 4 tables" and left
+open which of the four carried the value.  The guest's own read path answers
+that, and the answer is not what the port assumed.
+
+`ELF 0x991d1c`, the function that reads a member's value:
+
+```
+0x991d64  add  x0, x21, #0x20   ; TABLE 1
+0x991d6c  eon  x8, x8, x20      ; key0 = ~(seed0 ^ id)
+0x991d88  bl   0x991fd8         ; -> the node
+0x991d8c  ldr  x8, [x0, #0x18]  ; the node's value-cell pointer
+0x991d9c  ldr  x23, [x8]        ; cell1
+0x991d90  ldr  x9, [x21, #8]    ; seed1 = reg+0x08
+0x991d94  add  x0, x21, #0x48   ; TABLE 2
+0x991da0  eon  x8, x9, x20      ; key1
+0x991db8  bl   0x991fd8         ; -> the node
+0x991dcc  ldr  x8, [x8]         ; cell2
+0x991dc0  ldr  x9, [x21, #0x10]  ; seed2 = reg+0x10
+0x991dc4  add  x0, x21, #0x70   ; TABLE 3
+0x991dd0  eon  x9, x9, x20      ; key2
+0x991dec  bl   0x991fd8         ; -> the node
+0x991e00  ldr  x8, [x8]         ; cell3
+0x991de4  eor  x25, x8, x23     ; *** x25 = cell3 ^ cell1 ***
+0x991e10  eor  x8, x8, x25      ; cell2 ^ cell3 ^ cell1
+0x991e18  bl   0x15c3640        ; fnv1a64 of those eight LE bytes
+0x991e24  add  x0, x21, #0x98   ; TABLE 4
+0x991e44  bl   0x991fd8         ; -> the node
+0x991e4c  ldr  x8, [x8]         ; cell4
+0x991e50  cmp  x23, x8          ; the hash == cell4 ?
+0x991e54  b.eq #0x991e70        ; yes -> done
+0x991e58  bl   0x991eac         ; no -> mint a NEW id and re-insert
+0x991e88  mvn  x0, x25          ; *** THE VALUE = ~(cell3 ^ cell1) ***
+```
+
+**THE VALUE IS MADE OF CELLS 1 AND 3.**  The port computed `~(cell1 ^ cell2)`
+-- the wrong pair -- and looked the member up in tables 1 and 2 only, so every
+walk failed with "the key is not in the table" and no number ever came out.
+
+**TABLES 2 AND 4 ARE THE INTEGRITY CHECK**, not the value: the guest hashes
+`cell1 ^ cell2 ^ cell3` and compares the result with the cell in table 4; if
+they differ it MINTS A NEW ID and re-inserts the value (0x991e58), i.e. it
+treats the value it read as tampered with.  The port cannot re-key (that
+would mutate the guest), so it performs the check and REPORTS the verdict.
+
+**THE HASH IS FNV-1a 64-BIT, byte for byte** (ELF 0x15c3640):
+
+```
+0x15c3648  mov  x9, #0x1b3
+0x15c3650  movk x9, #0x100, lsl #32   ; the prime 0x100000001b3
+0x15c3654  ldrb w10, [x0], #1
+0x15c3658  eor  x10, x2, x10           ; h = h ^ byte
+0x15c3660  mul  x2, x10, x9            ; h = h * prime
+```
+
+with the offset basis `0xcbf29ce484222325` built at 0x991df4-0x991e0c -- the
+standard FNV-1a 64-bit basis.  So the check is reproducible in the port, and
+the probe now prefers a candidate slot whose cells SATISFY it, because a
+wrong slot can produce a wrong number.
+
+### 14. What q2 measured, in one table
+
+| question | answer | how |
+|---|---|---|
+| is the port's CGlobal the guest's CGlobal? | **YES** | `eIsVptr=1` in every sample: the object's first word is a vtable address point in `.data.rel.ro` |
+| is `CGlobal+0x10d88` the guest's GameMode slot? | **YES, but only during a race** | `A=0` in the front end, `A=0x212b981da0` while the scene state is 1 (114 of 298 samples) |
+| does the guest's own index agree? | **YES** | `D = *(uint32*)(CGlobal+0x10c78)` is -1 in the front end and 8 during the race; the accessor at 0x1547e68 returns 0 for an index of -1 |
+| is the GameMode reachable from the CGlobal's neighbourhood? | **NO** | the scan found `vptrCands=0` -- not one pointer in 128 KB has a vtable as its first word |
+| was the object found? | **YES, in 155 of 341 samples** | `rs=0x212bd00640 vptrOk=1` |
+| did the lookup read a value? | **NO** | every one of the seven candidate slots answered `ok=0` -- the wrong pair of cells, section 13 |
+
+**AND THE RACE IS NOT SHORT.**  The scene state was 1 (racing) for 114 of the
+298 samples, i.e. more than three thousand frames of the run -- so the guest
+really is in a race for minutes at a time, and the earlier reading of "two
+samples, sixty frames" was the probe MISSING the race, not the race being
+short.  That closes the last open question of the previous entry.
