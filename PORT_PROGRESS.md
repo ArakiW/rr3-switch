@@ -7407,3 +7407,105 @@ burns 6.3 s, a wedged one collapses to zero).
   no longer full-screen, it starts 160 pixels from the left.
 * The race-metrics probe (the goal's other blocker) is untouched by this
   round.
+
+## 2026-10-28 (night): the value store -- two bugs, and the port's own test had pinned the wrong one
+
+### 1. The headline
+
+The lap counter read nothing, ever: 7 candidate slots, two independent
+probes, one error string (`the-node-is-in-another-bucket`), 100% failure.
+Two INDEPENDENT bugs caused it, and one of them had been introduced by the
+port's own "fix" two rounds earlier.
+
+### 2. Bug #1: the bucket slot is NOT the node
+
+The guest's lookup (ELF 0x991fd8) takes the bucket slot and then
+dereferences it:
+
+```
+0x992024  ldr  x20, [x8, x24, lsl #3]   ; x20 = buckets[index]
+0x992070  ldr  x20, [x20]                ; x20 = *buckets[index]  <-- ONE MORE
+0x992078  ldr  x9,  [x20, #8]            ; the node's key
+```
+
+The slot holds the ADDRESS of a cell whose first word is the node.  The
+port used the slot as the node, so it read a garbage key and the guest's own
+"this node belongs to another bucket" stop condition fired on every single
+lookup -- which is precisely the error string that was observed, 100% of the
+time.
+
+**The chain links NODE to NODE** (ELF 0x9920e0 stores the previous head
+NODE into the new node's first word), while the SLOT holds the cell.  Getting
+that distinction wrong breaks the collision case, which is what the host
+self-test caught.
+
+### 3. Bug #2: the wrong PAIR of cells -- and the port's test banned the right one
+
+The value is assembled in two instructions:
+
+```
+0x991de4  eor x25, x8, x23   ; x25 = cell2 ^ cell1
+0x991e88  mvn x0, x25         ; the value is ~(cell1 ^ cell2)
+```
+
+`x8` holds **table 2's** cell and `x23` **table 1's** cell.  The trap is the
+INSTRUCTION ORDER: `0x991de4` executes BEFORE the table-3 lookup at
+`0x991dec`, so `x8` still holds table 2's cell when the XOR runs.  An
+earlier reading took `x8` for table 3's cell and made the port compute
+`~(cell1 ^ cell3)` -- and the port's own unit test then ASSERTED that the
+correct `~(cell1 ^ cell2)` must NOT appear in the source.
+
+**That test was the load-bearing error.**  It is why the wrong formula
+survived a review: the thing that checked it was wrong in the same way.
+
+The full shape of the guest's read (ELF 0x991d1c), now reproduced exactly:
+
+| step | guest | port (now) |
+|---|---|---|
+| table 1 (reg+0x20, seed reg+0x00) | cell1 | node1 -> cell1 |
+| table 2 (reg+0x48, seed reg+0x08) | cell2 | node2 -> cell2 |
+| **the value** | `mvn x0, x25` where `x25 = cell2 ^ cell1` | `~(cell1 ^ cell2)` |
+| table 3 (reg+0x70, seed reg+0x10) | cell3 | node3 -> cell3 |
+| table 4 (reg+0x98, seed reg+0x18) | cell4 | node4 -> cell4 |
+| the integrity check | `fnv1a64(cell1^cell2^cell3) == cell4` | the same |
+
+The port used to read the value out of tables 1 and 3 and run the check on
+tables 2 and 4 -- the wrong two tables for each half.
+
+### 4. How the contradiction was settled
+
+Two sub-agents disagreed about the XOR (one said cell3, the other cell2) and
+a third claim -- "the bucket slot is a cell address" -- was easy to believe
+and easy to get wrong.  Neither was voted on.  The disassembly was read
+again, instruction by instruction, and the order of the instructions
+settles it: `x8` is table 2's cell at `0x991de4` because table 3 has not
+been looked up yet.
+
+The same method settled the slot question: `0x992024` takes the slot,
+`0x992070` dereferences it, and `0x9920e0` shows what the chain links.
+
+### 5. What changed
+
+* `member_value_store.hpp`: `decodeValue(cell1, cell2)`; `findChainNode`
+  dereferences the slot once more; `lookup()` reads the value out of tables
+  1 and 2 and runs the integrity check on tables 3 and 4.
+* The host self-test builds the bucket slot the way the guest's insert does
+  (a cell whose first word is the node) and links node to node.
+* The python mirror of the algorithm models the same thing.
+* The static assertions were INVERTED: they now require `cell1 ^ cell2` and
+  forbid `cell3 ^ cell1`, and they require the extra dereference.
+
+Gates: build exit 0, Test-RR3Inputs exit 0, 29/29 python tests, cc symbols
+38 resolved / 16 known-absent / 0 unexpected.
+
+### 6. Still open
+
+* **The lap counter has to be RE-MEASURED.**  Everything above is a reading
+  of the guest's algorithm; the value has not yet been observed coming out
+  of a live run.
+* The lap member's exact slot is now known statically:
+  `RuleSet_RaceMetrics + 0x60` is `m_nTotalLaps`, and the guest reads it
+  through `0x991c8c` (the accessor that RE-KEYS the member, so the port
+  must not call it).  The port's own probe resolves the member id from the
+  slot and then reads the global value store, which is what this fix
+  repairs.

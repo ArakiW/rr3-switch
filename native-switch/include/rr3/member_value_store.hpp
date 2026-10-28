@@ -122,6 +122,17 @@
 //     node+0x10  the key again (the guest compares it too)
 //     node+0x18  a pointer to the 8-byte value cell
 //
+// BUT THE BUCKET SLOT IS NOT THE NODE.  The guest does
+//
+//     0x992024  ldr  x20, [x8, x24, lsl #3]   ; x20 = buckets[index]
+//     0x992070  ldr  x20, [x20]                ; x20 = *buckets[index]
+//
+// so the slot holds the ADDRESS of a cell whose first word is the node.
+// Treating the slot as the node -- which is what this port used to do --
+// made every key read garbage and every lookup stop with
+// "the-node-is-in-another-bucket": the 2026-10-28 measurement, where seven
+// candidate slots and two independent probes all failed the same way.
+//
 // The guest also STOPS the walk as soon as a node belongs to a different
 // bucket (0x992084 for the masked path, 0x992110 for the modulo path), and
 // this header stops there too.
@@ -225,9 +236,19 @@ inline bool bucketIndex(uint64_t count, uint64_t key, uint64_t* index) {
 }
 
 // The guest's own decode (ELF 0x991de4 / 0x991e88): the value is the
-// complement of the exclusive-or of cell3 and cell1 -- NOT cell1 and cell2.
-inline int32_t decodeValue(uint64_t cell1, uint64_t cell3) {
-    const uint64_t mixed = cell3 ^ cell1;
+// complement of the exclusive-or of cell1 and cell2.
+//
+//     0x991de4  eor x25, x8, x23   ; x25 = cell2 ^ cell1
+//     0x991e88  mvn x0, x25         ; the value is ~(cell1 ^ cell2)
+//
+// x8 holds the cell of TABLE 2 (reg+0x48) and x23 the cell of TABLE 1
+// (reg+0x20).  The instruction at 0x991de4 EXECUTES BEFORE the table-3
+// lookup at 0x991dec, so x8 still holds table 2's cell at that point.  An
+// earlier reading of the same instruction took x8 for table 3's cell and
+// made the port compute ~(cell1 ^ cell3); the order of the instructions
+// says otherwise, and the fix is to look the member up in tables 1 and 2.
+inline int32_t decodeValue(uint64_t cell1, uint64_t cell2) {
+    const uint64_t mixed = cell1 ^ cell2;
     return static_cast<int32_t>(static_cast<uint32_t>(~mixed));
 }
 
@@ -269,9 +290,19 @@ const char* findChainNode(Read& read, uint64_t buckets, uint64_t count,
     if (buckets == 0) {
         return "the-bucket-array-is-null";
     }
-    uint64_t node = 0;
-    if (!read(buckets + index * 8, &node)) {
+    uint64_t cell = 0;
+    if (!read(buckets + index * 8, &cell)) {
         return "the-bucket-is-unreadable";
+    }
+    // THE SLOT IS NOT THE NODE: it holds the address of a cell whose first
+    // word is the node (ELF 0x992024 then 0x992070).  One indirection more
+    // than this port used to do.
+    uint64_t node = 0;
+    if (cell == 0) {
+        return "the-chain-ended";
+    }
+    if (!read(cell, &node)) {
+        return "the-bucket-cell-is-unreadable";
     }
     for (int step = 0; step < kMaxChainSteps; ++step) {
         if (node == 0) {
@@ -373,15 +404,21 @@ const char* lookup(Read& read, uintptr_t registry, uint64_t id, Lookup* out) {
         }
     }
 
-    // TABLE 1 and TABLE 3 carry the value.  Both walks have to succeed.
+    // THE VALUE IS MADE OF CELLS 1 AND 2 (tables 1 and 2); the INTEGRITY
+    // CHECK is made of CELLS 3 AND 4 (tables 3 and 4).  The guest reads the
+    // four tables in that order -- 0x991d88 (table 1), 0x991db8 (table 2),
+    // 0x991dec (table 3), 0x991e44 (table 4) -- assembles the value from
+    // the first two (0x991de4), feeds the first three to the hash
+    // (0x991e10) and compares the result with the fourth (0x991e50).
     uint64_t index1 = 0;
-    uint64_t index3 = 0;
+    uint64_t index2 = 0;
     const char* why = findChainNode(read, buckets[0], counts[0], out->key0,
                                     &out->node1, &index1);
     if (why != nullptr) {
         return why;
     }
-    why = findChainNode(read, buckets[2], counts[2], out->key2, &out->node3, &index3);
+    why = findChainNode(read, buckets[1], counts[1], out->key1, &out->node2,
+                         &index2);
     if (why != nullptr) {
         return why;
     }
@@ -389,31 +426,31 @@ const char* lookup(Read& read, uintptr_t registry, uint64_t id, Lookup* out) {
     if (why != nullptr) {
         return why;
     }
-    why = readCell(read, out->node3, &out->cell3);
+    why = readCell(read, out->node2, &out->cell2);
     if (why != nullptr) {
         return why;
     }
 
-    out->value = decodeValue(out->cell1, out->cell3);
+    out->value = decodeValue(out->cell1, out->cell2);
 
-    // TABLES 2 and 4 carry the integrity check.  They are best effort: the
+    // TABLES 3 and 4 carry the integrity check.  They are best effort: the
     // value is already read, and the guest would have re-keyed the member
     // rather than refused to answer.
-    uint64_t index2 = 0;
+    uint64_t index3 = 0;
     uint64_t index4 = 0;
-    const char* why2 = findChainNode(read, buckets[1], counts[1], out->key1,
-                                     &out->node2, &index2);
+    const char* why3 = findChainNode(read, buckets[2], counts[2], out->key2,
+                                     &out->node3, &index3);
     const char* why4 = findChainNode(read, buckets[3], counts[3], out->key3,
                                      &out->node4, &index4);
-    if (why2 == nullptr) {
-        why2 = readCell(read, out->node2, &out->cell2);
+    if (why3 == nullptr) {
+        why3 = readCell(read, out->node3, &out->cell3);
     }
     if (why4 == nullptr) {
         why4 = readCell(read, out->node4, &out->cell4);
     }
-    out->checkRan = (why2 == nullptr) && (why4 == nullptr);
+    out->checkRan = (why3 == nullptr) && (why4 == nullptr);
     if (!out->checkRan) {
-        out->checkReason = (why2 != nullptr) ? why2 : why4;
+        out->checkReason = (why3 != nullptr) ? why3 : why4;
         out->verified = false;
     } else {
         out->verified =

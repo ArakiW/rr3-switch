@@ -21,14 +21,14 @@
 //
 // THE FORMULA IS THE GUEST'S (ELF 0x991d1c):
 //
-//     value = ~(cell3 ^ cell1)
+//     value = ~(cell1 ^ cell2)
 //
-// cell1 comes from TABLE 1 (reg+0x20, seed reg+0x00) and cell3 from TABLE 3
-// (reg+0x70, seed reg+0x10).  The port used to compute ~(cell1 ^ cell2) --
-// the wrong pair of cells -- and to look the member up in tables 1 and 2
-// only; that is what kept every lookup failing.
+// cell1 comes from TABLE 1 (reg+0x20, seed reg+0x00) and cell2 from TABLE 2
+// (reg+0x48, seed reg+0x08).  The port used to compute ~(cell1 ^ cell3) --
+// the wrong pair of cells, and the wrong pair of tables -- and to look the
+// member up in tables 1 and 3; that is what kept every lookup failing.
 //
-// TABLES 2 and 4 carry the guest's integrity check:
+// TABLES 3 and 4 carry the guest's integrity check:
 // fnv1a64(cell1 ^ cell2 ^ cell3) == cell4, with FNV-1a 64-bit over the
 // eight little-endian bytes.  The self-test inserts a cell4 that satisfies
 // it, so the check must PASS, and it also inserts a member whose cell4 does
@@ -131,8 +131,16 @@ uintptr_t addNode(Registry& reg, uintptr_t buckets, uint64_t count, uint64_t key
                   uint64_t cell) {
     const uint64_t index = indexFor(count, key);
     const uintptr_t slot = buckets + index * 8;
+    // The chain links NODE to NODE (ELF 0x9920e0: the new node's next word
+    // is the previous head NODE), while the SLOT holds the address of a cell
+    // whose first word is the head node.  So the previous node has to be read
+    // out of that cell, not used as the link itself.
+    uint64_t headCell = 0;
     uint64_t head = 0;
-    reg.arena.read(slot, &head);
+    reg.arena.read(slot, &headCell);
+    if (headCell != 0) {
+        reg.arena.read(headCell, &head);
+    }
     const uintptr_t node = reg.arena.alloc(32);
     reg.arena.put(node + rr3::member_value_store::kNodeNextOff, head);
     reg.arena.put(node + rr3::member_value_store::kNodeKeyOff, key);
@@ -140,17 +148,22 @@ uintptr_t addNode(Registry& reg, uintptr_t buckets, uint64_t count, uint64_t key
     const uintptr_t cellPointer = reg.arena.alloc(8);
     reg.arena.put(cellPointer, cell);
     reg.arena.put(node + rr3::member_value_store::kNodeCellOff, cellPointer);
-    reg.arena.put(slot, node);
+    // THE SLOT HOLDS THE ADDRESS OF A CELL WHOSE FIRST WORD IS THE NODE
+    // (ELF 0x992024 takes buckets[index], 0x992070 takes *buckets[index]),
+    // not the node itself.
+    const uintptr_t slotCell = reg.arena.alloc(8);
+    reg.arena.put(slotCell, node);
+    reg.arena.put(slot, slotCell);
     return node;
 }
 
 // The guest's own write path, for ONE member (ELF 0x992518), modelled on the
-// read path's inverse: the value lives in cells 1 and 3, and cells 2 and 4
+// read path's inverse: the value lives in cells 1 and 2, and cells 3 and 4
 // carry the integrity check.
 //
 //     cell1 = ~(minted ^ value)      ; table 1
-//     cell3 = minted                  ; table 3
-//     => ~(cell3 ^ cell1) == value
+//     cell2 = minted                  ; table 2
+//     => ~(cell1 ^ cell2) == value
 //
 // `breakIntegrity` writes a cell4 that does NOT match the hash, which is the
 // state the guest answers by minting a new id.

@@ -396,14 +396,14 @@ class SyntheticRegistry:
     (ELF 0x991d1c):
 
         table 1 (key0 = ~(seed0 ^ id)) gets the cell  ~(minted ^ value)
-        table 3 (key2 = ~(seed2 ^ id)) gets the cell  minted
-        table 2 (key1 = ~(seed1 ^ id)) gets a cell
+        table 2 (key1 = ~(seed1 ^ id)) gets the cell  minted
+        table 3 (key2 = ~(seed2 ^ id)) gets a cell
         table 4 (key3 = ~(seed3 ^ id)) gets the integrity hash
 
-    and the read path recovers  ~(cell3 ^ cell1)  ==  value.
+    and the read path recovers  ~(cell1 ^ cell2)  ==  value.
 
-    THE VALUE IS MADE OF CELLS 1 AND 3.  The port used to compute
-    ~(cell1 ^ cell2) -- the wrong pair -- which is why every lookup failed.
+    THE VALUE IS MADE OF CELLS 1 AND 2 (tables 1 and 2).  TABLES 3 and 4
+    carry the integrity check: fnv1a64(cell1 ^ cell2 ^ cell3) == cell4.
     """
 
     def __init__(self, seed0, seed1, count1, count2,
@@ -433,16 +433,22 @@ class SyntheticRegistry:
         cell4 = guest_integrity_hash(cell1, cell2, cell3)
         if break_integrity:
             cell4 ^= 0x5A5A5A5A5A5A5A5A
-        self.table1[bucket_index(self.count1, key0)].append((key0, cell1))
-        self.table2[bucket_index(self.count2, key1)].append((key1, cell2))
-        self.table3[bucket_index(self.count3, key2)].append((key2, cell3))
-        self.table4[bucket_index(self.count4, key3)].append((key3, cell4))
+        self.table1[bucket_index(self.count1, key0)].append(((key0, cell1),))
+        self.table2[bucket_index(self.count2, key1)].append(((key1, cell2),))
+        self.table3[bucket_index(self.count3, key2)].append(((key2, cell3),))
+        self.table4[bucket_index(self.count4, key3)].append(((key3, cell4),))
 
     def find(self, table, count, key):
         index = bucket_index(count, key)
         if index is None:
             return None, "the-table-has-no-buckets"
-        for node_key, cell in table[index]:
+        # THE BUCKET SLOT IS NOT THE NODE: the guest takes buckets[index] and
+        # then dereferences it (ELF 0x992024, then 0x992070), so the slot
+        # holds the address of a cell whose first word is the node.  The
+        # port used to treat the slot as the node, which made every key read
+        # garbage and every lookup stop with "the-node-is-in-another-bucket".
+        for slot_cell in table[index]:
+            node_key, cell = slot_cell[0]
             if node_key == key:
                 return (node_key, cell), None
             node_index = bucket_index(count, node_key)
@@ -460,22 +466,22 @@ class SyntheticRegistry:
         key1 = (~(self.seed1 ^ member_id)) & MASK
         key2 = (~(self.seed2 ^ member_id)) & MASK
         key3 = (~(self.seed3 ^ member_id)) & MASK
-        # TABLES 1 AND 3 CARRY THE VALUE.  Tables 2 and 4 carry the integrity
+        # TABLES 1 AND 2 CARRY THE VALUE.  Tables 3 and 4 carry the integrity
         # check (ELF 0x991de4 / 0x991e10 / 0x991e50).
         node1, why = self.find(self.table1, self.count1, key0)
         if why is not None:
             return None, why, False
-        node3, why = self.find(self.table3, self.count3, key2)
+        node2, why = self.find(self.table2, self.count2, key1)
         if why is not None:
             return None, why, False
         cell1 = node1[1]
-        cell3 = node3[1]
-        value = to_int32((~(cell3 ^ cell1)) & MASK)
-        node2, why2 = self.find(self.table2, self.count2, key1)
+        cell2 = node2[1]
+        value = to_int32((~(cell1 ^ cell2)) & MASK)
+        node3, why3 = self.find(self.table3, self.count3, key2)
         node4, why4 = self.find(self.table4, self.count4, key3)
         verified = False
-        if why2 is None and why4 is None:
-            cell2 = node2[1]
+        if why3 is None and why4 is None:
+            cell3 = node3[1]
             cell4 = node4[1]
             verified = guest_integrity_hash(cell1, cell2, cell3) == cell4
         return value, None, verified
@@ -600,13 +606,18 @@ def main() -> int:
         "the port does not take the key modulo the count")
     assert "~(seed0 ^ id)" in store and "~(seed1 ^ id)" in store, (
         "the port does not derive its keys as ~(seed ^ id)")
-    # THE VALUE IS MADE OF CELLS 1 AND 3.  The port used to compute
-    # ~(cell1 ^ cell2) -- the wrong pair -- which is why every lookup failed
-    # with "the key is not in the table".
-    assert "cell3 ^ cell1" in store and "~mixed" in store, (
-        "the port does not decode the value as ~(cell3 ^ cell1)")
-    assert "cell1 ^ cell2" not in store.split("decodeValue")[1][:400], (
-        "the port still decodes the value from cells 1 and 2")
+    # THE VALUE IS MADE OF CELLS 1 AND 2, and the port has to look the
+    # member up in TABLES 1 AND 2 to get them.  The port used to compute
+    # ~(cell3 ^ cell1) out of tables 1 and 3 -- the wrong pair of cells and
+    # the wrong pair of tables.
+    assert "cell1 ^ cell2" in store and "~mixed" in store, (
+        "the port does not decode the value as ~(cell1 ^ cell2)")
+    assert "cell3 ^ cell1" not in store.split("decodeValue")[1][:400], (
+        "the port still decodes the value from cells 1 and 3")
+    # THE BUCKET SLOT IS NOT THE NODE: the guest takes buckets[index] and
+    # then dereferences it (ELF 0x992024, then 0x992070).
+    assert "the-bucket-cell-is-unreadable" in store, (
+        "the port does not dereference the bucket slot once more")
     # The guest's integrity check: FNV-1a 64-bit over the eight
     # little-endian bytes of cell1 ^ cell2 ^ cell3, compared with cell4.
     assert "kFnv1a64Basis = 0xcbf29ce484222325" in store, (
