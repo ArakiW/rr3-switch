@@ -8252,3 +8252,83 @@ member names were scanned; the only speed members are `m_nTopGameSpeed` (a
 MAXIMUM), `m_fDollySpeed`, `m_fPedestalSpeed`, `m_nMinCarVelocitySwitchTime`,
 `m_Start_Vel` and `m_End_Vel`.  That is why the stall detector has to work
 off distance.
+
+## 2026-10-29 (part 2): the steering signal was in the guest all along -- aim at ITS target
+
+### 1. The measurement that started it
+
+The guest's own debug object registers, in one function (ELF 0xd052e0), the
+names of the things a car knows about its own place on the track:
+
+```
+0xd052e0  ldr w1, [x19, #0x20]   "m_nPrevNode"
+0xd052f0  ldr w1, [x19, #0x24]   "m_nCurrentNode"
+0xd05304  add x20, x19, #0x50     "m_nIdealNodeJump"
+0xd05328  ldr w1, [x19, #0x28]   "m_nCamNum"
+0xd05338  ldr w1, [x19, #0x2c]   "m_savedCameraIndex"
+0xd05348  ldr w1, [x19, #0x30]   "x"   0xd05368  ldr w1, [x19, #0x34]   "y"    >  m_vPosition
+0xd05388  ldr w1, [x19, #0x38]   "z"   /
+0xd053c0  ldr w1, [x19, #0x3c]   "x"   0xd053d8  ldr w1, [x19, #0x40]   "y"    >  m_vLastKnownTarget
+0xd053f0  ldr w1, [x19, #0x44]   "z"   /
+```
+
+And the copy that fills it (ELF 0xd05184) shows where the values come from:
+a 68-byte-per-record array (the base at x19+0x158, the index at x19+0x2c,
+the stride 0x44) -- and the record's own layout:
+
+```
++0x08  m_nCurrentNode          +0x0c  m_nCamNum
++0x10  the position's x,y      +0x18  the position's z
++0x1c or +0x28  the target's x,y + z
+```
+
+⇒ **THE CAR HAS ITS WORLD POSITION AND THE POINT IT IS AIMING AT.**
+All 32-bit integers in the guest's 1/256 metre unit.
+
+### 2. What that buys: a pure-pursuit controller
+
+The port was steering on ONE scalar -- the progress rate along the spline --
+and three measured rounds (q8, q10, q11) agree on why that fails: a single
+scalar cannot say "the road curves and I am not following it" apart from "I
+am off the road", so the controller's best strategy is always "go as
+straight as possible", and the car leaves the road at 491 m of a 7,056 m lap.
+
+The guest's own AI drives each car towards its m_vLastKnownTarget, so the
+port can drive by the same pair:
+
+```
+heading = the car's direction of travel, from the difference of two
+          position samples (this object carries no heading of its own);
+desired = the direction from the car to the target;
+error   = the signed angle from the heading to the desired direction;
+axis    = clamp(error / steergain, -1, +1).
+```
+
+A positive axis 0 steers RIGHT (MEASURED, .build/rr3-pad-mirror.txt: lx=+0.6
+at the launch ended up on the right runoff), and the world frame's
+handedness is the ONE thing in this that is not measured, so the sign is a
+config knob (`steersign`) and the log carries `perr=` -- **one round settles
+it**.  The magnitude servo stays as the fallback for when there is no
+target.
+
+### 3. The touch script's fragility is gone too
+
+The guest draws a **red glove cursor** on the control it wants pressed, so
+"where do I press" is a question the guest answers.  `tools/follow_glove.py`
+differences the port's own framebuffer captures -- the PRESENTED screen,
+which is the coordinate space the touch file expects -- and finds the glove:
+a colour mask cannot separate it from the red car behind it, but the glove
+ANIMATES, so it is the thing that MOVES between two frames of the same
+screen.
+
+MEASURED in q17, at the SHIPPING 2048x1152 layout: the watcher appended 42
+events and **the port injected all 42** into the guest (the counts match
+exactly), and the guest walked from the loading screen to the
+**EventMapScreen** on its own.  The legacy script's problems -- pixel
+coordinates tied to one layout, hops anchored to frame numbers that miss
+when the guest loads slower -- are gone: the glove is at (762,126) on the
+event card and at (1120,45) on another screen, and the tool follows it.
+
+The deploy script grew `-TouchMode glove` for this: it writes a
+COMMENTS-ONLY touch file, so the port's touch control owns the touch path
+but injects nothing until the host appends a line.
