@@ -91,14 +91,28 @@ struct RaceMetricsSample {
     // 3 = total spline distance, 4 = top speed, 5 = total time).  A member
     // that is NOT in the mask kept its raw descriptor reading.
     uint32_t membersResolved{};
-    // THE GUEST'S OWN PER-CAR TRACK STATE: the distance along the spline and
-    // the distance ACROSS it.  A single scalar cannot tell "the road curves
-    // and I am not following it" apart from "I am off the road", so these two
-    // are what the autopilot needs; WHICH is which is not established yet, so
-    // both are reported raw next to the port's own spline distance.
+    // THE GUEST'S OWN PER-CAR STATE.
+    //
+    // The chain, each step proved by the guest's own code:
+    //     RuleSet_RaceMetrics + 0x20   -> CAR         (ELF 0xb35c94)
+    //     CAR + 0x288                   -> CAR_STATE   (ELF 0xb35ce8)
+    //     CAR_STATE + 0x1a8             = the SPLINE NODE INDEX   (int)
+    //     CAR_STATE + 0x1c8             = the DISTANCE TRAVELLED  (int)
+    // and the car itself carries its CURRENT and PREVIOUS spline node
+    // (CAR+0x24 / CAR+0x20) and its WORLD POSITION (CAR+0x30/+0x34/+0x38).
+    //
+    // The position is what a lateral offset would be computed FROM: the
+    // guest computes the racing-line offset in its projection and does not
+    // store it, but it stores everything the projection needs.
+    uintptr_t carAddress{};
+    uint32_t carPrevNode{};
+    uint32_t carNode{};
+    float carX{};
+    float carY{};
+    float carZ{};
     uintptr_t trackStateAddress{};
-    uint32_t trackAlong{};
-    uint32_t trackAcross{};
+    uint32_t splineNode{};
+    uint32_t splineDistance{};
     // The rate of change of the progress metric, in units per frame.
     double progressRate{};
     // The progress metric the rate was computed from.

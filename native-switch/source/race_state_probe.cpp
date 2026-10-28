@@ -816,43 +816,57 @@ uint32_t g_lastTotalLaps = 0xFFFFFFFFu;
 unsigned long long g_brakeUntilFrame = 0;
 unsigned long long g_lastFlipFrame = 0;
 
-// THE GUEST'S OWN PER-CAR TRACK STATE.
+// THE GUEST'S OWN PER-CAR STATE.
 //
 // The port could read how FAR the car had come along the spline, and that is
 // enough to notice a car that is not moving -- but not enough to steer it,
 // because one scalar cannot say "the road curves and I am not following it"
-// apart from "I am off the road".  The guest keeps BOTH, and the port can
-// reach them.
+// apart from "I am off the road".  The guest keeps everything a lateral
+// offset needs, and it is all reachable from the object the port already
+// resolves.
 //
 // The chain, each step proved by the guest's own code:
 //
-//   RuleSet_RaceMetrics + 0x20    the spline-node structure   (ELF 0xb35e60)
-//   +0x288                         the per-car track state    (ELF 0xb35ce8)
-//   +0x1a8 (int32), scale 1/32     one of the two distances  (ELF 0xb35cf4)
-//   +0x1c8 (int32), scale 1/4      the other                (ELF 0xb35cf0)
+//   RuleSet_RaceMetrics + 0x20    the CAR                    (ELF 0xb35c94)
+//   CAR + 0x288                    the CAR_STATE             (ELF 0xb35ce8)
+//   CAR_STATE + 0x1a8              the SPLINE NODE INDEX     (int)
+//   CAR_STATE + 0x1c8              the DISTANCE TRAVELLED    (int)
+//   CAR + 0x20 / +0x24             the previous/current spline node
+//   CAR + 0x30/+0x34/+0x38         the car's WORLD POSITION
 //
-// WHICH is which is NOT established, and the two different scales are only
-// an inference, so BOTH are reported raw, next to the port's own spline
-// distance.  One race names them: the one that grows with the port's own
-// distance is the one along the track, and the other is the lateral term.
+// Three independent cross-checks exist for the CAR_STATE pair: the writer
+// 0xc2d888 (`ldr x8,[x0,#0x288]` then `str w4,[x8,#0x1a8]`), the
+// projection helper snapToClosestNode at 0xd05e44, and 0xb29264/0xb29284.
+//
+// NOTE WHAT IS NOT HERE: the racing-line offset itself.  `m_acrossAngle` is
+// NOT it -- that belongs to CarBodyPart_Swinging (a swinging body part's
+// rigid-body ROLL angle, in degrees), and the guest computes the offset in
+// its projection rather than storing it.  The position and the node index
+// are what the offset would be computed FROM.
 //
 // The reads are the port's own safe reads (plausibility gate, guest-image
 // check, svcQueryMemory, read) and nothing here writes anything.
-void fillTrackOffsets(RaceMetricsSample* out) {
+void fillCarState(RaceMetricsSample* out) {
     if (g_ruleSetRaceMetrics == 0) {
         return;
     }
-    uint64_t nodeStruct = 0;
-    if (!readWord(g_ruleSetRaceMetrics + 0x20ULL, &nodeStruct) || nodeStruct == 0) {
+    uint64_t car = 0;
+    if (!readWord(g_ruleSetRaceMetrics + 0x20ULL, &car) || car == 0) {
         return;
     }
+    out->carAddress = static_cast<uintptr_t>(car);
+    readDword(car + 0x20ULL, &out->carPrevNode);
+    readDword(car + 0x24ULL, &out->carNode);
+    readFloat(car + 0x30ULL, &out->carX);
+    readFloat(car + 0x34ULL, &out->carY);
+    readFloat(car + 0x38ULL, &out->carZ);
     uint64_t carState = 0;
-    if (!readWord(nodeStruct + 0x288ULL, &carState) || carState == 0) {
+    if (!readWord(car + 0x288ULL, &carState) || carState == 0) {
         return;
     }
     out->trackStateAddress = static_cast<uintptr_t>(carState);
-    readDword(carState + 0x1a8ULL, &out->trackAlong);
-    readDword(carState + 0x1c8ULL, &out->trackAcross);
+    readDword(carState + 0x1a8ULL, &out->splineNode);
+    readDword(carState + 0x1c8ULL, &out->splineDistance);
 }
 
 void fillMetrics(RaceMetricsSample* out, uintptr_t address) {
@@ -1447,7 +1461,8 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             "laps=%u lapF=%.3f lapd=%u lapdF=%.3f prev=%u total=%u "
             "totalF=%.3f speed=%u speedF=%.3f time=%u timeF=%.3f "
             "rate=%.6f prog=%.3f from_total=%d sawprog=%d "
-            "along=%u across=%u tsok=%d "
+            "car=0x%llx cnode=%u cprev=%u cpos=%.1f,%.1f,%.1f "
+            "snode=%u sdist=%u tsok=%d "
             "drive=%d steer=%.3f mag=%.3f sign=%d best=%.6f flips=%d stalls=%d "
             "thr=%d brk=%d",
             frame, static_cast<unsigned long long>(g_cglobal),
@@ -1474,7 +1489,10 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             m.progressRate, m.progress,
             m.progressFromTotal ? 1 : 0,
             g_sawProgress ? 1 : 0,
-            m.trackAlong, m.trackAcross,
+            static_cast<unsigned long long>(m.carAddress), m.carNode, m.carPrevNode,
+            static_cast<double>(m.carX), static_cast<double>(m.carY),
+            static_cast<double>(m.carZ),
+            m.splineNode, m.splineDistance,
             m.trackStateAddress != 0 ? 1 : 0,
             g_drive.enabled ? 1 : 0, static_cast<double>(g_drive.steer),
             static_cast<double>(g_drive.magnitude), g_drive.sign,
@@ -1583,7 +1601,7 @@ void pumpRaceStateProbe(unsigned long long frame) {
     if (g_metricsCount > 0) {
         RaceMetricsSample m{};
         fillMetrics(&m, g_metrics[0]);
-        fillTrackOffsets(&m);
+        fillCarState(&m);
         updateProgress(frame, &m);
         g_sample.metrics[0] = m;
         g_sample.metricsCount = 1;
