@@ -197,6 +197,44 @@ constexpr uintptr_t kMemberRegistryBssVa = 0x1F97980ULL;
 constexpr uintptr_t kVtableSectionLo = 0x1e1aae0ULL;
 constexpr uintptr_t kVtableSectionHi = 0x1f6d280ULL;
 
+// THE SCAN: how far around the CGlobal to look for the GameMode, and how
+// many candidates to examine.
+//
+// WHY A SCAN AT ALL.  MEASURED 2026-10-28 (.build/gamemode-holder.md):
+// the guest's OWN slot for the GameMode is CGlobal+0x10d88 -- the guest
+// reads it itself at ELF 0xf152a4 (`ldr x19, [x0, x8]` with x8 = 0x10d88
+// and x0 = the CGlobal taken from the GOT slot 0x1f6d5d8) and then makes
+// a vtable call through it.  So the probe's first candidate is RIGHT.
+//
+// But that slot is 0 in every one of the 1195/1204 (f1m2) and 837/846
+// (f1n) race-state log lines: the guest only stores the GameMode there
+// between creating it (0xb088fc) and destroying it (0x10af2e4), and the
+// creation is conditional (0xb0895c `cbnz` skips it wholesale).
+//
+// The lap counter does NOT read that slot.  It reaches a GameMode through a
+// different chain, and the object it comes from is not a CGlobal member at
+// all: the holder is the first argument of ELF 0xf2b508, and one of that
+// function's two call sites passes a STACK object (0x1522c40
+// `add x0, sp, #0x148`).  So "CGlobal + some offset" is the wrong question
+// for the lap counter.
+//
+// THE SCAN IS THE QUESTION TURNED INTO A MEASUREMENT.  The guest's own
+// shape for a GameMode is: a pointer V whose first word is a vtable address
+// point and whose ruleset map lives at V+0x128.  So the probe walks the
+// CGlobal's neighbourhood, takes every pointer it finds there, and keeps
+// the one whose vptr is a vtable AND whose map really yields the
+// RuleSet_RaceMetrics.  The check is the guest's own map walk, so a
+// candidate that passes it is a GameMode by the guest's own definition.
+//
+// THE POSITIVE CONTROL IS THE SAME SCAN: it must also find the slot the
+// guest reads, CGlobal+0x10d88, whenever that slot is non-zero.  A scan
+// that cannot find a GameMode the guest itself is using would be a scan
+// that proves nothing, so the control is reported next to the result.
+constexpr uintptr_t kGameModeScanSpan = 0x20000ULL;
+// How many vptr-passing candidates to try.  Every candidate costs a map
+// walk, so the bound keeps the scan from turning into a stall.
+constexpr int kGameModeScanMaxCandidates = 4096;
+
 constexpr const char* kGuestViewLogPath =
     "sdmc:/switch/rr3-native-rehost.guest-view.log";
 constexpr const char* kDriveControlPath =
@@ -382,6 +420,7 @@ uintptr_t g_cglobal = 0;
 // Forward declaration: the heap scan below uses the pointer filter, which is
 // defined after it.
 bool looksLikePointer(uintptr_t bias, uint64_t word);
+void logGameModeSlots(unsigned long long frame);
 
 //
 // The metrics object is HEAP allocated (the guest's operator new), so it is
@@ -1200,6 +1239,63 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             static_cast<double>(g_drive.bestRate), g_drive.flips, g_drive.stalls);
     }
     appendGuestBootLine(kGuestViewLogPath, "race-state", 100, 0, detail);
+    logGameModeSlots(frame);
+}
+
+// THE FIVE SLOTS.  One line per sample, five cheap reads, and they answer
+// the question the static analysis could not: is the port looking at the
+// guest's CGlobal at all, and is the guest's own GameMode slot live?
+//
+// MEASURED 2026-10-28 (.build/gamemode-holder.md):
+//
+//   A = *(CGlobal+0x10d88)   the slot the GUEST itself reads the GameMode
+//                             from (ELF 0xf152a4: `ldr x19, [x0, x8]` with
+//                             x8 = 0x10d88).  It is only filled between
+//                             creating the mode (0xb088fc) and destroying it
+//                             (0x10af2e4), and the creation is conditional
+//                             (0xb0895c `cbnz`).
+//   B = *(CGlobal+0x173f0)   the slot the probe's third candidate read.  The
+//                             guest uses it as a POINTER (it is fed to
+//                             0xc15fd8), so a small integer here means the
+//                             port is reading a different object than the
+//                             guest does.
+//   C = *(uint32*)(CGlobal+0x1c0)  the scene state; 1 triggers the teardown.
+//   D = *(uint32*)(CGlobal+0x10c78) the offset the guest itself reads from
+//                             the CGlobal at 0xf2bb8c.
+//   E = *(CGlobal)           the CGlobal's own vptr.  If E is not a vtable
+//                             address point, the port's `g` is not the
+//                             guest's CGlobal and every offset above is
+//                             meaningless.
+void logGameModeSlots(unsigned long long frame) {
+    const uintptr_t g = cGlobalObject();
+    if (g == 0) {
+        return;
+    }
+    uint64_t a = 0;
+    uint64_t b = 0;
+    uint64_t e = 0;
+    uint32_t c = 0;
+    uint32_t d = 0;
+    readWord(g + 0x10d88ULL, &a);
+    readWord(g + 0x173f0ULL, &b);
+    readWord(g, &e);
+    readDword(g + 0x1c0ULL, &c);
+    readDword(g + 0x10c78ULL, &d);
+    const uintptr_t bias = resolveMainImageLoadBias();
+    // Is E a vtable address point?  That is the check that says "this really
+    // is the guest's CGlobal".
+    const bool eIsVptr =
+        bias != 0 && e >= bias + kVtableSectionLo && e < bias + kVtableSectionHi;
+    char detail[256];
+    std::snprintf(detail, sizeof(detail),
+                  "f=%llu g=0x%llx A=0x%llx B=0x%llx C=%u D=%u E=0x%llx "
+                  "eIsVptr=%d",
+                  frame, static_cast<unsigned long long>(g),
+                  static_cast<unsigned long long>(a),
+                  static_cast<unsigned long long>(b),
+                  static_cast<unsigned>(c), static_cast<unsigned>(d),
+                  static_cast<unsigned long long>(e), eIsVptr ? 1 : 0);
+    appendGuestBootLine(kGuestViewLogPath, "gamemode-slots", 0, 0, detail);
 }
 
 }  // namespace
@@ -1393,6 +1489,111 @@ bool raceStateReadWord(uintptr_t address, uint64_t* out) {
 // point at the previous one. The value-store probe (source/race_metrics_probe
 // .cpp) uses this instead of re-deriving the chain: the chain is the guest's
 // own bookkeeping, and one implementation of it is one thing to keep correct.
+//
+// THE SCAN.  Finds the GameMode by the guest's own shape instead of by a
+// fixed offset, because the guest's lap counter does not read the CGlobal
+// slot the probe used to look at (see the long note at kGameModeScanSpan).
+//
+// The rule is the guest's: a GameMode is a pointer whose first word is a
+// vtable address point and whose ruleset map lives at +0x128, and the map
+// must really yield the RuleSet_RaceMetrics.  followGameMode() is that
+// check, unchanged.
+//
+// THE POSITIVE CONTROL runs first and is reported with the result: the scan
+// must be able to find the slot the guest itself reads (CGlobal+0x10d88)
+// whenever that slot is non-zero.  A scan that cannot find a GameMode the
+// guest is using proves nothing, so the control is part of the answer.
+struct GameModeScan {
+    uintptr_t gameMode = 0;
+    uintptr_t ruleSet = 0;
+    uintptr_t metrics = 0;
+    int candidatesTried = 0;
+    int vptrCandidates = 0;
+    // The control: did the scan find the slot the guest itself reads?
+    bool controlApplicable = false;   // the guest's own slot was non-zero
+    bool controlFound = false;        // ... and the scan found it
+    uintptr_t offsetFromCGlobal = 0;  // where the winner lives
+};
+
+GameModeScan g_gameModeScan;
+
+// Scans [g, g + kGameModeScanSpan) for a pointer that is a GameMode.
+//
+// It is expensive, so it runs at most once per kGameModeScanPeriod calls
+// and its result is reused in between: a race allocates a NEW GameMode, but
+// the CGlobal neighbourhood that holds it changes far more slowly than the
+// frame rate.
+constexpr unsigned long long kGameModeScanPeriod = 60ULL;
+unsigned long long g_gameModeScanCall = 0;
+
+GameModeScan scanForGameMode(uintptr_t bias, uintptr_t g) {
+    GameModeScan result;
+
+    // THE POSITIVE CONTROL: the guest's own slot, read the way the guest
+    // reads it.  If it is non-zero, the scan has to find it.
+    uint64_t ownSlot = 0;
+    if (readWord(g + 0x10d88ULL, &ownSlot) && ownSlot != 0) {
+        result.controlApplicable = true;
+    }
+
+    const uintptr_t vptrLo = bias + kVtableSectionLo;
+    const uintptr_t vptrHi = bias + kVtableSectionHi;
+
+    for (uintptr_t offset = 0; offset < kGameModeScanSpan; offset += 8) {
+        // Only addresses INSIDE the guest image are read.  An address outside
+        // it would cost a svcQueryMemory, and this file has already measured
+        // that ~1500 of those per sample dropped a run to 3120 frames: the
+        // syscall count, not the read count, is the budget.
+        if (!guestImageContains(g + offset, sizeof(uint64_t))) {
+            continue;
+        }
+        uint64_t candidate = 0;
+        if (!readWord(g + offset, &candidate) || candidate == 0) {
+            continue;
+        }
+        const uintptr_t pointer = static_cast<uintptr_t>(candidate);
+        if (!pointerPlausible(pointer)) {
+            continue;
+        }
+        uint64_t head = 0;
+        if (!readWord(pointer, &head)) {
+            continue;
+        }
+        const uintptr_t vptr = static_cast<uintptr_t>(head);
+        if (vptr < vptrLo || vptr >= vptrHi) {
+            continue;
+        }
+        ++result.vptrCandidates;
+        if (result.vptrCandidates > kGameModeScanMaxCandidates) {
+            break;
+        }
+        ++result.candidatesTried;
+        uintptr_t ruleSet = 0;
+        uintptr_t metrics = 0;
+        if (!followGameMode(bias, pointer, &ruleSet, &metrics)) {
+            continue;
+        }
+        result.gameMode = pointer;
+        result.ruleSet = ruleSet;
+        result.metrics = metrics;
+        result.offsetFromCGlobal = offset;
+        if (result.controlApplicable && pointer == static_cast<uintptr_t>(ownSlot)) {
+            result.controlFound = true;
+        }
+        break;
+    }
+    return result;
+}
+
+// The live RuleSet_RaceMetrics object, resolved the way this file resolves
+// it: the CGlobal -> the GameMode pointer -> the GameMode's ruleset map ->
+// the node whose value is a RuleSet_RaceMetrics.
+//
+// It is resolved ON DEMAND rather than served from the probe's own cache,
+// because a new race allocates a NEW object and a cached pointer would still
+// point at the previous one. The value-store probe (source/race_metrics_probe
+// .cpp) uses this instead of re-deriving the chain: the chain is the guest's
+// own bookkeeping, and one implementation of it is one thing to keep correct.
 uintptr_t raceStateResolveRuleSetRaceMetrics() {
     const uintptr_t bias = resolveMainImageLoadBias();
     if (bias == 0) {
@@ -1416,7 +1617,26 @@ uintptr_t raceStateResolveRuleSetRaceMetrics() {
         }
         return ruleSet;
     }
-    return 0;
+    // THE FALLBACK: the fixed offsets did not lead anywhere, so the GameMode
+    // is looked for by the guest's own shape instead.  This is what the
+    // 844-of-846 failures needed: the guest's lap counter does not use the
+    // CGlobal slot the probe was reading.
+    if (++g_gameModeScanCall >= kGameModeScanPeriod) {
+        g_gameModeScanCall = 0;
+        g_gameModeScan = scanForGameMode(bias, g);
+        char detail[256];
+        std::snprintf(detail, sizeof(detail),
+                      "vptrCands=%d tried=%d found=0x%llx off=0x%llx "
+                      "ctrlApplicable=%d ctrlFound=%d",
+                      g_gameModeScan.vptrCandidates,
+                      g_gameModeScan.candidatesTried,
+                      static_cast<unsigned long long>(g_gameModeScan.gameMode),
+                      static_cast<unsigned long long>(g_gameModeScan.offsetFromCGlobal),
+                      g_gameModeScan.controlApplicable ? 1 : 0,
+                      g_gameModeScan.controlFound ? 1 : 0);
+        appendGuestBootLine(kGuestViewLogPath, "gamemode-scan", 0, 0, detail);
+    }
+    return g_gameModeScan.ruleSet;
 }
 
 bool raceStateProgress(unsigned long long frame, float* rate, double* progress,
