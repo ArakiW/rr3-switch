@@ -197,6 +197,14 @@ int gfxScreenHeightOverride();
 int gfxUiScreenWidthOverride();
 int gfxUiScreenHeightOverride();
 
+// The size the port tells the GUEST its view is, in the onViewChangedJNI
+// call.  0 means "the 1280x720 this port has always said".  This is the
+// only lever on which GUI atlas tree the guest picks, because the guest's
+// own filter keeps a folder only when width <= screenW || height <=
+// screenH -- see readScreenConf() in source/gfx/gfx_backend.cpp.
+int gfxViewWidthOverride();
+int gfxViewHeightOverride();
+
 const char* gfxCloudcellCompleteMode();
 
 // "mlstub=1": force menu-loader vtable slot 21 to the host stub even when the

@@ -969,13 +969,13 @@ extern "C" void __wrap_glGetIntegerv(GLenum pname, GLint* data) {
             break;
         case GL_VIEWPORT:
             fillInts(data, 4, 0);
-            data[2] = 1280;
-            data[3] = 720;
+            data[2] = gfxViewWidthOverride() > 0 ? gfxViewWidthOverride() : 1280;
+            data[3] = gfxViewHeightOverride() > 0 ? gfxViewHeightOverride() : 720;
             break;
         case GL_SCISSOR_BOX:
             fillInts(data, 4, 0);
-            data[2] = 1280;
-            data[3] = 720;
+            data[2] = gfxViewWidthOverride() > 0 ? gfxViewWidthOverride() : 1280;
+            data[3] = gfxViewHeightOverride() > 0 ? gfxViewHeightOverride() : 720;
             break;
         case GL_MAX_VIEWPORT_DIMS:
             fillInts(data, 2, 0);

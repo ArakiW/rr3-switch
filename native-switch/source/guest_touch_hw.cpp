@@ -1,5 +1,6 @@
 #include "rr3/guest_touch_hw.hpp"
 
+#include "rr3/gfx_backend.hpp"
 #include "rr3/guest_touch.hpp"
 #include "rr3/recovery_guard.hpp"
 
@@ -67,7 +68,20 @@ constexpr unsigned kSyntheticHoldFrames = 120;
 // The digitizer and the guest's view are both 1280x720 on a Switch, so the
 // mapping is the identity. Both sizes are NAMED here so that a different
 // digitizer would be a changed constant and not a changed computation.
+//
+// THE VIEW SIZE IS THE ONE THE PORT TELLS THE GUEST (onViewChangedJNI), so
+// when rr3-screen.txt's "view=WxH" moves it, the mapping has to move with
+// it: the digitizer still reports 1280x720 pixels, and the guest's view is
+// now a different size.
 constexpr TouchMapping kTouchMapping{1280, 720, 1280, 720};
+
+TouchMapping touchMapping() {
+    const int viewWidth =
+        gfxViewWidthOverride() > 0 ? gfxViewWidthOverride() : 1280;
+    const int viewHeight =
+        gfxViewHeightOverride() > 0 ? gfxViewHeightOverride() : 720;
+    return TouchMapping{1280, 720, viewWidth, viewHeight};
+}
 
 // How often the digitizer's raw state is summarised in the log. The guest's
 // own log is the primary instrument; this is the sidebar.
@@ -284,12 +298,13 @@ bool prepareGuestTouchHardware() {
     HidTouchScreenState state{};
     const size_t entries = readDigitizer(&state);
     g_digitizerPresent = entries > 0;
+    const TouchMapping mapping = touchMapping();
     std::snprintf(detail, sizeof(detail),
                   "entries=%zu touches=%d present=%d mapping=%dx%d->%dx%d",
                   entries, static_cast<int>(state.count),
-                  g_digitizerPresent ? 1 : 0, kTouchMapping.sourceWidth,
-                  kTouchMapping.sourceHeight, kTouchMapping.viewWidth,
-                  kTouchMapping.viewHeight);
+                  g_digitizerPresent ? 1 : 0, mapping.sourceWidth,
+                  mapping.sourceHeight, mapping.viewWidth,
+                  mapping.viewHeight);
     logTouchHw("touch-hw-armed", 957, detail);
 
     g_prepared = true;
@@ -429,7 +444,7 @@ void pumpGuestTouchHardware(void* jniEnvironment, void* activityObject) {
     TouchEvent events[kTouchEventCapacity];
     const int produced =
         rr3PlanTouchFrame(samples, sampleCount, &g_tracker, guestForPlan,
-                           kTouchMapping, suspend, events, kTouchEventCapacity);
+                           touchMapping(), suspend, events, kTouchEventCapacity);
 
     // 6. The guest.
     for (int i = 0; i < produced; ++i) {

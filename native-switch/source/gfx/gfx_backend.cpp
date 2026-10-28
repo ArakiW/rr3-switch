@@ -398,8 +398,25 @@ ConfState s_conf;
 // measured A/B and not a silent change.
 //
 // The file takes "platform=WxH" (Platform.getScreenWidth/Height) and
-// "ui=WxH" (CCUserInterfaceManager.getScreenWidth/Height).  Both default to
-// 0, which means "answer the constant this port has always answered".
+// "ui=WxH" (CCUserInterfaceManager.getScreenWidth/Height), and
+// "view=WxH" (the size the port tells the GUEST its view is).  All three
+// default to 0, which means "answer the constant this port has always
+// answered".
+//
+// WHY THERE IS A "view" KEY AT ALL
+// -------------------------------
+// MEASURED 2026-10-28: the guest's GUI atlas filter (ELF 0x10f8ec8) keeps a
+// folder only when `width <= screenW || height <= screenH`, and the guest's
+// screen comes from the size the port hands it in onViewChangedJNI (a
+// hardcoded 1280x720 at source/guest_view_probe.cpp:2505).  With that size
+// the 2048x1536 GUI tree on the HD volume fails BOTH tests and is dropped
+// before the sort, so the 2D UI is a 960x640 atlas scaled up to 1280x720.
+//
+// A "view" larger than 1280x720 therefore changes what the guest reads: at
+// 2048 wide the 2048x1536 tree passes the filter (2048 <= 2048).  The 3D
+// render target follows the same number, and the present path already
+// renders into the guest's own framebuffer and blits it out, so the blit
+// becomes a scaled one.
 constexpr const char* kScreenConf = "sdmc:/switch/rr3-native-rehost/rr3-screen.txt";
 
 struct ScreenSizeState {
@@ -408,6 +425,8 @@ struct ScreenSizeState {
     int platformHeight = 0;
     int uiWidth = 0;
     int uiHeight = 0;
+    int viewWidth = 0;
+    int viewHeight = 0;
 };
 ScreenSizeState s_screen;
 
@@ -462,6 +481,11 @@ void readScreenConf() {
             if (parseScreenSize(value, &width, &height)) {
                 s_screen.uiWidth = width;
                 s_screen.uiHeight = height;
+            }
+        } else if (std::strcmp(key, "view") == 0) {
+            if (parseScreenSize(value, &width, &height)) {
+                s_screen.viewWidth = width;
+                s_screen.viewHeight = height;
             }
         }
     }
@@ -1073,6 +1097,23 @@ int gfxUiScreenHeightOverride() {
         readScreenConf();
     }
     return s_screen.uiHeight;
+}
+
+// The size the port tells the GUEST its view is (onViewChangedJNI).  0 means
+// "the 1280x720 this port has always said".  See the long note at
+// kScreenConf for why this is the only lever on the GUI atlas tree.
+int gfxViewWidthOverride() {
+    if (!s_screen.resolved) {
+        readScreenConf();
+    }
+    return s_screen.viewWidth;
+}
+
+int gfxViewHeightOverride() {
+    if (!s_screen.resolved) {
+        readScreenConf();
+    }
+    return s_screen.viewHeight;
 }
 
 const char* gfxCloudcellCompleteMode() {

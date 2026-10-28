@@ -2501,8 +2501,25 @@ GuestViewProbe runGuestViewProbe(NWindow* window, const char* progressPath) {
             static_cast<unsigned long long>(changedTarget));
     }
     probe.changedCalled = true;
+    // THE SIZE THE GUEST BELIEVES ITS VIEW IS.  This is the guest's screen:
+    // it is what the guest prints as "Res base: %dx%d", and it is what its
+    // GUI atlas filter compares against (ELF 0x10f8ec8: a folder survives
+    // only when width <= screenW || height <= screenH).  At 1280x720 the
+    // 2048x1536 tree on the HD volume fails both tests and is dropped, so
+    // the 2D UI is a 960x640 atlas scaled up.
+    //
+    // rr3-screen.txt's "view=WxH" changes it; absent that key this is the
+    // 1280x720 the port has always said.
+    const int viewWidth = gfxViewWidthOverride() > 0 ? gfxViewWidthOverride() : 1280;
+    const int viewHeight = gfxViewHeightOverride() > 0 ? gfxViewHeightOverride() : 720;
+    {
+        char detail[128];
+        std::snprintf(detail, sizeof(detail), "view=%dx%d", viewWidth, viewHeight);
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "view-size", 0, 0, detail);
+    }
     reinterpret_cast<void (*)(void*, void*, int, int, int, int)>(changedTarget)(
-        jniEnvironment, activityObject, 1280, 720, 0, 0);
+        jniEnvironment, activityObject, viewWidth, viewHeight, 0, 0);
     probe.changedReturned = true;
     cloudcell_pump("after-changed");
     appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "view-changed-ret", 264, 0);
@@ -8594,11 +8611,20 @@ void* frameLoopDriver(void* opaque) {
                 }
             }
             if (blit != nullptr) {
+                // The guest rendered into ITS OWN framebuffer, whose size is
+                // the view size the port told it (onViewChangedJNI).  The
+                // blit puts that on the device screen, so when the view is
+                // larger than the screen it is a DOWNSCALE -- which is also
+                // where the supersampling for the 3D scene comes from.
+                const int viewWidth =
+                    gfxViewWidthOverride() > 0 ? gfxViewWidthOverride() : 1280;
+                const int viewHeight =
+                    gfxViewHeightOverride() > 0 ? gfxViewHeightOverride() : 720;
                 const GLuint presentFbo = guestViewGlStats().lastBoundFramebuffer;
                 glBindFramebuffer(kReadFramebuffer, presentFbo);
                 glBindFramebuffer(kDrawFramebuffer, 0);
-                blit(0, 0, 1280, 720, 0, 0, 1280, 720,
-                     GL_COLOR_BUFFER_BIT, GL_NEAREST);
+                blit(0, 0, viewWidth, viewHeight, 0, 0, 1280, 720,
+                     GL_COLOR_BUFFER_BIT, GL_LINEAR);
                 glBindFramebuffer(GL_FRAMEBUFFER, 0);
             }
         }

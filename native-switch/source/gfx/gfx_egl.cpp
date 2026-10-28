@@ -376,7 +376,15 @@ extern "C" EGLBoolean __wrap_eglQuerySurface(EGLDisplay dpy, EGLSurface surface,
     if (gfxNullActive()) {
         gfxNoteVoidCall();
         if (value != nullptr) {
-            *value = attribute == EGL_WIDTH || attribute == EGL_HEIGHT ? 1280 : 0;
+            // The surface the guest renders into is the VIEW size the port
+            // told it (onViewChangedJNI).  rr3-screen.txt's "view=WxH" moves
+            // it; absent that key this is the 1280x720 the port has always
+            // answered.  See rr3/gfx_backend.hpp.
+            const int viewWidth =
+                gfxViewWidthOverride() > 0 ? gfxViewWidthOverride() : 1280;
+            const int viewHeight =
+                gfxViewHeightOverride() > 0 ? gfxViewHeightOverride() : 720;
+            *value = attribute == EGL_WIDTH ? viewWidth : viewHeight;
         }
         return EGL_TRUE;
     }
