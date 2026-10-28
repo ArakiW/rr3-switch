@@ -7260,3 +7260,150 @@ wrong slot can produce a wrong number.
 really is in a race for minutes at a time, and the earlier reading of "two
 samples, sixty frames" was the probe MISSING the race, not the race being
 short.  That closes the last open question of the previous entry.
+
+## 2026-10-28 (evening): the picture is sharp now -- and the harness was killing the guest
+
+### 1. The headline, measured by the guest itself
+
+The guest's own log, q5 (archive `20261028-165042-eden-q5`), with
+`rr3-screen.txt` set to `platform/ui/view = 2048x1536`:
+
+```
+phase=view-size   view=2048x1536 present=160,0 960x720
+phase=guest-log-any  Res base: 2048x1536
+phase=guest-log-any  Res order:
+phase=guest-log-any  (2048.000000, 1536.000000) - 1.333333 - gui_assets/2048x1536/
+phase=guest-log-any  (960.000000, 640.000000) - 1.500000 - gui_assets/960x640/
+phase=guest-log-any  (480.000000, 320.000000) - 1.500000 - gui_assets/480x320/
+phase=guest-log-any  share) Current res: 2048, 1536
+```
+
+Compare q4, same binary, `view` absent:
+
+```
+Res base: 1280x720
+Res order:
+(960.000000, 640.000000) - 1.500000 - gui_assets/960x640/
+(480.000000, 320.000000) - 1.500000 - gui_assets/480x320/
+```
+
+**The 2048x1536 tree is now the FIRST entry of the guest's own resolution
+order.**  That is the whole of "the picture is soft": the 2D UI was drawn
+from a 960x640 atlas blown up 1.33x into a 1280x720 frame.  It is now drawn
+from the 2048x1536 atlas and downscaled, i.e. a 2.1x DOWNSCALE of sharp
+source art.
+
+### 2. Two independent confirmations that the HD tree is really being used
+
+Not "the guest said so" -- two more instruments:
+
+| instrument | q4 (1280x720) | q5 (2048x1536) |
+|---|---|---|
+| `Failed to load image from atlas` | 125 | **0** |
+| `LocalStyles` load failures | 3 + 3 | **0** |
+| `assetlist-census-atlas` sample | 960x640 tree | `/gui_assets/2048x1536/achievements/sprites.android.atlas` |
+| `asset-invariant ... agree=1 src=rr3gui0:` | (960x640 tree) | **240/240 on the 2048x1536 tree** |
+
+`rr3gui0` is `gui-hd.romfs` (1,663,784,980 bytes), mounted at
+`rr3gui0:/files/.depot/gui_assets/2048x1536`.  The HD tree was on the card
+ALL ALONG and the guest simply refused to look at it.
+
+### 3. A reading of mine that was WRONG, and the correction
+
+I had written that "the card's 2048x1536 tree holds only 2 files (1 MB), so
+the HD assets are not there".  **That was wrong**, and the way it was wrong
+matters:
+
+* `E:\Eden\user\sdmc\switch\rr3-native-rehost\.depot\` is the port's
+  **override/target tree**, not the asset store.  Two files there are the
+  residue of the override set, nothing more.
+* The asset store is the seven romfs **volumes** (`data/*.romfs`), and
+  `gui-hd.romfs` is 1.66 GB of the real 2048x1536 tree.
+
+So the data was never missing.  The only thing that was missing was the
+guest's willingness to read it -- its own filter (ELF 0x10f8ec8) drops a
+folder unless `width <= screenW || height <= screenH`, and 2048x1536 fails
+both against a 1280x720 screen.
+
+### 4. The port change: FIT, never stretch
+
+A 4:3 view stretched into a 16:9 screen turns every circle into an ellipse,
+so the present path now scales the view to FIT and centres it:
+
+* `gfxFitRect()` (inline in `gfx_backend.hpp`, so a host test can reach it)
+  returns the rectangle the view occupies: 2048x1536 on 1280x720 is
+  **960x720 at x=160** -- two 160-pixel pillarbox bars, and the guest's
+  pixels are never stretched.  The guest's own log line
+  `view=2048x1536 present=160,0 960x720` is the instrument that says the
+  rectangle is the intended one.
+* The present blit draws into that rectangle and clears the bars.
+* The guest's scissor BOX and its viewport are never touched.  The viewport
+  is CONTEXT state, not framebuffer state: changing it without putting it
+  back would change how the guest renders into its own FBO on the next
+  frame.  Only the scissor test's enable bit is touched, and it is put back.
+
+### 5. The touch mapping has to use the SAME rectangle
+
+A tap is a tap on the OUTPUT screen, and the content is no longer the whole
+output.  So the mapping carries the rectangle, not just the sizes:
+
+* a tap inside the rectangle lands on the button the player sees;
+* a tap on a black bar presses NOTHING;
+* a finger that slides onto a bar is RELEASED, so the guest does not keep a
+  button held for a finger that is no longer on its screen;
+* a point off the DIGITIZER keeps the historical answer -- clamped into the
+  view, not dropped.  (This last one is a distinction the first
+  implementation got wrong, and the existing host test caught it: "a
+  coordinate past the view is clamped to the view's last pixel".)
+
+The host harness grew from 55 to 68 checks; the two new cases are the
+present rectangle and the letterboxed touch.
+
+### 6. q5 did not reach the menu -- and the HARNESS killed it, not the guest
+
+This is the part worth recording, because it is a defect in the measuring
+instrument and it would have been read as a defect in the port.
+
+The run ended at wall 152 s with
+`guest log stable for 120s (no growth since t=30s)`.  The guest had rendered
+**3 frames**.  The naive reading is "the 4:3 view wedges the guest".
+
+**It does not.**  The host CPU series is the discriminator, and the harness
+documents it itself ("a spin shows as a steady climb and a deadlock collapses
+toward zero"):
+
+| | q4 (1280x720) | q5 (2048x1536) |
+|---|---|---|
+| CPU delta per 10 s tick, steady state | 10.6 - 15.4 s | **6.3 - 7.1 s** |
+| shape | steady climb | **steady climb** |
+
+q5's CPU climbed from 41.2 s at t=30 to 120.3 s at t=150 -- a steady 0.65
+core.  A deadlock collapses toward zero; this did not collapse.  **The guest
+was ALIVE and booting a 3.15x larger view with the HD atlases, and the
+harness killed it while it worked.**
+
+The rule that ended the run (`$stableTickLimit = 12` ticks of a quiet log)
+never consulted the CPU, even though the CPU series two lines above it is
+the harness's own spin-vs-deadlock discriminator.  **Fixed**: a quiet log
+only counts towards the limit when the CPU has stopped climbing
+(`$cpuAliveThreshold = 1.0` CPU-second per 10-second tick -- a live guest
+burns 6.3 s, a wedged one collapses to zero).
+
+### 7. Four hypotheses for the q5 stop, each killed by a measurement
+
+| hypothesis | how it was killed |
+|---|---|
+| the guest crashed | Eden's log has no exception, no abort, no fault; the process was killed by the harness (`Stop-Process -Force`), and its CPU was still climbing at the end |
+| the card ran out of room (the archived ENOSPC mode) | host E: has **207 GiB free**; the card had 581 MB free at the start of q5 and 775 MB at the end |
+| the asset lists were not delivered | both runs requested the **same 400 lists with identical names** (set difference: 0 and 0), and the rewritten lists are byte-identical (`lists_touched=386 entries_rewritten=2982 bytes=2610656` in both) |
+| the port broke the rendering | the first three `gfx-stats` lines are **identical** in q4 and q5 (`frames=1 calls=5 draws=5/0`, `frames=2 calls=8 draws=10/0`, `frames=3 calls=11 draws=15/0`, `compile=90 link=46 prog=46 sh=90 tex=133`) |
+
+### 8. What is still open
+
+* **q6** re-runs the same configuration with the CPU-aware watchdog.  If the
+  guest reaches the menu, the 4:3 view is viable in Eden (and trivially
+  viable on real Switch hardware, which has a real GPU).
+* The touch script's pixel coordinates have to be re-measured: the content is
+  no longer full-screen, it starts 160 pixels from the left.
+* The race-metrics probe (the goal's other blocker) is untouched by this
+  round.

@@ -295,6 +295,27 @@ $lastGrowthElapsed = 0
 # to the wall clock.
 $stableTickLimit = 12
 $tickSeconds = 10
+#
+# AND WHY THE CPU COUNTS.  The comment on $cpuSeries below already says the
+# CPU series IS the spin-vs-deadlock discriminator -- but the rule that ENDS
+# THE RUN did not use it.  That is a real defect, and it is what ended the
+# first 2048x1536 run.
+#
+# MEASURED 2026-10-28, archive 20261028-165042-eden-q5: the guest log stopped
+# growing at t=30 s and the run was killed by this rule at t=152 s, while
+# Eden's CPU time climbed 6.3-7.1 s per 10 s tick for the whole two minutes
+# (41.2 s at t=30 -> 120.3 s at t=150, a steady 0.65 core).  That is the
+# SPIN signature, not the deadlock signature: the guest was ALIVE and booting
+# a 3.15x larger view with the HD atlases, and the harness killed it while it
+# worked.  The same run had already proved the quality change works (the guest
+# reported "Res base: 2048x1536" and picked the 2048x1536 tree first).
+#
+# So a quiet log only counts towards the limit when the CPU has stopped
+# climbing.  One CPU-second in a 10-second tick is the threshold: a live guest
+# burns an order of magnitude more than that (6.3 s measured), and a wedged
+# one collapses toward zero.
+$cpuAliveThreshold = 1.0
+$lastCpu = 0.0
 # Why the run ended, recorded in the archive so a short run explains itself.
 $exitReason = 'wall-clock deadline reached'
 # The host CPU series is the spin-vs-deadlock discriminator. An in-guest
@@ -322,24 +343,35 @@ try {
         $cpuSeries.Add([pscustomobject]@{ t = $elapsed; cpu = $live.CPU; logBytes = $size })
         Write-Host ("t={0,4}s cpu={1,7:N1}s log={2,6}B  {3}" -f $elapsed, $live.CPU, $size, $stampLine)
         if ($size -eq $lastSize -and $size -gt 0) {
-            $stableTicks++
-            if ($stableTicks -ge $stableTickLimit) {
-                # Say how long the log was ACTUALLY stable, not a hard-coded
-                # number. A reader comparing archives needs the real quiet
-                # window, and the old fixed "30s" text could not distinguish
-                # "quiet for exactly the threshold" from "quiet for 10 minutes
-                # with the rule firing late".
-                $stableFor = $elapsed - $lastGrowthElapsed
-                $exitReason = "guest log stable for ${stableFor}s (no growth since t=${lastGrowthElapsed}s)"
-                Write-Host ("        : log stable for {0}s (no growth since t={1}s, {2} ticks of {3}s), guest has stopped making progress" -f `
-                    $stableFor, $lastGrowthElapsed, $stableTicks, $tickSeconds)
-                break
+            $cpuDelta = $live.CPU - $lastCpu
+            if ($cpuDelta -ge $cpuAliveThreshold) {
+                # Quiet log, busy process.  The guest is ALIVE and just slow:
+                # a big view costs 3.15x the pixels and the boot has to load
+                # the HD atlases.  This tick does not count towards the limit.
+                $stableTicks = 0
+                Write-Host ("        : log quiet but the CPU climbed {0:N1}s -- the guest is alive, not wedged" -f $cpuDelta)
+            }
+            else {
+                $stableTicks++
+                if ($stableTicks -ge $stableTickLimit) {
+                    # Say how long the log was ACTUALLY stable, not a hard-coded
+                    # number. A reader comparing archives needs the real quiet
+                    # window, and the old fixed "30s" text could not distinguish
+                    # "quiet for exactly the threshold" from "quiet for 10 minutes
+                    # with the rule firing late".
+                    $stableFor = $elapsed - $lastGrowthElapsed
+                    $exitReason = "guest log stable for ${stableFor}s (no growth since t=${lastGrowthElapsed}s) and the CPU stopped climbing"
+                    Write-Host ("        : log stable for {0}s (no growth since t={1}s, {2} ticks of {3}s), guest has stopped making progress" -f `
+                        $stableFor, $lastGrowthElapsed, $stableTicks, $tickSeconds)
+                    break
+                }
             }
         } else {
             $stableTicks = 0
             $lastGrowthElapsed = $elapsed
         }
         $lastSize = $size
+        $lastCpu = $live.CPU
     }
 }
 finally {
