@@ -168,6 +168,35 @@ if ($TouchMode -eq 'glove') {
 
 Write-Host ("card     : {0}" -f $appDir)
 
+# --- the port's own configuration ---------------------------------------------
+#
+# rr3-gfx.conf is the PORT's configuration (which backend, whether the
+# socket stack comes up, how the Cloudcell calls are answered).  It lives one
+# level above the app directory, and until now it existed ONLY on the card,
+# which meant a round could not be reproduced from the repository.  It is
+# kept here, and installed from here.
+#
+# nogo=1 is the important one: with the socket stack up, the guest's main
+# thread parks in libnx send() waiting for a Cloudcell response that never
+# comes, and the run never gets past the cloud sync -- measured 2026-10-29:
+# the guest log stopped growing at 1.5 MB with not one frame rendered.  With
+# no socket stack every outbound connection fails at once and the guest takes
+# its own offline path.
+#
+# The port reads this file into a 4096-byte buffer and drops the rest in
+# silence (conf_trunc=1), so keep it short.
+$gfxConfSource = Join-Path $projectRoot 'tools\rr3-gfx.conf'
+if (Test-Path -LiteralPath $gfxConfSource -PathType Leaf) {
+    $gfxConfTarget = Join-Path (Split-Path -Parent $appDir) 'rr3-gfx.conf'
+    $gfxBytes = (Get-Item -LiteralPath $gfxConfSource).Length
+    if ($gfxBytes -gt 4096) {
+        Write-Host ("refused  : tools\rr3-gfx.conf is {0} bytes; the port reads 4096 and drops the rest" -f $gfxBytes)
+        exit 1
+    }
+    Copy-Item -LiteralPath $gfxConfSource -Destination $gfxConfTarget -Force
+    Write-Host ("gfxconf : {0} bytes -> {1}" -f $gfxBytes, $gfxConfTarget)
+}
+
 # --- 1. preflight ------------------------------------------------------------
 $plan = foreach ($name in $scripts) {
     $source = Join-Path $sourceRoot $name
