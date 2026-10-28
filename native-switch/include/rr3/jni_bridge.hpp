@@ -185,4 +185,17 @@ bool rr3ByteArrayView(uintptr_t handle, int32_t* outLength,
                       const uint8_t** outData);
 bool rr3ByteArrayMagic(uintptr_t handle, uint32_t* outMagic);
 
+// Starts the Cloudcell defer-queue drain (the alert-pump host thread).
+//
+// IT MUST BE CALLED AT THE PORT'S STARTUP, not when the guest first raises
+// a dialog.  The guest's cloud sync happens BEFORE any dialog, and its
+// answer is DEFERRED, so on a round where no alert comes first there is
+// nobody to drain the queue and the guest waits for the sync forever.
+// MEASURED 2026-10-29: two rounds froze with the guest log at 1.5 MB and
+// not one frame rendered, and their logs contain no "alert-pump" line at
+// all, while the round that reached the race has 44.
+//
+// Calling it twice is harmless: the thread is created once.
+void startAlertPumpEarly();
+
 } // namespace rr3

@@ -549,6 +549,18 @@ bool mapGuestZeroPage() {
 
 int main(int argc, char** argv) {
     runtimeTrace("[rr3] main entry\n");
+    // The Cloudcell defer-queue drain starts HERE, before anything else.
+    //
+    // The guest's Cloudcell HTTP answers are DEFERRED, and the drain was the
+    // alert-pump host thread -- which used to be started only when the guest
+    // raised a DIALOG.  The guest's cloud sync happens BEFORE any dialog, so
+    // on a round where no alert comes first there was nobody to take the
+    // deferred answer to POST .../CC_Sync.php and the guest waited for it
+    // forever: MEASURED 2026-10-29, two rounds froze with the guest log at
+    // 1.5 MB and not one frame rendered, and their logs contain no
+    // "alert-pump" line at all, while the round that reached the race has
+    // 44.  Starting the drain here makes "no drain" impossible.
+    rr3::startAlertPumpEarly();
     // The software console, native framebuffer, and Mesa EGL all own the
     // default NWindow. Never overlap them. The renderer runs in its own NRO
     // stage and returns telemetry through hbloader argv.

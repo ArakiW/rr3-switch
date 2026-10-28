@@ -5328,6 +5328,38 @@ g_jniTable[163] = reinterpret_cast<void*>(&jniNewStringSlot163); // NewString (U
 } // namespace
 
 // ---------------------------------------------------------------------------
+// The alert pump, started from the PORT's startup instead of from the first
+// alert.
+//
+// WHY THIS EXISTS (measured 2026-10-29).
+//
+// The Cloudcell HTTP answers are DEFERRED: `http_post` enqueues the work
+// with cloudcell_defer() and something has to drain the queue later.  The
+// drain used to be the alert-pump thread -- a raw libnx HOST thread, which
+// the OS schedules whether or not the guest is making progress -- and it
+// was started from alertAnswerPositiveImpl(), i.e. only once the guest had
+// raised a DIALOG.
+//
+// The guest's cloud sync happens BEFORE any dialog.  So on a round where no
+// alert is raised before the sync, the thread does not exist yet, the
+// deferred answer to POST https://connect-dev-ss.cloudcell.com:443/CC_Sync.php
+// sits in the queue with nobody to take it, and the guest waits for it
+// forever.  MEASURED: q13 and q15 froze with the guest log at 1.5 MB and
+// not one frame rendered, and their logs contain NO line mentioning
+// "alert-pump" at all, while q11 -- which reached the race -- has 44 of
+// them.  The guest's own HTTP stack was never the problem; the answer was
+// sitting in a queue with no drain.
+//
+// So the pump is started at the PORT's startup, before the guest does
+// anything.  It is the same thread, the same 80 ms tick and the same
+// cloudcell_pump() call; only its starting point moves earlier, and
+// earlier is exactly what this failure needs.
+// ---------------------------------------------------------------------------
+void startAlertPumpEarly() {
+    startAlertPump();
+}
+
+// ---------------------------------------------------------------------------
 // Exported to the GlyphVector facade
 // ---------------------------------------------------------------------------
 //
