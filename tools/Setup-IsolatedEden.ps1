@@ -117,14 +117,47 @@ foreach ($pair in @(@('eden.exe', 'eden-rr3.exe'), @('eden-cli.exe', 'eden-rr3-c
 }
 
 # --- 2. the firmware and the keys -------------------------------------------
-foreach ($name in @('firmware', '23.0.0固件', 'keys')) {
+# The firmware directory is copied under its OWN name too: the install ships
+# a second copy whose name is NOT ASCII ("23.0.0" plus the Chinese word for
+# firmware), and a private instance with an empty one starts the GUI and
+# never loads the game: measured on 2026-10-29, the first run of E:\Eden-rr3
+# produced a 250-line Eden log that stopped at t=0.8 s in the AES noise, a
+# guest log of 0 bytes and a CPU of 0.2 cores, and the guest never booted.
+#
+# The second directory is found by PATTERN, never by its literal name: the
+# name contains non-ASCII characters, and PowerShell 5.1 reads a script file
+# as GBK while the file system holds UTF-8, so a literal in the script does
+# not match the directory on disk.
+$firmwareDirs = @()
+foreach ($dir in (Get-ChildItem $SourceRoot -Force -Directory -ErrorAction SilentlyContinue)) {
+    if ($dir.Name -eq 'firmware' -or $dir.Name -eq 'keys') { continue }
+    # The user directory is the emulator's own state, not firmware, and it is
+    # handled separately below.  Skipping it here keeps the "alternate
+    # firmware" copy from dragging 11 GB of card into the firmware folder.
+    if ($dir.Name -eq 'user' -or $dir.Name -eq 'LICENSES') { continue }
+    $files = @(Get-ChildItem $dir.FullName -Recurse -File -ErrorAction SilentlyContinue)
+    # The alternate firmware copy is the one that holds the .nca/.ncd pairs.
+    if (@($files | Where-Object { $_.Extension -eq '.nca' }).Count -gt 0) {
+        $firmwareDirs += $dir
+    }
+}
+foreach ($dir in $firmwareDirs) {
+    $dst = Join-Path $TargetRoot $dir.Name
+    New-Item -ItemType Directory -Force -Path $dst | Out-Null
+    & robocopy.exe $dir.FullName $dst /E /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $($dir.Name) (code $LASTEXITCODE)" }
+    Write-Step ("copy   : {0} ({1} files)" -f $dir.Name, @(Get-ChildItem $dst -Recurse -File -ErrorAction SilentlyContinue).Count)
+}
+
+foreach ($name in @('firmware', 'keys')) {
     $src = Join-Path $SourceRoot $name
     if (-not (Test-Path $src -PathType Container)) { continue }
     $dst = Join-Path $TargetRoot $name
     New-Item -ItemType Directory -Force -Path $dst | Out-Null
     & robocopy.exe $src $dst /E /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null
     if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $name (code $LASTEXITCODE)" }
-    Write-Step ("copy   : {0}" -f $name)
+    $n = @(Get-ChildItem $dst -Recurse -File -ErrorAction SilentlyContinue).Count
+    Write-Step ("copy   : {0} ({1} files)" -f $name, $n)
 }
 foreach ($name in @('prod.keys', 'LICENSE.txt', 'README.md')) {
     $src = Join-Path $SourceRoot $name

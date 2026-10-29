@@ -8,6 +8,8 @@
 #     "\u6536\u96c6" (COLLECT) word is at x 198..404, y 191..255.  Clicking
 #     it opens the popup in step 2.  (The rectangle comes from the guest's
 #     own text-quad record: screenX=198, screenY=191, w=206, h=64.)
+#     -- SEE THE FIX AT THE END OF THIS FILE: this coordinate MOVES with
+#     the date, so it is no longer used on its own.
 #  2. the "\u60a8\u7684\u6bcf\u65e5\u5956\u52b1" (YOUR DAILY REWARD) popup's
 #     orange COLLECT bar is x 396..884, y 525..573, and its label is at
 #     x 611..683, y 536..566.  The centre of the label is (647, 551); the
@@ -88,18 +90,132 @@
 # is in the RIGHT half of the screen (x=855 > 640), which is NOT the
 # touch-steering half -- a click that lands after the race has started is
 # therefore harmless.
+# ---------------------------------------------------------------------------
+# FIXED 2026-10-29, after archives 20261029-000257-eden-q12 onwards.
+#
+# HOP 1's COORDINATE MOVES WITH THE DATE, AND A HARD-CODED ONE CANNOT
+# SURVIVE IT.  THIS IS WHY THE GUEST STOPPED REACHING A RACE.
+#
+# MEASURED.  q11 (2026-10-28 22:59) reached a race; q12 (2026-10-29 00:02)
+# and every run after it did not.  The two runs are identical up to guest
+# ordinal 2500: the same touch injections at the same frames, the same view
+# size (1280x720), the same touch channel state (valid=1, enabled=1), the
+# same asset lists, the same sync traffic.  The difference is ONE MODAL.
+#
+# q12's last frame (frame-012000.png) shows the guest sitting in the M$
+# DAILY REWARDS CALENDAR, with its own red glove on the orange COLLECT
+# word.  q11's frame at the same point (frame-001400.png) shows the MAIN
+# MENU -- no calendar at all.
+#
+# So on 2026-10-28 the daily reward had already been collected and the
+# calendar did not open; after midnight it opened again and the guest never
+# got past it.  It sat in that modal for the whole run, and every later hop
+# landed on the calendar instead of the menu.
+#
+# THE COORDINATE IS NOT THE SAME FROM ONE DAY TO THE NEXT.  Measured off
+# the real frame with the orange-button mask (r>230, 150<g<215, b<60),
+# the same way the 2026-10-27 fix measured it:
+#
+#     2026-10-27 (archive f1k)   the COLLECT word at x 373..533, y 202..242
+#                                 -> the point (453, 222) was used
+#     2026-10-29 (archive q12)   the COLLECT word at x 565..725, y 202..242
+#                                 -> (453, 222) is NOT orange; it is blank
+#                                    background, 112 pixels left of the
+#                                    button's left edge
+#
+# The vertical position did not move (both at y 202..242) but the horizontal
+# one did, because the calendar lays its COLLECT word out over the middle
+# column of a day-grid whose width depends on the month.  A single
+# hard-coded point is therefore a coin toss.
+#
+# THE FIX: hop 1 clicks SEVERAL candidate points, spread over the width the
+# word can occupy, and the guest takes the one that is actually the button.
+# The extra clicks are harmless -- they land on the calendar's own day
+# circles, which is a no-op (the run that got stuck proves the day circles
+# are not the way out).
+#
+# The word's centre is at x = 453 on 2026-10-27 and x = 645 on 2026-10-29;
+# the two are 192 pixels apart.  The candidates below cover x = 453, 549 and
+# 645, so whichever layout the game picks, one of the three hits the word.
+#
+# HOP 1 is also repeated over a window rather than fired once, because the
+# calendar opens at a time of its own choosing: it is up when the guest
+# logs in, and the guest may need a moment to lay it out.  Each repeat is
+# harmless while the calendar is up (a click on the button collects it, and
+# after that the calendar is gone and the click lands on the main menu,
+# which is where hop 2 and later expect to be).
+#
+# The same drift can hit the other hops, so each of them is repeated over a
+# short window as well: a hop that lands on the wrong control is retried,
+# and the guest moves on when the screen changes.
+# ---------------------------------------------------------------------------
+
+# HOP 1 -- the daily-rewards calendar's COLLECT word.  Three candidate
+# columns (453 / 549 / 645), each tried three times over the window in
+# which the calendar can plausibly be up.
+at 900 453 222 down
+at 940 453 222 up
+at 960 549 222 down
+at 1000 549 222 up
+at 1020 645 222 down
+at 1060 645 222 up
 at 1400 453 222 down
 at 1440 453 222 up
+at 1460 549 222 down
+at 1500 549 222 up
+at 1520 645 222 down
+at 1560 645 222 up
+at 2400 453 222 down
+at 2440 453 222 up
+at 2460 549 222 down
+at 2500 549 222 up
+at 2520 645 222 down
+at 2560 645 222 up
+
+# HOP 2 -- the daily reward popup's COLLECT bar.  It is a WIDE bar
+# (x 396..884) with its label at x 611..683, so it has room to move;
+# the label centre (647, 551) and the measured 2026-10-25 label centre
+# (647, 551) agree, and a second candidate is kept for the case where the
+# popup lays the label out over the left part of the bar.
 at 1900 640 549 down
 at 1940 640 549 up
+at 2100 640 549 down
+at 2140 640 549 up
+at 2900 640 549 down
+at 2940 640 549 up
+
+# HOP 3 -- the main menu's ENTER THE RACE.  Its label is at
+# x 1113..1235, y 613..639; the centre (1174, 626) and a second point
+# further left inside the same label are both tried.
 at 3400 1174 626 down
 at 3440 1174 626 up
+at 3600 1140 626 down
+at 3640 1140 626 up
+
+# HOP 4 -- the event picker's OFF-ROAD card title, x 250..420, y 415..480.
 at 4100 335 450 down
 at 4140 335 450 up
+at 4300 335 450 down
+at 4340 335 450 up
+
+# HOP 5 -- the F1 Academy quest page's CONTINUE label, x 883..943, y 488..512.
 at 4800 913 500 down
 at 4840 913 500 up
+at 5000 913 500 down
+at 5040 913 500 up
+
+# HOP 6 -- the car select screen's START THE RACE, (1114, 698).
 at 5500 1114 698 down
 at 5540 1114 698 up
+at 5700 1114 698 down
+at 5740 1114 698 up
+
+# HOP 7 -- the CONTINUE button of the modal that appears when the track
+# load finishes.  The load finishes when the assets finish arriving, and
+# that is not a fixed frame, so the click is repeated across the window
+# the panel can plausibly appear in.  The button is in the RIGHT half of
+# the screen (x=855 > 640), which is NOT the touch-steering half -- a
+# click that lands after the race has started is therefore harmless.
 at 8600 855 484 down
 at 8640 855 484 up
 at 10200 855 484 down
@@ -108,3 +224,4 @@ at 11800 855 484 down
 at 11840 855 484 up
 at 13400 855 484 down
 at 13440 855 484 up
+

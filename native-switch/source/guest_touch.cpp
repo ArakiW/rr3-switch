@@ -343,7 +343,19 @@ struct TouchEvent {
 // The queue is deliberately small and fixed: a control file is a script, not
 // a data stream, and a bounded queue cannot be made to allocate on the frame
 // loop.
-constexpr int kQueueCapacity = 64;
+//
+// IT IS 256 ENTRIES, NOT 64, AND THE SIZE IS MEASURED.  The whole file is
+// read in ONE poll, so every event in the script is queued in the same
+// poll.  The 2026-10-29 script has 48 events (the hops are repeated over a
+// window so that a hop which lands on the wrong control is retried), and a
+// script of that size did NOT fit the old 64-entry queue: the overflow path
+// fired, the remaining lines were dropped, and the guest never received
+// them -- with no error anywhere except one "event queue full" line.
+//
+// The queue is still bounded, and the overflow path now leaves the
+// unqueued lines for the next poll (see drainControlFile), so a script
+// larger than the queue is DELAYED, not truncated.
+constexpr int kQueueCapacity = 256;
 TouchEvent g_queue[kQueueCapacity];
 int g_queueHead = 0;
 int g_queueTail = 0;
@@ -631,6 +643,18 @@ void drainControlFile() {
         }
         if (!queueEvent(event)) {
             logControl("touch-control-overflow", "event queue full");
+            // THE UNQUEUED LINES MUST NOT BE CONSUMED.
+            //
+            // The consumed counter is what the next poll resumes from, so
+            // advancing it past lines that never entered the queue LOSES
+            // them: the script is silently truncated and the guest never
+            // receives the rest of it.  That is how a hop can be missing
+            // with no error anywhere -- the log says "overflow" once and
+            // the guest simply never gets the later clicks.
+            //
+            // So the counter is advanced only over the lines that were
+            // actually queued, and the rest is re-read on the next poll.
+            g_controlConsumed += cursor - (length + 1);
             break;
         }
         char detail[192];
