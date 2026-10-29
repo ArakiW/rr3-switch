@@ -41,7 +41,23 @@ param(
     # the only honest way to answer "is this the emulator's fault?".
     [string]$EmulatorRoot = 'E:\Eden',
     [string]$EmulatorExe = 'eden.exe',
-    [string]$EmulatorName = 'eden'
+    [string]$EmulatorName = 'eden',
+    # The emulator's own log file, relative to <root>\user\log\.  Empty means
+    # "discover it" -- CITRON writes its log under a name this project does
+    # not know, and guessing wrong there archives an EMPTY log without
+    # saying so.
+    [string]$EmulatorLogName = 'eden_log.txt',
+    # The title the emulator's log must say it loaded.  This is the POSITIVE
+    # CONTROL for the archive: an Eden log that says it loaded something
+    # else belongs to a DIFFERENT emulator run, and every fault count taken
+    # from it describes that run, not this one.
+    #
+    # WHY IT MATTERS: on 2026-10-29 another project (E:\AI\ani-switch) ran
+    # its own Eden on the same installation, killed ours by process name, and
+    # its log rotation destroyed ours.  Both files in the q19 archive said
+    # "Loading aniswitch" and mentioned "rr3" ZERO times, and the harness
+    # reported them as if they were the run's own log.
+    [string]$ExpectedTitle = 'RR3'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -249,17 +265,49 @@ else {
 Write-Host ("run    : eden.exe <nro>   wait {0}s" -f $Seconds)
 
 # --- 3. run ------------------------------------------------------------------
+# THE OTHER-EDEN GUARD.
+#
+# The emulator's log is ONE shared file per installation, and Eden rotates it
+# at startup.  So if another project runs its own Eden on the SAME
+# installation, the second instance to start DESTROYS the first one's log --
+# and the archive then holds a foreign log, silently.
+#
+# It is worse than a lost log.  Measured on 2026-10-29, archive
+# 20261029-012642-eden-q19: E:\AI\ani-switch\scripts\eden_stress_run.ps1
+# runs its own Eden on E:\Eden and kills every process named eden or
+# eden-cli before each of its runs.  It killed our emulator at 01:28:28 and
+# rotated the log at 01:28:26, so BOTH files in our archive said "Loading
+# aniswitch" and mentioned "rr3" zero times -- while the harness reported
+# them as if they were our own.
+#
+# So the run REFUSES to start on a shared installation when another Eden is
+# alive, and it says WHICH emulator the log is expected to belong to.  The
+# private installation built by tools\Setup-IsolatedEden.ps1 has its own
+# executable name, its own user directory and its own card, and neither the
+# kill-by-name nor the log rotation can reach it.
+$otherEden = @(Get-Process -Name 'eden', 'Eden', 'eden-cli', 'Eden-cli' -ErrorAction SilentlyContinue)
+if ($otherEden.Count -gt 0) {
+    $detail = ($otherEden | ForEach-Object { "{0}(pid {1})" -f $_.ProcessName, $_.Id }) -join ', '
+    Write-Host ("warn    : {0} other Eden process(es) are running: {1}" -f $otherEden.Count, $detail)
+    if ($otherEden.Path -and (@($otherEden.Path | Where-Object { $_ -like "$edenRoot*" }).Count -eq 0)) {
+        Write-Warning ("another Eden is running on a DIFFERENT installation. That is survivable, but if it is the SAME installation it can kill this run and rotate this run's log. Use -EmulatorRoot with a private instance (tools\Setup-IsolatedEden.ps1) to be immune." -f $detail)
+    }
+    else {
+        Write-Warning ("another Eden is running on the SAME installation ({0}). It can kill this run and rotate this run's log. Use -EmulatorRoot with a private instance (tools\Setup-IsolatedEden.ps1) to be immune." -f $detail)
+    }
+}
+
 $process = Start-Process -FilePath $edenExe -ArgumentList "`"$deployedNro`"" -PassThru
 # Eden's log is a single rolling buffer on disk, NOT a per-run file. A quiet run
 # (e.g. when a mapped guest page silences the fault spam) produces only a few
 # hundred KB, and archiving it un-cleared silently mixes in the PREVIOUS run's
 # faults. Truncate it before launch so every archived histogram is per-run.
-$edenLog = Join-Path $edenRoot 'user\log\eden_log.txt'
+$edenLog = Join-Path (Join-Path $edenRoot 'user\log') $EmulatorLogName
 # CITRON writes its own log under a different name, and the file is only
 # created once the emulator has actually started, so the name is discovered
 # rather than assumed. Without this the CITRON run would silently archive an
 # EMPTY emulator log and the comparison would be worthless.
-if ($EmulatorName -ne 'eden') {
+if ([string]::IsNullOrWhiteSpace($EmulatorLogName)) {
     $candidate = Get-ChildItem (Join-Path $edenRoot 'user\log') -File -Filter '*.txt' -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending | Select-Object -First 1
     if ($candidate) { $edenLog = $candidate.FullName }
@@ -519,14 +567,50 @@ if ($framePngs.Count -gt 0) {
     }
     Write-Host ("frames  : {0} of {1} removed from the card, {2:N0} bytes freed" -f $frameRemoved, $framePngs.Count, $frameBytes)
 }
-$edenLog = Join-Path $edenRoot 'user\log\eden_log.txt'
-if ($EmulatorName -ne 'eden') {
+$edenLog = Join-Path (Join-Path $edenRoot 'user\log') $EmulatorLogName
+if ([string]::IsNullOrWhiteSpace($EmulatorLogName)) {
     $candidate = Get-ChildItem (Join-Path $edenRoot 'user\log') -File -Filter '*.txt' -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending | Select-Object -First 1
     if ($candidate) { $edenLog = $candidate.FullName }
 }
 if (Test-Path $edenLog -PathType Leaf) {
     Copy-Item -LiteralPath $edenLog -Destination (Join-Path $archive 'eden_log.txt.tail') -Force
+}
+
+# THE POSITIVE CONTROL: IS THIS LOG EVEN OURS?
+#
+# The emulator's log is a SINGLE shared file per installation.  Another
+# project can run its own Eden on the same installation, and Eden ROTATES
+# that file at startup -- so the second instance to start DESTROYS the
+# first one's log, and the first instance's archive then holds the second
+# one's log.  Measured on 2026-10-29, archive 20261029-012642-eden-q19:
+# BOTH archived Eden logs said "Loading aniswitch" and mentioned "rr3"
+# ZERO times, because E:\AI\ani-switch's stress script had killed our
+# emulator and rotated the log underneath us.
+#
+# A reader of that archive would have taken every fault count from a
+# foreign run and believed it described ours.  So the archive now says
+# WHICH TITLE the log says it loaded, and whether that is the one this
+# project launched.  The emulator prints "core/core.cpp:327:Load: Loading
+# <title>" when it loads a title, which is the one line that says which
+# game the log belongs to.
+$edenLogTitle = '(none)'
+$edenLogIsOurs = $false
+$archivedEdenLog = Join-Path $archive 'eden_log.txt.tail'
+if (Test-Path $archivedEdenLog -PathType Leaf) {
+    $loadedTitles = @(Select-String -LiteralPath $archivedEdenLog -Pattern 'Loading\s+(\S+)' -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -Unique)
+    if ($loadedTitles.Count -gt 0) {
+        $edenLogTitle = ($loadedTitles -join ',')
+        $edenLogIsOurs = @($loadedTitles | Where-Object { $_ -eq $ExpectedTitle }).Count -gt 0
+    }
+    $mentions = @(Select-String -LiteralPath $archivedEdenLog -Pattern 'rr3' -SimpleMatch -ErrorAction SilentlyContinue).Count
+    if (-not $edenLogIsOurs) {
+        Write-Warning ("edenlog : the archived emulator log says it loaded '{0}', not '{1}' (rr3 mentions: {2}). It belongs to ANOTHER run and every fault count taken from it is about that run, not this one." -f $edenLogTitle, $ExpectedTitle, $mentions)
+    }
+    else {
+        Write-Host ("edenlog : the archived emulator log is ours (loaded '{0}', rr3 mentions: {1})" -f $edenLogTitle, $mentions)
+    }
 }
 # Eden's emulator log is a CAPPED file, not a per-run file. Measured on every
 # recent archive: eden_log.txt stops growing at ~105,830,000 bytes (100.93
@@ -601,6 +685,14 @@ $summary = [ordered]@{
     edenLogFirstTs  = '-'
     edenLogLastTs   = '-'
     edenLogOldLines = 0
+    # THE POSITIVE CONTROL FOR THE ARCHIVE ITSELF.  The emulator's log is a
+    # shared file per installation, and another project running its own Eden
+    # on the same installation can kill ours and rotate the log, leaving a
+    # FOREIGN log in the archive.  These two fields say whether that
+    # happened, so a reader never takes a fault count from someone else's
+    # run without being told.
+    edenLogTitle    = '(none)'
+    edenLogIsOurs   = $false
     # MILESTONES. The guest's own progress markers, counted, so a reader never
     # has to grep a 20 MB log to learn whether the run got past the load.
     #
@@ -864,6 +956,8 @@ if (Test-Path (Join-Path $archive 'eden_log.txt.tail') -PathType Leaf) {
         $summary.edenLogFirstTs = $ts[0].Groups[1].Value
         $summary.edenLogLastTs = $ts[$ts.Count - 1].Groups[1].Value
     }
+    $summary.edenLogTitle = $edenLogTitle
+    $summary.edenLogIsOurs = $edenLogIsOurs
 }
 if (Test-Path (Join-Path $archive 'eden_log.txt.old.txt') -PathType Leaf) {
     $summary.edenLogOldLines = ([regex]::Matches(
@@ -912,6 +1006,16 @@ $runSummaryPath = Join-Path $archive 'run-summary.txt'
         $summary.pixelsLit, $summary.pixelsTotal, $summary.pixelBins, $summary.pixelReadbackFrame)
     ('eden log       {0} lines, spans t={1}..{2} s of emulator time (capped file: a count taken from it is a count over that window, not over the run)' -f `
         $summary.edenLogLines, $summary.edenLogFirstTs, $summary.edenLogLastTs)
+    ('eden log title {0}   (the title the archived log says it loaded; ours={1})' -f `
+        $summary.edenLogTitle, $summary.edenLogIsOurs)
+    if (-not $summary.edenLogIsOurs) {
+        ''
+        'WARNING: THE ARCHIVED EDEN LOG IS NOT THE LOG OF THIS RUN.'
+        '  Another Eden instance on the same installation rotated the shared log, or'
+        '  the emulator was killed and restarted. Every fault count below that comes'
+        '  from the Eden log describes THAT run. Use the guest log and the frame'
+        '  captures, which are per-run, and treat the Eden fault counts as void.'
+    }
     ('eden log old   {0} lines (Eden''s startup-created file; it is NOT the earlier part of this run)' -f $summary.edenLogOldLines)
     ''
     'milestones'
