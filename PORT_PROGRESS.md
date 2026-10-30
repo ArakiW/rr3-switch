@@ -8555,3 +8555,44 @@ measurement.
 The port must not read a field at an offset that has not been measured on
 a live object.  Where the measurement is missing, the port says so
 instead of reporting a number it cannot back.
+
+
+## The causal chain q21 closed: ONE wrong offset explains every symptom
+
+Sampling q21's race-state line by line shows the car did not merely
+"fail to steer" - it drove 513 m and then froze, and every number agrees on
+why:
+
+    f        total(m)   speed      thr  brk   steer    stalls  flips
+    5700     0          4294967295 1   0     0.000   0       0
+    7530     513        11808      1   0    -0.050   0       0
+    9360     674        11808      0   1    -0.600   4       1
+    11190    672        11808      0   1    -0.600   11      1
+    ...      672        11808      0   1    -0.600   ...     1
+    38640    672        11808      0   1    -0.600   125     1
+
+* the car accelerates, covers 513 m and then 674 m, and from there
+  `total` NEVER MOVES AGAIN (672 m for the rest of the race),
+* `speed` is FROZEN at 11808 (46 km/h) - the guest's own speed value
+  stopped changing, which is what a car against a barrier looks like,
+* the port holds `brk=1` and `thr=0` the whole time, and `steer` is
+  pinned at -0.600 with `mag=0.230`,
+* `stalls` climbs to 126 and `flips` stays at 1.
+
+WHY: the pursuit error is `perr=0.0000` and `pur=0` in EVERY sample, and
+the position it would be computed from is `cpos=2,33,0` with `ctgt=0,0,0`
+and `cnode=0`.  With no position and no target there is no error, so the
+pure-pursuit branch never engages and the rate-only fallback servo has
+nothing to steer towards: it winds the axis up to its floor and holds it.
+The car drives into the barrier and the guest's own counters freeze.
+
+So the port's single wrong assumption - that the car's world position and
+aim target live at CAR+0x30.. and CAR+0x3c.. - is not a cosmetic
+mismatch.  It is the reason the car cannot be driven, and therefore the
+reason the steering sign, the lap counter and the pursuit error have
+never been measurable.
+
+THE FIX IS A MEASUREMENT, NOT AN OFFSET CHANGE.  The port now dumps the
+CAR object's own bytes (phase=car-raw, 0x120 bytes, every 600 frames) in
+the same format the metrics modifier is dumped, so the next round reads
+the layout off a LIVE object instead of guessing it again.
