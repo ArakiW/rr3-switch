@@ -9716,10 +9716,39 @@ the alias FIRED 12 times, and the car that needed it stopped falling back:
 and the run is otherwise normal: md5 mismatch 0, start lights 4, race screen 10,
 HUD 10, 600 frames.
 
-**=>⇒ AND THE SAME RULE FIXES THE OTHER TWO CARS**: both the 2019 Aston Martin
-Vantage GTE and the 2020 Chevrolet C8.R are the same shape (a car EA shipped as
-a livery over another car's body).  Their base cars are named in their own
-car definitions, so the same DECRYPT-AND-READ method adds them to the table --
-and the table is evidence-based by construction, never a guess on the year.
+**=>=> AND THE OTHER TWO CARS ARE **NOT** THE SAME CASE -- MEASURED, NOT
+ASSUMED.**  The obvious next move was to add the 2019 Aston Martin Vantage GTE
+and the 2020 Chevrolet C8.R to the same table.  Decrypting THEIR OWN
+definitions says no:
+
+    452_2021_porsche_911_rsr.bin.nct          ->  "2020_911_RSR"   (A BASE CAR)
+    380_2019_aston_martin_vantage_gte.bin.nct ->  (no base car named)
+    381_2020_chevrolet_c8.r.bin.nct           ->  (no base car named)
+
+and their BODIES ARE NOT MISSING: the C8.R's per-car asset list names
+2020_chevrolet_corvette_c8r_sha.dxt.dds.z, _cab, _int, _mask, _misc, _wheel,
+_ext_shadows_high and _int_shadows -- **all present in the volumes**.  What
+is missing is badges / lights / sw / wheel_blur / dashplanes (small parts)
+**plus EVERY .atc AND .etc VARIANT OF EVERYTHING**.
+
+**=>=> AND THAT LAST PART IS THE GENERAL FINDING**: a per-car asset list names
+all THREE texture formats (atc / dxt / etc) and only ONE pack (DXT) is
+installed, so **most of the "missing file" noise in the log is the other two
+FORMATS, not missing content** -- and chasing a car's missing files one by one
+is chasing the noise.  The 2019 Aston Martin is the extreme case: its per-car
+asset list does not exist in ANY volume ("asset_list_vehicle_2019_aston_martin_
+vantage_gte.txt" NOT FOUND), so the guest gets nothing for that car.
+
+**=>=> SO THE ALIAS TABLE STAYS AT ONE ENTRY** -- the 2021 Porsche 911 RSR, the
+one car whose definition NAMES the car whose body it uses.  Every entry says
+which definition said so.
+
+**=>=> AND A NOTE ON THE NAMES**: the ASSET DIRECTORY is not always the name
+in the definition.  The C8.R is defined as "381_2020_chevrolet_c8.r.bin.nct"
+but its assets live in "2020_chevrolet_corvette_c8r"; the Porsche's
+definition is "452_2021_porsche_911_rsr.bin.nct" and its assets live in
+"2021_porsche_911_rsr".  An alias table keyed on the wrong spelling would
+never match -- and it would look like "the alias does not fire" rather than
+"the key is wrong".
 
 =========================================================================
