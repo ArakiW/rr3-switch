@@ -8963,3 +8963,81 @@ CarSelectScreen and DebugRaceSelectScreen.  A screen's CHILDREN are at
 comp+0x138 with their names at comp+0x38 and their rectangle through
 vtable slot 10, so the port can find a control BY NAME and stop hunting
 pixels altogether.
+## q27: the guest's own QA framework runs, and CRASHES the guest -- and the
+## front end's animation breaks the feedback loop
+
+q27 ran with the race gate fixed (the guest's own bookkeeping instead of
+the change rate) and with the action file's parser fixed.
+
+**THE ACTION FILE NOW WORKS, AND THE GUEST'S OWN AUTOMATION RAN.**
+
+    phase=guest-action ... name="Soaks|CLEAR SOAKS" idx=226 fn=0x210986d218 arg=0x0 owner=0 calling=1 called=1
+    phase=guest-action ... name="Character|Unlock All Tracks" idx=20 fn=0x21098662c8 arg=0x0 owner=0 calling=1 called=1
+    phase=guest-action ... name="Soaks|QUEUE SOAK:RACE LOOP" idx=227 fn=0x210986d22c arg=0x0 owner=0 calling=1 called=1
+    phase=guest-action ... name="Soaks|START SOAK" idx=224 fn=0x210986d1e8 arg=0x0 owner=0 calling=1 called=1
+    phase=guest-action ... pending=4 all-done=1
+
+Every function address is the one the reverse engineering predicted, and
+every command was called with a ZERO argument and no owner -- which is
+what the instruction-level analysis said, because the two QUEUE commands
+overwrite x0 before they use it.
+
+**AND THEN THE GUEST CRASHED.**  The harness ended the run at 663 s with
+"the guest is blocked, not slow", and the guest had written its OWN
+automation log to the card first:
+
+    AUTOMATION LOG [Debug]:  Start Test SOAK TEST
+    AUTOMATION LOG [Debug]:  Enter Scene 3
+    AUTOMATION LOG [Debug]:  Scene changed from None to FrontEnd, memory usage: 0 KiB
+
+**"memory usage: 0 KiB" IS THE WHOLE STORY.**  The soak framework needs a
+CONFIGURATION string per test id (0..5) out of a runtime table, and in
+this build that table is EMPTY: the race request has no data, the scene
+comes up with nothing in it, and the guest dereferences a null pointer
+(the emulator's log: Unmapped WriteExclusive64 @ 0x8).
+
+So the Soaks route is real -- it reaches the guest's own QA machinery --
+but it is **not usable until that configuration table is populated**, and
+until then it takes the guest down.  A crashed guest measures nothing, so
+the card's rr3-action.txt no longer asks for it: the file now carries the
+harmless unlock and a note saying exactly why the rest is not there.  It
+becomes the shortest route into a race the moment the table is filled.
+
+**AND THE FEEDBACK LOOP'S SIGNAL WAS ALWAYS TRUE.**  The port pressed the
+SAME control 45 times in a row -- the red glove on the main menu's promo
+car, at (465, 355) -- and never moved on.  The success test was
+
+    if (!pressedStillThere || screenJumped) { the press worked }
+
+and `screenJumped` was "the screen changed by more than 12000 pixels".
+MEASURED on q27's own log, the MAIN MENU changes 268510 pixels -- 37 % of
+the screen -- between two readbacks, because the banner is an animation.
+So "the screen changed" is ALWAYS true on the front end, the test was
+always satisfied, and the tried list was cleared after every press.
+
+**The screen's change rate cannot be a feedback signal in a UI that
+animates.**  The signal is the CONTROL: a press that worked takes its
+control away (the button is gone, or the guest's hint hand has moved),
+and a press that did nothing leaves the control exactly where it was.
+Twelve pixels of slack, because a control moves a little when it is
+pressed.
+
+**AND THE ACCENT-COLOURED CONTROLS ARE TRIED BEFORE THE GLOVE.**  On the
+main menu the glove sits on the promo car -- a decoration -- while the way
+into a race is the orange ENTER THE RACE button, which carries no glove at
+all.  With the glove first, the port pressed the decoration and never
+reached the button.
+
+**THE LESSON, WHICH IS BIGGER THAN THE GAME.**  Every one of the four
+defects in this round was a *signal* that looked like a fact:
+
+  * "the tap happened" -- it happened, with zero duration, and the guest
+    dropped it;
+  * "the screen changed" -- it changed, by 37 %, and it said nothing;
+  * "the screen is moving, so a race is running" -- it was moving, and it
+    was a parked car on a menu;
+  * "the command was called" -- it was called, and it crashed the guest.
+
+  A signal has to be checked against the thing it is supposed to mean,
+  and the check has to be a DIFFERENT instrument from the one that
+  produced it.

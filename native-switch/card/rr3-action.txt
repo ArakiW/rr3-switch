@@ -1,39 +1,39 @@
 # The guest's own commands, by name.
 #
-# THE PIXEL-FREE ROUTE INTO A RACE.
+# WHAT IS HERE, AND WHY NOT MORE.
 #
 # The guest ships a QA framework of its own -- the "Soaks" -- that builds a
-# race request and hands it to the guest's normal race flow.  That is a way
-# into a race with no pixels involved at all, and it is the guest's own code
-# doing the work.
+# race request and hands it to the guest's normal race flow.  It LOOKS like
+# a pixel-free route into a race, and it WORKS as far as it goes:
 #
-# REVERSE ENGINEERED 2026-10-30 (libRealRacing3.so):
+#   Soaks|QUEUE SOAK:RACE LOOP   fn 0xa6e22c  push_back(3)
+#   Soaks|START SOAK             fn 0xa6e1e8  SoakMgr::Start(0)
+#   Soaks|CLEAR SOAKS            fn 0xa6e218  clears the queue
 #
-#   Soaks|QUEUE SOAK:RACE LOOP             fn 0xa6e22c  push_back(3)
-#   Soaks|QUEUE SOAK:RACE LOOP - fast fwd  fn 0xa6e244  push_back(4)
-#   Soaks|START SOAK                       fn 0xa6e1e8  SoakMgr::Start(0)
-#   Soaks|CLEAR SOAKS                      fn 0xa6e218  clears the queue
-#   Character|Unlock All Tracks            fn 0xa672c8  unlocks the tracks
+# MEASURED 2026-10-30 (archive 20261030-231541-eden-rr3-q27-race-gate-action):
+# all four commands were called with arg=0x0 and no owner -- which is what
+# the instruction-level analysis said, because the two QUEUE commands
+# overwrite x0 before they use it -- and the guest wrote its OWN automation
+# log to the card:
 #
-# THE ORDER MATTERS.  START takes the queue's LAST entry (index = count-1),
-# so the QUEUE has to have run first.
+#   AUTOMATION LOG [Debug]:  Start Test SOAK TEST
+#   AUTOMATION LOG [Debug]:  Enter Scene 3
+#   AUTOMATION LOG [Debug]:  Scene changed from None to FrontEnd, memory usage: 0 KiB
 #
-# THE FRAMES ARE LATE ON PURPOSE.  The port's own UI driver (the red glove
-# and the accent-coloured controls, see native-switch/source/ui_target.cpp)
-# gets the first 6000 frames to work the menus by itself.  If it has not
-# reached a race by then, this takes over.  The frame counter is the port's
-# own, which is the guest's frame counter to within one.
+# -- and then the guest CRASHED: the emulator logged an Unmapped
+# WriteExclusive64 at 0x8 and the guest log stopped growing for 133 s.
 #
-# MEASURED 2026-10-30: the guest's front end is up by frame 390 (the first
-# glove of the q25 run was found at frame 390), so 6000 is far past the
-# point where the front end exists and far short of the point where the
-# race itself would be disturbed.
+# "memory usage: 0 KiB" is the reason.  The soak framework needs a
+# CONFIGURATION string per test id (0..5) out of a runtime table, and in
+# this build that table is EMPTY: the race request has no data, and the
+# guest dereferences a null pointer.
 #
-# The port calls a command only if its name is in its own allow list
-# (native-switch/source/guest_action.cpp, kAllowedActions), so a command
-# that the guest has but the port does not allow is never called, and the
-# port logs that it refused.
-at=5950 Soaks|CLEAR SOAKS
+# So the Soaks route is NOT enabled here.  With an empty configuration it
+# takes the guest down, and a crashed guest measures nothing.  It becomes
+# the shortest route into a race the moment that table is populated.
+#
+# WHAT IS HERE: the unlock, which is harmless, which the guest's own
+# automation did run without complaint, and which the daily race wants.
+# The rest of the way forward is the port's own UI driver, which READS
+# the controls off the guest's picture instead of naming coordinates.
 at=6000 Character|Unlock All Tracks
-at=6100 Soaks|QUEUE SOAK:RACE LOOP
-at=6200 Soaks|START SOAK
