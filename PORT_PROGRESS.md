@@ -9264,6 +9264,7 @@ while"), and it is the price of the quality switches.
 also the lesson: change ONE thing at a time when one of the changes can
 cost a recompile.
 ## THREE separate knobs, and only one of them is the picture quality
+## (CORRECTED: it is the VIEW, not the platform)
 
 The PS Vita port sent the whole thing in the right direction, and the
 measurement that came out of it is worth writing down on its own.
@@ -9272,16 +9273,22 @@ measurement that came out of it is worth writing down on its own.
 THINGS.**  All three live in native-switch/card/rr3-screen.txt:
 
     platform=WxH   Platform.getScreenWidth / getScreenHeight
-                  -> what the guest calls "Res base" (it prints it:
-                     "Res base: 2048x1536")
-                  -> THE GUEST'S ATLAS FILTER uses it:
-                     width <= screenW OR height <= screenH
-                     (cc::ImageResManager, ELF 0x10f8cf8)
+                  -> NOT the number the guest's atlas filter uses.
+                     MEASURED 2026-10-31 (q30): with platform=2048x1536 and
+                     view=1280x720 the guest still printed "Res base:
+                     1280x720" and used the SD atlas (1192 paths from
+                     rr3gui1, none from rr3gui0).
     ui=WxH         CCUserInterfaceManager.getScreenWidth / getScreenHeight
                   -> the UI layout space
     view=WxH       the size the port tells the GUEST its view is
+                  -> WHAT THE GUEST CALLS "Res base" (MEASURED: q28 and q30
+                     both show the guest's "Res base" following the VIEW and
+                     not the platform)
                   -> the viewport the guest DRAWS into, and the space the
                      touch coordinates live in
+                  -> AND THEREFORE THE NUMBER THE ATLAS FILTER USES:
+                     width <= screenW OR height <= screenH
+                     (cc::ImageResManager, ELF 0x10f8cf8)
 
 **MEASURED, and they do not agree by accident:**
 
@@ -9301,16 +9308,28 @@ THINGS.**  All three live in native-switch/card/rr3-screen.txt:
             detector was looking at the window, which at that moment held
             the presented (letterboxed) image, not the guest's picture.
 
-**⇒⇒ THE COHERENT COMBINATION** is the one that keeps every space the
-size of the output and only moves the ATLAS:
+**⇒⇒ THE COHERENT COMBINATION, AND WHAT IS STILL MISSING.**
 
-    platform=2048x1536   the guest's "Res base" -> the HD atlas is a
-                         candidate -> the 2D UI is drawn from 2048x1536
-                         textures instead of a 960x640 one
-    ui=2048x1536         the layout space
-    view=1280x720         the guest's viewport = the window, so the
-                         readback, the touch coordinates and the picture
-                         are all the same space
+MEASURED 2026-10-31 (q30, platform=ui=2048x1536, view=1280x720): the
+guest printed "Res base: 1280x720", used the SD atlas, and the frame
+loop made TWELVE presses in 1200 frames and REACHED THE RACE (start
+lights 4, race screen 10, HUD 10).  So:
+
+  * the closed loop works at a 1280x720 view, and it reaches a race;
+  * the ATLAS is chosen from the VIEW, not from the platform -- q28
+    (view=2048x1152) took the 2048x1536 atlas (750 paths from rr3gui0),
+    q30 (view=1280x720) took the 960x640 one (1192 from rr3gui1, none from
+    rr3gui0);
+  * and q29 (view=2048x1536) shows why a bigger view is not simply
+    better: the guest then draws into an OFFSCREEN target of the view size
+    while the port's readback reads the WINDOW, so the capture and the
+    glove detector look at the wrong image and the frame loop made ZERO
+    presses in 9120 frames.
+
+=>=> THE REMAINING PIECE is therefore ONE thing: the readback has to
+target the guest's render target (the offscreen surface it draws into),
+not the default framebuffer.  With that, view=2048x1152 would give BOTH
+the HD atlas AND a picture and touch space that match the window.
 
 ⇒ The UI is then drawn from the HD atlas into the 1280x720 window: sharp
 (a downscale, not a 1.33x upscale), and correctly proportioned, because
