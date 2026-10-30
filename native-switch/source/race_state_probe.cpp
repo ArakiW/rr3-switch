@@ -852,6 +852,15 @@ unsigned long long g_lastFlipFrame = 0;
 //   CAR + 0x20 / +0x24             the previous/current spline node
 //   CAR + 0x30/+0x34/+0x38         the car's WORLD POSITION
 //
+// THE LAST TWO ARE ASSUMED, NOT MEASURED, AND MEASUREMENT SHOWS THEM
+// WRONG.  The port took them from the guest's DEBUG REGISTRATION function
+// (0xd052e0), which describes a 68-BYTE-PER-RECORD ARRAY, not the CAR
+// object itself.  MEASURED 2026-10-29, q21: cnode=0, cpos=2,33,0 and
+// ctgt=0,0,0, while CAR_STATE's pair (snode, sdist) is right.  The CAR's
+// own bytes are now dumped (phase=car-raw) so one round shows where the
+// position really is; until then the pursuit error is identically zero and
+// the port says so rather than steering on noise.
+//
 // Three independent cross-checks exist for the CAR_STATE pair: the writer
 // 0xc2d888 (`ldr x8,[x0,#0x288]` then `str w4,[x8,#0x1a8]`), the
 // projection helper snapToClosestNode at 0xd05e44, and 0xb29264/0xb29284.
@@ -873,6 +882,46 @@ void fillCarState(RaceMetricsSample* out) {
         return;
     }
     out->carAddress = static_cast<uintptr_t>(car);
+    // THE CAR'S OWN LAYOUT, DUMPED.
+    //
+    // MEASURED 2026-10-29, q21: the node index, the world position and the
+    // aim target all read as zero or noise (cnode=0, cpos=2,33,0,
+    // ctgt=0,0,0), while CAR_STATE's node index and distance ARE right
+    // (snode=290, sdist=13508).  So the offsets the port uses on the CAR
+    // are not the fields it thinks they are.
+    //
+    // Rather than guess again, this prints the CAR object's own bytes, the
+    // same way the metrics modifier is dumped: 32-bit words with "%08x",
+    // which byte-swaps each group of four relative to memory, so a reader
+    // must undo it.  One round of this settles where the position is.
+    //
+    // It is a DIAGNOSTIC, and it is bounded: 0x120 bytes at a fixed rate.
+    {
+        // The probe is pumped once per frame by the frame loop, so a local
+        // counter is the frame number.  It is a LOCAL static on purpose:
+        // this file has no global pump counter, and borrowing one from
+        // another translation unit would couple two unrelated files.
+        static unsigned long long s_dumpAt = 0;
+        static unsigned long long s_calls = 0;
+        const unsigned long long now = ++s_calls;
+        if (now >= s_dumpAt) {
+            s_dumpAt = now + 600ULL;
+            char raw[2048];
+            int written = std::snprintf(raw, sizeof(raw), "car=0x%llx w=",
+                                        static_cast<unsigned long long>(car));
+            for (int off = 0x00; off < 0x120; off += 4) {
+                if (written <= 0 || written >= static_cast<int>(sizeof(raw)) - 12) {
+                    break;
+                }
+                uint32_t word = 0;
+                readDword(car + static_cast<uintptr_t>(off), &word);
+                written += std::snprintf(raw + written,
+                                         sizeof(raw) - static_cast<size_t>(written),
+                                         "%08x", word);
+            }
+            appendGuestBootLine(kGuestViewLogPath, "car-raw", 103, 0, raw);
+        }
+    }
     readDword(car + 0x20ULL, &out->carPrevNode);
     readDword(car + 0x24ULL, &out->carNode);
     // The world's position and the point the car is aiming at.  The guest
@@ -925,6 +974,11 @@ void fillMetrics(RaceMetricsSample* out, uintptr_t address) {
     // the member DESCRIPTORS (rotating ids and name hashes), which is why
     // they read as noise: the numbers the engine uses are elsewhere, and
     // the probe has to ask the value store for them the way the guest does.
+    //
+    // MEASURED 2026-10-29, q21: the VALUES are right (mres=0x3f, and the
+    // guest's own class name comes back as 27RuleSetModifier_RaceMetrics),
+    // so the SLOTS are the guest's own.  What the slots do NOT hold is the
+    // member NAME - see the identity check below.
     //
     // A member that resolves replaces its descriptor reading; one that does
     // not keeps it, and the mask says which happened.
