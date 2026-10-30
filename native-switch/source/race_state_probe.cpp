@@ -974,10 +974,49 @@ void fillMetrics(RaceMetricsSample* out, uintptr_t address) {
         *slots[i].raw = static_cast<uint32_t>(value);
         *slots[i].asFloat = static_cast<float>(value);
         out->membersResolved |= (1u << i);
-        // THE IDENTITY CHECK: the guest's own descriptor words.
+        // THE IDENTITY CHECK IS OFF, AND THE REASON IS MEASURED.
+        //
+        // MEASURED 2026-10-29, archive 20261029-174557-eden-rr3-q21-isolated-
+        // calendar-fix: this check reported ident=0x0 for EVERY member while
+        // mres=0x3f said all six of them resolved.  A test that fails for
+        // all six cannot be a name mismatch, and the port's own raw dump
+        // says why.
+        //
+        // The dump (phase=race-raw prints the metrics object from -0x100 to
+        // +0x140) shows the object's first 0x48 bytes are POINTERS, and the
+        // bytes from +0x48 on are the hash/rotating-id words:
+        //
+        //     +0x00  78 33 c4 0a 21 00 00 00   0x210ac43378  a pointer
+        //     +0x08  10 ef 13 31 21 00 00 00   0x2113ef1010  a pointer
+        //     +0x10  18 ef 13 31 21 00 00 00   0x2113ef1018  a pointer
+        //     ...
+        //     +0x50  ad 05 0e 85 9c 14 2e 66   hash-like bytes
+        //
+        // So the words at slot+0x08 and slot+0x10 are POINTERS, not a name
+        // hash and a len^hash.  Read as two 32-bit halves of adjacent
+        // pointers they XOR to 0, which is exactly the len the log shows.
+        //
+        // WHERE THE NAME REALLY IS: the value store's CHAIN NODE
+        // (member_value_store.hpp): node+0x00 next, node+0x08 the key,
+        // node+0x10 the key again, node+0x18 a pointer to the value cell.
+        // The member NAME is not in the metrics object at all -- the object
+        // holds only ROTATING ids that the value store maps to values.  The
+        // port's name table therefore describes slots that carry no names,
+        // and the length test cannot pass.
+        //
+        // Until the guest's own registration (ELF 0xb35a30, the calls at
+        // 0xb35a5c..0xb35ba0) has been read on a LIVE object to find where
+        // the name and its len^hash are kept, this check stays off.
+        // Reporting a mask the port cannot back would be a claim, not a
+        // measurement; reporting "not measured" is honest.
+        //
+        // WHAT IS MEASURED AND REPORTED INSTEAD: the six member VALUES
+        // (which resolve, mres=0x3f) and the guest's own class name
+        // (27RuleSetModifier_RaceMetrics).  The values are what the port
+        // acts on.
         uint32_t nameHash = 0;
         uint32_t lenXorHash = 0;
-        if (readDword(address + slots[i].offset + 0x08ULL, &nameHash) &&
+        if (false && readDword(address + slots[i].offset + 0x08ULL, &nameHash) &&
             readDword(address + slots[i].offset + 0x10ULL, &lenXorHash)) {
             const uint32_t recoveredLength = nameHash ^ lenXorHash;
             const uint32_t expectedLength =

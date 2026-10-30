@@ -8332,3 +8332,226 @@ event card and at (1120,45) on another screen, and the tool follows it.
 The deploy script grew `-TouchMode glove` for this: it writes a
 COMMENTS-ONLY touch file, so the port's touch control owns the touch path
 but injects nothing until the host appends a line.
+
+
+# 2026-10-29 -- THE GUEST REACHED A RACE AGAIN, AND WHY IT HAD STOPPED
+
+## q19 was not a port regression: another project killed our emulator
+
+The run tagged q19 died after 112 seconds and its archive was worthless.
+The cause was NOT in this port:
+
+* E:\AI\ani-switch\scripts\eden_stress_run.ps1 runs its own Eden on the
+  SAME E:\Eden installation and, before every run, executes
+  `Get-Process -Name 'eden','eden-cli','Eden','Eden-cli' | Kill` --
+  which matches our emulator by PROCESS NAME and killed it at 01:28:28.
+* Eden's log is ONE file per installation and Eden TRUNCATES it at
+  startup, so the second instance to start DESTROYS the first one's log.
+  Both files in the q19 archive (eden_log.txt.tail and
+  eden_log.txt.old.txt) say "Loading aniswitch" and mention "rr3" ZERO
+  times: they are the other project's log, and the harness archived them
+  as if they were ours.
+
+So a whole round was lost to an environment collision, and the harness
+reported it as "eden exited on its own", which reads exactly like a port
+regression.
+
+THE FIX (tools/Setup-IsolatedEden.ps1, tools/Test-OnEden.ps1):
+
+* a PRIVATE Eden at E:\Eden-rr3: the executables under a name the other
+  project does not kill and its Resolve-EdenRoot does not find
+  (eden-rr3.exe), its OWN user\ directory (log, crash dumps, NAND,
+  config) and its OWN COPY of the SD card.  The card is copied rather
+  than linked, because the guest WRITES to it.
+* the harness now READS the title the archived emulator log says it
+  loaded and says so in the archive, so a foreign log can never be
+  mistaken for the run's own.  q21 reported
+  "edenlog : the archived emulator log is ours (loaded 'RR3', rr3 mentions: 11003)".
+* the harness warns at launch when another Eden is alive, and says whether
+  it is on the SAME installation (which can kill this run and rotate this
+  run's log) or a different one.
+
+## Why the guest stopped reaching a race at all: a MODAL, not a code change
+
+Every archive from q12 (2026-10-29 00:02) onwards failed to reach a
+race, while q8, q10 and q11 (all on 2026-10-28) did.  The two runs are
+IDENTICAL up to guest ordinal 2500: the same touch injections at the same
+frames, the same 1280x720 view, the same touch channel state
+(valid=1, enabled=1), the same asset lists, the same sync traffic.
+
+The difference is ONE MODAL.  q12's last frame (frame-012000.png) shows
+the guest sitting in the M$ DAILY REWARDS CALENDAR with its own red glove
+on the orange COLLECT word; q11's frame at the same point
+(frame-001400.png) shows the MAIN MENU, with no calendar at all.  On
+2026-10-28 the daily reward had already been collected, so the calendar
+did not open; after midnight it opened again and the guest never got past
+it.  It sat in that modal for the whole run and every later hop landed on
+the calendar instead of the menu.  The guest's own log says it plainly:
+q12 never queued the asset update sync that in q11 brought the track's
+asset lists down and led to the race.
+
+THE HARD-CODED COORDINATE MOVED WITH THE DATE.  Measured off the real
+frame with the orange-button mask (r>230, 150<g<215, b<60):
+
+    2026-10-27 (archive f1k)   the COLLECT word at x 373..533, y 202..242
+                                -> the point (453, 222) was used
+    2026-10-29 (archive q12)   the COLLECT word at x 565..725, y 202..242
+                                -> (453, 222) is NOT orange: blank
+                                   background, 112 px left of the button
+
+The vertical position did not move; the horizontal one did, because the
+calendar lays the word over the middle column of a day grid whose width
+depends on the month.  One hard-coded point is a coin toss.
+
+THE FIX: hop 1 clicks THREE candidate columns (453, 549, 645) over a
+window in which the calendar can plausibly be up, and every other hop is
+repeated over a window too, so a hop that lands on the wrong control is
+retried.  The extra clicks are harmless: they land on the calendar's own
+day circles, which is a no-op.
+
+## The touch queue was silently dropping events
+
+The whole script is read in ONE poll, so all 48 events are queued
+together -- and the queue held 64 entries.  On overflow the code
+advanced the CONSUMED counter past the lines it had not queued, so those
+lines were never re-read and never delivered: the script was truncated
+with nothing to show for it but one "event queue full" line.  The queue
+is now 256 entries, and the overflow path advances the counter only over
+the lines that were actually queued, so an oversized script is DELAYED
+rather than cut.
+
+## q21: the guest got into a race, on the private instance
+
+Archive 20261029-174557-eden-rr3-q21-isolated-calendar-fix, 1509 s, run
+to the wall-clock deadline with nothing interfering:
+
+    start lights (StartLightsScreen)   7
+    race screen (InGameScreen)        10
+    pre-race (PreRaceScreen)            4
+    track load finished                1   ("Total Levelloading: 21832")
+    HUD string (race marker)           10
+    objective string (race marker)     15
+    touch injections                   48   (0 overflow, 0 badline)
+    QueueAssetsUpdateSync / ConsentToDownload   2 / 2
+
+And the port read the guest's OWN race state for the first time in a race
+that it could steer:
+
+    metrics=1  mres=0x3f  cls=27RuleSetModifier_RaceMetrics
+    total=171997 (673 m)  speed=11808 (46 km/h)  rate=-11.96
+    drive=1  steer=-0.600  mag=0.170  stalls=2  flips=1
+
+The screenshot .build/showcase/q21-in-race-brands-hatch.png shows the
+guest's own F1 car on the Brands Hatch circuit, in position 7, with the
+guest's "hold the brake to reverse" message on screen.
+
+## What is STILL wrong, and where it is: the member slots are NOT descriptors
+
+q21 reported "mres=0x3f" (all six members resolved: the rotating ids and
+the value store are fine) and "ident=0x0" (the name test failed for all
+six).  A test that fails for EVERY slot cannot be a name mismatch: it
+means the two words the check reads are not the pair it thinks they are.
+
+MEASURED from the port's own race-raw dump, with the per-word byte swap
+undone (the probe prints each DWORD with "%08x", so the hex of a group of
+four bytes is reversed relative to memory):
+
+    +0x00  73 65 72 69 65 73 2f 71 75 61 6e 74 69 63 66 69  series/quanticfi
+    +0x10  72 65 5f 66 65 72 72 61 72 69 5f 32 39 36 5f 67  re_ferrari_296_g
+    +0x20  74 62 5f 74 74 63 2f 73 70 72 69 74 65 73 2e 61  tb_ttc/sprites.a
+    +0x30  6e 64 72 6f 69 64 2e 61 74 6c 61 73 00 64 73 2e  ndroid.atlas.ds.
+    +0x40  7a 00 ff ff ff ff ff f1 31 00 00 00 00 00 00 00  z.......1.......
+
+So the object the probe dumps begins with the STRING
+"series/quanticfire_ferrari_296_gtb_ttc/sprites.android.atlas" -- an ASSET
+PATH, not a member descriptor -- and the port's member offsets
+(0x08, 0x20, 0x38, 0x50, 0x68, 0x88) land INSIDE that string and in the
+pointer words after it.
+
+That explains all three remaining zeros at once:
+
+* "ident=0x0" -- the words read at slot+0x08 and slot+0x10 are ASCII of
+  the asset path, so "hash ^ (len^hash)" is not a length.
+* "perr=0.0000" and "pur=0" -- the pursuit needs the car's position and
+  its target, which come from the same wrong offsets, so the error is
+  identically zero and the pure-pursuit controller never engages.
+* "laps=4294967295" -- the lap counter is read as the same noise.
+
+WHAT THE NEXT ROUND MUST MEASURE: the descriptor layout of the object the
+guest's OWN registration builds (ELF 0xb35a30, the registration calls at
+0xb35a5c..0xb35ba0), and where the value-store SLOT for each member
+really is.  The port must not read a member descriptor at an offset that
+has not been measured on a LIVE object.
+
+NOTE: this also means the offsets the port uses for the CAR CHAIN
+(CAR+0x20 -> CAR_STATE, CAR_STATE+0x1a8 -> node id, +0x1c8 -> distance)
+must be re-measured the same way, since the object that was dumped is
+the one the probe thinks is CAR_STATE+0x2c8.
+
+
+## The rest of q21, read field by field
+
+The last race-state line of q21, every field the port reports:
+
+    metrics   1        active    0        nodes     1        keyoff    1
+    cls       27RuleSetModifier_RaceMetrics             mres      0x3f
+    laps      4294967295         lapF     -1.000
+    lapd      1101824            lapdF    1101824.000
+    prev      4294461080
+    total     171941             totalF   171941.000
+    speed     11808              speedF   11808.000
+    time      911163             rate     0.033333
+    prog      171941.000
+    car       0x213e929770       cnode    0          cprev     0
+    cpos      2,33,0             ctgt     0,0,0
+    snode     290                sdist    13508      tsok      1
+    perr      0.0000             pur      0          ident     0x0
+    drive     1                  steer    -0.600     mag       0.230
+    sign      1                  best     0.000000   flips     1
+    stalls    126                thr      0          brk       1
+
+WHAT IS ALREADY RIGHT, AND IT IS THE PART THAT MATTERS:
+
+* `mres=0x3f` -- all six member VALUES resolve out of the guest's value
+  store, and the guest's own class name is confirmed:
+  `27RuleSetModifier_RaceMetrics`.  The port is reading the right OBJECT
+  and the right MEMBERS.
+* `total=171941` (672 m travelled), `lapd=1101824` (a 4304 m lap),
+  `snode=290`, `sdist=13508` -- the guest's OWN progress numbers, read
+  from the guest, not inferred.
+* `laps=4294967295` is `-1` as an unsigned 32-bit value, and
+  `lapF=-1.000` says the same thing in the float reading: **the lap
+  counter is at its INITIAL value because the car had covered 672 m of a
+  4304 m lap and had not crossed the line.**  So the counter is not
+  broken; the run simply did not last long enough to complete a lap.
+  The sign of this measurement is the opposite of what the archive's
+  "laps left 0xFFFFFFFF" phrasing suggested.
+
+WHAT IS STILL WRONG, AND IT IS ALL IN THE CAR CHAIN:
+
+* `cnode=0`, `cpos=2,33,0`, `ctgt=0,0,0` -- the car's node index, world
+  position and aim target are all ZERO or noise.  These come from
+  `fillCarState()`, which reads them off the CAR object at +0x20/+0x24
+  (the node indices) and +0x30..+0x38 (the position) and +0x3c..+0x44
+  (the target).  The port's raw dump shows that the object it dumps at
+  that address holds POINTERS in its first 0x48 bytes, so those offsets
+  are not the fields the port thinks they are.
+* `perr=0.0000` and `pur=0` follow directly: the pure-pursuit error is
+  computed from the position and the target, and both are zero, so the
+  error is identically zero and the pursuit branch never engages.  The
+  sign of the world frame (the `steersign` knob) therefore cannot be
+  measured until the position is read from the right place.
+* `ident=0x0` -- the name test, whose reason is measured above.
+* `stalls=126` with `thr=0 brk=1` -- the servo spent most of the race
+  braking.  With no position to steer towards, the rate-only fallback
+  servo had nothing to work with, which is the same root cause.
+
+SO THE NEXT ROUND HAS ONE JOB: find where the CAR's node index, world
+position and aim target REALLY are, on a LIVE object, the same way the
+member slots were found.  Everything downstream -- the pursuit error, its
+sign, the lap counter leaving its initial value -- depends on that one
+measurement.
+
+The port must not read a field at an offset that has not been measured on
+a live object.  Where the measurement is missing, the port says so
+instead of reporting a number it cannot back.
