@@ -9173,3 +9173,93 @@ UI by reading what the game draws -- the guest's hint hand and its
 accent-coloured controls -- and get all the way into a race with no
 coordinates in the source at all.  What it cannot do yet is make the game
 happy with the assets it wants.
+## The picture is soft because of the GUEST'S OWN ATLAS FILTER -- and the
+## screen size the port reports is the only lever
+
+This is the answer to "the picture looks soft", and it came out of reading
+the PS Vita port (see the q27/q28 section above for how).
+
+**THE GUEST'S RULE** (cc::ImageResManager, ELF 0x10f8cf8): every folder in
+the gui_assets listing is kept only if
+
+    width <= screenW  OR  height <= screenH
+
+against the screen size the port reports.  With 1280x720 the 2048x1536 tree
+fails BOTH tests, so it is dropped BEFORE the sort and is never a
+candidate.  The HD tree is on the card the whole time; the guest never
+looks at it.
+
+**MEASURED, 2026-10-31, archive 20261031-004255-eden-rr3-q28-hd-screen-only**
+(default device profile, the only change is the reported screen size
+2048x1152 instead of 1280x720):
+
+    the paths the guest asked for, by volume
+      rr3core   20261      the game's own data
+      rr3veh0   10001      the classic vehicles
+      rr3track   2486
+      rr3gui0     750      <== the HD volume: gui_assets/2048x1536/
+      rr3veh1     205
+      rr3gui1      33      <== the SD volume: gui_assets/960x640/ and 480x320/
+
+and the 750 are the whole front end, from the HD tree:
+
+    rr3gui0:/files/.depot/gui_assets/2048x1536/common/sprites_0.dxt.dds.z
+    rr3gui0:/files/.depot/gui_assets/2048x1536/button/sprites.android.atlas
+    rr3gui0:/files/.depot/gui_assets/2048x1536/hud/sprites.android.atlas
+    rr3gui0:/files/.depot/gui_assets/2048x1536/events/map/sprites.android.atlas
+    rr3gui0:/files/.depot/gui_assets/2048x1536/round_hub/season_5/sprites.android.atlas
+    rr3gui0:/files/.depot/gui_assets/2048x1536/landing_page/sprites.android.atlas
+    rr3gui0:/files/.depot/gui_assets/2048x1536/daily_race/flag_bg/sprites_1.dxt.dds.z
+
+At 1280x720 the same run asked the SD volume for its 960x640 tree and the
+picture was a 1.33x upscale of every sprite and glyph.  THAT is "the
+picture is soft", and the fix is one number.
+
+**AND THE DEVICE PROFILE IS THE OTHER HALF -- AND IT IS A TRAP.**
+The guest also reads `eds/<device>.plist`, and that file is encrypted with
+a reversible RC4 variant (key a5 35 b3 b1 e8 43 e7 cf, the keystream at
+ELF 0x13c5a08), so the port can ship any profile it likes
+(tools/rr3-plist.py).  The guest's own list of what it reads from that
+profile is 36 keys, all read natively:
+
+    ALLOW_RETINA  GUI_IMAGE_AUTO_SCALE  HIGH_RES_MENU
+    CAR_SHADOW_MAPS  EXTERIOR_SHADOWS_{MENU,OPPONENT,PLAYER}
+    EXTERIOR_SELF_SHADOWS  CAR_DASH_SHADOWS  CAR_INTERIOR_SHADOW_MAPS
+    STREAMING_CAR_SHADOW_MAPS  MENU_ANIMATED_SHADOWS
+    DYNAMIC_CAR_REFLECTIONS  SPLIT_SCREEN_DYNAMIC_REFLECTIONS
+    RENDER_CARS_IN_CUBEMAP  USE_ANISOTROPIC_FILTERING
+    USE_FULL_SCREEN_EFFECTS  USE_PARTICLE_EFFECTS  USE_PAUSE_BLUR
+    DEPTH_OF_FIELD_ALLOWED  CREATE_FULL_SCREEN_BUFFERS  REDUCED_PNG_BITDEPTH
+    HAS_PHOTO_MODE  SUPPORT_EXTERNAL_SCREEN  FMOD_ZERO_VOLUME_VIRTUALISATION
+    USE_FLAREBLOCK_LIST  FULL_OPPONENT_DAMAGE  BLEND_IMAGE_ANIMS
+    CUSTOMISATION_{DECAL,LIVERY}_TEXTURE_SIZE  ENGINE_FONT_CACHE_SIZE
+    PARTY_PLAY_MAX_AI_OPP(_NASCAR)  CAR_INTERIOR_LOD
+
+and the volume ships the guest's own HD profile, AndroidXtraHigh.plist
+(2048x1536, HIGH_RES_MENU=true, AA_LEVEL=4, FONT_PAGE_SIZE=2048,
+MIPMAP_BIAS=-2.0, and twenty more switches AndroidHigh does not have).
+
+**BUT SHIPPING IT KILLED THE RUN** (archive
+20261031-003750-eden-rr3-q27-hd-profile): the guest died at 42 s, and the
+log shows why -- it spent the whole run pulling .vsh/.fsh and RECOMPILING:
+
+    rr3core:/files/.depot/Shaders/2dimage.vsh
+    rr3core:/files/.depot/Shaders/rr2/frontend_blur.vsh
+    rr3core:/files/.depot/Shaders/rr2/livery_bake.vsh
+
+because changing the quality keys changes the SHADER SET.  That is the
+guest's own warning ("Preparing the shaders for the new graphics
+settings... only happens after changing the graphics and may take a
+while"), and it is the price of the quality switches.
+
+**⇒⇒ THE RULE THIS PRODUCES**:
+  * the ATLAS choice is free -- it costs nothing but the reported screen
+    size, and it is what the picture quality is made of;
+  * the QUALITY switches are not free -- they invalidate the shader cache
+    and cost a full recompile, so they may only be changed deliberately,
+    and the profile must be kept CONSTANT from run to run.
+
+⇒ The measurement that separates the two (q27 = profile + HD size, died at
+42 s; q28 = default profile + HD size, alive and drawing at 312 s) is
+also the lesson: change ONE thing at a time when one of the changes can
+cost a recompile.
