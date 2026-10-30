@@ -8317,23 +8317,40 @@ void* frameLoopDriver(void* opaque) {
         // On backend=null glReadPixels is a counted no-op, so the buffer stays
         // zero; only read these lines when gfxBackendName() is "mesa".
         const auto readbackAndLog = [](const char* when, unsigned frame) {
-            // 1280x720 RGBA is 3.5 MiB: too big for the stack, and this runs on
-            // the frame-loop thread.
+            // THE READBACK FOLLOWS THE VIEW SIZE, NOT A CONSTANT.
+            //
+            // MEASURED 2026-10-31 (archive
+            // 20261031-004255-eden-rr3-q28-hd-screen-only): at a 2048x1152
+            // view a fixed 1280x720 readback returns the BOTTOM LEFT CORNER
+            // of the frame -- the capture was a four-times zoomed crop, and
+            // the guest was drawing its 2D UI at the atlas' own pixel size.
+            // A capture that lies about what is on screen is worse than no
+            // capture: the glove detector reads the SAME buffer.
+            const int vw = gfxViewWidth();
+            const int vh = gfxViewHeight();
+            if (vw <= 0 || vh <= 0) {
+                return;
+            }
+            // 2048x1536 RGBA is 12 MiB: too big for the stack, and this runs
+            // on the frame-loop thread.
             static unsigned char* px = nullptr;
-            if (px == nullptr) {
-                px = static_cast<unsigned char*>(
-                    std::malloc(static_cast<size_t>(1280) * 720 * 4));
+            static size_t pxBytes = 0;
+            const size_t need = static_cast<size_t>(vw) * vh * 4;
+            if (px == nullptr || pxBytes < need) {
+                std::free(px);
+                px = static_cast<unsigned char*>(std::malloc(need));
+                pxBytes = (px != nullptr) ? need : 0;
                 if (px == nullptr) {
                     return;
                 }
             }
-            std::memset(px, 0, static_cast<size_t>(1280) * 720 * 4);
+            std::memset(px, 0, need);
             glPixelStorei(GL_PACK_ALIGNMENT, 1);
-            glReadPixels(0, 0, 1280, 720, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            glReadPixels(0, 0, vw, vh, GL_RGBA, GL_UNSIGNED_BYTE, px);
 
             unsigned long long lit = 0;      // pixels with any non-zero RGB
             unsigned int unique[4] = {0, 0, 0, 0};
-            for (int i = 0; i < 1280 * 720; ++i) {
+            for (int i = 0; i < vw * vh; ++i) {
                 const unsigned char* p = px + i * 4;
                 if (p[0] | p[1] | p[2]) { ++lit; }
                 ++unique[p[0] >> 6];
@@ -8341,19 +8358,21 @@ void* frameLoopDriver(void* opaque) {
             // Five probe points: four corners and the centre, so a log line is
             // enough to tell "blank" from "content somewhere unexpected".
             struct { int x, y; } probe[5] = {
-                {8, 8}, {1271, 8}, {8, 711}, {1271, 711}, {640, 360}
+                {8, 8}, {vw - 9, 8}, {8, vh - 9}, {vw - 9, vh - 9},
+                {vw / 2, vh / 2}
             };
             char pts[5 * 9] = {};
             for (int k = 0; k < 5; ++k) {
                 const unsigned char* p =
-                    px + (static_cast<size_t>(probe[k].y) * 1280 + probe[k].x) * 4;
+                    px + (static_cast<size_t>(probe[k].y) * vw + probe[k].x) * 4;
                 std::snprintf(pts + k * 9, 9, "%02x%02x%02x", p[0], p[1], p[2]);
             }
             char diag[288];
             std::snprintf(diag, sizeof(diag),
-                "%s frame=%u full 1280x720 lit=%llu of %d px0=%02x%02x%02x%02x"
+                "%s frame=%u full %dx%d lit=%llu of %d px0=%02x%02x%02x%02x"
                 " quads[r_bins=%u,%u,%u,%u] pts=[%s %s %s %s %s] glerr=0x%x",
-                when, frame, lit, 1280 * 720, px[0], px[1], px[2], px[3],
+                when, frame, vw, vh, lit, vw * vh,
+                px[0], px[1], px[2], px[3],
                 unique[0], unique[1], unique[2], unique[3],
                 pts, pts + 9, pts + 18, pts + 27, pts + 36, glGetError());
             appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
@@ -8371,7 +8390,7 @@ void* frameLoopDriver(void* opaque) {
                 char path[128];
                 std::snprintf(path, sizeof(path),
                     "sdmc:/switch/rr3-native-rehost/frame-%06u.png", frame);
-                const bool wrote = rr3::writeFramePng(path, px, 1280, 720);
+                const bool wrote = rr3::writeFramePng(path, px, vw, vh);
                 char pdiag[192];
                 std::snprintf(pdiag, sizeof(pdiag),
                     "frame=%u png=%s path=%s", frame,
@@ -8700,6 +8719,7 @@ void* frameLoopDriver(void* opaque) {
             {
                 static unsigned char* glovePrev = nullptr;
                 static unsigned char* gloveCur = nullptr;
+                static size_t gloveBytes = 0;
                 static unsigned s_gloveAt = 0;
                 // THE TAP STATE MACHINE.  A tap is down-then-up in DIFFERENT
                 // frames; see include/rr3/ui_tap.hpp for the measurement that
@@ -8749,20 +8769,34 @@ void* frameLoopDriver(void* opaque) {
                 if (!gfxNullActive() && frames >= 30u &&
                     frames - s_gloveAt >= kGloveEvery) {
                     s_gloveAt = frames;
-                    const size_t bytes = static_cast<size_t>(1280) * 720 * 4;
-                    if (gloveCur == nullptr) {
+                    // The detector reads the SAME buffer the capture reads,
+                    // and that buffer is the VIEW: at a 2048x1152 view a
+                    // fixed 1280x720 readback is the bottom left corner, and
+                    // the detector would hunt for the guest's red glove in a
+                    // crop of the screen (measured 2026-10-31, archive
+                    // 20261031-004255-eden-rr3-q28-hd-screen-only).
+                    const int viewW = gfxViewWidth();
+                    const int viewH = gfxViewHeight();
+                    const size_t bytes =
+                        static_cast<size_t>(viewW) * viewH * 4;
+                    if (bytes == 0) {
+                        // nothing to read
+                    } else if (gloveCur == nullptr || gloveBytes != bytes) {
+                        std::free(gloveCur);
+                        std::free(glovePrev);
                         gloveCur = static_cast<unsigned char*>(std::malloc(bytes));
                         glovePrev = static_cast<unsigned char*>(std::malloc(bytes));
+                        gloveBytes = bytes;
                     }
                     if (gloveCur != nullptr && glovePrev != nullptr) {
                         std::memcpy(glovePrev, gloveCur, bytes);
                         std::memset(gloveCur, 0, bytes);
                         glPixelStorei(GL_PACK_ALIGNMENT, 1);
-                        glReadPixels(0, 0, 1280, 720, GL_RGBA, GL_UNSIGNED_BYTE,
+                        glReadPixels(0, 0, viewW, viewH, GL_RGBA, GL_UNSIGNED_BYTE,
                                      gloveCur);
                         int changed = 0;
                         rr3::ui::TargetList targets =
-                            rr3::ui::findTargets(gloveCur, glovePrev, 1280, 720,
+                            rr3::ui::findTargets(gloveCur, glovePrev, viewW, viewH,
                                                  &changed);
                         // NEVER CLICK WHILE THE GUEST IS RACING.
                         //
@@ -8843,7 +8877,8 @@ void* frameLoopDriver(void* opaque) {
                         // whether the screen is in motion, but it no longer
                         // decides anything: a turning car on the car-select
                         // screen changes as much as a race does.
-                        const bool screenMoving = changed > (1280 * 720) / 5;
+                        const bool screenMoving =
+                            changed > (static_cast<size_t>(viewW) * viewH) / 5;
 
                         // THE FEEDBACK LOOP.
                         //
