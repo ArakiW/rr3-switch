@@ -9096,3 +9096,80 @@ Five of them now, all in the port's own UI driver:
 A detector that finds A RED BLOB has not found a glove.  The glove is a
 glove because it is RED **AND NOT WARM**, and because the guest drew it
 there.
+## q30: THE CLOSED LOOP REACHED A RACE -- and the race hung on an asset
+## that is not on the card
+
+q30 is the run where the port's own UI driver took the guest all the way
+into a race **without a single hard-coded coordinate**.
+
+    start lights (StartLightsScreen)   4
+    race screen (InGameScreen)        10
+    race marker: HUD string           10
+    EventMapScreen                   181
+
+**THE PRESSES WERE ALL DIFFERENT.**  Ten presses, ten different targets,
+in this order:
+
+    glove  (123,546)   orange (840,226)   orange (634,547)
+    orange (1157,627)  glove (381,404)    orange (894,494)
+    orange (894,494)   orange (1234,694)   glove (553,326)
+    glove (744,401)
+
+(1157, 627) is the main menu's ENTER THE RACE; (894, 494) and (1234, 694)
+are controls on the screens after it.  The port found them by READING the
+picture -- the guest's red glove, and the accent-coloured controls -- and
+it pressed them with real taps (every down->up gap 40 frames, none
+same-frame).
+
+**AND THE WARM-COLOUR RULE IS NOT A NICETY: IT IS WHAT MAKES THE GLOVE
+FINDABLE ON TOP OF A BUTTON.**  The race ends with a modal panel -- a
+driver's portrait and an orange CONTINUE button, with the guest's own red
+glove sitting on it.  Measured on that exact frame:
+
+    with the warm rule     the glove stands alone: 83x50 at (911,471)-(993,520)
+    without the warm rule  the glove MERGES with the orange button into one
+                           258x50 blob -- which the size bound then rejects
+
+So without the rule the port cannot see the guest's own hint hand exactly
+when the guest puts it on a button, which is the one time it matters most.
+
+**AND THE RACE METRICS PROBE FOUND THE OBJECT FOR THE FIRST TIME:**
+
+    phase=race-metrics ... rs=0x2136289cc0 ok=1 vptr=0x210a252378 vptrOk=1
+                          reg=0x210a39e980 lapsOk=1 topspeedOk=1
+
+The guest's RuleSet_RaceMetrics is now FOUND (the vptr is the one the
+guest's own class has).  The member VALUES still read -1, so the value
+store lookup is not resolved yet -- that is the next thing to fix.
+
+**BUT THE GUEST THEN HUNG, AND IT WAS NOT THE PORT'S TOUCH.**  The port's
+own log shows exactly what the guest was waiting for:
+
+    phase=map-app   rr3veh2:/files/.depot/vehicles/2021_porsche_911_rsr/2021_porsche_911_rsr_sha.dxt.dds.z
+    phase=stat-path rc=-1 errno=2  guest='sdmc:/switch/rr3-native-rehost/.depot/vehicles/2021_porsche_911_rsr/...'
+    ... four candidate paths, all rc=-1 errno=2 (ENOENT) ...
+
+**The guest picked a car whose assets are not on the card.**  The card has
+the 2013 Porsche 911 RSR; the guest wants the 2021 one, and it waits for
+that car's shader for ever.  The port's frame loop stopped with it (the
+port's frame counter froze at 789, the harness's "the guest is blocked,
+not slow").
+
+**THE DATA IS THERE; THE DOWNLOAD NEVER HAPPENED.**  The volumes carry
+it:
+
+    core.romfs            128 x "2021_porsche_911_rsr"   42 x "porsche_911_rsr_sha"
+    vehicles-modern.romfs   2 x "2021_porsche_911_rsr"    0 x "porsche_911_rsr_sha"
+    vehicles-classic.romfs  2 x "2021_porsche_911_rsr"   30 x "2013_porsche_911_rsr"
+
+but the card's .depot holds only the 2013 car and 82 vehicle asset
+lists.  So the question is NOT "is the asset available" but "why did the
+guest's own download manager not fetch it" -- and that is the next thing
+to look at, with the asset-list rewrite (the port rewrites 386 asset
+lists, 2988 entries) as the first suspect.
+
+**WHAT THIS ROUND PROVED, IN ONE LINE.**  A port can drive a game's own
+UI by reading what the game draws -- the guest's hint hand and its
+accent-coloured controls -- and get all the way into a race with no
+coordinates in the source at all.  What it cannot do yet is make the game
+happy with the assets it wants.
