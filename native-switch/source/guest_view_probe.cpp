@@ -8878,7 +8878,8 @@ void* frameLoopDriver(void* opaque) {
                         // decides anything: a turning car on the car-select
                         // screen changes as much as a race does.
                         const bool screenMoving =
-                            changed > (static_cast<size_t>(viewW) * viewH) / 5;
+                            static_cast<size_t>(changed) >
+                                (static_cast<size_t>(viewW) * viewH) / 5;
 
                         // THE FEEDBACK LOOP.
                         //

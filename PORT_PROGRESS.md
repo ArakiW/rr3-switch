@@ -9263,3 +9263,62 @@ while"), and it is the price of the quality switches.
 42 s; q28 = default profile + HD size, alive and drawing at 312 s) is
 also the lesson: change ONE thing at a time when one of the changes can
 cost a recompile.
+## THREE separate knobs, and only one of them is the picture quality
+
+The PS Vita port sent the whole thing in the right direction, and the
+measurement that came out of it is worth writing down on its own.
+
+**THE THREE KNOBS ARE INDEPENDENT, AND THE GUEST USES THEM FOR DIFFERENT
+THINGS.**  All three live in native-switch/card/rr3-screen.txt:
+
+    platform=WxH   Platform.getScreenWidth / getScreenHeight
+                  -> what the guest calls "Res base" (it prints it:
+                     "Res base: 2048x1536")
+                  -> THE GUEST'S ATLAS FILTER uses it:
+                     width <= screenW OR height <= screenH
+                     (cc::ImageResManager, ELF 0x10f8cf8)
+    ui=WxH         CCUserInterfaceManager.getScreenWidth / getScreenHeight
+                  -> the UI layout space
+    view=WxH       the size the port tells the GUEST its view is
+                  -> the viewport the guest DRAWS into, and the space the
+                     touch coordinates live in
+
+**MEASURED, and they do not agree by accident:**
+
+    q28  platform=ui=view=2048x1152
+         -> the guest printed "Res base: 2048x1536"?? no: it picked the
+            2048x1536 ATLAS (750 paths from rr3gui0) and DREW the UI at
+            2048x1152, so the capture -- a fixed 1280x720 readback -- was a
+            four-times zoomed crop of the corner.
+    q29  platform=ui=view=2048x1536
+         -> the guest printed "Res base: 2048x1536" and its viewport was
+            2048x1536 (the scissor log says viewport=0,0,2048,1536), but
+            only 921600 of the 3145728 pixels were lit: the guest draws into
+            an OFFSCREEN target of the view size and the port's readback
+            reads the WINDOW, which is 1280x720 -- so it read the window and
+            asked for more than the window has.
+         -> and the frame loop made ZERO presses in 9120 frames: the
+            detector was looking at the window, which at that moment held
+            the presented (letterboxed) image, not the guest's picture.
+
+**⇒⇒ THE COHERENT COMBINATION** is the one that keeps every space the
+size of the output and only moves the ATLAS:
+
+    platform=2048x1536   the guest's "Res base" -> the HD atlas is a
+                         candidate -> the 2D UI is drawn from 2048x1536
+                         textures instead of a 960x640 one
+    ui=2048x1536         the layout space
+    view=1280x720         the guest's viewport = the window, so the
+                         readback, the touch coordinates and the picture
+                         are all the same space
+
+⇒ The UI is then drawn from the HD atlas into the 1280x720 window: sharp
+(a downscale, not a 1.33x upscale), and correctly proportioned, because
+the .gui layouts are resolution independent and only the textures change.
+
+**⇒⇒ AND THIS IS THE GENERAL LESSON**: three numbers that LOOK like one
+setting were three settings, and only one of them is the picture quality.
+Every measurement that blamed "the resolution" was measuring the wrong
+knob.  Read the guest's OWN log line for the number it actually uses
+("Res base"), and find out which of the three the guest's filter compares
+against, before changing any of them.
