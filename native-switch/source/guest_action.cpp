@@ -102,10 +102,32 @@ constexpr AllowedAction kAllowedActions[] = {
     // owner cannot be identified.
     {"Character|Unlock + Own Everything", true},
     {"Debug Race Selector:", true},
-    // The guest's own "start a race" commands. The guest's dispatcher calls
-    // them with the owner, so the port does the same.
-    {"Soaks|QUEUE SOAK:RACE LOOP", true},
-    {"Soaks|QUEUE SOAK:RACE LOOP - fast forward", true},
+    // THE GUEST'S OWN QA RACE FRAMEWORK.
+    //
+    // The guest ships a soak framework of its own: "Soaks|QUEUE SOAK:*"
+    // pushes a test onto the guest's own test queue and "Soaks|START SOAK"
+    // runs the queue's last entry, which builds a RACE REQUEST and hands it
+    // to the guest's normal race flow.  That is a way into a race with no
+    // pixels involved at all.
+    //
+    // REVERSE ENGINEERED 2026-10-30 (libRealRacing3.so):
+    //   Soaks|QUEUE SOAK:RACE LOOP            fn 0xa6e22c  push_back(3)
+    //   Soaks|QUEUE SOAK:RACE LOOP - fast fwd fn 0xa6e244  push_back(4)
+    //   Soaks|START SOAK                      fn 0xa6e1e8  SoakMgr::Start(0)
+    //   Soaks|CLEAR SOAKS                     fn 0xa6e218  clears the queue
+    //
+    // The two QUEUE commands OVERWRITE x0 before they use it
+    // ("ldr x0,[x8,#0x78]"), so they do not read the owner and do not need
+    // it: they are called with a zero argument.  That is why they carry
+    // needsOwner == false here -- the owner's own dispatcher would pass the
+    // owner, and the command would ignore it.
+    //
+    // The order matters: START takes the queue's LAST entry, so the QUEUE
+    // has to run first.
+    {"Soaks|QUEUE SOAK:RACE LOOP", false},
+    {"Soaks|QUEUE SOAK:RACE LOOP - fast forward", false},
+    {"Soaks|CLEAR SOAKS", false},
+    {"Soaks|START SOAK LOOP", false},
     {"TestRecorder|Time Trial", true},
     {"Main Menu|Enter Deep Link", true},
 };
@@ -492,6 +514,42 @@ void readActionConf() {
         if (hash != nullptr) {
             *hash = '\0';
         }
+        // An optional "at=<frame>" postpones the call to the port's own
+        // frame counter, so a command can wait for the front end to be up.
+        //
+        // IT MAY COME BEFORE THE NAME OR AFTER IT.
+        //
+        // The first version cut everything from "at=" onwards out of the
+        // name, which only works when the frame comes LAST: a line written
+        // the natural way round ("at=5950 Soaks|START SOAK") left an EMPTY
+        // name, and the command was dropped SILENTLY -- a control file that
+        // does nothing has to SAY that it did nothing.  The frame token is
+        // removed wherever it is, and what is left is the name.
+        //
+        // The name may contain spaces ("Character|Unlock All Tracks"), so
+        // the name is the whole rest of the line, not its first word.
+        unsigned long long at = 0;
+        bool haveAt = false;
+        for (char* p = line; *p != '\0';) {
+            while (*p == ' ' || *p == '\t') {
+                ++p;
+            }
+            if (*p == '\0') {
+                break;
+            }
+            char* tokenEnd = p;
+            while (*tokenEnd != '\0' && *tokenEnd != ' ' && *tokenEnd != '\t') {
+                ++tokenEnd;
+            }
+            if (tokenEnd - p >= 3 && p[0] == 'a' && p[1] == 't' && p[2] == '=') {
+                at = std::strtoull(p + 3, nullptr, 10);
+                haveAt = true;
+                std::memmove(p, tokenEnd, std::strlen(tokenEnd) + 1);
+                p = line;
+                continue;
+            }
+            p = tokenEnd;
+        }
         char* name = line;
         while (*name == ' ' || *name == '\t') {
             ++name;
@@ -503,22 +561,17 @@ void readActionConf() {
         }
         *end = '\0';
         if (name[0] == '\0') {
-            continue;
-        }
-        // An optional "at=<frame>" postpones the call to the port's own
-        // frame counter, so a command can wait for the front end to be up.
-        unsigned long long at = 0;
-        char* atMarker = std::strstr(name, "at=");
-        if (atMarker != nullptr) {
-            at = std::strtoull(atMarker + 3, nullptr, 10);
-            *atMarker = '\0';
-            end = atMarker;
-            while (end > name && (end[-1] == ' ' || end[-1] == '\t')) {
-                --end;
+            if (haveAt) {
+                // A LINE THAT CARRYED A FRAME BUT NO NAME IS REPORTED, NOT
+                // DROPPED.  A command that never runs and never says so is
+                // indistinguishable from a command that was never written.
+                char details[192];
+                std::snprintf(details, sizeof(details),
+                              "dropped=1 reason=no-command-name-after-the-frame "
+                              "frame=%llu",
+                              at);
+                logAction("guest-action", 109, details);
             }
-            *end = '\0';
-        }
-        if (name[0] == '\0') {
             continue;
         }
         // A COMMAND THAT DOES NOT FIT IS REPORTED, NOT DROPPED. The table

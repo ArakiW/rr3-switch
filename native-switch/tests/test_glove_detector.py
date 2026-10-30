@@ -240,10 +240,18 @@ def main() -> None:
     assert "height - 1 - centreY" in src, (
         "the reported y must be flipped: glReadPixels returns the BOTTOM row first")
     # The detector must be wired into the frame loop.
+    #
+    # IT NOW LIVES ONE LEVEL DOWN.  The frame loop asks the target finder for
+    # the controls to press (the glove is one of them), and the target finder
+    # asks the glove detector.  The glove's own rules did not change.
     probe = (root / "source" / "guest_view_probe.cpp").read_text(encoding="utf-8")
-    assert "rr3::glove::find" in probe, "the frame loop does not call the detector"
-    assert "glove-click" in probe, "the frame loop does not report the clicks it made"
-    assert "injectGuestTouchEvent" in probe, "the frame loop does not inject the click"
+    finder = (root / "source" / "ui_target.cpp").read_text(encoding="utf-8")
+    assert "rr3::ui::findTargets" in probe, "the frame loop does not call the finder"
+    assert "glove::find" in finder, "the finder does not call the glove detector"
+    assert "ui-press" in probe, "the frame loop does not report the presses it made"
+    # The press goes through the shared tap primitive, which is what makes a
+    # tap span more than one frame; see test_ui_tap.py.
+    assert "tapper.press" in probe, "the frame loop does not press through the tapper"
     # THE RULE THAT MAKES IT SAFE: never click while the guest is racing.
     # A click in a race IS A STEER, and the guest's cars are red, so a false
     # detection there throws the car off the track.  The race is recognised by
@@ -257,9 +265,27 @@ def main() -> None:
                   and not ln.strip().startswith("//")]
     assert not call_lines, (
         "the frame loop still walks the guest's memory: %r" % (call_lines[:2],))
-    assert "det.valid && !screenMoving" in probe, (
-        "the click is not gated on the screen being still")
-    assert "screenMoving" in probe
+    # THE RACE GATE IS THE GUEST'S OWN BOOKKEEPING, NOT THE PICTURE.
+    #
+    # The picture cannot do it: MEASURED 2026-10-30, the car-select screen
+    # changes 68..71 % of its pixels between two captures (it is a 3D scene
+    # with a turning car) and a race screen never drops below 57 %.  The two
+    # ranges overlap completely, so a change-rate threshold cannot tell a
+    # menu from a race -- and a 20 % threshold cost the port 4300 frames of
+    # a screen it had already reached.
+    assert "raceStateSample()" in probe, (
+        "the press is not gated on the guest's own race bookkeeping")
+    assert "guestRacing" in probe, (
+        "the press is not gated on the guest's own race bookkeeping")
+    assert "race.metricsCount > 0" in probe
+    assert "!guestRacing" in probe, (
+        "the press is not gated on the guest's own race bookkeeping")
+    # The change rate may still be REPORTED, but it must not GATE anything.
+    press_condition = [ln for ln in probe.split("\n")
+                       if "!s_waitingFeedback" in ln]
+    assert press_condition, "the press condition was not found"
+    assert all("screenMoving" not in ln for ln in press_condition), (
+        "the press is still gated on the change rate: %r" % (press_condition,))
     print("static contract                     : the detector is wired and matches the rules")
     print("safety rule                         : no click while the guest is racing")
 

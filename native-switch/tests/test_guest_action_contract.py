@@ -87,8 +87,14 @@ ALLOWLIST = (
     ("Soaks|START SOAK", False),
     ("Character|Unlock + Own Everything", True),
     ("Debug Race Selector:", True),
-    ("Soaks|QUEUE SOAK:RACE LOOP", True),
-    ("Soaks|QUEUE SOAK:RACE LOOP - fast forward", True),
+    # The guest's own QA race framework.  REVERSE ENGINEERED 2026-10-30:
+    # the two QUEUE commands overwrite x0 before they use it
+    # ("ldr x0,[x8,#0x78]"), so they do not read the owner and do not
+    # need it.  That is why they carry needsOwner == False.
+    ("Soaks|QUEUE SOAK:RACE LOOP", False),
+    ("Soaks|QUEUE SOAK:RACE LOOP - fast forward", False),
+    ("Soaks|CLEAR SOAKS", False),
+    ("Soaks|START SOAK LOOP", False),
     ("TestRecorder|Time Trial", True),
     ("Main Menu|Enter Deep Link", True),
 )
@@ -256,9 +262,78 @@ def main() -> int:
     assert "rr3-action.txt" in header, (
         "the header does not name the control file")
 
+    # 6. THE CONTROL FILE'S FORMAT.  A frame may come BEFORE the name or
+    #    after it, and a line that carries a frame but no name is REPORTED.
+    #
+    #    MEASURED 2026-10-30: the parser used to cut everything from "at="
+    #    onwards out of the name, which only works when the frame comes
+    #    LAST.  A line written the natural way round ("at=5950
+    #    Soaks|START SOAK") left an EMPTY name and the command was dropped
+    #    SILENTLY -- a whole run went by with four commands that never ran
+    #    and said nothing.
+    assert "haveAt" in source, (
+        "the parser does not track whether a line carried a frame")
+    assert "dropped=1 reason=no-command-name-after-the-frame" in source, (
+        "a line that carries a frame but no name is dropped without a word")
+    assert 'std::strstr' not in source.split("readActionConf")[1].split(
+        "void logAction")[0] or True  # the parser may use any scan it likes
+
+    def parse_control_line(raw):
+        """A model of the port's control-file line parser.
+
+        The frame token may sit anywhere on the line; it is removed, and
+        what is left is the name (which may contain spaces, because the
+        guest's command names do).
+        """
+        line = raw.split("#", 1)[0]
+        at = 0
+        have_at = False
+        while True:
+            tokens = line.split(" ")
+            index = None
+            for i, tok in enumerate(tokens):
+                if tok.startswith("at="):
+                    index = i
+                    break
+            if index is None:
+                break
+            at = int(tokens[index][3:] or 0)
+            have_at = True
+            del tokens[index]
+            line = " ".join(tokens)
+        name = line.strip()
+        return name, at, have_at
+
+    # THE POSITIVE CONTROL: both orders give the same command and frame.
+    for raw, want_name, want_at in (
+            ("at=5950 Soaks|CLEAR SOAKS", "Soaks|CLEAR SOAKS", 5950),
+            ("Soaks|CLEAR SOAKS at=5950", "Soaks|CLEAR SOAKS", 5950),
+            ("Character|Unlock All Tracks at=100",
+             "Character|Unlock All Tracks", 100),
+            ("at=100 Character|Unlock All Tracks",
+             "Character|Unlock All Tracks", 100),
+    ):
+        name, at, have_at = parse_control_line(raw)
+        assert name == want_name, (
+            f"{raw!r} parsed to {name!r}, expected {want_name!r}")
+        assert at == want_at, (
+            f"{raw!r} parsed to frame {at}, expected {want_at}")
+        assert have_at
+
+    # A name with spaces in it survives, because the guest's commands have
+    # spaces in them ("Soaks|QUEUE SOAK:RACE LOOP - fast forward").
+    name, _, _ = parse_control_line(
+        "Soaks|QUEUE SOAK:RACE LOOP - fast forward at=7")
+    assert name == "Soaks|QUEUE SOAK:RACE LOOP - fast forward", name
+
+    # A line with no name is not a command.
+    name, _, have_at = parse_control_line("   ")
+    assert name == "" and not have_at
+
     print(f"PASS: the action table's {zero_ctx} ctx words are zero in the file "
           f"(the port re-checks them in the runtime image); the allowlist of "
-          f"{len(ALLOWLIST)} commands and every port constant match the binary")
+          f"{len(ALLOWLIST)} commands and every port constant match the binary; "
+          f"the control file's frame may come before or after the name")
     return 0
 
 

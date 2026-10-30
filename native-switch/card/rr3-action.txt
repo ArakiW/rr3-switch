@@ -1,38 +1,39 @@
 # The guest's own commands, by name.
 #
-# NONE in this run.  The path to a race is now driven entirely by the touch
-# script (see rr3-touch.txt), which was measured end to end on 2026-10-25
-# (archive 20261025-161933-eden-f1a): daily reward -> event picker -> quest
-# page -> car select -> start race, and the last one of those made the guest
-# try to load a track.
+# THE PIXEL-FREE ROUTE INTO A RACE.
 #
-# The variable under test in this run is the PORT'S MEMORY REPORT, so
-# nothing else is allowed to move: the guest's own commands are not called at
-# all.
+# The guest ships a QA framework of its own -- the "Soaks" -- that builds a
+# race request and hands it to the guest's normal race flow.  That is a way
+# into a race with no pixels involved at all, and it is the guest's own code
+# doing the work.
 #
-# For the record, the commands that exist in the guest's runtime name table
-# and are NOT called here:
+# REVERSE ENGINEERED 2026-10-30 (libRealRacing3.so):
 #
-#   Character|Unlock All Tracks
-#   Career|Reload event data
-#   Career|Win all events
-#   Career|Win tapped event
-#   Assets|UPDATE EVENTS
-#   Career|Bypass Locked Series
-#   Soaks|START SOAK
-#   Soaks|QUEUE SOAK:RACE LOOP
-#   Soaks|QUEUE SOAK:RACE LOOP - fast forward
-#   TestRecorder|Time Trial
-#   Main Menu|Enter Deep Link
-#   Character|Unlock + Own Everything    (opens a MODAL confirm dialog)
-#   Debug Race Selector:                (needs the player to OWN a car)
-#   Store|Clear all daily rewards       (not in the port's allow list)
-#   Character|Unlock Everything         (not in the port's allow list)
-#   Career|Tutorial|Placeholder
-#   Character|Early Access|Reset / Enable / Disable
-#   Car|ALL ONE CAR / Car|Remove All Cars / Car|Upgrade all cars
+#   Soaks|QUEUE SOAK:RACE LOOP             fn 0xa6e22c  push_back(3)
+#   Soaks|QUEUE SOAK:RACE LOOP - fast fwd  fn 0xa6e244  push_back(4)
+#   Soaks|START SOAK                       fn 0xa6e1e8  SoakMgr::Start(0)
+#   Soaks|CLEAR SOAKS                      fn 0xa6e218  clears the queue
+#   Character|Unlock All Tracks            fn 0xa672c8  unlocks the tracks
+#
+# THE ORDER MATTERS.  START takes the queue's LAST entry (index = count-1),
+# so the QUEUE has to have run first.
+#
+# THE FRAMES ARE LATE ON PURPOSE.  The port's own UI driver (the red glove
+# and the accent-coloured controls, see native-switch/source/ui_target.cpp)
+# gets the first 6000 frames to work the menus by itself.  If it has not
+# reached a race by then, this takes over.  The frame counter is the port's
+# own, which is the guest's frame counter to within one.
+#
+# MEASURED 2026-10-30: the guest's front end is up by frame 390 (the first
+# glove of the q25 run was found at frame 390), so 6000 is far past the
+# point where the front end exists and far short of the point where the
+# race itself would be disturbed.
 #
 # The port calls a command only if its name is in its own allow list
-# (native-switch/source/guest_action.cpp, kAllowedActions), so a command that
-# the guest has but the port does not allow is never called, and the port
-# logs that it refused.
+# (native-switch/source/guest_action.cpp, kAllowedActions), so a command
+# that the guest has but the port does not allow is never called, and the
+# port logs that it refused.
+at=5950 Soaks|CLEAR SOAKS
+at=6000 Character|Unlock All Tracks
+at=6100 Soaks|QUEUE SOAK:RACE LOOP
+at=6200 Soaks|START SOAK

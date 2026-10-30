@@ -8727,3 +8727,117 @@ BEFORE that point".  A missing measurement is a LOCATION, not a
 non-event.  And an instrument that hangs the thing it measures is worse
 than no instrument, so the new code was scheduled on the schedule the port
 already proved works: not before frame 30, and every 30 frames after.
+## q25: the port clicked 144 times and the guest never moved -- the TAP had
+## no DURATION
+
+q25 ran on the private instance for 1500 seconds with the glove detector
+wired in.  It produced 65 frames, 23 glove detections and 144 clicks, and
+the guest ended the run in the SAME place it started: the main menu.
+
+    start lights (StartLightsScreen)   0
+    race screen (InGameScreen)         0
+    Total Levelloading                 0
+    EventMapScreen                   292   (the front end WAS up)
+
+The guest was not stuck because it could not be reached.  It was stuck
+because the clicks were not clicks.
+
+**THE MEASUREMENT THAT SETTLED IT.**  Every archive in .build/eden-runs
+that injected touches at all was swept for the gap between a down and its
+up.  The separation is perfect:
+
+    q21   24 taps, every down->up gap 40 frames   -> reached a race
+    q25  144 taps, every down->up gap  0 frames   -> never advanced
+
+Every archive that reached a race has same-frame = 0, and q25 -- the only
+run with a same-frame tap -- is the only one that never moved.  The gaps
+that appear in the archives are 1, 14..18, 20, 30, 36 and 40 frames; the
+ones that reach a race are 1, 20 and 40.
+
+The port's glove loop injected onTouchBeginJNI and onTouchEndJNI in the
+SAME frame.  That is a zero-duration tap: the button's "pressed" state
+never exists for one of the guest's own frames, and the guest's UI drops
+it.  A tap is not a pair of coordinates; its SHAPE is part of the
+contract.
+
+**THE SECOND DEFECT, IN THE SAME PLACE.**  The guest's touch object
+SHIPS with "a finger is down" set and with x = y = -1, and the guest's
+engine (ELF 0x12b45f4) stores a new point ONLY when no finger is down.
+So the first press of a run is swallowed unless that stale pointer is
+released first.  Measured: q25's first press left the guest's own point
+at (-1,-1); q21's first press, 900 frames in, landed.
+
+**THE THIRD DEFECT: THE GLOVE WAS NOT THE TARGET.**  q25's last frame
+shows the main menu.  The guest's red glove sits on the season-promo CAR
+IMAGE at (465, 355) -- a decoration.  The actual way into a race was the
+ORANGE "ENTER THE RACE" button at x 1090..1223, y 611..641, and the
+guest does NOT draw a glove on it.  The same glove was still on that car
+in q21 -- the archive that DID reach a race -- while the coordinate
+script walked the menus underneath it.  So "find the glove" was never a
+complete rule.
+
+**WHAT CHANGED IN THE PORT.**
+
+  * `include/rr3/ui_tap.hpp` + `source/ui_tap.cpp` -- a shared TAP
+    primitive.  press() injects the Begin and schedules the End
+    kTapHoldFrames (40) later; service() injects it when the frame
+    arrives, on EVERY frame, so a tap cannot stay down.  Before the first
+    press it releases the guest's shipped stale pointer.  Every path that
+    presses a control goes through it, so no second path can grow its own
+    idea of what a tap is.
+
+  * `include/rr3/ui_target.hpp` + `source/ui_target.cpp` -- the CONTROL
+    finder.  The glove is still one of the candidates, but the guest's
+    accent-coloured controls are found as well: the orange band
+    (r>230, 150<g<215, b<60) and the yellow band (r>225, g>215, b<90).
+    A button's label is a row of glyphs with gaps between them, so the
+    accent runs are MERGED (boxes within 8 pixels) before they are
+    called a control, and the press point is the CENTROID of the accent
+    pixels -- the middle of the box can be empty background between two
+    characters, and can be off a skewed button entirely.  Measured on
+    q25's last frame: the orange control is found at (1157, 626), which
+    is on an accent pixel (rgb 255,167,16).
+
+  * the frame loop -- the FEEDBACK LOOP.  A press that changes nothing
+    leaves its own control exactly where it was; a press that worked does
+    not.  So the port presses one candidate, watches the screen, and
+    moves on to the next candidate when the screen did not move.  That is
+    what lets it try more than one thing instead of hammering the same
+    one for the whole run -- which is what q25 did, 144 times.
+
+  * `native-switch/card/rr3-action.txt` -- a PIXEL-FREE route into a
+    race, from the guest's own code.  The guest ships a QA framework of
+    its own (the "Soaks"): `Soaks|QUEUE SOAK:RACE LOOP` (fn 0xa6e22c)
+    pushes a test onto the guest's test queue, `Soaks|START SOAK`
+    (fn 0xa6e1e8) runs the queue's last entry, and that entry builds a
+    RACE REQUEST and hands it to the guest's normal race flow.  The
+    order matters (START takes count-1).  The two QUEUE commands
+    overwrite x0 before they use it, so they do not read the owner and
+    the port now calls them with a zero argument.
+
+**TWO AGENT FINDINGS THAT CORRECTED THE PREMISES.**
+
+  * The guest's own `TouchStart: x = ... y = ...` log is NOT an echo of
+    the injection.  Three runs with different injection sets printed
+    three unrelated values, one of them with y = 759, which is outside
+    the 1280x720 viewport.  The guest's touch logs are behind a debug
+    flag, and their absence means nothing.  The acceptance signal that
+    does mean something is the GUEST'S SCREEN changing.
+
+  * The action table is TWO parallel tables -- function pointers in
+    .data.rel.ro at 0x1e78b70 and names in .bss at 0x1f9d6d8 -- bound
+    by index, not by hash.  `Assets|UPDATE EVENTS` (idx 100) is an EMPTY
+    implementation: a bare `ret`.
+
+**THE SCREEN REGISTRY, FOR THE ROUND AFTER THIS ONE.**  The guest's
+screen manager registers 65 screens in a red-black tree at mgr+0xa0
+whose root is at mgr+0xa8; the name is at node+0x20 and the instance at
+node+0x38, so the port can ENUMERATE every registered screen instead of
+guessing.  There is no virtual Enter -- each screen has its own
+non-virtual one -- but mgr+0xb8 + i*0x30 is the screen stack and
+0x14a7f90(mgr, name) switches screens by name.  The screens that matter
+are EventMapScreen (mgr+0x2850), EventsScreen, SeriesScreen,
+CarSelectScreen and DebugRaceSelectScreen.  A screen's CHILDREN are at
+comp+0x138 with their names at comp+0x38 and their rectangle through
+vtable slot 10, so the port can find a control BY NAME and stop hunting
+pixels altogether.

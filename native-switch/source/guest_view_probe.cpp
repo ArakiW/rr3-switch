@@ -27,6 +27,9 @@
 #include "rr3/guest_frame_capture.hpp"
 #include "rr3/glove_detector.hpp"
 #include "rr3/guest_touch.hpp"
+#include "rr3/race_state_probe.hpp"
+#include "rr3/ui_tap.hpp"
+#include "rr3/ui_target.hpp"
 
 // The deferred-callback pump (jni_compat/classes/cloudcell_defer.cpp). It is
 // called on the thread that runs the guest's per-frame callbacks, bracketing
@@ -8698,10 +8701,29 @@ void* frameLoopDriver(void* opaque) {
                 static unsigned char* glovePrev = nullptr;
                 static unsigned char* gloveCur = nullptr;
                 static unsigned s_gloveAt = 0;
-                static int s_lastX = -1;
-                static int s_lastY = -1;
-                static int s_repeat = 0;
+                // THE TAP STATE MACHINE.  A tap is down-then-up in DIFFERENT
+                // frames; see include/rr3/ui_tap.hpp for the measurement that
+                // makes that non-negotiable.
+                static rr3::ui::Tapper tapper;
+                // The candidates already tried since the screen last CHANGED.
+                // A press that changes nothing must not be repeated forever,
+                // and a press that DID change the screen clears the list.
+                struct Tried {
+                    rr3::ui::TargetKind kind;
+                    int x;
+                    int y;
+                    int attempts;
+                };
+                static Tried s_tried[8];
+                static int s_triedCount = 0;
+                static bool s_waitingFeedback = false;
+                static int s_maxChanged = 0;
+                static unsigned long long s_pressFrame = 0;
+                static rr3::ui::Target s_pressed;
                 const unsigned kGloveEvery = 30u;
+                // A TAP IN FLIGHT IS ALWAYS RELEASED -- also on the frames
+                // when no readback happens.
+                tapper.service(jniEnvironment, activityObject, frames);
                 // NOT BEFORE FRAME 30.
                 //
                 // MEASURED 2026-10-30: the first version of this ran its
@@ -8739,8 +8761,9 @@ void* frameLoopDriver(void* opaque) {
                         glReadPixels(0, 0, 1280, 720, GL_RGBA, GL_UNSIGNED_BYTE,
                                      gloveCur);
                         int changed = 0;
-                        const rr3::glove::Detection det =
-                            rr3::glove::find(gloveCur, glovePrev, 1280, 720, &changed);
+                        rr3::ui::TargetList targets =
+                            rr3::ui::findTargets(gloveCur, glovePrev, 1280, 720,
+                                                 &changed);
                         // NEVER CLICK WHILE THE GUEST IS RACING.
                         //
                         // A click in a race IS A STEER, and the guest's cars
@@ -8784,37 +8807,144 @@ void* frameLoopDriver(void* opaque) {
                         // screen in motion, and a click on a moving screen
                         // is a STEER.  The glove is only pressed on a still
                         // one.
+                        // NEVER CLICK WHILE THE GUEST IS RACING.
+                        //
+                        // A click in a race IS A STEER, and the guest's cars
+                        // are red, so a false detection there throws the car
+                        // off the track.
+                        //
+                        // THE RACE IS RECOGNISED BY THE GUEST'S OWN
+                        // BOOKKEEPING, NOT BY THE PICTURE.  The guest
+                        // allocates a RuleSet_RaceMetrics when a race starts
+                        // and the port's race-state probe finds it.  The
+                        // probe is pumped by the INPUT PUMP, on this same
+                        // thread and once per frame, so the sample is at most
+                        // one frame old -- and reading the probe's cached
+                        // sample touches no guest memory at all, which is why
+                        // it is safe here (the on-demand resolver
+                        // raceStateResolveRuleSetRaceMetrics() is NOT, and
+                        // calling it from the frame loop froze q23 and q24).
+                        //
+                        // THE CHANGE RATE IS NOT THE SIGNAL, AND MEASURED IT
+                        // CANNOT BE.  The car-select screen changes 68..71 %
+                        // of its pixels between two captures -- it is a 3D
+                        // scene with a turning car -- and a race screen never
+                        // drops below 57 %.  The two ranges OVERLAP
+                        // COMPLETELY, so no rate threshold can tell them
+                        // apart.  The first version of this used a 20 %
+                        // threshold, and the consequence was measured: the
+                        // port reached the car-select screen in 900 frames
+                        // and then pressed NOTHING for the next 4300, because
+                        // a turning car looks exactly like a race.
+                        const rr3::RaceStateSample& race = rr3::raceStateSample();
+                        const bool guestRacing =
+                            race.metricsCount > 0 || race.activeIndex >= 0;
+                        // The change rate is still REPORTED, because it says
+                        // whether the screen is in motion, but it no longer
+                        // decides anything: a turning car on the car-select
+                        // screen changes as much as a race does.
                         const bool screenMoving = changed > (1280 * 720) / 5;
-                        if (det.valid && !screenMoving) {
-                            // The glove has to be where it was a moment ago, or
-                            // where it was on the previous detection: a new
-                            // position is a NEW control to press, the same
-                            // position is the same control being held.
-                            const bool sameSpot = (det.x == s_lastX && det.y == s_lastY);
-                            s_lastX = det.x;
-                            s_lastY = det.y;
-                            ++s_repeat;
-                            if (!sameSpot || s_repeat >= 3) {
-                                s_repeat = 0;
-                                injectGuestTouchEvent(jniEnvironment, activityObject,
-                                                      GuestTouchAction::Begin, 0,
-                                                      det.x, det.y, false,
-                                                      "glove-begin");
-                                injectGuestTouchEvent(jniEnvironment, activityObject,
-                                                      GuestTouchAction::End, 0,
-                                                      det.x, det.y, true,
-                                                      "glove-end");
-                                char diag[192];
-                                std::snprintf(diag, sizeof(diag),
-                                              "frame=%llu x=%d y=%d red=%d changed=%d "
-                                              "screenChanged=%d moving=%d",
-                                              static_cast<unsigned long long>(frames),
-                                              det.x, det.y, det.redPixels,
-                                              det.changed, changed,
-                                              screenMoving ? 1 : 0);
-                                appendGuestBootLine(
-                                    "sdmc:/switch/rr3-native-rehost.guest-view.log",
-                                    "glove-click", 250, 0, diag);
+
+                        // THE FEEDBACK LOOP.
+                        //
+                        // A press that changes nothing leaves its own control
+                        // exactly where it was; a press that worked does not.
+                        // That is what lets the port try MORE THAN ONE
+                        // candidate instead of hammering the same one for
+                        // the whole run -- which is what q25 did, 144 times.
+                        bool pressedStillThere = false;
+                        if (s_waitingFeedback) {
+                            for (int i = 0; i < targets.count; ++i) {
+                                if (targets.items[i].kind == s_pressed.kind &&
+                                    targets.items[i].x == s_pressed.x &&
+                                    targets.items[i].y == s_pressed.y) {
+                                    pressedStillThere = true;
+                                    break;
+                                }
+                            }
+                            if (changed > s_maxChanged) {
+                                s_maxChanged = changed;
+                            }
+                            // THE SCREEN REALLY MOVED.  A still front end
+                            // changes 2287..4419 pixels between two readbacks
+                            // (q25); a screen transition changes 15941 or
+                            // more.  12000 sits between the two, and the
+                            // number is logged so that a run which says
+                            // otherwise can move it.
+                            const bool screenJumped = s_maxChanged > 12000;
+                            if (!pressedStillThere || screenJumped) {
+                                // The press moved the guest on: everything is
+                                // a candidate again.
+                                s_triedCount = 0;
+                                s_waitingFeedback = false;
+                            } else if (frames - s_pressFrame > 100u) {
+                                // The press did nothing: leave this candidate
+                                // and try the next one.
+                                s_waitingFeedback = false;
+                            }
+                        }
+
+                        if (!s_waitingFeedback && !guestRacing &&
+                            !tapper.pending()) {
+                            for (int i = 0; i < targets.count; ++i) {
+                                const rr3::ui::Target& t = targets.items[i];
+                                int tries = 0;
+                                int slot = -1;
+                                for (int k = 0; k < s_triedCount; ++k) {
+                                    if (s_tried[k].kind == t.kind &&
+                                        s_tried[k].x == t.x &&
+                                        s_tried[k].y == t.y) {
+                                        tries = s_tried[k].attempts;
+                                        slot = k;
+                                        break;
+                                    }
+                                }
+                                if (tries >= 2) {
+                                    // Two presses on the same control and the
+                                    // guest did not move: leave it alone and
+                                    // try the next candidate.
+                                    continue;
+                                }
+                                if (slot >= 0) {
+                                    ++s_tried[slot].attempts;
+                                } else if (s_triedCount <
+                                           static_cast<int>(sizeof(s_tried) /
+                                                            sizeof(s_tried[0]))) {
+                                    s_tried[s_triedCount].kind = t.kind;
+                                    s_tried[s_triedCount].x = t.x;
+                                    s_tried[s_triedCount].y = t.y;
+                                    s_tried[s_triedCount].attempts = 1;
+                                    ++s_triedCount;
+                                }
+                                if (tapper.press(jniEnvironment, activityObject,
+                                                 frames, t.x, t.y, "ui-press")) {
+                                    s_waitingFeedback = true;
+                                    s_pressFrame = frames;
+                                    s_maxChanged = 0;
+                                    s_pressed = t;
+                                    char diag[256];
+                                    const char* kind = "glove";
+                                    if (t.kind ==
+                                        rr3::ui::TargetKind::OrangeButton) {
+                                        kind = "orange";
+                                    } else if (t.kind ==
+                                               rr3::ui::TargetKind::YellowButton) {
+                                        kind = "yellow";
+                                    }
+                                    std::snprintf(
+                                        diag, sizeof(diag),
+                                        "frame=%llu kind=%s x=%d y=%d area=%d "
+                                        "w=%d h=%d screenChanged=%d moving=%d "
+                                        "racing=%d tried=%d",
+                                        static_cast<unsigned long long>(frames),
+                                        kind, t.x, t.y, t.area, t.width, t.height,
+                                        changed, screenMoving ? 1 : 0,
+                                        guestRacing ? 1 : 0, s_triedCount);
+                                    appendGuestBootLine(
+                                        "sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                        "ui-press", 250, 0, diag);
+                                }
+                                break;
                             }
                         }
                     }
