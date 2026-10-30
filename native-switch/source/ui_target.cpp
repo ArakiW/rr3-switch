@@ -215,7 +215,31 @@ TargetList findTargets(const unsigned char* bottomUpRgba,
         return list;
     }
 
-    // The glove first: it is the guest's own "press here".
+    // THE ACCENT-COLOURED CONTROLS FIRST, THE GLOVE LAST.
+    //
+    // MEASURED 2026-10-30 (q26/q27): the glove is the guest's own "press
+    // here", but on the main menu it sits on the season-promo CAR IMAGE --
+    // a decoration -- while the way into a race is the ORANGE button, which
+    // carries no glove at all.  With the glove first, the port pressed the
+    // decoration and never reached the button.
+    //
+    // The accent colour is the guest's own convention for a PRIMARY
+    // ACTION, and it is on the control that matters: the daily-rewards
+    // calendar's COLLECT word, the main menu's ENTER THE RACE, the
+    // car-select screen's START, the track-load panel's CONTINUE.  The
+    // LARGEST accent group comes first, because the way forward is the
+    // biggest thing the guest is offering.
+    Blob orange{};
+    if (largestButton(bottomUpRgba, width, height, kOrangeBand, &orange)) {
+        addButton(&list, orange, TargetKind::OrangeButton, height);
+    }
+    Blob yellow{};
+    if (largestButton(bottomUpRgba, width, height, kYellowBand, &yellow)) {
+        addButton(&list, yellow, TargetKind::YellowButton, height);
+    }
+
+    // The glove is the fallback: the guest's own hint hand, for the screens
+    // where the control it wants pressed carries no accent colour.
     const glove::Detection det =
         glove::find(bottomUpRgba, previous, width, height, changedTotal);
     if (det.valid &&
@@ -228,18 +252,6 @@ TargetList findTargets(const unsigned char* bottomUpRgba,
         t.width = 0;
         t.height = 0;
         t.area = det.redPixels;
-    }
-
-    // Then the accent-coloured controls: the guest's own convention for a
-    // primary action.  The LARGEST one first, because the way forward is
-    // the biggest thing the guest is offering.
-    Blob orange{};
-    if (largestButton(bottomUpRgba, width, height, kOrangeBand, &orange)) {
-        addButton(&list, orange, TargetKind::OrangeButton, height);
-    }
-    Blob yellow{};
-    if (largestButton(bottomUpRgba, width, height, kYellowBand, &yellow)) {
-        addButton(&list, yellow, TargetKind::YellowButton, height);
     }
 
     return list;

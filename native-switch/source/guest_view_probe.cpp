@@ -8854,10 +8854,31 @@ void* frameLoopDriver(void* opaque) {
                         // the whole run -- which is what q25 did, 144 times.
                         bool pressedStillThere = false;
                         if (s_waitingFeedback) {
+                            // IS THE PRESSED CONTROL STILL THERE?
+                            //
+                            // THAT is the whole feedback signal, and the
+                            // screen's own change rate cannot be part of it.
+                            // MEASURED 2026-10-30 (q27): the main menu
+                            // changes 268510 pixels -- 37 % of the screen --
+                            // between two readbacks, because the banner is an
+                            // animation, so "the screen changed" is ALWAYS
+                            // true there, and the port pressed the same
+                            // decoration 45 times in a row.
+                            //
+                            // A press that worked takes its control AWAY: the
+                            // button is gone, or the guest's own hint hand
+                            // has moved somewhere else.  A press that did
+                            // nothing leaves the control exactly where it
+                            // was.  Twelve pixels of slack, because a
+                            // control can move a little when it is pressed.
                             for (int i = 0; i < targets.count; ++i) {
-                                if (targets.items[i].kind == s_pressed.kind &&
-                                    targets.items[i].x == s_pressed.x &&
-                                    targets.items[i].y == s_pressed.y) {
+                                const rr3::ui::Target& c = targets.items[i];
+                                if (c.kind != s_pressed.kind) {
+                                    continue;
+                                }
+                                const int dx = c.x - s_pressed.x;
+                                const int dy = c.y - s_pressed.y;
+                                if (dx > -12 && dx < 12 && dy > -12 && dy < 12) {
                                     pressedStillThere = true;
                                     break;
                                 }
@@ -8865,14 +8886,7 @@ void* frameLoopDriver(void* opaque) {
                             if (changed > s_maxChanged) {
                                 s_maxChanged = changed;
                             }
-                            // THE SCREEN REALLY MOVED.  A still front end
-                            // changes 2287..4419 pixels between two readbacks
-                            // (q25); a screen transition changes 15941 or
-                            // more.  12000 sits between the two, and the
-                            // number is logged so that a run which says
-                            // otherwise can move it.
-                            const bool screenJumped = s_maxChanged > 12000;
-                            if (!pressedStillThere || screenJumped) {
+                            if (!pressedStillThere) {
                                 // The press moved the guest on: everything is
                                 // a candidate again.
                                 s_triedCount = 0;
