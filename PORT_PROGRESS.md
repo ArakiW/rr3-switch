@@ -9341,3 +9341,385 @@ Every measurement that blamed "the resolution" was measuring the wrong
 knob.  Read the guest's OWN log line for the number it actually uses
 ("Res base"), and find out which of the three the guest's filter compares
 against, before changing any of them.
+
+
+=========================================================================
+THE LAUNCHER-SIDE SETTINGS LAYER -- THE PS VITA LESSON, APPLIED
+=========================================================================
+
+**THE QUESTION THIS ANSWERS.**  The PS Vita port of this game ships a
+launcher ("eboot.bin") AND a separate GRAPHICAL CONFIGURATOR
+("configurador.bin"), and the configurator writes a PLAIN TEXT
+"ux0:data/rr3/config.txt" which the launcher TRANSLATES into the guest's
+own ENCRYPTED device profile ("eds/Vita*.plist").  The guest never sees the
+plain text: it reads its own profile, decrypts it, and reads the quality
+switches out of it.
+
+**=> THAT IS THE LESSON, AND IT IS THE RIGHT ONE, because it is the GUEST'S
+OWN mechanism.**  The settings live in the guest's device profile, and the
+launcher only decides WHAT GOES INTO IT.  Nothing in the host invents a
+parallel configuration system the guest cannot see.
+
+**=> SO THE PORT IS THE LAUNCHER.**  This is that layer, and it is now
+implemented and MEASURED:
+
+    sdmc:/switch/rr3-native-rehost/rr3-settings.txt   (plain text)
+        -> the guest's own device profile, decrypted, edited, RE-ENCRYPTED
+        -> the guest reads it exactly as it reads the original
+
+New files: native-switch/include/rr3/guest_settings.hpp,
+native-switch/source/guest_settings.cpp,
+native-switch/card/rr3-settings.txt,
+native-switch/tests/guest_settings_test.cpp,
+native-switch/tests/test_guest_settings.py.
+Wiring: native-switch/source/guest_filesystem.cpp (resolvePath + the boot
+build), tools/Deploy-RR3CardScripts.ps1 (-SettingsFile).
+
+-------------------------------------------------------------------------
+WHAT THE GUEST ACTUALLY DOES WITH ITS PROFILE (measured 2026-10-31,
+archive 20261031-010828-eden-rr3-q30-res-base-2048-view-720)
+-------------------------------------------------------------------------
+
+    2088  ======= platform AndroidHigh
+    2089  map-app   rr3core:/files/.depot/eds/
+    2093  readdir   AndroidHigh.plist
+    2099  Searching for settings for device: AndroidHigh
+    2103  stat-path guest='sdmc:/switch/rr3-native-rehost/.depot/eds/AndroidHigh.plist'
+                    primary='rr3core:/files/.depot/eds/AndroidHigh.plist'
+                    fallback='rr3core:/files/apk/res/eds/AndroidHigh.plist'
+    2107  open-ok   e6ea60c54026f388a8a65a62e99576bf
+    2108  mmap-file-ok len=6808
+    2115  Loaded settings file: AndroidHigh.plist
+
+**THREE THINGS IN THAT LIST DECIDE THE WHOLE DESIGN.**
+
+  1. **THE FILE MAY NOT BE RENAMED OR REMOVED.**  The guest READDIRs the
+     directory to learn the name, so a profile the port does not publish is a
+     profile the guest never asks for.  The port can change the BYTES.
+
+  2. **THE BYTES MAY NOT CHANGE SIZE.**  The guest mmaps 6808 bytes and the
+     size comes from the stat, so the port has to serve a file of exactly the
+     same length.  That is why the translation keeps the length: the
+     ciphertext is the plaintext XORed with a stream of the same length, and
+     the record's size is fixed.
+
+  3. **THE HOOK BELONGS IN THE RESOLVER, NOT IN THE READER.**  The guest
+     reads the profile through guestOpen() and then MMAPS the descriptor, so
+     a hook in guestFopen() would never fire at all.  And the asset list
+     publishes an md5 for the same path, so the substitution has to happen
+     where BOTH the read and the digest computation see it: resolvePath(),
+     the one place every path takes.
+
+-------------------------------------------------------------------------
+THE SETTINGS FILE
+-------------------------------------------------------------------------
+
+One setting per line, "key = value", "#" starts a comment, keys are matched
+case-insensitively:
+
+    calidad = ultrawide        # WHICH guest profile the guest reads
+    ALLOW_RETINA = false       # the guest's OWN key, one at a time
+    msaa = 4x                  # the PS Vita's spelling, translated
+
+"calidad" selects one of the guest's own capability tiers, by the name the
+volume ships them under:
+
+    bajo        -> AndroidLow
+    medio       -> AndroidMid
+    medioalto   -> AndroidMid2
+    alto        -> AndroidHigh        (the tier the port reports today)
+    ultrawide   -> AndroidUltraWide
+    xtralto     -> AndroidXtraHigh    (the guest's own HD tier)
+    personal    -> keep the profile the guest asked for, apply the overrides
+
+Every other key is the GUEST'S OWN key (the ones its native readers ask for:
+the bool getter 0x13c65a8, the int getter 0x13c64d4).  The PS Vita's Spanish
+names are accepted as ALIASES (msaa, reflejos, det_particulas,
+det_pantalla_completa, det_danios, det_sombras_coche, det_sombras_cabina,
+det_sombras_rivales, det_rivales, det_interior, det_texturas, det_pista,
+det_coche, brillos); the ones that are not the guest's own settings (giro,
+zona_muerta, invertir_giro, inclinacion, botones, volumen_motor,
+actualizaciones) are reported as belonging to rr3-pad.txt / rr3-drive.txt
+instead of being applied to the wrong place.
+
+**THE DEFAULT IS "NOTHING HAPPENS".**  The shipped rr3-settings.txt is all
+comments, because a quality switch costs a full shader recompile (the rule
+measured in q27, below) and a card that has never been configured must serve
+the stock profile, byte for byte.
+
+-------------------------------------------------------------------------
+MEASURED: THE CHAIN, END TO END
+-------------------------------------------------------------------------
+
+Round q33 (2026-10-31, archive 20261031-020607-eden-rr3-q33-settings-live;
+settings file: "calidad = ultrawide" + "ALLOW_RETINA = false"):
+
+    settings-load    file=.../rr3-settings.txt present=1 settings=1
+                     tier=ultrawide profile=AndroidUltraWide usable=1
+    settings-profile profile=AndroidHigh.plist tier=ultrawide
+                     base=rr3core:/files/.depot/eds/AndroidUltraWide.plist
+                     stock=rr3core:/files/.depot/eds/AndroidHigh.plist
+                     out=sdmc:/.../cache/eds-AndroidHigh.plist
+                     bytes=6808/6808 changed=1 written=1 errno=0
+    settings-substitute  why=substituted substituted=1
+                     guest=sdmc:/.../eds/AndroidHigh.plist
+                     primary=sdmc:/.../cache/eds-AndroidHigh.plist
+
+AND THE GUEST'S OWN LOG -- the guest prints its WHOLE settings table, which
+is the readout instrument for this layer (q33 guest-view.log):
+
+    "ALLOW_RETINA"           -> false : BOOL          (was true)
+    "EXPECTED_SCREEN_HEIGHT" -> 720 : INT             (was 320)
+    "EXPECTED_SCREEN_WIDTH"  -> 1480 : INT            (was 480)
+    "PLIST_IDENTIFIER"       -> "AndroidUltraWide"    (was "AndroidHigh")
+
+**=>=> THE CHAIN IS PROVEN, AND IT IS THE GUEST THAT SAYS SO.**  A plain
+text file on the card became an encrypted profile, the port served it, and
+the guest's own settings dump reports the new values.  Nothing in the host
+claims it worked: the guest read the profile and printed what it read.
+
+**=>=> AND THE TIER SWAP IS SAFE, BECAUSE THE TIERS DIFFER IN FOUR KEYS.**
+MEASURED by diffing the decrypted profiles: AndroidHigh and AndroidUltraWide
+have the SAME 113 keys and differ in FOUR of them -- EXPECTED_SCREEN_WIDTH
+(480 vs 1480), EXPECTED_SCREEN_HEIGHT (320 vs 720), PLIST_IDENTIFIER and the
+"Notes:" comment.  **Every graphics switch is identical**, so the swap does
+NOT invalidate the shader cache, which is what killed q27.
+
+**=>=> AND THE LENGTH FIT IS PROVEN ON THE REAL DATA.**  The UltraWide record
+is 6833 bytes and the record the guest reads is 6808, so 25 bytes have to
+come out of the WHITESPACE BETWEEN ELEMENTS.  Measured on the real records
+(the shipped code, run against the real volumes): 6808 bytes out, 113 keys
+in, 5 keys changed (the 4 above + the explicit ALLOW_RETINA), and **0 text
+values damaged** -- a shortened text value would be a different setting.
+
+-------------------------------------------------------------------------
+THE TWO BUGS THIS COST, AND WHAT THEY TEACH
+-------------------------------------------------------------------------
+
+**1. THE OFF-BY-ONE THAT MADE THE WHOLE LAYER DEAD SILENTLY.**
+The predicate "is this path a plist?" was written as
+`strcmp(base + length - 5, ".plist")`.  The suffix is SIX bytes, so the slice
+it compared was "plist", the predicate was ALWAYS false, and the settings
+layer NEVER FIRED -- while every other instrument said it had: the port wrote
+the file, the port logged "settings-profile written=1", and the guest's own
+settings dump showed the STOCK values.  The two instruments disagreed, and
+the one that disagreed was the one being measured.
+
+**=>=> THE RULE THIS PRODUCES**: a predicate that decides "is this the thing
+I am looking for" has to be TESTED, and the test has to live where a host
+compiler can build it.  The predicate now lives in guest_settings.cpp (the
+one module the host CAN compile and run), and the harness runs it against
+eight spellings.  The general shape of this bug -- "the filter is never
+true" -- is the same shape as the earlier "the atlas filter is never true"
+one, and the rule is the same: **a filter that has never been seen to be
+TRUE has never been seen to work.**
+
+**2. THE UTF-8 BOM IS NOT A COMMENT.**
+A settings file written by a Windows editor (or by PowerShell's Out-File)
+starts with EF BB BF, and the first line's "#" then sits behind it: the
+line looks like a setting, has no "=", and the port reported "a line has no
+'='" about the FIRST line of the file.  The BOM is now dropped where the
+file is read, because a user editing a text file on a PC is the normal case
+and cannot be asked to know what a BOM is.
+
+**3. AND A ROUND THAT WAS KILLED FROM OUTSIDE LOOKED LIKE A CRASH.**
+q34 (2026-10-31, archive 20261031-021041-eden-rr3-q34-settings-target-only)
+died at 12 s: "eden exited on its own", 0 frames, and the emulator log ends
+MID-LINE at t=3.998 s with no exception, no signal, no guest message.  The
+cause was NOT the port: ANOTHER PROJECT's regression script (scripts/
+eden_v29_regression.ps1) was running on the same machine and kills emulator
+processes BY NAME, and "eden-rr3" is inside "eden*".  **=>=> A LOG THAT
+STOPS MID-LINE, WITH NO EXCEPTION AND NO STACK, IS AN EXTERNAL KILL, NOT A
+CRASH** -- and it must not be attributed to the code that happened to be
+running.  (The same trap killed an earlier round of the OTHER project: its
+script rotated our archived log and the other run's log was archived under
+our label.)
+
+-------------------------------------------------------------------------
+THE PRICE, STATED PLAINLY (unchanged by this layer)
+-------------------------------------------------------------------------
+
+Changing a QUALITY switch changes the SET of shaders the guest compiles, and
+the guest then recompiles all of them: q27 (archive
+20261031-003750-eden-rr3-q27-hd-profile) died at 42 s while it was still
+pulling .vsh/.fsh.  So:
+
+  * the ATLAS choice is free -- it costs nothing but the reported screen
+    size (rr3-screen.txt's view=), and it is what the picture quality is
+    made of;
+  * the QUALITY switches are not free -- they invalidate the shader cache,
+    so they may only be changed DELIBERATELY, and the profile has to be
+    kept CONSTANT from run to run.
+
+**=> AND THIS LAYER IS BETTER THAN THE OLD WAY FOR THAT REASON.**  Editing
+the volume in place changed the profile underneath a warm shader cache.  A
+settings FILE is stable: the same settings produce the same bytes, so the
+cache stays valid, and changing a setting is a deliberate act with its own
+line in the log.
+
+**=> THE PSV PORT HAD THE SAME PROBLEM AND SOLVED IT THE SAME WAY**: it ships
+a shader cache directory ("ux0:data/shader_cache/RR3VITA01") and a "clear
+the shader cache" button in its configurator.  Ours does not have a shader
+cache button yet; that is the one piece of the Vita configurator that is
+still missing.
+
+=========================================================================
+THE 2021 PORSCHE 911 RSR: THE ENOENT IS REAL AND IT IS NOT THE BLOCKER
+=========================================================================
+
+MEASURED 2026-10-31 (read-only investigation over the q30 archive, the seven
+ROMFS volumes and the three source texture packs):
+
+**WHAT THE GUEST ASKS FOR.**  The exact string
+"2021_porsche_911_rsr_sha.dxt.dds.z" appears on 30 lines of the q30 guest
+log, in five bursts (LF line numbers 172202-172207, 218077-218082,
+219294-219299, 220373-220378, 221457-221462).  The guest asks for NINE
+format variants of the "_sha" texture (_dxt.dds.z, _dxt.dds, _etc.dds.z,
+_etc.dds, _pvr, _rgb.pvr, _rgb.pvr.z, _rgbm.pvr, _rgbm.pvr.z) under three
+root spellings, and the car has 128 distinct leaf names in all.
+
+**NONE OF THEM IS A PACK-ENDPOINT REQUEST.**  "phase=cc-asset-req" has 53
+lines in the whole log and MENTIONS this car on ZERO of them.  These are
+guest FILESYSTEM stats (guestStat), so the fix belongs in the file layer's
+candidate chain, not in the cloud endpoint.
+
+**WHERE THEY WERE LOOKED (all ENOENT, rc=-1 errno=2).**  Five device paths,
+quoted from the log:
+    rr3veh2:/files/.depot/vehicles/2021_porsche_911_rsr/..._sha.dxt.dds.z
+    rr3core:/files/apk/res/vehicles/2021_porsche_911_rsr/..._sha.dxt.dds.z
+    sdmc:/switch/rr3-native-rehost/.depot/vehicles/2021_porsche_911_rsr/...
+    sdmc:/switch/rr3-native-rehost/apk/res/vehicles/2021_porsche_911_rsr/...
+    sdmc:/switch/rr3-native-rehost/doc/vehicles/2021_porsche_911_rsr/...
+The routing is right: contentDevice sends year>=2021 to rr3veh2, and the
+same-named "_sha" files of 2013/2014/2016/2017/2018/2020 ARE in their
+volumes.  The naming rule is not broken.
+
+**WHERE THE BYTES ACTUALLY ARE.**  The 2021 directory in vehicles-modern
+holds exactly ONE file:
+    rr3veh2:/files/.depot/vehicles/2021_porsche_911_rsr/livery/
+        2021_porsche_911_rsr_ext.dxt.dds.z   189,918 B
+        md5 9328497ba26e99690e5a4df22e231af1
+A full traversal of all seven ROMFS file tables (41,574 entries) and of the
+three source ZIPs' namelists (150,960 entries) finds ZERO files named
+"2021_porsche_911_rsr_sha.*" or any of its eight part suffixes.  The bytes
+were never published.
+
+**THE ROOT CAUSE, PROVEN BY DECRYPTING THE CAR DEFINITION.**
+"452_2021_porsche_911_rsr.bin.nct" (968 B) decrypts with the SAME RC4
+variant (key a535b3b1e843e7cf, tools/rr3-plist.py) and its plaintext
+contains "2020_911_RSR": EA shipped the 2021 RSR as a LIVERY-ONLY car that
+reuses the 2020 body.  "liveries/2021_porsche_911_rsr.liveries.bin.nct"
+(1,193 B) decrypts to the per-part livery overrides.  This is not a one-off:
+37 of the 547 car directories in the DXT pack are livery-only.
+
+**=>=> SO THE MINIMAL FIX IS AN ALIAS RULE, AND IT MUST GO IN THE SHARED
+CANDIDATE LIST** (native-switch/source/rr3_asset_candidates.hpp,
+buildCandidates, :188) -- the ONE list consumed by BOTH the cloud endpoint
+(cc_http_request.cpp:952 assetCandidates) and the digest side
+(guest_filesystem.cpp:4677 resolveAssetLocalFile).  Adding the alias to one
+side only would publish a digest for bytes the port never sends, which is
+worse than the quiet ENOENT it replaces.
+
+**=>=> AND IT IS NOT THE TERMINAL BLOCKER.**  The guest DEGRADES GRACEFULLY:
+"Warning: Using default AI values for '2021 Porsche 911 RSR' on track
+lemans-sarthe" (LF 206498), and the render keeps going to frame 1200
+(L221452 gfx-stats frames=1200, L222962 view-frame-png frame=1200).  The
+TERMINAL line is elsewhere: "ShowInterstitial" appears three times
+(L137678, L200964, L223817) and the first two are each followed by
+"Cannot show interstitial." -- the THIRD has no receipt, and the ad path has
+ZERO observability in the log (the tag "ad.interstitial" appears 0 times).
+The guest is alive and waiting for a callback that never arrives
+(L223959 reaper-asset-singleton waited_ns=210000000000).
+
+**=>=> THE MD5 CONTRACT IS HEALTHY AND IS THE GUARD** for the alias work:
+phase=asset-invariant-summary reports agreed=8645 disagreed=0 unresolved=0
+published=8645 controls=2 control_ok=1 (L1175), and the 34 base-list entries
+that name this car are all gui_assets atlases and liveries -- none of them a
+body texture.  After the alias, the 2021 path would publish the 2020 body's
+digest (18f6edf5...), which is exactly the bytes the endpoint would send.
+
+=========================================================================
+
+
+=========================================================================
+THE VEHICLE-BODY ALIAS: THE LIVERY-ONLY CAR REUSES AN EARLIER CAR
+=========================================================================
+
+**THE FIX.**  The 2021 Porsche 911 RSR's body texture is served from the 2020
+Porsche 911 RSR, because that is what the car definition says.  The alias lives
+in the FILE LAYER (native-switch/source/guest_filesystem.cpp), as the FOURTH
+candidate of withReadFallback():
+
+  * the car name is rewritten in the GUEST path and the result is RESOLVED
+    AGAIN, because the DEVICE changes with it (the 2021 car is routed to
+    rr3veh2 by contentDevice's year rule, the 2020 body lives in rr3veh1);
+  * it is tried LAST, so a file that does exist under its own name always
+    wins and the car's OWN livery files are never shadowed;
+  * it serves the base car's file and logs it as "vehicle-body-alias".
+
+**=>⇒ AND THE TWO BUGS IT COST ARE BOTH WORTH THE ROUNDS THEY COST.**
+
+**BUG 1: THE ALIAS WAS TOO BROAD, AND IT BROKE THE MD5 CONTRACT.**
+The first version rewrote EVERY path under the car's directory.  The car's
+LIVERY files ("<car>_ext.dxt.dds.z" and the per-part "<car>_lights.ptc.pvr.z")
+DO exist under their own name AND they ARE named in the asset lists, so
+rewriting them changed the bytes the port serves under a path whose PUBLISHED
+digest is the original one's.  The guest's md5 check then rejected the
+download, and the run stopped dead with no error anywhere -- the port's own
+sampler even showed the guest waiting on a cloudcell POST that never
+completed.
+
+**=>⇒ THE RULE THIS PRODUCES**: an alias is only safe where NO DIGEST IS
+PUBLISHED for the path it redirects.  The "_sha" body textures are named in NO
+asset list (the 34 base-list entries that name this car are all gui_assets
+atlases and liveries), so redirecting them cannot desynchronise a published
+digest.  The alias is therefore restricted to the "_sha" family, and the rule
+to write down is: **before redirecting a path, ask what the lists publish for
+it.**
+
+**BUG 2: THE ALIAS PUT 4 KB ON THE GUEST THREAD'S STACK.**
+withReadFallback() runs on the GUEST's threads, whose stacks are the guest's
+own, and this project has already MEASURED a 64 KiB stack buffer as fatal
+there (the candidate list in rr3_asset_candidates.hpp is on the heap for
+exactly that reason).  The alias added three 1,280-byte candidate paths, one
+1,536-byte guest path and a 2,452-BYTE Resolution to that frame.
+
+The symptom was the hardest kind to read: the run stopped making progress,
+the log went quiet, there was NO exception anywhere, and the port's own
+watchdog reported "OUT-OF-RANGE pc_off=0x1ce0eac" -- the port's PC was inside
+the DATA, which is what a CORRUPTED RETURN ADDRESS looks like.
+
+**=>⇒ AND THE FIRST FIX WAS HALF A FIX**: moving the path buffers to the heap
+did not help, because the 2,452-byte Resolution was still on the stack.  Only
+the whole alias block on the heap (vectors for the guest path, the candidate
+paths AND the resolution) fixed it.
+
+**=>⇒ THE RULE THIS PRODUCES**: in a function that runs on the guest's
+threads, EVERY local counts, and a struct with 1,536-byte members costs 2.5 KB
+before you write a single field into it.  "It is only a few kilobytes" is not
+a safety argument on a thread whose stack size you have not measured.
+
+=========================================================================
+
+
+**MEASURED (2026-10-31, archive 20261031-031607-eden-rr3-q39-alias-heapall):**
+the alias FIRED 12 times, and the car that needed it stopped falling back:
+
+    phase=vehicle-body-alias alias=.../2020_porsche_911_rsr/2020_porsche_911_rsr_sha.dxt.dds.z
+                         guest=.../2021_porsche_911_rsr/2021_porsche_911_rsr_sha.dxt.dds.z
+
+    "Using default AI values for ..."   q30: 3 cars (2019 Aston Martin Vantage
+                                       GTE, 2021 Porsche 911 RSR, 2020 Chevrolet
+                                       C8.R)   ->   q39: 2 cars (the 2021
+                                       Porsche is GONE)
+
+and the run is otherwise normal: md5 mismatch 0, start lights 4, race screen 10,
+HUD 10, 600 frames.
+
+**=>⇒ AND THE SAME RULE FIXES THE OTHER TWO CARS**: both the 2019 Aston Martin
+Vantage GTE and the 2020 Chevrolet C8.R are the same shape (a car EA shipped as
+a livery over another car's body).  Their base cars are named in their own
+car definitions, so the same DECRYPT-AND-READ method adds them to the table --
+and the table is evidence-based by construction, never a guess on the year.
+
+=========================================================================

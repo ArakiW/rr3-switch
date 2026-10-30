@@ -2,6 +2,7 @@
 
 #include "rr3/bionic_misc_shims.hpp"
 #include "rr3/gfx_backend.hpp"
+#include "rr3/guest_settings.hpp"
 #include "rr3/recovery_guard.hpp"
 #include "rr3/rr3_md5.hpp"
 #include "bionic_errno.hpp"
@@ -1920,8 +1921,23 @@ void logAssetListRequest(const char* guestPath, const Resolution& resolution,
 // The resolver itself. resolvePath() below is the wrapper every caller uses.
 bool resolvePathImpl(const char* path, bool writing, Resolution& resolution);
 
+// THE LAUNCHER-SIDE SETTINGS LAYER.  Defined further down, next to the rest
+// of the profile work; declared here because resolvePath() is where it
+// belongs.  See the note at its definition for WHY it is here and not in the
+// reader.
+bool maybeSubstituteDeviceProfile(const char* guestPath, Resolution& resolution);
+
 bool resolvePath(const char* path, bool writing, Resolution& resolution) {
     const bool resolved = resolvePathImpl(path, writing, resolution);
+    if (resolved && !writing) {
+        // THE GUEST'S DEVICE PROFILE, WITH THE CARD'S SETTINGS APPLIED.
+        //
+        // This is here, in the ONE place every path takes, because the guest
+        // reads the profile with open() + mmap() and the asset list publishes
+        // an md5 for it: a substitution anywhere else would make the bytes
+        // the guest reads and the digest the list publishes disagree.
+        maybeSubstituteDeviceProfile(path, resolution);
+    }
     if (resolved && isAstLeaf(path)) {
         // THE ".ast" RULE: CARD-ONLY, AND IT IS ENFORCED HERE, IN THE ONE
         // PLACE EVERY PATH TAKES.
@@ -3213,6 +3229,117 @@ void recordAssetPath(const char* guestPath) {
     std::fclose(file);
 }
 
+// ---------------------------------------------------------------------------
+// THE LIVERY-ONLY CARS: a car that ships ONLY its livery, and the car whose
+// body it reuses.
+//
+// MEASURED 2026-10-31, over the q30 archive, all seven ROMFS volumes and the
+// three source texture packs: the 2021 Porsche 911 RSR's directory in
+// vehicles-modern.romfs holds exactly ONE file
+// (livery/2021_porsche_911_rsr_ext.dxt.dds.z, 189,918 B) and NO body
+// texture at all -- and the guest's own car definition
+// (vehicles/data/452_2021_porsche_911_rsr.bin.nct, 968 B), decrypted with the
+// guest's OWN RC4 variant (tools/rr3-plist.py), names "2020_911_RSR" as its
+// base car.  So the body was never published under the 2021 name: the 2021
+// car IS a livery over the 2020 body.
+//
+// WITHOUT THE ALIAS the guest asks for a body texture that does not exist
+// (30 log lines in five bursts, ENOENT on FIVE different device paths) and
+// falls back to "Warning: Using default AI values for '2021 Porsche 911
+// RSR'" -- the car renders with default values instead of its own.
+//
+// WHY IT BELONGS IN THE FILE LAYER AND NOT IN THE ASSET CANDIDATE LIST.
+// The request is a guest FILESYSTEM stat (guestStat), not a pack-endpoint
+// request: "phase=cc-asset-req" has 53 lines in the whole log and mentions
+// this car on ZERO of them.  And the path is in NO asset list -- the 34 base
+// list entries that name this car are all gui_assets atlases and liveries,
+// none of them a body texture -- so NO digest is published for it and the
+// md5 contract is not touched by this alias at all.
+//
+// EVERY ENTRY IS EVIDENCE: the base car is the one the car definition names.
+// It is not a guess on the year.
+// ---------------------------------------------------------------------------
+struct VehicleBodyAlias {
+    const char* car;   // the livery-only car
+    const char* base;  // the car whose body it reuses
+};
+
+constexpr VehicleBodyAlias kVehicleBodyAliases[] = {
+    {"2021_porsche_911_rsr", "2020_porsche_911_rsr"},
+};
+
+constexpr unsigned kVehicleBodyAliasCount = static_cast<unsigned>(
+    sizeof(kVehicleBodyAliases) / sizeof(kVehicleBodyAliases[0]));
+
+// Rewrites every occurrence of the car's name in a GUEST path.
+//
+// THE CAR NAME IS IN THE DIRECTORY AND IN THE FILE NAME
+// ("<car>_sha.dxt.dds.z"), so both have to change -- otherwise the alias
+// asks for a file that cannot exist under any name.
+//
+// BUT ONLY THE BODY TEXTURE IS ALIASED, AND THAT RESTRICTION IS THE WHOLE
+// POINT.  The first version rewrote EVERY path under the car's directory,
+// and that broke the run: the car's LIVERY files ("<car>_ext.dxt.dds.z" and
+// the per-part "<car>_lights.ptc.pvr.z") DO exist under their own name AND
+// they ARE named in the asset lists, so rewriting them changed the bytes the
+// port serves under a path whose published digest is the ORIGINAL one's --
+// and the guest's md5 check then rejected the download and the boot blocked
+// with no error anywhere.
+//
+// So the alias is restricted to the "_sha" family, which is (a) PROVEN missing
+// for this car, (b) PROVEN to exist under the base car, and (c) NOT named in
+// any asset list, so no published digest describes it and none is broken.
+bool rewriteVehicleBodyAlias(const char* guestPath, char* out, size_t outSize) {
+    if (guestPath == nullptr || out == nullptr || outSize == 0u) {
+        return false;
+    }
+    for (unsigned i = 0; i < kVehicleBodyAliasCount; ++i) {
+        const char* from = kVehicleBodyAliases[i].car;
+        const char* to = kVehicleBodyAliases[i].base;
+        if (std::strstr(guestPath, from) == nullptr) {
+            continue;
+        }
+        // ONLY THE LEAF THAT IS THE BODY TEXTURE.
+        const char* leaf = std::strrchr(guestPath, '/');
+        leaf = (leaf != nullptr) ? (leaf + 1) : guestPath;
+        if (std::strstr(leaf, "_sha") == nullptr) {
+            continue;
+        }
+        const size_t fromLength = std::strlen(from);
+        const size_t toLength = std::strlen(to);
+        size_t written = 0;
+        const char* cursor = guestPath;
+        bool replaced = false;
+        while (*cursor != '\0') {
+            const char* hit = std::strstr(cursor, from);
+            const size_t chunk = (hit != nullptr)
+                                     ? static_cast<size_t>(hit - cursor)
+                                     : std::strlen(cursor);
+            if (written + chunk >= outSize) {
+                return false;
+            }
+            std::memcpy(out + written, cursor, chunk);
+            written += chunk;
+            cursor += chunk;
+            if (hit == nullptr) {
+                break;
+            }
+            if (written + toLength >= outSize) {
+                return false;
+            }
+            std::memcpy(out + written, to, toLength);
+            written += toLength;
+            cursor = hit + fromLength;
+            replaced = true;
+        }
+        out[written] = '\0';
+        if (replaced) {
+            return true;
+        }
+    }
+    return false;
+}
+
 template <typename Callback>
 int withReadFallback(const Resolution& resolution, const char* guestPath,
                      Callback callback, const char** servedOut = nullptr) {
@@ -3538,6 +3665,87 @@ int withReadFallback(const Resolution& resolution, const char* guestPath,
             // Same retraction as the volume candidate above, and for the
             // same reason: a ".z" request must not be answered with the
             // uncompressed file. The guest inflates unconditionally.
+        }
+    }
+    // FOURTH CANDIDATE: THE LIVERY-ONLY CAR'S BODY, from the car it reuses.
+    //
+    // The car name is rewritten in the GUEST path and the result is resolved
+    // AGAIN, because the DEVICE changes with it: the 2021 car is routed to
+    // rr3veh2 (year >= 2021) and the 2020 body lives in rr3veh1 (2016..2020).
+    // A string replacement on the device path would look for the body in the
+    // wrong volume.
+    //
+    // IT IS TRIED LAST, so a file that does exist under its own name always
+    // wins: the 2021 car's OWN livery files are never shadowed by the base
+    // car's, and the base car is only reached for the files that were never
+    // published.
+    if (result != 0 && guestPath != nullptr) {
+        // THE BUFFERS LIVE ON THE HEAP, ON PURPOSE.
+        //
+        // withReadFallback() runs on the GUEST's threads, whose stacks are the
+        // guest's own, and this port has already MEASURED a 64 KiB stack
+        // buffer as fatal there (the candidate list in
+        // rr3_asset_candidates.hpp is on the heap for the same reason).
+        //
+        // THE RESOLUTION GOES ON THE HEAP TOO, AND THAT WAS THE SECOND HALF
+        // OF THE SAME BUG: Resolution is two 1,536-byte path slots plus two
+        // flags, so a local one costs 2.5 KB of the guest thread's stack.
+        // With it on the stack the port overflowed the guest thread, the
+        // return address was corrupted, and the port kept running with a PC
+        // INSIDE THE DATA (the port's own sampler reported "OUT-OF-RANGE
+        // pc_off=0x1ce0eac"), which is what a corrupted stack looks like.
+        // The symptom was a run that stopped making progress with no error
+        // anywhere -- and the first attempt, which only moved the path
+        // buffers to the heap, still had the Resolution on the stack.
+        std::vector<char> aliasGuest(0x600, '\0');
+        std::vector<char> candidates(3u * 0x600u, '\0');
+        std::vector<char> aliasStorage(sizeof(Resolution), '\0');
+        Resolution& aliasResolution =
+            *reinterpret_cast<Resolution*>(aliasStorage.data());
+        if (rewriteVehicleBodyAlias(guestPath, aliasGuest.data(),
+                                    aliasGuest.size())) {
+            if (resolvePath(aliasGuest.data(), false, aliasResolution)) {
+                int count = 0;
+                if (aliasResolution.primary[0] != '\0') {
+                    std::snprintf(candidates.data() + count * 0x600, 0x600,
+                                  "%s", aliasResolution.primary);
+                    ++count;
+                }
+                if (aliasResolution.fallback[0] != '\0') {
+                    std::snprintf(candidates.data() + count * 0x600, 0x600,
+                                  "%s", aliasResolution.fallback);
+                    ++count;
+                }
+                if (count > 0 &&
+                    std::strncmp(aliasResolution.primary, "sdmc:", 5) != 0 &&
+                    appLocalPath(aliasResolution.primary,
+                                 candidates.data() + count * 0x600, 0x600)) {
+                    ++count;
+                }
+                for (int i = 0; i < count; ++i) {
+                    ++attempts;
+                    result = callback(candidates.data() + i * 0x600);
+                    lastErrno = errno;
+                    if (result == 0) {
+                        if (servedOut != nullptr) {
+                            *servedOut = candidates.data() + i * 0x600;
+                        }
+                        char diag[640];
+                        std::snprintf(diag, sizeof(diag),
+                                      "alias=%s guest=%.200s served=%.200s",
+                                      aliasGuest.data(), guestPath,
+                                      candidates.data() + i * 0x600);
+                        appendGuestBootLine(
+                            "sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "vehicle-body-alias", 0, 0, diag);
+                        if (assetList) {
+                            logAssetListRequest(guestPath, resolution, false, 0,
+                                                lastErrno);
+                        }
+                        return 0;
+                    }
+                }
+            }
         }
     }
     if (result != 0 && errno == 0) {
@@ -6806,6 +7014,455 @@ bool buildConsistentGuiBaseList(unsigned* rewrittenOut, unsigned* keptOut) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// THE LAUNCHER-SIDE SETTINGS LAYER -- THE PS VITA LESSON, APPLIED.
+//
+// WHAT THE GUEST ACTUALLY DOES (measured 2026-10-31, archive
+// 20261031-010828-eden-rr3-q30-res-base-2048-view-720, guest-view.log):
+//
+//   2088  ======= platform AndroidHigh
+//   2089  map-app   rr3core:/files/.depot/eds/
+//   2093  readdir   AndroidHigh.plist
+//   2099  Searching for settings for device: AndroidHigh
+//   2103  stat-path guest='sdmc:/switch/rr3-native-rehost/.depot/eds/AndroidHigh.plist'
+//                   primary='rr3core:/files/.depot/eds/AndroidHigh.plist'
+//                   fallback='rr3core:/files/apk/res/eds/AndroidHigh.plist'
+//   2107  open-ok   e6ea60c54026f388a8a65a62e99576bf
+//   2108  mmap-file-ok len=6808
+//   2126  Loaded settings file: AndroidHigh.plist
+//
+// THREE THINGS IN THAT LIST DECIDE THE WHOLE DESIGN:
+//
+//  1. THE FILE MAY NOT BE RENAMED OR REMOVED.  The guest READDIRs the
+//     directory to learn the name, so a profile the port does not publish is
+//     a profile the guest never asks for.  The port can change the BYTES.
+//
+//  2. THE BYTES MAY NOT CHANGE SIZE.  The guest mmaps 6808 bytes and the
+//     size comes from the stat, so the port has to serve a file of exactly
+//     the same length.  That is why the translation keeps the length: the
+//     ciphertext is the plaintext XORed with a stream of the same length.
+//
+//  3. THE HOOK BELONGS IN THE RESOLVER, NOT IN THE READER.  The guest reads
+//     the profile through guestOpen() and then MMAPS the descriptor, so a
+//     hook in guestFopen() would never fire at all.  And the asset list
+//     publishes an md5 for "/eds/AndroidHigh.plist" that has to describe the
+//     bytes the port serves, so the substitution has to happen where BOTH
+//     the read and the digest computation see it -- resolvePath(), which is
+//     the one place every path takes.
+//
+// WHAT THIS IS: the port acting as the LAUNCHER, the way the PS Vita port
+// does.  The Vita launcher reads a plain text config.txt and TRANSLATES it
+// into the guest's own encrypted device profile (eds/Vita*.plist); the
+// guest never sees the plain text.  This does the same thing, with the
+// port's rr3-settings.txt on the card.
+//
+// WHAT IT IS NOT: the host inventing a quality setting.  The keys are the
+// GUEST'S OWN keys (the ones its native readers ask for), the profile is
+// the guest's own profile, and the cipher is the guest's own cipher.
+//
+// THE DEFAULT IS "NOTHING HAPPENS".  A card with no rr3-settings.txt serves
+// the stock profile, byte for byte, and the port logs that it did.  The
+// settings layer can only change the picture when a user asks for it.
+//
+// THE PRICE, STATED PLAINLY: changing a QUALITY switch changes the SET of
+// shaders the guest compiles, and the guest then recompiles all of them
+// (measured: archive 20261031-003750, the run died at 42 s while it was
+// still pulling .vsh/.fsh).  The PS Vita port had the same problem and
+// shipped a shader cache and a "clear the cache" button with it.  So the
+// settings file has to be CONSTANT from run to run -- which it is, because
+// it is a file, and not something the port rewrites under the guest's feet
+// the way editing the volume in place did.
+// ---------------------------------------------------------------------------
+namespace {
+
+// The settings file, on the card, beside the port's other control files.
+constexpr const char* kSettingsFile =
+    "sdmc:/switch/rr3-native-rehost/rr3-settings.txt";
+
+// Where the generated profile goes.  The cache root is already a writable
+// root (ensureWritableRoots), so this needs no new directory.
+constexpr const char* kProfileCacheRoot =
+    "sdmc:/switch/rr3-native-rehost/cache";
+
+// The profile the guest asks for, when the settings do not name one.
+//
+// The guest picks the tier from the device identity the port reports (the GL
+// identity in gfx_gles.cpp), and MEASURED 2026-10-31 (the q30 archive, line
+// 2099) that tier is "AndroidHigh".  A settings file may name another one
+// with the "perfil" key.
+constexpr const char* kDefaultProfileName = "AndroidHigh.plist";
+
+// What the settings layer knows about this run.
+struct ProfileSettingsState {
+    bool loaded{false};
+    bool usable{false};      // the settings say something at all
+    GuestSettings settings{};
+    char builtFor[128]{};     // the profile we generated
+    char generated[0x600]{};  // the file we generated
+    char source[0x600]{};     // where the stock profile came from
+    int changed{0};
+    char error[192]{};
+};
+
+ProfileSettingsState gProfileSettings;
+
+// TRUE while the settings layer is building the profile.  The build resolves
+// the profile path ITSELF, and that resolve would come straight back here.
+bool gBuildingProfile = false;
+
+// TRUE for a guest path whose LEAF is a "*.plist" file.
+//
+// The device profile is one of many plists the guest has, so this is only
+// the first half of the test: the parent directory has to be "eds" as well.
+//
+// THE PREDICATE ITSELF LIVES IN THE SETTINGS MODULE, because that one CAN be
+// built and run by a host compiler -- and the version that lived here was
+// off by one byte ("base + length - 5" against a SIX-character suffix), so
+// it was always false and the settings layer never fired.
+bool hasPlistLeaf(const char* guestPath) {
+    return rr3::guestProfileLeafIsPlist(guestPath);
+}
+
+// TRUE when the parent directory of the guest path is "eds".
+bool parentDirectoryIsEds(const char* guestPath) {
+    const char* slash = std::strrchr(guestPath, '/');
+    if (slash == nullptr || slash == guestPath) {
+        return false;
+    }
+    char parent[0x600]{};
+    const size_t cut = static_cast<size_t>(slash - guestPath);
+    if (cut >= sizeof(parent)) {
+        return false;
+    }
+    std::memcpy(parent, guestPath, cut);
+    parent[cut] = '\0';
+    const char* parentBase = pathBasename(parent);
+    return parentBase != nullptr && std::strcmp(parentBase, "eds") == 0;
+}
+
+// TRUE for a guest path that names a DEVICE PROFILE: a "*.plist" file inside
+// an "eds" directory.
+//
+// The parent directory has to be "eds", because the guest has other plists
+// (the asset lists are .txt, but the volume carries iPad/iPhone profiles
+// under the same "eds" directory) and only the device profile carries the
+// quality switches.  The two halves are separate functions because the hook
+// has to tell "not a plist at all" (the common case, and quiet) from "a
+// plist, but not the device profile" (worth a line in the log).
+
+// Puts a different leaf on the same path: "rr3core:/files/.depot/eds/A.plist"
+// with "B.plist" gives "rr3core:/files/.depot/eds/B.plist".
+bool replaceBasename(const char* path, const char* newBase, char* out,
+                     size_t outSize) {
+    if (path == nullptr || newBase == nullptr || out == nullptr ||
+        outSize == 0) {
+        return false;
+    }
+    const char* slash = std::strrchr(path, '/');
+    if (slash == nullptr) {
+        return false;
+    }
+    const size_t prefix = static_cast<size_t>(slash - path) + 1;
+    const int written = std::snprintf(out, outSize, "%.*s%s",
+                                      static_cast<int>(prefix), path, newBase);
+    return written > 0 && static_cast<size_t>(written) < outSize;
+}
+
+// Reads the settings file ONCE.
+//
+// They are a file on the card that a user edits BETWEEN runs, and the port
+// must not see them change under it: the guest reads its profile during
+// boot, and a profile that changes mid-boot is a profile the guest mmaps in
+// two halves.
+bool loadProfileSettings() {
+    if (gProfileSettings.loaded) {
+        return gProfileSettings.usable;
+    }
+    gProfileSettings.loaded = true;
+    GuestSettings settings;
+    const bool present = guestSettingsLoad(kSettingsFile, settings);
+    gProfileSettings.settings = settings;
+    gProfileSettings.usable =
+        present && (settings.count > 0 || settings.profile[0] != '\0');    char diag[640];
+    std::snprintf(diag, sizeof(diag),
+                  "file=%s present=%d settings=%d tier=%s profile=%s target=%s "
+                  "usable=%d error=%s",
+                  kSettingsFile, present ? 1 : 0, settings.count,
+                  settings.tier[0] != '\0' ? settings.tier : "-",
+                  settings.profile[0] != '\0' ? settings.profile : "-",
+                  settings.target[0] != '\0' ? settings.target : "-",
+                  gProfileSettings.usable ? 1 : 0,
+                  settings.error[0] != '\0' ? settings.error : "-");
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "settings-load", 0, 0, diag);
+    return gProfileSettings.usable;
+}
+
+// The name of the profile to patch: the file name, ".plist" included.
+const char* profileTargetName() {
+    if (gProfileSettings.settings.target[0] != '\0') {
+        // "perfil = AndroidHigh" and "perfil = AndroidHigh.plist" mean the
+        // same profile, so the extension is added when it is missing.
+        static char name[128]{};
+        std::snprintf(name, sizeof(name), "%s", gProfileSettings.settings.target);
+        const size_t length = std::strlen(name);
+        if (length < 6 || std::strcmp(name + length - 6, ".plist") != 0) {
+            std::snprintf(name + length, sizeof(name) - length, ".plist");
+        }
+        return name;
+    }
+    return kDefaultProfileName;
+}
+
+// Builds the profile the guest will read, with the settings applied.
+//
+// Returns true when the generated file is on the card and may be served.
+bool buildDeviceProfile(const char* profileName) {
+    if (profileName == nullptr || profileName[0] == '\0') {
+        return false;
+    }
+    // THE GUEST PATH SPELLING, measured (q30 archive, line 2103):
+    //   guest='sdmc:/switch/rr3-native-rehost/.depot/eds/AndroidHigh.plist'
+    //   primary='rr3core:/files/.depot/eds/AndroidHigh.plist'
+    //   fallback='rr3core:/files/apk/res/eds/AndroidHigh.plist'
+    char guestPath[0x600]{};
+    std::snprintf(guestPath, sizeof(guestPath),
+                  "sdmc:/switch/rr3-native-rehost/.depot/eds/%s", profileName);
+    Resolution resolution{};
+    gBuildingProfile = true;
+    const bool resolved = resolvePath(guestPath, false, resolution);
+    gBuildingProfile = false;
+    if (!resolved) {
+        char diag[640];
+        std::snprintf(diag, sizeof(diag), "profile=%s FAILED resolve", profileName);
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "settings-profile", 0, 0, diag);
+        return false;
+    }
+    // THE STOCK PROFILE, read the way the port serves it.
+    std::string original;
+    char source[0x600]{};
+    if (!readWholeFile(resolution.primary, original)) {
+        if (resolution.fallback[0] == '\0' ||
+            !readWholeFile(resolution.fallback, original)) {
+            char diag[640];
+            std::snprintf(diag, sizeof(diag),
+                          "profile=%s FAILED no-stock primary=%s fallback=%s",
+                          profileName, resolution.primary, resolution.fallback);
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                "settings-profile", 0, 0, diag);
+            return false;
+        }
+        std::snprintf(source, sizeof(source), "%s", resolution.fallback);
+    } else {
+        std::snprintf(source, sizeof(source), "%s", resolution.primary);
+    }
+    // THE BASE PROFILE: the one the quality tier selected, when the tier
+    // selected one.  It lives in the same directory, so the path is the
+    // stock path with a different leaf.
+    std::string baseBytes = original;
+    char baseSource[0x600]{};
+    std::snprintf(baseSource, sizeof(baseSource), "%s", source);
+    if (gProfileSettings.settings.profile[0] != '\0') {
+        const std::string wanted =
+            std::string(gProfileSettings.settings.profile) + ".plist";
+        char candidate[0x600]{};
+        bool got = false;
+        const char* const sources[2] = {resolution.primary, resolution.fallback};
+        for (int i = 0; i < 2 && !got; ++i) {
+            if (sources[i] == nullptr || sources[i][0] == '\0') {
+                continue;
+            }
+            if (!replaceBasename(sources[i], wanted.c_str(), candidate,
+                                 sizeof(candidate))) {
+                continue;
+            }
+            if (readWholeFile(candidate, baseBytes)) {
+                std::snprintf(baseSource, sizeof(baseSource), "%s", candidate);
+                got = true;
+            }
+        }
+        if (!got) {
+            char diag[640];
+            std::snprintf(diag, sizeof(diag),
+                          "profile=%s FAILED tier=%s names a profile that is not "
+                          "here (looked for %s)",
+                          profileName, gProfileSettings.settings.profile,
+                          wanted.c_str());
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                "settings-profile", 0, 0, diag);
+            return false;
+        }
+    }
+    // THE TRANSLATION.
+    const std::vector<unsigned char> requested(original.begin(), original.end());
+    const std::vector<unsigned char> base(baseBytes.begin(), baseBytes.end());
+    std::string composed;
+    GuestSettingsResult result;
+    if (!guestSettingsComposeProfile(gProfileSettings.settings,
+                                     requested.data(), requested.size(),
+                                     base.data(), base.size(), composed,
+                                     result)) {
+        char diag[640];
+        std::snprintf(diag, sizeof(diag),
+                      "profile=%s FAILED compose error=%s", profileName,
+                      result.error);
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "settings-profile", 0, 0, diag);
+        return false;
+    }
+    // WRITE IT.  Through a temporary name, and remove the target first:
+    // libnx's fsdev rename does NOT overwrite an existing file.
+    char generated[0x600]{};
+    std::snprintf(generated, sizeof(generated), "%s/eds-%s", kProfileCacheRoot,
+                  profileName);
+    char tempPath[0x600]{};
+    std::snprintf(tempPath, sizeof(tempPath), "%s.tmp", generated);
+    std::FILE* output = std::fopen(tempPath, "wb");
+    bool written = false;
+    int writeErrno = 0;
+    if (output != nullptr) {
+        const size_t bytes =
+            composed.empty() ? 0u
+                             : std::fwrite(composed.data(), 1, composed.size(),
+                                           output);
+        const bool flushed = (bytes == composed.size());
+        const int closeResult = std::fclose(output);
+        writeErrno = errno;
+        written = flushed && (closeResult == 0);
+        if (written) {
+            std::remove(generated);
+            written = std::rename(tempPath, generated) == 0;
+            if (!written) {
+                writeErrno = errno;
+            } else {
+                // THE CARD NEEDS TIME.  See waitForCardFile(): the file lands
+                // on the card long after the write returns, and the guest
+                // reads this profile during boot.
+                const bool landed =
+                    waitForCardFile(generated, composed.size(), 30000u);
+                if (!landed) {
+                    writeErrno = ETIMEDOUT;
+                    written = false;
+                }
+            }
+        }
+    } else {
+        writeErrno = errno;
+    }
+    char diag[1400];
+    std::snprintf(diag, sizeof(diag),
+                  "profile=%s tier=%s base=%s stock=%s out=%s bytes=%zu/%zu "
+                  "changed=%d written=%d errno=%d error=%s",
+                  profileName,
+                  gProfileSettings.settings.tier[0] != '\0'
+                      ? gProfileSettings.settings.tier
+                      : "-",
+                  baseSource, source, generated, composed.size(),
+                  requested.size(), result.changed, written ? 1 : 0, writeErrno,
+                  result.error[0] != '\0' ? result.error : "-");
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "settings-profile", 0, 0, diag);
+    if (!written) {
+        return false;
+    }
+    std::snprintf(gProfileSettings.builtFor, sizeof(gProfileSettings.builtFor),
+                  "%s", profileName);
+    std::snprintf(gProfileSettings.generated, sizeof(gProfileSettings.generated),
+                  "%s", generated);
+    std::snprintf(gProfileSettings.source, sizeof(gProfileSettings.source),
+                  "%s", source);
+    gProfileSettings.changed = result.changed;
+    return true;
+}
+
+// THE HOOK.  Called from resolvePath(), which is the one place every path
+// takes -- so the guest's read, the guest's stat and the asset list's md5
+// all see the SAME file.
+bool maybeSubstituteDeviceProfile(const char* guestPath, Resolution& resolution) {
+    if (!hasPlistLeaf(guestPath)) {
+        // Not a plist at all: the common case, and quiet.
+        return false;
+    }
+    // IT IS A PLIST.  From here on every outcome is NAMED and written down,
+    // because a hook that says nothing when it does not fire cannot be told
+    // apart from "the guest never asked for it" -- and that is exactly the
+    // question a failed substitution raises.
+    static unsigned s_reported = 0;
+    const char* why = "substituted";
+    bool substituted = false;
+    if (gBuildingProfile) {
+        // The build resolves the profile path itself.
+        why = "building-the-profile";
+    } else if (!parentDirectoryIsEds(guestPath)) {
+        why = "parent-is-not-eds";
+    } else if (!loadProfileSettings()) {
+        why = "no-settings";
+    } else {
+        const char* base = pathBasename(guestPath);
+        const char* target = profileTargetName();
+        // ONLY THE TARGET PROFILE IS SUBSTITUTED.
+        //
+        // The volume carries a profile for EVERY device the guest knows
+        // (AndroidHigh, iPad2,1, iPhone4,1, ...), and the asset list names
+        // all of them with a digest.  A port that rewrote every one of them
+        // would change the bytes behind forty published digests to fix one
+        // device's settings -- and the guest reads the OTHER profiles too.
+        //
+        // So the settings apply to the profile this port builds (the one the
+        // guest asks for by name), and every other profile is served exactly
+        // as it shipped.
+        if (base == nullptr || base[0] == '\0') {
+            why = "no-leaf-name";
+        } else if (std::strcmp(base, target) != 0) {
+            why = "not-the-target-profile";
+        } else if (gProfileSettings.generated[0] == '\0') {
+            why = "no-generated-file";
+        } else {
+            std::snprintf(resolution.primary, sizeof(resolution.primary),
+                          "%s", gProfileSettings.generated);
+            substituted = true;
+        }
+    }
+    if (s_reported < 12) {
+        ++s_reported;
+        char diag[900];
+        std::snprintf(diag, sizeof(diag),
+                      "why=%s substituted=%d guest=%.240s primary=%.240s "
+                      "generated=%s",
+                      why, substituted ? 1 : 0,
+                      guestPath != nullptr ? guestPath : "-", resolution.primary,
+                      gProfileSettings.generated);
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "settings-substitute", 0, 0, diag);
+    }
+    // THE STOCK PROFILE STAYS AS THE FALLBACK.  A card that cannot be
+    // written then costs the settings and nothing else: the guest still
+    // boots with the profile it shipped with.
+    return substituted;
+}
+
+// Builds the profile at boot, before the asset lists are rewritten.
+//
+// THE ORDER MATTERS.  The asset lists publish an md5 for every path they
+// name, and the guest checks the bytes it receives against it -- so the
+// profile has to be the GENERATED one BEFORE the lists are built, or the
+// list would publish the digest of the stock profile for a file the port
+// serves differently.
+void buildDeviceProfileFromSettings() {
+    if (!loadProfileSettings()) {
+        char diag[256];
+        std::snprintf(diag, sizeof(diag),
+                      "no settings: the stock device profile is served unchanged");
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "settings-profile", 0, 0, diag);
+        return;
+    }
+    buildDeviceProfile(profileTargetName());
+}
+
+}  // namespace
+
 // Reads one asset list THE WAY THE PORT SERVES IT, and scans it against the
 // override set.
 //
@@ -7396,6 +8053,15 @@ ExternalDataStatus mountExternalData() {
     // A failure here costs the completion and nothing else: the shipped
     // manifest is still served, and the log line says why.
     gCompletedManifestReady = buildCompletedGuiAssetsManifest();
+    // THE LAUNCHER-SIDE SETTINGS LAYER: the guest's own device profile,
+    // rebuilt with the settings from the card.
+    //
+    // It is built HERE, on the boot thread, and BEFORE the asset lists are
+    // rewritten, because the lists publish an md5 for every path they name:
+    // a list built against the stock profile would publish the stock digest
+    // for a file the port serves differently, and the guest would answer
+    // "didn't match its MD5" about a file it never even downloaded.
+    buildDeviceProfileFromSettings();
     // THE ASSET LIST THE GUEST CHECKS ITS DOWNLOADS AGAINST, made to describe
     // the bytes the port will actually send.
     //

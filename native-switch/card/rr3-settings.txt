@@ -1,0 +1,127 @@
+# ============================================================================
+# RR3 Switch —— 端口设置（明文，可直接用记事本/编辑器改）
+#
+# 位置：sdmc:/switch/rr3-native-rehost/rr3-settings.txt
+# 读取者：端口（它就是「启动器」），在客机读自己的设备档案之前完成翻译。
+# ============================================================================
+#
+# 这是从 PS Vita 版学来的做法，不是新发明。
+#
+# PSV 版的结构是：
+#     eboot.bin（启动器） + configurador.bin（图形化配置器）
+#         ↓ 配置器写明文
+#     ux0:data/rr3/config.txt          ← 明文，一行一个 key = value
+#         ↓ 启动器翻译
+#     eds/Vita*.plist                   ← 加密二进制，客机自己读
+#
+# 客机从头到尾只认它自己的加密设备档案。启动器不发明第二套配置系统，
+# 启动器只决定「往客机的档案里写什么」。
+#
+# 我们的端口扮演的就是启动器这一层，所以：
+#     rr3-settings.txt（明文）  →  客机的 eds/*.plist（加密）
+#
+# 客机读到的还是它熟悉的那个文件，端口没有在宿主层伪造任何东西。
+#
+# ---------------------------------------------------------------------------
+# 写法：一行一个 key = value，# 开头是注释，空行忽略，键名不区分大小写。
+# ---------------------------------------------------------------------------
+#
+# 【1】画质档 —— 切换客机自己的设备档案
+#
+#   bajo        → AndroidLow
+#   medio       → AndroidMid
+#   medioalto   → AndroidMid2
+#   alto        → AndroidHigh（客机默认挑的那一档）
+#   ultrawide   → AndroidUltraWide
+#   xtralto     → AndroidXtraHigh（客机自带的 HD 档：2048x1536 图集 + AA + 字体页 2048）
+#   personal    → 保留客机自己选的档案，只应用下面逐项写的覆盖
+#
+#   perfil = AndroidHigh.plist
+#     → 改哪一份档案（默认就是它，一般不用写）
+#
+# 这一项最省事：档案里已经带了 GUI_LAYOUT_EXTENSION / EXPECTED_SCREEN /
+# AA_LEVEL / FONT_PAGE_SIZE / MIPMAP_BIAS / 各类阴影开关，一档全带走。
+#
+# ⚠ 不是免费的：画质键一变，客机的 shader 集合就变，客机会把整套 shader
+#   重编一遍。第一次换档要等（实测 q27：42 秒还没编完就死了），
+#   编过之后会缓存下来，之后就快了。
+#
+#calidad = alto
+#
+# ---------------------------------------------------------------------------
+# 【2】逐项覆盖 —— 用客机自己的键名
+#
+# 这些键名是逆向确证的客机原生键（客机用 bool getter 0x13c65a8 /
+# int getter 0x13c64d4 去读它们）。要哪一档写哪一档。
+#
+# 下面是「客机档案里有什么就写什么」的常见几项（完整列表见档案本身）：
+#
+#   GUI_LAYOUT_EXTENSION      用哪棵 UI 资源树（_480x320 / _960x640 / _1024x768 / _2048x1536）
+#   EXPECTED_SCREEN_WIDTH     客机以为屏幕多宽
+#   EXPECTED_SCREEN_HEIGHT    客机以为屏幕多高
+#   HIGH_RES_MENU             高分菜单（bool）
+#   AA_LEVEL                  抗锯齿档（int）
+#   FONT_PAGE_SIZE            字体图集页大小（int）
+#   MIPMAP_BIAS               mipmap 偏置（real）
+#   CAR_SHADOW_MAPS           车辆阴影贴图（bool）
+#   EXTERIOR_SHADOWS_MENU     菜单里的车外阴影（bool）
+#   EXTERIOR_SHADOWS_OPPONENT 对手车外阴影（bool）
+#   EXTERIOR_SHADOWS_PLAYER   玩家车外阴影（bool）
+#   CAR_INTERIOR_SHADOW_MAPS  车内阴影贴图（bool）
+#   CAR_INTERIOR_LOD          车内 LOD（bool）
+#   FULL_OPPONENT_DAMAGE      对手车辆可见损坏（bool）
+#   USE_PARTICLE_EFFECTS      粒子特效（bool）
+#   USE_FULL_SCREEN_EFFECTS   全屏特效（bool）
+#   DYNAMIC_CAR_REFLECTIONS   动态车辆反射（bool）
+#   USE_ANISOTROPIC_FILTERING 各向异性过滤（bool）
+#
+# 布尔值写 true / false（也认 si / no，对齐 PSV 的写法）。
+#
+#AA_LEVEL = 4
+#HIGH_RES_MENU = true
+#EXTERIOR_SHADOWS_OPPONENT = false
+#
+# ---------------------------------------------------------------------------
+# 【3】PS Vita config.txt 的键 —— 可以直接照抄
+#
+# 端口认得下面这些西语键名，会翻译成上面那些客机原生键。
+# 注意：语义对应是按意思推的（西语那个词比客机的键更宽），
+# 所以真要精确控制，请直接写客机的原生键名 —— 原生键永远优先。
+#
+#   msaa                  → AA_LEVEL                    （写 2x / 4x）
+#   reflejos              → DYNAMIC_CAR_REFLECTIONS
+#   det_particulas        → USE_PARTICLE_EFFECTS
+#   det_pantalla_completa → USE_FULL_SCREEN_EFFECTS
+#   det_danios            → FULL_OPPONENT_DAMAGE
+#   det_sombras_coche     → CAR_SHADOW_MAPS
+#   det_sombras_cabina    → CAR_INTERIOR_SHADOW_MAPS
+#   det_sombras_rivales   → EXTERIOR_SHADOWS_OPPONENT
+#   det_rivales           → EXTERIOR_SHADOWS_OPPONENT
+#   det_interior          → CAR_INTERIOR_LOD
+#   det_texturas          → TEXTURE_MIPMAP_LEVELS_TO_SKIP
+#   det_pista             → LIGHTMAP_MIPMAP_LEVELS_TO_SKIP
+#   det_coche             → EXTERIOR_SHADOWS_PLAYER
+#   brillos               → USE_FULL_SCREEN_EFFECTS
+#
+# 这一组是客机档案管不了的（它们是启动器自己的，不是客机的）：
+#
+#   giro / zona_muerta / invertir_giro / inclinacion / botones / boton_<动作>
+#       → 写在 rr3-pad.txt 里（手柄映射）
+#   volumen_motor
+#       → 写在 rr3-drive.txt 里（驱动设置）
+#   actualizaciones
+#       → 端口还没做自动更新
+#
+# ---------------------------------------------------------------------------
+# 【4】画面尺寸不在这里
+#
+# 视图尺寸（客机 viewport + 触摸坐标空间）是 rr3-screen.txt 的 view= 那一行，
+# 不是这里。它和画质档案是两个独立的旋钮：
+#   view 决定客机「以为屏幕多大」→ 决定它选哪棵图集；
+#   档案决定它「开哪些效果」→ 决定它编哪些 shader。
+#
+# 实测：view=2048x1152 时客机整个前端改用 2048x1536 的 HD 图集（750 条路径），
+# 而 1280x720 时它只用 960x640 的 SD 图集。
+#
+# 同一个画面尺寸下，改档案要重编 shader，改 view 不用。
+# ---------------------------------------------------------------------------

@@ -11,6 +11,8 @@
         rr3-pad.txt     the gamepad timeline: "[at <frame>] lx=.. rt=.. b=.."
         rr3-action.txt  the guest's own named commands (currently none)
         rr3-screen.txt  the screen size the port reports to the guest
+        rr3-settings.txt the launcher-side settings, translated into the
+                        guest's own encrypted device profile (eds/*.plist)
 
     They are EXPERIMENT INPUTS, not environment: a run is only reproducible
     if the inputs are on record with the result.  They live in the repository
@@ -61,8 +63,7 @@
     on the 1280x720 layout, so a round that has to drive into a race needs
     that one; the picture the port ships needs the 2048x1152 one.)
 
-.PARAMETER TouchMode
-    "legacy" (the default) deploys the repository's rr3-touch.txt, whose
+.PARAMETER TouchMode    "legacy" (the default) deploys the repository's rr3-touch.txt, whose
     hops are pixel coordinates measured on the 1280x720 layout and anchored
     to frame numbers.  "glove" deploys a COMMENTS-ONLY touch file instead:
     the file is still there, so the port's touch control owns the touch
@@ -78,6 +79,16 @@
     end for exactly this reason, while q10 and q11 with the same script
     did reach the race.
 
+.PARAMETER SettingsFile
+    Deploy THIS file as the card's rr3-settings.txt, instead of the
+    repository's.  The settings file is the launcher-side one: the port
+    translates it into the guest's own encrypted device profile
+    (eds/*.plist), the way the PS Vita port translates its config.txt into
+    eds/Vita*.plist.  The repository's copy ships NO settings at all -- a
+    quality switch costs the guest a full shader recompile, so the default
+    has to be "nothing happens" -- and this switch is how a round asks for
+    something else without editing the repository.
+
 .EXAMPLE
     .\Deploy-RR3CardScripts.ps1 -Apply
 .EXAMPLE
@@ -91,7 +102,8 @@ param(
     [switch]$Apply,
     [string]$ScreenView = '',
     [ValidateSet('legacy', 'glove')]
-    [string]$TouchMode = 'legacy'
+    [string]$TouchMode = 'legacy',
+    [string]$SettingsFile = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -100,7 +112,7 @@ $sourceRoot = Join-Path $projectRoot 'native-switch\card'
 $appDir = Join-Path (Join-Path (Join-Path $EmulatorRoot 'user\sdmc') 'switch') 'rr3-native-rehost'
 
 $scripts = @('rr3-touch.txt', 'rr3-drive.txt', 'rr3-pad.txt', 'rr3-action.txt',
-    'rr3-screen.txt')
+    'rr3-screen.txt', 'rr3-settings.txt')
 
 # --- the screen override ------------------------------------------------------
 #
@@ -205,6 +217,9 @@ $plan = foreach ($name in $scripts) {
     }
     if ($name -eq 'rr3-touch.txt' -and $null -ne $touchOverrideFile) {
         $source = $touchOverrideFile
+    }
+    if ($name -eq 'rr3-settings.txt' -and $SettingsFile -ne '') {
+        $source = $SettingsFile
     }
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
         Write-Host ("preflight: MISSING {0} in {1}" -f $name, $sourceRoot)
