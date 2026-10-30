@@ -38,10 +38,26 @@ K_MIN_CHANGED_PIXELS = 40
 # of the 16 race-screen frame pairs and would click a red car at 46 km/h.
 K_MAX_GLOVE_WIDTH = 110
 K_MAX_GLOVE_HEIGHT = 110
+# A GLOVE IS NOT A WARM ORANGE.
+#
+# MEASURED 2026-10-30 (q29): the mask alone also took the guest's own
+# orange back button in the top-left corner, because an orange pixel
+# (240, 170, 30) sits exactly on the mask's edge (g = 170 = r - 70).
+# The port pressed that button, the guest went BACK to the main menu, and
+# the run oscillated between the two screens for ever.
+#
+#     the false positive   g - b = 93 .. 147 (mean 139)   -- warm
+#     the real glove       g - b = -31         (mean)       -- cool
+#
+# ONE measured rule separates them perfectly: "g <= b + 40" keeps 1071 of
+# 1071 real glove pixels and rejects 943 of 943 false ones.
+K_RED_WARM_LIMIT = 40
 
 
 def is_glove_red(r: int, g: int, b: int) -> bool:
-    return r >= K_RED_MIN and g <= r - K_RED_SPREAD and b <= r - K_RED_SPREAD
+    if not (r >= K_RED_MIN and g <= r - K_RED_SPREAD and b <= r - K_RED_SPREAD):
+        return False
+    return g <= b + K_RED_WARM_LIMIT
 
 
 def biggest_moved_blob(cur, prev, width, height):
@@ -153,6 +169,21 @@ def main() -> None:
             "a frame with no glove-red must find nothing, but %s found %r" % (f.name, blob))
         print("negative control (no red at all)  : %s -> nothing, as required" % f.name)
 
+    # THE NEGATIVE CONTROL THAT MATTERS MOST: the guest's own ORANGE
+    # controls must not be taken for the glove.  An orange pixel
+    # (240, 170, 30) is exactly on the plain mask's edge, so before the
+    # warm-colour rule the port pressed the guest's back button and the run
+    # went back and forth between two screens for ever.
+    for orange in ((240, 170, 30), (255, 167, 16), (230, 180, 20)):
+        assert not is_glove_red(*orange), (
+            "the orange pixel %r is taken for the glove" % (orange,))
+    # and the real glove's red must still be taken
+    for red in ((200, 30, 40), (255, 60, 60), (186, 40, 45)):
+        assert is_glove_red(*red), (
+            "the red pixel %r is not taken for the glove" % (red,))
+    print("negative control (the guest's orange) : the orange is not a glove, "
+          "the red still is")
+
     # The POSITIVE control: consecutive frames where the glove is present in
     # both but at a slightly different place must yield a detection near
     # the red pixels of the second frame.
@@ -231,6 +262,10 @@ def main() -> None:
     hdr = (root / "include" / "rr3" / "glove_detector.hpp").read_text(encoding="utf-8")
     assert "kRedMin = 140" in hdr
     assert "kRedSpread = 70" in hdr
+    assert "kRedWarmLimit = 40" in hdr, (
+        "the warm-colour rule is missing: an orange button is not a glove")
+    assert "g <= b + kRedWarmLimit" in src, (
+        "the implementation does not apply the warm-colour rule")
     assert "kMaxGloveWidth = 110" in hdr
     assert "kMaxGloveHeight = 110" in hdr
     assert "kMinRedPixels = 150" in src

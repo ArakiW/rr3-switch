@@ -82,6 +82,20 @@ Detection find(const unsigned char* bottomUpRgba,
 constexpr int kRedMin = 140;
 constexpr int kRedSpread = 70;
 
+// A GLOVE IS NOT A WARM ORANGE.
+//
+// MEASURED 2026-10-30 (q29): the mask alone also takes the guest's own
+// orange back button, because an orange pixel (240, 170, 30) sits exactly
+// on the mask's edge (g = 170 = r - 70).  Pressing it sent the guest BACK
+// to the main menu, and the run oscillated between two screens for ever.
+//
+//     the false positive   g - b = 93 .. 147 (mean 139)   -- warm
+//     the real glove       g - b = -31         (mean)       -- cool
+//
+// "g <= b + kRedWarmLimit" keeps 1071 of 1071 real glove pixels and
+// rejects 943 of 943 false ones.
+constexpr int kRedWarmLimit = 40;
+
 // The glove is HAND-SIZED.  MEASURED 2026-10-30 over the q21 archive:
 // the glove's bounding box is 44x41, 48x40 and 83x51 pixels, while the
 // red car's is 227x172, 219x103 and 208x90.  The bound is on the width

@@ -27,7 +27,25 @@ inline bool isGloveRed(const unsigned char* p) {
     const int r = p[0];
     const int g = p[1];
     const int b = p[2];
-    return r >= kRedMin && g <= r - kRedSpread && b <= r - kRedSpread;
+    if (!(r >= kRedMin && g <= r - kRedSpread && b <= r - kRedSpread)) {
+        return false;
+    }
+    // A GLOVE IS NOT A WARM ORANGE.
+    //
+    // MEASURED 2026-10-30 (q29): the mask alone also took the guest's own
+    // ORANGE back button in the top-left corner, because an orange pixel
+    // (240, 170, 30) sits exactly on the mask's edge (g = 170 = r - 70).
+    // The port pressed that button and the guest went BACK to the main menu,
+    // so the run oscillated between the two screens for ever:
+    //
+    //     the false positive   g - b = 93 .. 147   (mean 139)  -- warm
+    //     the real glove       g - b = -31          (mean)      -- cool
+    //
+    // A saturated red has its green and blue close together; an orange has
+    // its green far above its blue.  ONE measured rule separates them
+    // perfectly: "g <= b + kRedWarmLimit" keeps 1071 of 1071 real glove
+    // pixels and rejects 943 of 943 false ones.
+    return g <= b + kRedWarmLimit;
 }
 
 // The blob has to be big enough to be the glove and not noise, and it has
