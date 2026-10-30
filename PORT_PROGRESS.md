@@ -9041,3 +9041,58 @@ defects in this round was a *signal* that looked like a fact:
   A signal has to be checked against the thing it is supposed to mean,
   and the check has to be a DIFFERENT instrument from the one that
   produced it.
+## q29: the guest's own ORANGE back button was taken for the red glove, and
+## the run oscillated between two screens
+
+q29 ran with the accent-coloured controls tried before the glove and with
+the feedback signal changed from "the screen changed" to "the control is
+still there".
+
+WHAT THE PORT DID, IN ITS OWN LOG:
+
+    10 presses at (1157, 627)   kind=orange  area=2940  box=134x31
+     9 presses at (31, 28)      kind=glove   area=943
+
+and the guest's own touch state says the pipeline was never the problem:
+
+    down x=1157 y=627 frame=1591 -> guest gx=1157 gy=627 down=1
+    up   x=1157 y=627 frame=1631 -> guest gx=1157 gy=627 down=0
+
+**The guest HAD the point on the "ENTER THE RACE" label, stored it, and
+did not act.**  (1157, 627) is inside the label the coordinate script
+measured (x 1113..1235, y 613..639), so the press was in the right place.
+
+**WHAT ACTUALLY HAPPENED: THE RUN OSCILLATED.**  (31, 28) is the guest's
+own ORANGE back button in the top-left corner.  The port pressed "ENTER THE
+RACE", the guest went to the next screen, the port then pressed the back
+button, the guest came back, and the two of them went round and round for
+the whole run.
+
+**AND THE RED MASK TAKES THAT ORANGE BUTTON.**  The glove's mask is
+"r >= 140 and g, b <= r - 70", and an orange pixel is (240, 170, 30) --
+and 170 IS 240 - 70, so the orange sits exactly on the mask's edge.
+
+**THE FIX IS THE WARMTH, AND IT IS ONE MEASURED RULE:**
+
+    the false positive (the orange back button)   g - b = 93 .. 147  (mean 139)
+    the real glove (on the promo car)             g - b = -31        (mean)
+
+A saturated red has its green and blue close together; an orange has its
+green far above its blue.  "g <= b + 40" keeps **1071 of 1071** real
+glove pixels and rejects **943 of 943** false ones.
+
+**WHAT THIS ROUND ADDS TO THE LIST OF SIGNALS THAT LOOK LIKE FACTS.**
+Five of them now, all in the port's own UI driver:
+
+  * "the tap happened" -- it happened, with zero duration, and the guest
+    dropped it;
+  * "the screen changed" -- it changed, by 37 %, and it said nothing;
+  * "the screen is moving, so a race is running" -- it was moving, and it
+    was a parked car on a menu;
+  * "the command was called" -- it was called, and it crashed the guest;
+  * "the glove was found" -- a red blob was found, and it was the guest's
+    own back button.
+
+A detector that finds A RED BLOB has not found a glove.  The glove is a
+glove because it is RED **AND NOT WARM**, and because the guest drew it
+there.
