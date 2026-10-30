@@ -215,7 +215,22 @@ def main() -> int:
     parser.add_argument("--app-dir", default=APP_DIR)
     parser.add_argument("--touch", default=TOUCH_PATH)
     parser.add_argument("--guest-log", default=GUEST_LOG)
+    # The Eden installation whose card the watcher reads and writes.  It
+    # exists because the PRIVATE instance (tools\Setup-IsolatedEden.ps1)
+    # has its own card, and the defaults above point at the shared one --
+    # which is what the other project's stress runs use as well.  Pointing
+    # the watcher at the shared card while the emulator runs on the private
+    # one means the watcher follows frames that nobody is reading and
+    # writes clicks into a file the port never opens.
+    parser.add_argument("--emulator-root", default="",
+                        help="Eden installation root; overrides the three paths above")
     args = parser.parse_args()
+    if args.emulator_root:
+        root = args.emulator_root.rstrip("\/")
+        app = root + r"\user\sdmc\switch\rr3-native-rehost"
+        args.app_dir = app
+        args.touch = app + r"\rr3-touch.txt"
+        args.guest_log = root + r"\user\sdmc\switch\rr3-native-rehost.guest-view.log"
     if args.selftest:
         return selftest(args.selftest)
     return follow(args.seconds, args.app_dir, args.touch, args.guest_log)
