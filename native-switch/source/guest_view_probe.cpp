@@ -8702,8 +8702,30 @@ void* frameLoopDriver(void* opaque) {
                 static int s_lastY = -1;
                 static int s_repeat = 0;
                 const unsigned kGloveEvery = 30u;
-                if (!gfxNullActive() && frames >= s_gloveAt &&
-                    (s_gloveAt == 0u || frames - s_gloveAt >= kGloveEvery)) {
+                // NOT BEFORE FRAME 30.
+                //
+                // MEASURED 2026-10-30: the first version of this ran its
+                // readback on the FIRST frame, and the run froze at frame 3
+                // (and then at frame 16 in the next attempt) with the guest
+                // log stopping mid-download and the emulator spinning at
+                // half a core.  The port's own readback -- the same
+                // glReadPixels of the same buffer -- is first done at frame
+                // 30 and has never failed: archive q21 has 61 successful
+                // readbacks, all of them from frame 30 onwards, and every
+                // one reports "lit=921600 of 921600", i.e. a complete
+                // picture.
+                //
+                // So the readback itself is fine, but EARLY it is not: the
+                // guest has not rendered anything yet, and reading the
+                // back buffer then does not return, it waits.  A diagnostic
+                // that hangs the thing it measures is worse than no
+                // diagnostic at all.
+                //
+                // The same schedule the port's own capture uses, so the two
+                // readbacks cannot disagree about what the screen looks
+                // like.
+                if (!gfxNullActive() && frames >= 30u &&
+                    frames - s_gloveAt >= kGloveEvery) {
                     s_gloveAt = frames;
                     const size_t bytes = static_cast<size_t>(1280) * 720 * 4;
                     if (gloveCur == nullptr) {

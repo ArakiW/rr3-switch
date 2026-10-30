@@ -8679,3 +8679,51 @@ The port also now reports `posok=1|0`, a PLAUSIBILITY GATE on the
 position it read (|x|,|y| < 400000, |z| < 20000), and `cnum=`, the car's
 own number, which the guest itself reads at 0xb35ca8.  A run that read
 the wrong object now says so in the log instead of driving on noise.
+
+
+## q23 and q24: two runs that died EARLY, and what they teach
+
+Both runs were on the private instance with the new glove detector, and
+both died before reaching the front end:
+
+    q23   died at frame 3,   guest log frozen at 1.57 MB, CPU 0.5 cores
+    q24   died at frame 16,  guest log frozen at 2.29 MB, CPU 0.5 cores
+
+TWO FALSE LEADS, AND WHAT SETTLED THEM.
+
+**LEAD ONE: "Unmapped Read64 @ 0x28".**  The Eden log was full of it, and
+0x28 is what a null pointer plus an offset looks like, so it was the
+obvious suspect for a new fault.  It is NOT new: the archived logs of the
+runs BEFORE this change have it too -- 1170 times in q21 and 1390 times in
+q22, against 102 in q23.  It is a long-standing condition of the port's
+probes, not this change.  A fault that appears in every archive is a
+standing condition, not a regression.
+
+**LEAD TWO: "the diagnostic walked the guest's memory".**  The first
+version asked the guest whether it was racing, by calling
+raceStateResolveRuleSetRaceMetrics() from the frame loop, and that
+resolver walks the guest's GameMode chain.  That was a real mistake and it
+was removed: a diagnostic must not read the state of the thing it
+measures.  It was NOT what killed these two runs, though, because q24 died
+with it already gone.
+
+**WHAT ACTUALLY KILLED THEM.**  The port's own readback line never
+appeared at all:
+
+    q21   61 readbacks, all from frame 30 onwards, every one of them
+          reporting "lit=921600 of 921600"
+    q23    0 readbacks
+    q24    0 readbacks
+
+The port reads the same back buffer with the same glReadPixels at frame 30
+and it has never failed.  The glove loop read it on the FIRST frame
+instead, and an early readback does not return -- it waits, because the
+guest has not rendered anything yet.  So the glove loop HUNG THE GUEST on
+its very first act.
+
+**THE RULE, AND IT IS GENERAL.**  "The instrument's own first output line
+never appeared" is not "the feature did not fire" -- it is "the run died
+BEFORE that point".  A missing measurement is a LOCATION, not a
+non-event.  And an instrument that hangs the thing it measures is worse
+than no instrument, so the new code was scheduled on the schedule the port
+already proved works: not before frame 30, and every 30 frames after.
