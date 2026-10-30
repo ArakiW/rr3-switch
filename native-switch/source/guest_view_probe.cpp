@@ -27,7 +27,6 @@
 #include "rr3/guest_frame_capture.hpp"
 #include "rr3/glove_detector.hpp"
 #include "rr3/guest_touch.hpp"
-#include "rr3/race_state_probe.hpp"
 
 // The deferred-callback pump (jni_compat/classes/cloudcell_defer.cpp). It is
 // called on the thread that runs the guest's per-frame callbacks, bracketing
@@ -8736,9 +8735,35 @@ void* frameLoopDriver(void* opaque) {
                         // change between two frames) while the race screen
                         // never drops below 57 % -- but the race state is
                         // the DIRECT signal, so it is the one used.
-                        const bool inRace =
-                            raceStateResolveRuleSetRaceMetrics() != 0;
-                        if (det.valid && !inRace) {
+                        // NEVER CLICK WHILE THE GUEST IS RACING -- but do
+                        // NOT ask the guest's memory to find out.
+                        //
+                        // MEASURED 2026-10-30: the first version of this
+                        // called raceStateResolveRuleSetRaceMetrics() here,
+                        // and the run froze at frame 3 with the emulator
+                        // logging "Unmapped Read64 @ 0x0000000000000028"
+                        // over and over: the resolver walks the guest's
+                        // GameMode chain, and calling it from the frame
+                        // loop touches memory the guest owns.
+                        //
+                        // THE SCREEN SAYS IT, AND IT IS FREE.
+                        //
+                        // The front end is a still picture and the track is
+                        // a moving one, and the port already counts the
+                        // pixels that changed between the two readbacks it
+                        // makes: the "screenChanged" number below.
+                        //
+                        // MEASURED over the q21 archive's captured frames:
+                        //   the front end changes 0.34 .. 0.43 % of its
+                        //   pixels between two frames,
+                        //   the race screen never drops below 57 %.
+                        //
+                        // So a screen that changed by more than 20 % is a
+                        // screen in motion, and a click on a moving screen
+                        // is a STEER.  The glove is only pressed on a still
+                        // one.
+                        const bool screenMoving = changed > (1280 * 720) / 5;
+                        if (det.valid && !screenMoving) {
                             // The glove has to be where it was a moment ago, or
                             // where it was on the previous detection: a new
                             // position is a NEW control to press, the same
@@ -8760,10 +8785,11 @@ void* frameLoopDriver(void* opaque) {
                                 char diag[192];
                                 std::snprintf(diag, sizeof(diag),
                                               "frame=%llu x=%d y=%d red=%d changed=%d "
-                                              "screenChanged=%d",
+                                              "screenChanged=%d moving=%d",
                                               static_cast<unsigned long long>(frames),
                                               det.x, det.y, det.redPixels,
-                                              det.changed, changed);
+                                              det.changed, changed,
+                                              screenMoving ? 1 : 0);
                                 appendGuestBootLine(
                                     "sdmc:/switch/rr3-native-rehost.guest-view.log",
                                     "glove-click", 250, 0, diag);

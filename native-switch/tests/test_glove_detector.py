@@ -249,10 +249,17 @@ def main() -> None:
     # detection there throws the car off the track.  The race is recognised by
     # the guest's OWN bookkeeping -- it allocates a RuleSet_RaceMetrics when a
     # race starts.
-    assert "raceStateResolveRuleSetRaceMetrics" in probe, (
-        "the frame loop does not check whether the guest is racing")
-    assert "det.valid && !inRace" in probe, (
-        "the click is not gated on the guest NOT being in a race")
+    # The CALL must be gone.  The name may still appear in a COMMENT that
+    # explains why it was removed, so the check is on the code, not on the
+    # text: a line that calls it would not start with a comment marker.
+    call_lines = [ln for ln in probe.split("\n")
+                  if "raceStateResolveRuleSetRaceMetrics" in ln
+                  and not ln.strip().startswith("//")]
+    assert not call_lines, (
+        "the frame loop still walks the guest's memory: %r" % (call_lines[:2],))
+    assert "det.valid && !screenMoving" in probe, (
+        "the click is not gated on the screen being still")
+    assert "screenMoving" in probe
     print("static contract                     : the detector is wired and matches the rules")
     print("safety rule                         : no click while the guest is racing")
 
