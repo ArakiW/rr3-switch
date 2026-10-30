@@ -882,6 +882,82 @@ void fillCarState(RaceMetricsSample* out) {
         return;
     }
     out->carAddress = static_cast<uintptr_t>(car);
+    // THE CAR'S OWN WORLD POSITION.
+    //
+    // MEASURED 2026-10-30 by reading the guest's own code, and the numbers
+    // are the guest's instructions:
+    //
+    //   CAR+0xc8 / +0xcc / +0xd0   the car's WORLD POSITION, 3 x int32 in
+    //                               the guest's 1/256 metre unit, with Y
+    //                               NEGATED (the converter at 0xf05600
+    //                               does `mov w8,#-0x3c800000` before
+    //                               scaling Y).
+    //
+    //   The writer is 0xc2d888: `str x9,[x0,#0xc8]` for x,y and
+    //   `str w8,[x0,#0xd0]` for z, and its argument comes from 0xf05600,
+    //   which reads a float3 in METRES and converts it.
+    //
+    //   The guest USES it as the position: 0xc2de4c reads w9 from
+    //   [x8,#0xc8] and ldp w10,w11 from [x0,#0xcc]; the camera's
+    //   snapToClosestNode at 0xd05e4c reads [x8,#0xc8] and [x8,#0xcc]
+    //   for its spline projection.
+    //
+    //   The node index is at CAR+0x1a8 (0x109e258) as well as at
+    //   CarState+0x1a8 (written by 0xc2d8dc).
+    //
+    // WHAT WAS WRONG BEFORE, AND WHY IT LOOKED RIGHT.  The port used
+    // CAR+0x20/+0x24 for the node indices and CAR+0x30.. for the
+    // position and CAR+0x3c.. for the target.  Those offsets are the
+    // FOLLOW CAMERA's debug members, not the car's: the guest's debug
+    // registration at 0xd052e0 registers m_nPrevNode (+0x20),
+    // m_nCurrentNode (+0x24), m_nCamNum (+0x28),
+    // m_savedCameraIndex (+0x2c), m_vPosition (+0x30..+0x38) and
+    // m_vLastKnownTarget (+0x3c..+0x44) on the CAMERA CONTROLLER, and
+    // that controller copies its position and target out of a 68-byte
+    // camera-preset table (0xd05184: the preset base at x19+0x158, the
+    // index at x19+0x2c, the stride 0x44).  The port read a camera's
+    // presets and called them the car's.
+    //
+    // The camera's own object hangs off the car: the car's per-car debug
+    // object is at CAR+0x448 (0xc27fe8), the camera is at +0x08 of it
+    // and the camera's owner pointer is at +0x6a0 of it (0xd04f50).
+    //
+    // The AIM TARGET is a candidate, not a proof: CAR+0xfc/+0x104/+0x108
+    // is a second 3 x int32 written by the same routine (0xc2d8c4) and
+    // the same unit, and the guest compares CAR+0x78/+0x7c with the car's
+    // position in 2D (0xc2dea4), so both are worth reading.  Neither is
+    // used for steering until one of them is SEEN to move with the car.
+    readDword(car + 0xc8ULL, reinterpret_cast<uint32_t*>(&out->carX));
+    readDword(car + 0xccULL, reinterpret_cast<uint32_t*>(&out->carY));
+    readDword(car + 0xd0ULL, reinterpret_cast<uint32_t*>(&out->carZ));
+    readDword(car + 0xfcULL, reinterpret_cast<uint32_t*>(&out->carTargetX));
+    readDword(car + 0x104ULL, reinterpret_cast<uint32_t*>(&out->carTargetY));
+    readDword(car + 0x108ULL, reinterpret_cast<uint32_t*>(&out->carTargetZ));
+    readDword(car + 0x1a8ULL, &out->carNode);
+    // THE PLAUSIBILITY GATE.
+    //
+    // The offsets above were measured on the guest's own code, but the
+    // port has to be able to say "this read is not a position" if it ever
+    // stops being one.  A world position in the guest's 1/256 metre unit
+    // is a signed integer: on a circuit of a few kilometres it is in the
+    // tens of thousands, and it is NEVER all zero while the car is
+    // driving.  So the gate is:
+    //
+    //   |x| < 400000        (<= about 1.5 km from the origin)
+    //   |y| < 400000
+    //   |z| <  20000        (<= about 78 m of altitude)
+    //
+    // and the verdict is reported in the log, so a run that read the wrong
+    // object says so instead of driving on noise.
+    out->positionPlausible =
+        (out->carX > -400000 && out->carX < 400000) &&
+        (out->carY > -400000 && out->carY < 400000) &&
+        (out->carZ > -20000 && out->carZ < 20000);
+    // The car's own number, which the guest reads at 0xb35ca8
+    // (`ldr w1,[x9,#0x49c]`).  It is a cheap identity check: the value has
+    // to be the same one the guest would read, and it changes when the
+    // player changes car.
+    readDword(car + 0x49cULL, &out->carNumber);
     // THE CAR'S OWN LAYOUT, DUMPED.
     //
     // MEASURED 2026-10-29, q21: the node index, the world position and the
@@ -922,20 +998,10 @@ void fillCarState(RaceMetricsSample* out) {
             appendGuestBootLine(kGuestViewLogPath, "car-raw", 103, 0, raw);
         }
     }
-    readDword(car + 0x20ULL, &out->carPrevNode);
-    readDword(car + 0x24ULL, &out->carNode);
-    // The world's position and the point the car is aiming at.  The guest
-    // copies them out of a 68-byte-per-record array (ELF 0xd05184: the base
-    // at x19+0x158, the index at x19+0x2c, the stride 0x44), and the
-    // registration function at 0xd052e0 reads them back from the same
-    // offsets: m_vPosition at +0x30/+0x34/+0x38 and m_vLastKnownTarget at
-    // +0x3c/+0x40/+0x44.  All 32-bit integers in 1/256 metre.
-    readDword(car + 0x30ULL, reinterpret_cast<uint32_t*>(&out->carX));
-    readDword(car + 0x34ULL, reinterpret_cast<uint32_t*>(&out->carY));
-    readDword(car + 0x38ULL, reinterpret_cast<uint32_t*>(&out->carZ));
-    readDword(car + 0x3cULL, reinterpret_cast<uint32_t*>(&out->carTargetX));
-    readDword(car + 0x40ULL, reinterpret_cast<uint32_t*>(&out->carTargetY));
-    readDword(car + 0x44ULL, reinterpret_cast<uint32_t*>(&out->carTargetZ));
+    // The previous node index is the camera controller's, and the camera
+    // controller is a DIFFERENT object from the car, so there is no
+    // "previous node" on the car to read.  It stays 0.
+    out->carPrevNode = 0;
     uint64_t carState = 0;
     if (!readWord(car + 0x288ULL, &carState) || carState == 0) {
         return;
@@ -1675,8 +1741,8 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             "laps=%u lapF=%.3f lapd=%u lapdF=%.3f prev=%u total=%u "
             "totalF=%.3f speed=%u speedF=%.3f time=%u timeF=%.3f "
             "rate=%.6f prog=%.3f from_total=%d sawprog=%d "
-            "car=0x%llx cnode=%u cprev=%u cpos=%d,%d,%d ctgt=%d,%d,%d "
-            "snode=%u sdist=%u tsok=%d perr=%.4f pur=%d ident=0x%llx "
+            "car=0x%llx cnum=%u cnode=%u cprev=%u cpos=%d,%d,%d ctgt=%d,%d,%d "
+            "snode=%u sdist=%u tsok=%d posok=%d perr=%.4f pur=%d ident=0x%llx "
             "drive=%d steer=%.3f mag=%.3f sign=%d best=%.6f flips=%d stalls=%d "
             "thr=%d brk=%d",
             frame, static_cast<unsigned long long>(g_cglobal),
@@ -1703,10 +1769,12 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             m.progressRate, m.progress,
             m.progressFromTotal ? 1 : 0,
             g_sawProgress ? 1 : 0,
-            static_cast<unsigned long long>(m.carAddress), m.carNode, m.carPrevNode,
+            static_cast<unsigned long long>(m.carAddress), m.carNumber, m.carNode,
+            m.carPrevNode,
             m.carX, m.carY, m.carZ,
             m.carTargetX, m.carTargetY, m.carTargetZ,
             m.splineNode, m.splineDistance,
+            m.positionPlausible ? 1 : 0,
             m.trackStateAddress != 0 ? 1 : 0,
             static_cast<double>(g_drive.steerError), g_drive.pursuit ? 1 : 0,
             static_cast<unsigned long long>(m.membersIdentified),

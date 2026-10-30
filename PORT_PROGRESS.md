@@ -8596,3 +8596,86 @@ THE FIX IS A MEASUREMENT, NOT AN OFFSET CHANGE.  The port now dumps the
 CAR object's own bytes (phase=car-raw, 0x120 bytes, every 600 frames) in
 the same format the metrics modifier is dumped, so the next round reads
 the layout off a LIVE object instead of guessing it again.
+
+
+## q22: the calendar moved AGAIN, so the coordinate cannot be fixed
+
+The run tagged q22 (archive 20261030-210709-eden-rr3-q22-carraw, 1512 s, on
+the private instance, nothing interfering) did NOT reach a race, and its
+last frame says why: the guest was in the daily-rewards calendar again, and
+this time the orange COLLECT word was at x 720..940 -- the FOURTH day
+circle, not the third.
+
+So the word has now been measured in three places:
+
+    2026-10-27   x 373..533   the script clicked (453, 222)
+    2026-10-29   x 565..725   (453, 222) was 112 px of blank background
+    2026-10-30   x 720..940   and the glove pointed at the fourth circle
+
+Three positions in three days, and the third one is not even the same
+column.  The calendar lays its word over the day grid, whose width
+depends on the month, and the selected day moves too.  **A hard-coded
+coordinate cannot be repaired -- it can only be replaced.**
+
+The replacement is to read the coordinate instead of knowing it: the guest
+draws a RED GLOVE on the control it wants pressed, and the port already
+has the pixels in hand (it reads them back for the PNG capture).  So the
+port now finds the glove in the picture it just drew and clicks THAT
+(native-switch/source/glove_detector.cpp, wired into the frame loop in
+guest_view_probe.cpp, phase=glove-click).
+
+THE DETECTOR'S FIRST RULE WAS WRONG, AND A TEST CAUGHT IT.  A colour mask
+alone cannot tell the glove from a red car, so the rule was "the red
+cluster that MOVED between two frames".  Measured over the q21 archive's
+104 captured frames, that rule fires on 6 of the 16 race-screen frame
+pairs: it would click a red car at 46 km/h and throw the car off the
+track, which is the failure the port already has once per race.
+
+What the measurements showed:
+
+  * the SHAPE does not separate them: the glove's box is 44x41, 48x40,
+    83x51 and the car's is 227x172, 219x103, 208x90, but their FILL
+    ratios overlap (0.3..0.7 for both);
+  * the WHITE STRIPES do not separate them either: the stripes are
+    covered by the red mask, so "white inside the cluster" is 0 for every
+    blob, real or false;
+  * the SIZE does: a hand never exceeds about 90 pixels across and a car
+    always does.
+
+So the detector bounds the blob's WIDTH AND HEIGHT separately (110 px
+each), not its area -- a car seen head-on is narrow but tall, and a hand is
+small in both.
+
+## The CAR chain: the chain is right, the OFFSETS belonged to the CAMERA
+
+MEASURED 2026-10-30 by reading the guest's own code, and every offset
+below is a guest instruction:
+
+  RuleSet_RaceMetrics+0x20   the CAR          0xb35e60 `str x0,[x19,#0x20]`
+  CAR+0x288                   the CAR_STATE    0xd05e44 `ldr x9,[x8,#0x288]`
+  CAR+0x1a8                   the node index   0x109e258
+  CAR+0xc8/+0xcc/+0xd0        the POSITION     0xc2d8ac / 0xc2d8a8
+  CAR+0xfc/+0x104/+0x108      a second vector  0xc2d8c4
+  CAR+0x49c                   the car's number 0xb35ca8 `ldr w1,[x9,#0x49c]`
+
+The position is three int32 in the guest's 1/256 metre unit, and the
+converter that produces it (0xf05600) NEGATES Y.
+
+WHAT THE PORT WAS READING.  The offsets it used -- CAR+0x20/+0x24 for the
+node indices and CAR+0x30..+0x38 for the position and CAR+0x3c..+0x44
+for the target -- are the FOLLOW CAMERA's debug members, not the car's.
+The guest's debug registration at 0xd052e0 registers m_nPrevNode (+0x20),
+m_nCurrentNode (+0x24), m_nCamNum (+0x28), m_savedCameraIndex (+0x2c),
+m_vPosition (+0x30..+0x38) and m_vLastKnownTarget (+0x3c..+0x44) on
+the CAMERA CONTROLLER, and that controller copies its position and target
+out of a 68-byte camera-preset table (0xd05184: the preset base at
+x19+0x158, the index at x19+0x2c, the stride 0x44).  The port read a
+camera's presets and called them the car's.
+
+That is why q21's cpos was 2,33,0 and ctgt was 0,0,0: those are the
+presets of a camera that had not loaded one yet.
+
+The port also now reports `posok=1|0`, a PLAUSIBILITY GATE on the
+position it read (|x|,|y| < 400000, |z| < 20000), and `cnum=`, the car's
+own number, which the guest itself reads at 0xb35ca8.  A run that read
+the wrong object now says so in the log instead of driving on noise.

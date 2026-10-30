@@ -25,6 +25,9 @@
 // three Eeden runs died 42-55 s in -- earlier than any run with the
 // previous binary -- even though the capture never executed in them.
 #include "rr3/guest_frame_capture.hpp"
+#include "rr3/glove_detector.hpp"
+#include "rr3/guest_touch.hpp"
+#include "rr3/race_state_probe.hpp"
 
 // The deferred-callback pump (jni_compat/classes/cloudcell_defer.cpp). It is
 // called on the thread that runs the guest's per-frame callbacks, bracketing
@@ -8660,6 +8663,116 @@ void* frameLoopDriver(void* opaque) {
             // frames out to 12000 -- which covers the whole front end, the
             // daily reward, the event picker, the quest page, the car select
             // screen and the race itself.
+            // THE GLOVE LOOP: CLICK WHAT THE GUEST POINTS AT.
+            //
+            // The touch script named pixel coordinates, and the guest moved
+            // them: the daily-rewards calendar's orange COLLECT word was at
+            // x 373..533 on 2026-10-27, at x 565..725 on 2026-10-29 and at
+            // x 720..940 on 2026-10-30, because the calendar lays the word
+            // over the middle column of a day grid whose width depends on
+            // the month.  A hard-coded point cannot survive that, and the
+            // guest sat in that modal for a whole run on both days after
+            // the first.
+            //
+            // The guest draws a RED GLOVE on the control it wants pressed,
+            // so the coordinate does not have to be KNOWN -- it can be
+            // READ from the picture the guest just drew.  The port already
+            // has the pixels (it reads them back for the PNG capture), and
+            // this runs on the frame-loop thread, right after the guest
+            // rendered, so the glove is where the guest wants it NOW.
+            //
+            // A colour mask alone cannot tell the glove from a red car, so
+            // the detector differences two consecutive readbacks and looks
+            // for a saturated red cluster that MOVED: the glove animates, a
+            // car does not.
+            //
+            // IT IS BOUNDED: the readback is 3.5 MiB and the scan is a
+            // million pixels, so it runs every 30 frames, not every frame.
+            // The glove is pressed for a second or two, so 30 frames is
+            // well inside its lifetime.
+            //
+            // IT IS ALSO OPT-OUT: the config file turns it off, because a
+            // run that wants the pixel coordinates exactly (the archives
+            // that measured them) must not have them fighting with the
+            // glove.
+            {
+                static unsigned char* glovePrev = nullptr;
+                static unsigned char* gloveCur = nullptr;
+                static unsigned s_gloveAt = 0;
+                static int s_lastX = -1;
+                static int s_lastY = -1;
+                static int s_repeat = 0;
+                const unsigned kGloveEvery = 30u;
+                if (!gfxNullActive() && frames >= s_gloveAt &&
+                    (s_gloveAt == 0u || frames - s_gloveAt >= kGloveEvery)) {
+                    s_gloveAt = frames;
+                    const size_t bytes = static_cast<size_t>(1280) * 720 * 4;
+                    if (gloveCur == nullptr) {
+                        gloveCur = static_cast<unsigned char*>(std::malloc(bytes));
+                        glovePrev = static_cast<unsigned char*>(std::malloc(bytes));
+                    }
+                    if (gloveCur != nullptr && glovePrev != nullptr) {
+                        std::memcpy(glovePrev, gloveCur, bytes);
+                        std::memset(gloveCur, 0, bytes);
+                        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+                        glReadPixels(0, 0, 1280, 720, GL_RGBA, GL_UNSIGNED_BYTE,
+                                     gloveCur);
+                        int changed = 0;
+                        const rr3::glove::Detection det =
+                            rr3::glove::find(gloveCur, glovePrev, 1280, 720, &changed);
+                        // NEVER CLICK WHILE THE GUEST IS RACING.
+                        //
+                        // A click in a race IS A STEER, and the guest's cars
+                        // are red, so a false detection there throws the car
+                        // off the track.  The race is recognised by the
+                        // guest's OWN bookkeeping: it allocates a
+                        // RuleSet_RaceMetrics when a race starts, so a
+                        // non-zero result means there is a race to drive and
+                        // no menu to click.
+                        //
+                        // MEASURED 2026-10-30: the screen's change rate
+                        // separates the two situations as well -- the
+                        // front end is quiet (0.34..0.43 % of the pixels
+                        // change between two frames) while the race screen
+                        // never drops below 57 % -- but the race state is
+                        // the DIRECT signal, so it is the one used.
+                        const bool inRace =
+                            raceStateResolveRuleSetRaceMetrics() != 0;
+                        if (det.valid && !inRace) {
+                            // The glove has to be where it was a moment ago, or
+                            // where it was on the previous detection: a new
+                            // position is a NEW control to press, the same
+                            // position is the same control being held.
+                            const bool sameSpot = (det.x == s_lastX && det.y == s_lastY);
+                            s_lastX = det.x;
+                            s_lastY = det.y;
+                            ++s_repeat;
+                            if (!sameSpot || s_repeat >= 3) {
+                                s_repeat = 0;
+                                injectGuestTouchEvent(jniEnvironment, activityObject,
+                                                      GuestTouchAction::Begin, 0,
+                                                      det.x, det.y, false,
+                                                      "glove-begin");
+                                injectGuestTouchEvent(jniEnvironment, activityObject,
+                                                      GuestTouchAction::End, 0,
+                                                      det.x, det.y, true,
+                                                      "glove-end");
+                                char diag[192];
+                                std::snprintf(diag, sizeof(diag),
+                                              "frame=%llu x=%d y=%d red=%d changed=%d "
+                                              "screenChanged=%d",
+                                              static_cast<unsigned long long>(frames),
+                                              det.x, det.y, det.redPixels,
+                                              det.changed, changed);
+                                appendGuestBootLine(
+                                    "sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                    "glove-click", 250, 0, diag);
+                            }
+                        }
+                    }
+                }
+            }
+
             static const unsigned kScheduleHead[] = { 30u, 120u, 300u, 600u, 1000u };
             constexpr unsigned kScheduleFrom = 1200u;
             constexpr unsigned kScheduleStep = 200u;

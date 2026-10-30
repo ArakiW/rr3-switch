@@ -119,6 +119,16 @@ struct RaceMetricsSample {
     int32_t carTargetX{};
     int32_t carTargetY{};
     int32_t carTargetZ{};
+    // The car's own number, which the guest reads at 0xb35ca8
+    // (`ldr w1,[x9,#0x49c]`).  It is a cheap identity check: the value the
+    // port reads has to be the one the guest itself would read, and it
+    // changes when the player changes car.
+    uint32_t carNumber{};
+    // Whether the position that was just read is PLAUSIBLE as a world
+    // position: inside the gate the port checks, and not all zero.  It is
+    // reported so that a run which read the wrong object says so in the
+    // log instead of driving on noise.
+    bool positionPlausible{false};
     uintptr_t trackStateAddress{};
     uint32_t splineNode{};
     uint32_t splineDistance{};
