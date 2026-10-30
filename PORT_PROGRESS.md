@@ -8841,3 +8841,125 @@ CarSelectScreen and DebugRaceSelectScreen.  A screen's CHILDREN are at
 comp+0x138 with their names at comp+0x38 and their rectangle through
 vtable slot 10, so the port can find a control BY NAME and stop hunting
 pixels altogether.
+## q26: the tap shape is fixed, and two MORE defects show up -- one of them
+## a heuristic that measurement killed
+
+q26 ran the new port (the shared tap primitive, the control finder, the
+feedback loop) on the private instance for 1500 seconds.
+
+WHAT THE PORT DID, MEASURED IN ITS OWN LOG:
+
+    downs=7  ups=7   down->up gaps: min=40 max=40  same-frame=0
+
+**Every tap was a real tap.**  q25's 144 taps had a zero-frame gap; these
+seven have a forty-frame gap, which is the value every archive that
+reached a race used.  The first press also shows the stale pointer being
+released first (`phase=tap-stale-release ... down=0` immediately before
+the Begin), and then the guest's own point is stored (`gx=881 gy=300
+down=1`) -- so the first press of the run was NOT swallowed this time.
+
+AND THE GUEST CONFIRMED ONE OF THEM IN ITS OWN WORDS:
+
+    phase=guest-log-any ... MenuSelectHit: PRESS
+    phase=guest-log-any ... TouchStart: x = 421 y = 356
+
+`MenuSelectHit: PRESS` is the guest's own line for "the UI caught this
+click" (guest ELF 0x13b8368), and it is paired with the TouchStart line
+(0x13b855c).  ONE of the seven presses was consumed by the UI -- which is
+the first time in this project that the guest has said so in its own
+words.
+
+AND THE FRONT END MOVED.  q26's frames show the main menu, then the event
+picker, then the CAR SELECT screen ("选择赛车 / 越野赛", with the guest's
+own red glove on the yellow car and an orange "start" button at the
+bottom right).  q25 never left the main menu.
+
+**BUT NO RACE, AND THE REASON IS A HEURISTIC THAT MEASUREMENT KILLED.**
+
+    start lights (StartLightsScreen)   0
+    race screen (InGameScreen)         0
+    EventMapScreen                   270
+
+The port pressed SEVEN times, in the first 900 frames, and then pressed
+NOTHING for the next 4300.  The gate that stopped it was this one:
+
+    const bool screenMoving = changed > (1280 * 720) / 5;   // 20 %
+    if (!s_waitingFeedback && !screenMoving && !tapper.pending()) { ... }
+
+which was there because "a click in a race IS A STEER".  The rule is
+right and the SIGNAL is wrong.  MEASURED on q26's own captures:
+
+    the car-select screen   68 .. 71 % of its pixels change between two
+                            captures -- it is a 3D scene with a turning car
+    a race screen           never drops below 57 %   (q21 archive)
+
+**The two ranges overlap completely**, so no change-rate threshold can
+tell a menu from a race.  A 3D car on the select screen looks exactly
+like a race to that rule, and the port sat on the screen it had reached
+and pressed nothing.
+
+THE SIGNAL IS NOW THE GUEST'S OWN BOOKKEEPING.  The guest allocates a
+RuleSet_RaceMetrics when a race starts, and the port's race-state probe
+finds it.  The probe is pumped by the INPUT PUMP, on the frame-loop
+thread, once per frame, so the frame loop can read the cached sample
+without touching guest memory at all -- which matters, because the
+on-demand resolver (raceStateResolveRuleSetRaceMetrics) is exactly what
+froze q23 and q24.
+
+**AND THE ACTION FILE'S "at=<frame>" WAS PARSED IN ONE ORDER ONLY.**
+`native-switch/card/rr3-action.txt` asks the guest's OWN QA race
+framework to start a race:
+
+    at=5950 Soaks|CLEAR SOAKS
+    at=6000 Character|Unlock All Tracks
+    at=6100 Soaks|QUEUE SOAK:RACE LOOP
+    at=6200 Soaks|START SOAK
+
+and the port ran NONE of them: the parser cut everything from "at="
+onwards out of the name, so a line written with the frame FIRST left an
+empty name and the command was dropped SILENTLY.  The frame may now come
+before or after the name, and a line that carries a frame but no name is
+REPORTED (a command that never runs and never says so is
+indistinguishable from a command that was never written).
+
+The action pump also DEFERS a race command while the guest is racing,
+for the same reason the UI driver does: the guest's own bookkeeping says
+whether it is in a race, and a second race request in the middle of a race
+is exactly the kind of thing that spoils a measurement.
+
+**THE CARD'S ACTION FILE IS A PIXEL-FREE ROUTE INTO A RACE.**  The guest
+ships a QA framework of its own -- the "Soaks".  `Soaks|QUEUE SOAK:RACE
+LOOP` (fn 0xa6e22c) pushes a test onto the guest's own test queue,
+`Soaks|START SOAK` (fn 0xa6e1e8) runs the queue's last entry, and that
+entry builds a RACE REQUEST and hands it to the guest's normal race flow.
+REVERSE ENGINEERED 2026-10-30: the two QUEUE commands overwrite x0
+before they use it ("ldr x0,[x8,#0x78]"), so they do not read the owner
+and the port calls them with a zero argument; and the ORDER MATTERS,
+because START takes the queue's LAST entry (index = count-1).
+
+**TWO AGENT FINDINGS THAT CORRECTED THE PREMISES.**
+
+  * The guest's own `TouchStart: x = ... y = ...` log is NOT an echo of
+    the injection.  Three runs with different injection sets printed three
+    unrelated values, one of them with y = 759, which is outside the
+    1280x720 viewport.  The guest's touch logs are behind a debug flag,
+    and their absence means nothing.  The acceptance signal that does
+    mean something is the GUEST'S SCREEN changing.
+
+  * The action table is TWO parallel tables -- function pointers in
+    .data.rel.ro at 0x1e78b70 and names in .bss at 0x1f9d6d8 -- bound by
+    index, not by hash.  `Assets|UPDATE EVENTS` (idx 100) is an EMPTY
+    implementation: a bare `ret`.
+
+**AND THE ROAD TO THE NEXT LEVEL, FROM THE SAME REVERSE ENGINEERING.**
+The guest's screen manager registers 65 screens in a red-black tree at
+mgr+0xa0 whose root is at mgr+0xa8; the name is at node+0x20 and the
+instance at node+0x38, so the port can ENUMERATE every registered screen
+instead of guessing.  There is no virtual Enter -- each screen has its own
+non-virtual one -- but mgr+0xb8 + i*0x30 is the screen stack and
+0x14a7f90(mgr, name) switches screens by name.  The screens that matter
+are EventMapScreen (mgr+0x2850), EventsScreen, SeriesScreen,
+CarSelectScreen and DebugRaceSelectScreen.  A screen's CHILDREN are at
+comp+0x138 with their names at comp+0x38 and their rectangle through
+vtable slot 10, so the port can find a control BY NAME and stop hunting
+pixels altogether.

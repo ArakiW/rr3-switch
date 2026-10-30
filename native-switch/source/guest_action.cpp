@@ -1,4 +1,5 @@
 #include "rr3/guest_action.hpp"
+#include "rr3/race_state_probe.hpp"
 
 #include "rr3/elf_preflight.hpp"
 #include "rr3/recovery_guard.hpp"
@@ -455,6 +456,9 @@ struct PendingAction {
     unsigned attempts{};
     bool done{};
     bool refused{};
+    // Whether the "the guest is racing" deferral has already been reported
+    // for this command, so the log says it once instead of every 60 frames.
+    bool deferralReported{};
 };
 
 // THE COMMAND TABLE.
@@ -681,6 +685,34 @@ void pumpGuestActions(unsigned long long frame) {
         if (frame < entry.atFrame) {
             allDone = false;
             continue;
+        }
+        // A COMMAND THAT ASKS THE GUEST TO START A RACE MUST NOT BE ISSUED
+        // WHILE THE GUEST IS RACING.
+        //
+        // The port's own UI driver may already have taken the guest into a
+        // race by the time this command comes due, and a second race request
+        // in the middle of a race is exactly the kind of thing that spoils a
+        // measurement.  The guest's OWN bookkeeping says whether it is
+        // racing: it allocates a RuleSet_RaceMetrics when a race starts, and
+        // the port's race-state probe reads that from the input pump on this
+        // same thread -- it touches no guest memory here.
+        //
+        // The command is NOT marked done: it waits for the race to end.
+        {
+            const rr3::RaceStateSample& race = rr3::raceStateSample();
+            if (race.metricsCount > 0 || race.activeIndex >= 0) {
+                allDone = false;
+                if (!entry.deferralReported) {
+                    entry.deferralReported = true;
+                    char deferred[256];
+                    std::snprintf(deferred, sizeof(deferred),
+                                  "name=\"%.100s\" deferred=1 "
+                                  "reason=the-guest-is-racing metrics=%d active=%d",
+                                  entry.name, race.metricsCount, race.activeIndex);
+                    logAction("guest-action", 120 + static_cast<unsigned>(i), deferred);
+                }
+                continue;
+            }
         }
         bool needsOwner = false;
         if (!isAllowed(entry.name, &needsOwner)) {
