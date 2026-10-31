@@ -292,3 +292,57 @@ those characters IS the `const char*` that Find wants.
 
 **=>=> SO THE NEXT STEP IS: call the guest's own Find (0x14a7d5c) with the
 registry node's own name address, and then the screen's Enter.**
+
+---
+
+## THE NAME LITERALS: THE PORT DOES NOT HAVE TO BUILD A STRING (q53)
+
+Every registered screen's name is a plain literal in the guest's .rodata:
+
+    EventMapScreen           0x3fcc66
+    CarPurchaseScreen        0x3a87fe
+    CommunityScreen          0x4175e4
+    UpgradesScreen           0x3fec1e
+    CarCustomisationScreen   0x47a4ff
+    MyGarageScreen           0x4503be
+
+**=>=> SO THE PORT CAN CALL THE GUEST'S OWN ScreenManager::Find
+(0x14a7d5c) WITH THE ADDRESS OF THE NAME LITERAL.**  No string is built, no
+guest memory is allocated, and the lookup is the guest's own.
+
+**AND THE DEEP LINKS ARE NOT THE GENERAL MECHANISM.**  The guest's action
+#145 is "Main Menu|Enter Deep Link" (its function is at 0xa75734, and it
+prints "Enter Deep Link (rr3:// will be added):"), and the image contains
+only seven deep-link literals:
+
+    rr3://RaceTeamsAdmin            0x39e0a8
+    rr3://MULTIPLAYERINVITE/        0x3b1d7c
+    rr3://RaceTeams                 0x3eee4f
+    rr3://STREAM/STREAM_ID          0x46e02e
+    rr3://MULTIPLAYERINVITE/server:port:room:key:etc   0x47c657
+
+so a deep link is not how a screen is opened in general.
+
+**=>=> WHICH LEAVES ONE THING, AND IT IS SMALL.**  `Enter` is not virtual
+(0xdac364 is not a vtable entry), so it cannot be called through the
+vtable.  BUT THE GUEST HAS A PER-SCREEN ENTRY FOR EVERY SCREEN IT CAN
+OPEN, and each one is exactly the guest's own path:
+
+    Find(name literal) -> __dynamic_cast -> Enter(1)
+
+The guest's front-end entry for the event map is at 0xa679a0 and reads:
+
+    0xa67a0c  ldr  x0, [x8, #0x17f8]   ; the screen manager
+    0xa67a10  bl   0x14a7d5c            ; Find("EventMapScreen")
+    0xa67a2c  bl   0x1e17c80            ; __dynamic_cast
+    0xa67a3c  bl   0xdac364             ; EventMapScreen::Enter(1)
+
+**=>=> SO THE NEXT STEP IS A SCAN, NOT A GUESS: find the function that
+references a wanted screen's name literal, and call THAT.**  The guest then
+does its own Find, its own cast and its own Enter, with all of its own
+preconditions satisfied -- which is exactly what the port cannot reproduce
+by hand.
+
+**AND THE ENTRY'S OWN SCREEN NAME IS THE ANCHOR, NOT ITS ADDRESS.**  The
+xref machinery is the same one that proved the vtable slots: scan .text for
+the adrp/add pair that forms the literal's address.
