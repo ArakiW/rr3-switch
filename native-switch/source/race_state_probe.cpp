@@ -2026,6 +2026,12 @@ bool raceStateReadWord(uintptr_t address, uint64_t* out) {
     return readWord(address, out);
 }
 
+// The live CGlobal, exposed for the semantic UI probe.  See the header for
+// why the chain lives here and not in the caller.
+uintptr_t raceStateResolveGlobal() {
+    return cGlobalObject();
+}
+
 // The live RuleSet_RaceMetrics object, resolved the way this file resolves
 // it: the CGlobal -> the GameMode pointer -> the GameMode's ruleset map ->
 // the node whose value is a RuleSet_RaceMetrics.

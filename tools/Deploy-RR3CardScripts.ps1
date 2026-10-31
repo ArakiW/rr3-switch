@@ -89,6 +89,15 @@
     has to be "nothing happens" -- and this switch is how a round asks for
     something else without editing the repository.
 
+.PARAMETER UiFile
+    Deploy THIS file as the card's rr3-ui.txt, instead of the repository's.
+    The ui file is the SEMANTIC UI request list: one control id per line
+    ("BTN_STATS"), and the port presses exactly that control, at the
+    rectangle the guest's own screen tree gives.  The repository's copy ships
+    NO requests at all, because a request that names the wrong control
+    presses the wrong thing -- and this switch is how a round asks for a
+    named control without editing the repository.
+
 .EXAMPLE
     .\Deploy-RR3CardScripts.ps1 -Apply
 .EXAMPLE
@@ -103,7 +112,8 @@ param(
     [string]$ScreenView = '',
     [ValidateSet('legacy', 'glove')]
     [string]$TouchMode = 'legacy',
-    [string]$SettingsFile = ''
+    [string]$SettingsFile = '',
+    [string]$UiFile = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -112,7 +122,7 @@ $sourceRoot = Join-Path $projectRoot 'native-switch\card'
 $appDir = Join-Path (Join-Path (Join-Path $EmulatorRoot 'user\sdmc') 'switch') 'rr3-native-rehost'
 
 $scripts = @('rr3-touch.txt', 'rr3-drive.txt', 'rr3-pad.txt', 'rr3-action.txt',
-    'rr3-screen.txt', 'rr3-settings.txt')
+    'rr3-screen.txt', 'rr3-settings.txt', 'rr3-ui.txt')
 
 # --- the screen override ------------------------------------------------------
 #
@@ -220,6 +230,9 @@ $plan = foreach ($name in $scripts) {
     }
     if ($name -eq 'rr3-settings.txt' -and $SettingsFile -ne '') {
         $source = $SettingsFile
+    }
+    if ($name -eq 'rr3-ui.txt' -and $UiFile -ne '') {
+        $source = $UiFile
     }
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
         Write-Host ("preflight: MISSING {0} in {1}" -f $name, $sourceRoot)

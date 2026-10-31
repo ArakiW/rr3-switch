@@ -74,6 +74,7 @@
 #include "rr3/guest_touch_hw.hpp"
 #include "rr3/race_state_probe.hpp"
 #include "rr3/recovery_guard.hpp"
+#include "rr3/ui_control_probe.hpp"
 
 #include <switch.h>
 
@@ -435,6 +436,18 @@ void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
     // sdmc:/switch/rr3-native-rehost/rr3-drive.txt exists and says
     // enable=1, so every other experiment in this tree is unaffected.
     pumpRaceStateProbe(g_frameCounter);
+
+    // THE SEMANTIC UI PROBE.
+    //
+    // It reads the guest's OWN screen tree, so the port can ask WHERE a
+    // button is by the id the guest gives it ("BTN_RACE_NOW") instead of
+    // hunting for an accent-coloured blob.  It is pumped HERE, beside the
+    // race-state probe, for the same reason: the probe's walk is a graph
+    // walk over the guest's objects, and doing that ON DEMAND from the frame
+    // loop froze two runs (q23, q24).  The walk runs on its own cadence
+    // inside the probe, and the frame loop reads only the cached sample.
+    pumpUiControlProbe(g_frameCounter);
+
     const bool driving = raceStateDriveEnabled();
     const RaceDriveState& drive = raceDriveState();
 

@@ -9789,3 +9789,260 @@ therefore what it takes to turn those 909 untouched features into tested
 ones.
 
 =========================================================================
+
+=========================================================================
+THE SEMANTIC UI DRIVER: THE GUEST'S OWN SCREEN TREE, READ BY CONTROL ID
+=========================================================================
+
+WHAT THIS ROUND SET OUT TO DO
+-----------------------------
+The feature matrix (docs/FEATURE-MATRIX.md) said the port opens 58 of the
+guest's 967 UI feature files -- 6%.  The RACING half works; the META half
+(bank, garage, crew, community, friends, leaderboard, multiplayer) has never
+been opened.  The reason is not that the port cannot render those screens; it
+is that the port's UI driver finds buttons by their COLOURS, so it can only
+press what happens to be accented, and it can never NAME what it pressed.
+
+The guest, on the other hand, names everything.  So the plan was: read the
+guest's own screen tree and address controls by the ids the guest gives them.
+
+THE .gui FILES ARE ENCRYPTED -- WITH THE CIPHER ALREADY REVERSED
+-----------------------------------------------------------------
+The first thing the round had to establish was WHERE the control ids live.
+They live in the guest's .gui files, and those files are encrypted: every
+1 KB block has an entropy of ~7.78, so it is ciphertext, not compression.
+
+But it decrypted with the SAME RC4 variant and the SAME key the device
+profiles use (a535b3b1e843e7cf -- the cipher already reversed for
+tools/rr3-plist.py).  One key, several formats.  All 939 .gui files came out
+as well-formed XML, with an `id_string` on every widget:
+
+    939 screens, 11,936 widgets with an id, 4,729 distinct control ids
+    (recursively: 2,381 files, 22,161 widgets, 6,420 distinct ids)
+
+THE CROSS-CHECK, WITH TWO INDEPENDENT INSTRUMENTS
+-------------------------------------------------
+"the .gui files declare ids" is not yet "the guest looks controls up by those
+ids".  The second instrument is the guest's own binary: its .rodata holds 647
+control-id-looking literals ("BTN_", "IMG_", "LBL_", ...).  The two sets
+overlap in 314 ids, so the guest's code is looking up exactly the ids the
+files declare.  (The 333 binary-only ids are controls the guest creates at
+runtime or lives in files that are not on the card; the 4,415 file-only ids
+are editor names the code never looks up.)
+
+AND ONE NAME THAT EVERYONE GUESSES WRONG: there is no BTN_BANK in this
+guest.  The bank screen's scroller is BANK_SCROLLER, and it belongs to
+BankScrollerScreen.
+
+WHAT THE PROBE FOUND ON THE MACHINE (q40)
+------------------------------------------
+The probe (native-switch/source/ui_control_probe.cpp) reads the guest's
+screen registry and its live component tree, and it PROVES every pointer it
+follows: a pointer is taken as a component only when the name at +0x38 reads
+back as 1..63 characters of [A-Za-z0-9_].  q40's log says:
+
+    phase=ui-ctl f=90  screen=-            controls=0   screens=62 live=0
+                        why=no-live-component-tree
+    phase=ui-ctl f=180 screen=EventMapScreen  controls=342 screens=62 live=1
+                        ANIM_IN(0,0,1280,720) FRAME(-2409,-108,8926,951)
+                        IMG_SKY_BURN(0,0,1280,395) IMG_ROAD_BURN(0,603,1280,236)
+                        SCROLLER_FRAME(0,52,1280,619) TITLE_...
+    phase=ui-ctl f=330 screen=EventsScreen  controls=406 screens=62 live=2
+                        QUESTS_BG(0,1,1280,720) ANIM_IN(0,0,1281,720)
+                        FRAME_SCROLLER(1,98,1280,...)
+    phase=ui-ctl f=420 screen=CarSelectScreen controls=452 screens=62 live=3
+                        CAR_SELECT_SCROLLER(64,89,1152,423)
+                        BTN_LEFT_CAR(16,513,52,54) INVITE_PENDING_N...
+
+So: the registry holds 62 screens, the probe names the one that is up, and it
+lists EVERY named control in it with a rectangle.
+
+AND THE RECTANGLES ARE VIEW PIXELS -- CONFIRMED TWICE
+-----------------------------------------------------
+The static file and the live object agree, which is the point of having two
+instruments.  CarSelect.gui declares BTN_LEFT_CAR at x=0.0122839 y=0.7125
+with widthRel/heightRel true, i.e. a fraction of the screen.  At a 1280x720
+view that is (15.7, 513); the live tree says (16, 513).  Same place.  And
+CAR_SELECT_SCROLLER's declared width 0.9 gives 1152, and the live tree says
+1152.
+
+**=>=> SO THE PORT CAN NOW ADDRESS A CONTROL BY THE ID THE GUEST GIVES IT,
+AND GET THE PIXELS WHERE IT IS.**  That is the key the meta half needed: a
+control-id driver can open BuyCarScreen, CrewScreen, BankScreen and
+online_multiplayer BY NAME, and therefore can turn those 909 untouched
+features into tested ones.
+
+WHY IT IS A CARD-SIDE FILE AND NOT A POLICY
+-------------------------------------------
+The colour driver decides on its own what to press, and that is exactly why
+it pressed the same decoration 45 times in a row (measured in q27).  A
+semantic driver that also decided on its own would make the same class of
+mistake with better eyesight.  So it does not decide: the card's new
+rr3-ui.txt NAMES the control to press, one per line, and the port presses
+exactly that one, once, at the rectangle the guest's own tree gives:
+
+    at=<frame> <CONTROL_ID>
+
+The repository's rr3-ui.txt ships NO requests at all (every line is a
+comment), so the delivered card changes nothing.
+
+THE PROBE'S TWO RULES, BOTH LEARNED THE HARD WAY
+-------------------------------------------------
+1. It is pumped from the INPUT PUMP, on a 30-frame cadence, and the frame
+   loop reads only the CACHED sample.  Walking the guest's object graph ON
+   DEMAND from the frame loop froze two runs (q23 at frame 3, q24 at frame
+   16) -- and q40, with the probe wired into the loop, ran 305 s and 4181
+   frames without a hiccup.
+2. Its control list is a std::vector ON THE HEAP.  This code runs on the
+   guest's own thread, and this repository has already measured that a 64 KiB
+   stack buffer on that thread is fatal and that a 4 KiB one overflowed the
+   stack and corrupted a return address, with a symptom indistinguishable
+   from an external kill.
+
+AND THE INSTRUMENT SAYS WHEN IT FINDS NOTHING
+---------------------------------------------
+"the instrument did not measure it" and "the thing did not happen" are
+different statements.  The probe logs `why=no-live-component-tree` with the
+counts it DID get (screens=62 live=0) every tenth walk, so a reader can tell
+a broken probe from an empty screen.  The first version of the probe kept a
+fixed 48-entry cache, which silently truncated 342 controls -- and the
+truncation is exactly where the interesting buttons were.
+
+WHAT IS STILL OPEN
+------------------
+* The readback is still bound to the window instead of the guest's offscreen
+  render target, so at an HD view the screenshot and the glove detector are
+  looking at the wrong pixels.
+* The guest's advertisement path still has zero observability, so the third
+  ShowInterstitial can hang the run with no way to see why.
+* The race metrics members still read as -1, so the lap counter and the top
+  speed are still not available as a verdict.
+* The meta screens are now REACHABLE but not yet OPENED: the next job is to
+  write the rr3-ui.txt requests that walk the meta half and prove it.
+
+=========================================================================
+THE SAME BUILD, THREE TIMES: WHAT A STALL LOOKS LIKE WHEN IT IS NOT A REGRESSION
+=========================================================================
+
+MEASURED 2026-10-31, rounds q42 (worked), q43 and q44 (stalled), q45 (worked).
+
+    q42   4200 frames   305 s   reached the race
+    q43      4 frames   152 s   "guest log stable for 120s: the guest is blocked"
+    q44      3 frames   152 s   the same
+    q45   (same binary as q43/q44)  -- worked
+
+The binary was IDENTICAL in q43, q44 and q45 (nro sha256 59AF42B0E3948EC5).
+q42's binary differed from it by four cosmetic lines.  So a single run cannot
+tell a regression from a transient, and the SECOND run cannot either: q43 and
+q44 reproduced each other exactly.  It took the THIRD run of the same binary
+to show that the pair was a transient.
+
+WHERE IT STALLED, AND WHAT WAS DIFFERENT
+-----------------------------------------
+Both stalled rounds froze at the same place, with the log line for line
+identical up to the freeze, and one line missing:
+
+    q42:  phase=bulk-cache-hit ordinal=2 path=sdmc:/switch/rr3-native-rehost/
+          cache/asset_list_base.txtCache.txt size=4212795 cached_md5=21b52192a1e0436fc1c3eafa414fa269
+          phase=assetlist-serve ... rc=0 errno=0
+
+    q44:  phase=assetlist-serve ... rc=0 errno=12
+          phase=fopen-other ordinal=11 ... size=4212795 ...
+
+The guest asks for the 4.2 MB base asset list TWICE: once from the ROMFS
+volume, once from the card cache.  The port has an in-memory ring for big
+reads (kBulkReadSlots = 4, kBulkReadMaxTotalBytes = 32 MB) and the second
+ask is supposed to hit it.  When it hits, the guest gets the bytes instantly.
+When it misses, the guest gets the slow path -- and on this card the slow
+path did not come back.
+
+THE PART THAT IS WORTH FIXING
+------------------------------
+gBulkReadTotalBytes only ever GROWS (guest_filesystem.cpp:4006): every
+bulk-read adds to it and nothing ever takes it off, so after 32 MB of
+big reads in one run the port stops caching big files entirely and every
+later big file takes the slow path.  Four slots and a monotonically growing
+counter are a cache that degrades to nothing as the run goes on, and the
+symptom appears far away from the cause: the run dies minutes later, on a
+file it had already read once.
+
+=>=> THE NEXT FIX ON THIS PATH IS NOT IN THE UI PROBE.  It is: make the big
+read cache account for what it actually holds, and make the slow path for a
+file the port has ALREADY served in this run impossible to take.
+
+AND THE RULE THIS CONFIRMS
+--------------------------
+**=>=> "THE SAME BUILD FAILED TWICE" IS NOT "THE BUILD IS BROKEN".**  Two
+reproductions of a failure are still two samples of one condition.  The
+discriminator is a third run of the SAME binary, and the answer is often
+that the thing under test was never the thing that changed.
+
+=========================================================================
+THE SEMANTIC PRESS, MEASURED (q45): NAMING A CONTROL AND TOUCHING IT
+=========================================================================
+
+The card's rr3-ui.txt named two controls.  The port pressed one of them and
+refused the other, and both decisions are in the log:
+
+    phase=ui-press ordinal=251 frame=420 kind=semantic id=BTN_LEFT_CAR
+                x=16 y=513 w=52 h=54 cx=42 cy=540
+                screen=CarSelectScreen controls=452
+
+    phase=ui-ctl  ordinal=131 frame=480 id=BTN_STATS x=-370 y=81 w=335 h=72
+                view=1280x720 why=out-of-view
+
+BTN_LEFT_CAR is a SymbolButton -- the small grey arrow beside the car on the
+car-select screen.  It is neither the guest's red glove nor an accent-coloured
+button, so the colour detector cannot see it at all.  The port found it
+because the guest calls it that, and touched the centre of the rectangle the
+guest's own screen tree gave.
+
+THE GUEST RECEIVED IT
+---------------------
+The port's touch hook is the guest's own function, so the injection is the
+guest's own log of what it did:
+
+    phase=ui-press-semantic ordinal=941 x=42 y=540 action=down
+                fn=onTouchBeginJNI elfva=12b39d8 frame=421
+                guest{valid=1 eng=21041bc480 obj=21053bfaa0 paused=0 focus=1
+                       enabled=1 gid=0 gx=42 gy=540 down=1}
+    phase=tap-end          ordinal=941 x=42 y=540 action=up
+                fn=onTouchEndJNI elfva=12b3a58 frame=461
+                guest{valid=1 ... gx=42 gy=540 down=0}
+
+So the chain is: the probe read the guest's tree -> the guest's own name ->
+the guest's own rectangle -> a touch at the centre of it -> the guest's own
+touch handler, called with exactly those coordinates, against an engine
+object that was valid, focused and enabled.
+
+AND THE ONE THAT WAS REFUSED
+----------------------------
+BTN_STATS is declared in CarSelect.gui at (-1, 81) -- essentially the top
+left of the screen -- and the live tree reports (-370, 81) with the SAME
+height and width.  The difference is 369 pixels of x, and it is the
+animation frame the button lives in sliding it off screen.  The static file
+says where the button is DESIGNED to be; the live tree says where it IS.  The
+port refused to touch it, and said why, and kept the request pending.
+
+**=>=> THE PORT NOW HAS A WAY TO NAME A CONTROL AND TOUCH IT, AND IT KNOWS
+THE DIFFERENCE BETWEEN "NOT ON SCREEN" AND "NOT THERE".**
+
+WHAT THIS DOES NOT YET PROVE
+----------------------------
+* The guest produced no "MenuSelectHit" line in this run, so the guest's own
+  confirmation that the button's ACTION fired is still missing.  The touch
+  reached the guest's touch handler; whether BTN_LEFT_CAR then switched the
+  car is not yet confirmed by a second instrument.
+* The static index says the guest has 4,729 control ids (6,420 recursively),
+  and the live tree carries 335 to 452 named controls on a single screen.
+  The vocabulary is mapped; the meta screens are reachable but not yet
+  opened.
+
+THE NEXT JOB, AND IT IS A LIST, NOT A TASK
+------------------------------------------
+The feature matrix named 909 UI features a run has never opened.  They are
+now reachable by name.  Writing the rr3-ui.txt requests that walk the meta
+half -- the bank, the garage customisation, the crew, the community, the
+friends list, the leaderboard, the online multiplayer menus -- is now a
+matter of a list of control ids, and the tool that finds them is
+tools/gui_index.py.

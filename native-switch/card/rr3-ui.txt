@@ -1,0 +1,39 @@
+# rr3-ui.txt -- THE SEMANTIC UI REQUESTS.
+#
+# The port can press a control BY ITS ID: the name the guest itself gives it.
+# The guest names every widget ("BTN_RACE_NOW", "BTN_CONTINUE", "BTN_OK",
+# "BANK_SCROLLER", ...) and those names are the ids the .gui files declare,
+# so the port can ask the guest WHERE a button is instead of hunting for a
+# coloured blob.
+#
+# FORMAT.  One request per line, the same shape as rr3-action.txt:
+#
+#     at=<frame> <CONTROL_ID>      ; not before that frame
+#     <CONTROL_ID>                 ; as soon as the control exists
+#
+# The frame counter is the same one rr3-action.txt's "at=" uses.
+#
+# WHAT IT DOES.  When the named control is on screen, the port touches its
+# centre -- at the rectangle the guest's own screen tree gives -- once, and
+# then never again.  A request whose control does not exist yet simply waits.
+#
+# WHY IT IS A FILE.  The colour driver decides on its own what to press, and
+# that is why it pressed the same decoration 45 times in a row.  A semantic
+# driver that also decided on its own would make the same kind of mistake
+# with better eyesight.  So it does not decide: it presses what a human
+# wrote down here, and nothing else.
+#
+# NOTHING IS ACTIVE BY DEFAULT.  Every line below is a comment, so the
+# shipped card changes nothing.  Uncomment one to try it.
+#
+# The ids that exist are the ones the guest's .gui files declare.  To find
+# them, run the index tool (it reads the card's own .gui files):
+#
+#     python tools/gui_index.py --find <CONTROL_ID>
+#
+# Examples of real ids in this build:
+#
+#     BTN_RACE_NOW          the main menu's race button
+#     BTN_CONTINUE          the continue button, on 72 screens
+#     BANK_SCROLLER         the bank screen's scroller
+#     SCROLLER_FRAME        a frame inside a screen

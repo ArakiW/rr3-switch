@@ -30,6 +30,7 @@
 #include "rr3/race_state_probe.hpp"
 #include "rr3/ui_tap.hpp"
 #include "rr3/ui_target.hpp"
+#include "rr3/ui_control_probe.hpp"
 
 // The deferred-callback pump (jni_compat/classes/cloudcell_defer.cpp). It is
 // called on the thread that runs the guest's per-frame callbacks, bracketing
@@ -8936,6 +8937,73 @@ void* frameLoopDriver(void* opaque) {
 
                         if (!s_waitingFeedback && !guestRacing &&
                             !tapper.pending()) {
+                            // THE SEMANTIC REQUEST.
+                            //
+                            // The card can NAME a control ("BTN_RACE_NOW"),
+                            // and the port presses exactly that one, at the
+                            // rectangle the guest's OWN screen tree gives.
+                            // Nothing here is inferred: the NAME comes from
+                            // the card, the RECTANGLE comes from the guest.
+                            //
+                            // The colour driver decides on its own what to
+                            // press, which is why it pressed the same
+                            // decoration 45 times in a row (measured in q27).
+                            // A semantic driver that also decided on its own
+                            // would make the same class of mistake with
+                            // better eyesight, so it does not: it only ever
+                            // presses what a human wrote down.
+                            rr3::UiControl request{};
+                            if (rr3::uiControlNextRequest(&request)) {
+                                const int cx = request.x + request.w / 2;
+                                const int cy = request.y + request.h / 2;
+                                const bool inside =
+                                    request.w > 0 && request.h > 0 && cx >= 0 &&
+                                    cy >= 0 && cx < viewW && cy < viewH;
+                                if (!inside) {
+                                    // The rectangle is not somewhere a touch
+                                    // can go.  Report it ONCE per request (a
+                                    // per-frame report would drown the log)
+                                    // and leave the request pending.
+                                    static char reported[64] = {0};
+                                    if (std::strcmp(reported, request.name) != 0) {
+                                        std::memcpy(reported, request.name,
+                                                    sizeof(reported));
+                                        char diag[256];
+                                        std::snprintf(
+                                            diag, sizeof(diag),
+                                            "frame=%llu id=%s x=%d y=%d w=%d h=%d "
+                                            "view=%dx%d why=out-of-view",
+                                            static_cast<unsigned long long>(frames),
+                                            request.name, request.x, request.y,
+                                            request.w, request.h, viewW, viewH);
+                                        appendGuestBootLine(
+                                            "sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                            "ui-ctl", 131, 0, diag);
+                                    }
+                                } else if (tapper.press(jniEnvironment,
+                                                         activityObject, frames,
+                                                         cx, cy,
+                                                         "ui-press-semantic")) {
+                                    rr3::uiControlServeRequest(request.name);
+                                    s_waitingFeedback = true;
+                                    s_pressFrame = frames;
+                                    s_maxChanged = 0;
+                                    char diag[256];
+                                    std::snprintf(
+                                        diag, sizeof(diag),
+                                        "frame=%llu kind=semantic id=%s x=%d y=%d "
+                                        "w=%d h=%d cx=%d cy=%d screen=%s "
+                                        "controls=%d",
+                                        static_cast<unsigned long long>(frames),
+                                        request.name, request.x, request.y,
+                                        request.w, request.h, cx, cy,
+                                        rr3::uiControlSample().screen,
+                                        rr3::uiControlSample().count);
+                                    appendGuestBootLine(
+                                        "sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                        "ui-press", 251, 0, diag);
+                                }
+                            }
                             for (int i = 0; i < targets.count; ++i) {
                                 const rr3::ui::Target& t = targets.items[i];
                                 int tries = 0;

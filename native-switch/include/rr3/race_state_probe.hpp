@@ -167,6 +167,17 @@ const RaceStateSample& raceStateSample();
 // cannot be read; the port must never read guest memory any other way.
 bool raceStateReadWord(uintptr_t address, uint64_t* out);
 
+// The live CGlobal -- the game global G -- resolved the way this file
+// resolves it: the GOT slot at ELF 0x1f6d5d8 -> the .bss cell -> G.
+// 0 when the guest is not up yet.
+//
+// Exposed because the semantic UI probe needs the SAME object to reach the
+// FrontEnd2::MainMenuManager (G + 0x17f8).  The chain lives in one place on
+// purpose: a second, subtly different chain is a second thing to get wrong,
+// and this repository has already paid for one divergence between the two
+// copies of the GameMode lookup.
+uintptr_t raceStateResolveGlobal();
+
 // The live RuleSet_RaceMetrics object, resolved the way this probe resolves
 // it (the CGlobal -> the GameMode -> the ruleset map -> the node whose value
 // is a RuleSet_RaceMetrics). 0 when the chain does not lead there yet.
