@@ -319,6 +319,7 @@ unsigned long long g_walkCount = 0;
 // The layout diagnostic runs ONCE per run: it is expensive and it is only
 // interesting the first time.
 bool g_layoutLogged = false;
+bool g_displayNamesLogged = false;
 
 uint64_t hashControls(const std::vector<UiControl>& controls) {
     uint64_t h = 1469598103934665603ULL;
@@ -449,6 +450,65 @@ uintptr_t findRegistryInstance(uintptr_t node, const char* wanted,
                                     depth + 1);
     }
     return 0;
+}
+
+// THE SCREEN'S OWN NAME (vtable slot 73).
+//
+// It returns a plain `const char*` -- EventMapScreen's returns the literal
+// "Stream Selection", which is NOT the name it is registered under.  The
+// guest's own bookkeeping (ELF 0x14a44b8) takes this name, measures it
+// (the PLT call at 0x1e17bf0 is a string-length function) and requires it to
+// be SHORTER THAN 23 CHARACTERS, because it copies it into a 24-byte
+// short-string buffer on the stack.
+//
+// So this is not a name lookup and not a table index: it is a LENGTH CHECK.
+// And it is why a screen that has built its component tree can still take the
+// guest down on the way in.
+//
+// The getter takes no argument and has no side effects, so calling it is
+// safe; the copy is bounded and stops at the first byte that is not a
+// printable character.
+bool readScreenDisplayName(uintptr_t instance, uintptr_t vptr, char* out,
+                           size_t capacity) {
+    if (out == nullptr || capacity == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    uint64_t slot = 0;
+    if (!readU64(vptr + kScreenNameSlot * 8, &slot) || slot == 0) {
+        return false;
+    }
+    const uintptr_t bias = resolveMainImageLoadBias();
+    if (bias == 0 || static_cast<uintptr_t>(slot) < bias ||
+        static_cast<uintptr_t>(slot) >= bias + kGuestTextEndVa) {
+        return false;
+    }
+    const char* text = nullptr;
+    {
+        using NameFn = const char* (*)(uintptr_t);
+        GuestTlsScope tls;
+        text = reinterpret_cast<NameFn>(static_cast<uintptr_t>(slot))(instance);
+    }
+    if (text == nullptr || !pointerSane(reinterpret_cast<uintptr_t>(text))) {
+        return false;
+    }
+    size_t n = 0;
+    for (; n + 1 < capacity; ++n) {
+        uint64_t byte = 0;
+        if (!readU64(reinterpret_cast<uintptr_t>(text) + n, &byte)) {
+            break;
+        }
+        const char c = static_cast<char>(byte & 0xFF);
+        if (c == '\0') {
+            break;
+        }
+        if (c < 0x20 || c > 0x7E) {
+            break;
+        }
+        out[n] = c;
+    }
+    out[n] = '\0';
+    return n > 0;
 }
 
 // ---- the component tree ----------------------------------------------------
@@ -616,6 +676,40 @@ void logLayoutDiagnostic(const ScreenEntry* screens, int screenCount,
     }
 }
 
+
+// THE DISPLAY NAMES OF EVERY REGISTERED SCREEN, ONCE PER RUN.
+//
+// The front end's bookkeeping measures the name a screen calls itself (its
+// vtable slot 73) and requires it to be shorter than 23 characters, so the
+// port has to know those names to know which screens can be opened at all.
+// One line, once, so a single round answers the question.
+void logScreenDisplayNames(const ScreenEntry* screens, int screenCount,
+                           uintptr_t manager, unsigned long long frame) {
+    char line[3072];
+    int written = std::snprintf(line, sizeof(line),
+                                "f=%llu screens=%d mgr=0x%llx names=",
+                                frame, screenCount,
+                                static_cast<unsigned long long>(manager));
+    for (int i = 0; i < screenCount && written > 0 &&
+                    written < static_cast<int>(sizeof(line)) - 60; ++i) {
+        uint64_t vptr = 0;
+        if (!readU64(screens[i].instance, &vptr)) {
+            continue;
+        }
+        char display[64] = {0};
+        if (!readScreenDisplayName(screens[i].instance,
+                                   static_cast<uintptr_t>(vptr), display,
+                                   sizeof(display))) {
+            continue;
+        }
+        written += std::snprintf(line + written,
+                                 sizeof(line) - static_cast<size_t>(written),
+                                 "%s=%s(%d);", screens[i].name, display,
+                                 static_cast<int>(std::strlen(display)));
+    }
+    appendGuestBootLine(kGuestViewLogPath, "ui-names", 142, 0, line);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -709,6 +803,11 @@ void pumpUiControlProbe(unsigned long long frame) {
         merged.insert(merged.end(), controls.begin(), controls.end());
     }
     sample.screensLive = liveScreens;
+    if (!g_displayNamesLogged && liveScreens > 0) {
+        g_displayNamesLogged = true;
+        logScreenDisplayNames(screens, screenCount,
+                              static_cast<uintptr_t>(manager), frame);
+    }
     if (merged.empty()) {
         ++g_walkCount;
         if (g_walkCount % 10ULL == 1ULL) {
@@ -1017,12 +1116,40 @@ bool uiScreenOpen(const char* name, bool allowOpen) {
         appendGuestBootLine(kGuestViewLogPath, "ui-open", 140, 0, details);
         return false;
     }
-    char built[224];
+    // AND THE NAME THE SCREEN CALLS ITSELF.
+    //
+    // The guest's own bookkeeping copies this name into a 24-byte short-string
+    // buffer, so a name of 23 characters or more takes the error path.  That
+    // is a length the port can measure BEFORE it calls anything.
+    char display[64] = {0};
+    const bool named = readScreenDisplayName(
+        instance, static_cast<uintptr_t>(vptr), display, sizeof(display));
+    const int displayLen = static_cast<int>(std::strlen(display));
+    char built[320];
     std::snprintf(built, sizeof(built),
-                  "screen=\"%.80s\" inst=0x%llx built=1 children=%d open=%d",
+                  "screen=\"%.80s\" inst=0x%llx built=1 children=%d open=%d "
+                  "display=\"%.60s\" displayLen=%d",
                   name, static_cast<unsigned long long>(instance), builtCount,
-                  allowOpen ? 1 : 0);
+                  allowOpen ? 1 : 0, named ? display : "-", displayLen);
     appendGuestBootLine(kGuestViewLogPath, "ui-open", 141, 0, built);
+    if (!named) {
+        char details[224];
+        std::snprintf(details, sizeof(details),
+                      "screen=\"%.80s\" refused=1 reason=no-display-name",
+                      name);
+        appendGuestBootLine(kGuestViewLogPath, "ui-open", 140, 0, details);
+        return false;
+    }
+    if (displayLen >= 23) {
+        char details[256];
+        std::snprintf(details, sizeof(details),
+                      "screen=\"%.80s\" display=\"%.60s\" displayLen=%d "
+                      "refused=1 reason=the-display-name-is-too-long-for-the-"
+                      "guests-own-buffer",
+                      name, display, displayLen);
+        appendGuestBootLine(kGuestViewLogPath, "ui-open", 140, 0, details);
+        return false;
+    }
 
     // AND ONLY NOW, WITH THE CARD'S EXPLICIT "open=1", IS THE SCREEN OPENED.
     //

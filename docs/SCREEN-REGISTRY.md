@@ -220,3 +220,75 @@ The other candidate is the flags word: the descriptor's byte at +0x10 is
 line of its own makes the port BUILD the screen and report whether the
 build worked -- which IS proven.  The card's "open=1" line is what turns
 the open on.
+
+---
+
+## THE DISPLAY NAMES, MEASURED (q52)
+
+The port now calls each registered screen's vtable slot 73 -- a plain
+`const char*` getter with no side effects -- and logs every name and its
+length, once per run.  This is the front end's own vocabulary, and it is
+NOT the registry's:
+
+    MyGarageScreen=Garage Screen(13)            EventsScreen=Event Select Screen(19)
+    CarSelectScreen=Car Select Screen(17)       AchievementScreen=Achievement Screen(18)
+    CarPurchaseScreen=Car Purchase Screen(19)    CommunityScreen=Community Screen(16)
+    EventMapScreen=Stream Selection(16)          ProfileMenu=Profile Screen(14)
+    UpgradesScreen=Upgrades Screen(15)           RepairsScreen=Repairs Screen(14)
+    HelpMenu=Help Screen(11)                     MailScreen=Mail Screen(11)
+    CarCustomisationScreen=Customisation Screen(20)  TUNING_SCREEN=TUNING_SCREEN(13)
+    GARAGE_OVERVIEW_SCREEN=GARAGE_OVERVIEW_SCREEN(22)  TrophyUnlockScreen=Trophy Unlock Screen(20)
+    GhostChallengeMenu=GhostChallengeMenu(18)    PartyPlayLocalScreen=Party Play(10)
+    PhotoModeScreen=PhotoModeScreen(15)          NewCarPurchasedScreen=New Car Purchased Screen(24)
+    ProfileLoadSaveScreen=Profile Load/Save Screen(24)
+    FrontEndAwardScreen=Front End Award Screen(22)  ManufacturerDemoGameModeScreen=ManufacturerDemoPromo(21)
+    MOTORSPORT_TEAM_SELECT=MOTORSPORT_TEAM_SELECT(22)
+    CHAMPIONSHIP_ROUND_HUB_SCREEN=CHAMPIONSHIP_ROUND_HUB_SCREEN(29)
+    CarFilterScreen=Car Manufacturer Filter Screen(30)
+    AppleTVBluetoothControllerScreen=Apple TV Bluetooth Controls Screen(34)
+    MOTORSPORT_QUEST_DRIVER_SELECT_SCREEN=MOTORSPORT_QUEST_DRIVER_SELECT_SCREEN(37)
+
+**=>=> THE GUEST'S OWN BUFFER IS 24 BYTES, SO A NAME OF 23 CHARACTERS OR MORE
+TAKES ITS ERROR PATH.**  Six of the screens are too long to be opened this
+way: AppleTVBluetoothControllerScreen (34), MOTORSPORT_QUEST_DRIVER_SELECT_SCREEN
+(37), CarFilterScreen (30), CHAMPIONSHIP_ROUND_HUB_SCREEN (29),
+NewCarPurchasedScreen (24) and ProfileLoadSaveScreen (24).
+
+**=>=> BUT THE LENGTH IS NOT WHAT STOPPED US.**  UpgradesScreen's display name
+is "Upgrades Screen" -- 15 characters, comfortably inside the guest's buffer
+-- and it still took the guest down (q51).  So the check that kills the
+guest is further along: the bookkeeping compares the display name against
+the front end's own table of names, and THAT comparison is where it dies.
+
+**=>=> AND THE BUILD ITSELF WORKS FOR THE SCREENS THAT MATTER.**  q52, with
+the card asking for three screens and WITHOUT the open turned on:
+
+    CarPurchaseScreen  refused=1  reason=the-screen-did-not-build
+    UpgradesScreen     built=1 children=1  display="Upgrades Screen" (15)
+    CommunityScreen    built=1 children=3  display="Community Screen" (16)
+
+So the guest's own XML loader builds CommunityScreen's tree with three
+children, and UpgradesScreen's with one.  Only CarPurchaseScreen's build
+failed -- and that one is refused and reported, not crashed.
+
+## THE GUEST HAS ANOTHER WAY TO OPEN A SCREEN, AND IT IS THE ONE TO USE
+
+The front end's own entry (ELF 0xa679a0) opens a screen WITHOUT any of the
+descriptor machinery:
+
+    0xa679fc  ldr  x8, [x8, #0x5d8]   ; G
+    0xa67a08  ldr  x8, [x8]           ; G
+    0xa67a0c  ldr  x0, [x8, #0x17f8]  ; the screen manager
+    0xa67a10  bl   0x14a7d5c          ; ScreenManager::Find("EventMapScreen")
+    0xa67a14  cbz  x0, ...            ; if null, bail
+    0xa67a2c  bl   0x1e17c80          ; __dynamic_cast<EventMapScreen*>
+    0xa67a3c  bl   0xdac364           ; EventMapScreen::Enter(1)
+
+**=>=> FIND BY NAME, THEN ENTER.  No descriptor, no bookkeeping, no 24-slot
+table, no length check.**  And the port can supply the name argument without
+allocating anything in guest memory: a registry name is a SHORT libc++
+string, so its characters are INLINE in the registry node, and the address of
+those characters IS the `const char*` that Find wants.
+
+**=>=> SO THE NEXT STEP IS: call the guest's own Find (0x14a7d5c) with the
+registry node's own name address, and then the screen's Enter.**
