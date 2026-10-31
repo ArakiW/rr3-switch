@@ -9752,3 +9752,40 @@ never match -- and it would look like "the alias does not fire" rather than
 "the key is wrong".
 
 =========================================================================
+
+
+=========================================================================
+THE FEATURE MATRIX: "完整移植" IS NOW A COUNTABLE THING
+=========================================================================
+
+"完整移植安卓端功能" had no countable content: there was no list of the
+guest's features, so nobody could say what was done and what was not.  And
+the guest NAMES ITS FEATURES ITSELF -- every screen and panel it has is a
+GUI file under gui/processed/, named after the feature, and every asset it
+expects is named in its asset lists.
+
+**=>=> SO THE INVENTORY IS READABLE, AND A RUN SAYS WHICH OF IT IT TOUCHED:**
+
+    the guest's whole inventory        40,864 assets in 1,090 features
+    the UI feature files (gui/processed/*)      967
+    what a full run (q39) actually opened        58 of 967   (6%)
+
+**=>=> AND THAT IS THE HONEST ANSWER TO "how much is left": the RACING half
+of the game works and the META half is untouched.**  A run reaches the event
+map, the car select, a race, the pause screen and the store menu -- and it
+has never opened a single bank, garage-customisation, crew, community,
+friends, leaderboard, multiplayer or quest screen.
+
+The generated artifact is docs/FEATURE-MATRIX.md, and the generator is
+tools/build_feature_matrix.py (it reads the card's own
+.depot/asset_list_base.txtCache.txt and a real run's guest log).
+
+**=>=> AND THE MATRIX CHANGES WHAT "NEXT" MEANS.**  The three items that were
+queued -- the semantic UI driver, the readback target, the ad callback --
+are all in the RACING half, and the semantic driver is the one that can
+REACH the meta half: a control-id driver is what it takes to open
+BuyCarScreen, CrewScreen, BankScreen and online_multiplayer by name, and
+therefore what it takes to turn those 909 untouched features into tested
+ones.
+
+=========================================================================
