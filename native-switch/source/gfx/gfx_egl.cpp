@@ -380,10 +380,13 @@ extern "C" EGLBoolean __wrap_eglQuerySurface(EGLDisplay dpy, EGLSurface surface,
             // told it (onViewChangedJNI).  rr3-screen.txt's "view=WxH" moves
             // it; absent that key this is the 1280x720 the port has always
             // answered.  See rr3/gfx_backend.hpp.
-            const int viewWidth =
-                gfxViewWidthOverride() > 0 ? gfxViewWidthOverride() : 1280;
-            const int viewHeight =
-                gfxViewHeightOverride() > 0 ? gfxViewHeightOverride() : 720;
+            //
+            // gfxViewWidth() is the EFFECTIVE view, already clamped to the
+            // real surface: a viewport bigger than the buffer draws the
+            // picture in a corner (measured, q67).  The null backend must
+            // answer the same number the mesa path's real EGL answers.
+            const int viewWidth = gfxViewWidth();
+            const int viewHeight = gfxViewHeight();
             *value = attribute == EGL_WIDTH ? viewWidth : viewHeight;
         }
         return EGL_TRUE;

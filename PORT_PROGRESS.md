@@ -10671,4 +10671,46 @@ Cost, measured: 1680 frames in 305 s against 3720 in 306 s at 1280x720, i.e.
 it is a different story.  The 2D UI atlas also becomes the HD tree at that
 view size, which is a one-off cost (VRAM and load time), not a per-frame one.
 
+### 2026-11-01 (02:30): THE VIEW IS NOW CLAMPED TO THE SURFACE, SO NO CONFIGURATION CAN PRODUCE A CORNER CROP
+
+The corner crop is not a property of the 2048x1152 view; it is a property of
+the port LACKING a surface of that size.  Two measurements pin it down:
+
+  * the guest binds fb=0 once at start-up and never binds an FBO again (the
+    `fbo-bind` lines of a guest-view log show four binds, all at start-up
+    with draws=0), so the guest always renders into the DEFAULT framebuffer;
+  * the present path's scaled blit hangs on `lastBoundFramebuffer != 0`, and
+    that field is reset every frame, so the blit NEVER RAN -- not once, in
+    any run (`fbo-present` appears zero times in the q66 and q67 logs).
+
+So the port had no way to draw at the view size, and the guest's viewport
+(2048x1152) simply did not fit the buffer (1280x720).
+
+**The fix: `gfxViewWidth()` / `gfxViewHeight()` now return the view CLAMPED
+to the real surface, and they say so.**  One line in the log, once:
+
+    phase=view-clamped view 2048x1152 clamped to 1280x720: the port owns no
+    offscreen target of the view size, and a viewport bigger than the buffer
+    draws the picture in a corner (measured, q67)
+
+MEASURED (run q68, archive `20261101-021452-eden-rr3-q68-viewclamp`), the
+same configuration that produced the corner crop in q67:
+
+    phase=view-clamped ... view 2048x1152 clamped to 1280x720
+    phase=guest-log-any Res base: 1280x720
+    phase=guest-log-any share) Current res: 1280, 720
+    frames/frame-000030.png: 1280x720, and every sampled row of it has
+    content -- the blank corner is gone
+
+So every view setting is now safe, and the configuration that was broken
+behaves exactly like the 1280x720 one -- including the touch script, whose
+pixel coordinates belong to the 1280x720 layout.
+
+The null backend's `eglQuerySurface` now answers the same EFFECTIVE view the
+mesa path's real EGL answers, so the two backends agree.
+
+**⇒ The port's picture is now honest, and the HD path is a missing feature
+rather than a broken one.**
+
+
 

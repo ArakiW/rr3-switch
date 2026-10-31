@@ -1116,15 +1116,69 @@ int gfxViewHeightOverride() {
     return s_screen.viewHeight;
 }
 
+// The size of the surface the guest actually renders into: the 1280x720
+// window.  (On the Switch the framebuffer is 1280x720; on Eden the guest's
+// window is that same framebuffer, and the emulator is the one that scales it
+// into whatever size the host window is.)
+constexpr int kRealSurfaceWidth = 1280;
+constexpr int kRealSurfaceHeight = 720;
+
+// The view size, clamped to the real surface, and SAID OUT LOUD when it is
+// clamped.
+//
+// The guest asks the surface how big it is (eglQuerySurface) and sets its
+// viewport to the answer, so a view bigger than the buffer draws only the
+// part that fits: the picture lands in a corner and the rest is never drawn.
+// MEASURED, run q67 (archive 20261101-020018-eden-rr3-q67-hd2048): with
+// view=2048x1152 the guest's content occupies only the bottom left 1280x720
+// of the buffer and the rest of it is blank.
+//
+// The port owns no offscreen target of the view size yet -- it does not own an
+// FBO, and the guest renders into the default framebuffer (the guest binds
+// fb=0 once at start-up and never binds an FBO again; see the fbo-bind lines
+// in a guest-view log).  Until the port owns one, a bigger view is a broken
+// picture, not a sharper one, so the view is CLAMPED.
+//
+// The clamp is LOUD on purpose: a silent clamp is the "silent fallback" that
+// hides the difference between "the picture is 720p because that is what the
+// hardware is" and "the picture is 720p because the config asked for more and
+// the port could not deliver it".
+void gfxViewSize(int* width, int* height) {
+    int w = gfxViewWidthOverride() > 0 ? gfxViewWidthOverride() : kRealSurfaceWidth;
+    int h = gfxViewHeightOverride() > 0 ? gfxViewHeightOverride() : kRealSurfaceHeight;
+    if (w > kRealSurfaceWidth || h > kRealSurfaceHeight) {
+        static bool s_loggedClamp = false;
+        if (!s_loggedClamp) {
+            s_loggedClamp = true;
+            char details[224];
+            __builtin_snprintf(
+                details, sizeof(details),
+                "view %dx%d clamped to %dx%d: the port owns no offscreen "
+                "target of the view size, and a viewport bigger than the buffer "
+                "draws the picture in a corner (measured, q67)",
+                w, h, kRealSurfaceWidth, kRealSurfaceHeight);
+            writeLine("view-clamped", 0, 0, details);
+        }
+        if (w > kRealSurfaceWidth) w = kRealSurfaceWidth;
+        if (h > kRealSurfaceHeight) h = kRealSurfaceHeight;
+    }
+    if (width != nullptr) *width = w;
+    if (height != nullptr) *height = h;
+}
+
 // The view size with the historical default applied.
 int gfxViewWidth() {
-    const int override = gfxViewWidthOverride();
-    return override > 0 ? override : 1280;
+    int w = kRealSurfaceWidth;
+    int h = kRealSurfaceHeight;
+    gfxViewSize(&w, &h);
+    return w;
 }
 
 int gfxViewHeight() {
-    const int override = gfxViewHeightOverride();
-    return override > 0 ? override : 720;
+    int w = kRealSurfaceWidth;
+    int h = kRealSurfaceHeight;
+    gfxViewSize(&w, &h);
+    return h;
 }
 
 // FIT, not FILL.
