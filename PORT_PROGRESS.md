@@ -10233,3 +10233,93 @@ must not be the default.
 there: the port knows every screen's name, has every screen's instance, and
 has the guest's own call to open one.  What is missing is one virtual call
 in front of it.
+
+=========================================================================
+Q49, q50, q51: THE STALL WAS NOT WHERE I THOUGHT, AND THE BUILD STEP WORKS
+=========================================================================
+
+MEASURED 2026-10-31, rounds q49, q50, q51.
+
+THE 30-SECOND STALL WAS THE CARD'S COPY OF THE 4.2 MB LIST
+---------------------------------------------------------
+q43, q44 and q49 all died the same way: the log stopped with no line for
+120 s, the CPU still climbing, and the last thing the port had done was
+
+    phase=fopen-other ordinal=11 size=4212795
+              served=sdmc:/switch/rr3-native-rehost/cache/asset_list_base.txtCache.txt
+
+with Eden's last line a GetFileTimeStampRaw on that very file.
+
+**=>=> THE CAUSE IS NOT THE BUDGET.**  Raising the budget to 128 MB and the
+ring to 8 slots did not help, and there was no "bulk-rejected" line, so the
+budget was never the reason.  The reason is that the guest asks for the 4.2
+MB base list TWICE -- once from the ROMFS volume and once from the card's
+rewritten copy -- and the SECOND ask is served by the ordinary fopen path,
+which hands the guest a stdio stream on the emulated SD card.  The guest
+then reads 4.2 MB through the port's per-call interception, thousands of
+small reads, and the round looks frozen while it is in fact crawling.
+
+**=>=> AND WHETHER THE IN-MEMORY RING HAPPENED TO HOLD THAT PATH WAS
+LUCK.**  In q42 it did (a "bulk-cache-hit" line) and the round was fine; in
+q43, q44 and q49 it did not.  So the card's copy is now REGISTERED, from the
+very bytes the port wrote (registerBulkRead), and in the cached=1 branch --
+the branch a round takes when the card's list is already the rewritten one,
+which is the common case after the first run -- the port reads it into the
+ring with one bulkOpenFile call.  The guest's second ask now hits the ring
+every time, because the port put it there on purpose.
+
+**=>=> MEASURED: q50 and q51 both sailed past the 30 s mark that killed
+q43, q44 and q49.**  The stall is fixed.
+
+A PREDICATE THAT WAS ALWAYS TRUE
+--------------------------------
+The first version of the instance self-check used the guest's TEXT end
+(0x1e19ae0) as the vtable section's UPPER bound.  But the vtables are in
+.data.rel.ro, which is ABOVE the executable region:
+
+    .text         0x988000 .. 0x1e17af0
+    .plt          0x1e17af0 .. 0x1e19ae0      <- the executable region ends
+    .data.rel.ro  0x1e1aae0 .. 0x1f6cd80      <- THE VTABLES ARE HERE
+
+So the range was EMPTY, every instance was refused, and the reason line said
+"the instance is not a screen object" for screens that are.  **A predicate
+that is always true is a predicate that has never been true.**  (It did its
+job as a guard -- it refused instead of crashing -- for entirely the wrong
+reason.)
+
+THE BUILD-THEN-OPEN PIPELINE, MEASURED (q51)
+---------------------------------------------
+    phase=ui-open ordinal=140 screen="CarPurchaseScreen"
+              inst=0x212c729650 refused=1 reason=the-screen-did-not-build
+    phase=ui-open ordinal=141 screen="UpgradesScreen"
+              inst=0x212c72dde0 built=1 children=1
+    phase=ui-open ordinal=140 screen="UpgradesScreen"
+              inst=0x212c72dde0 fn=0x210a239820 calling=1
+
+**=>=> THE PIPELINE WORKS.**
+  * CarPurchaseScreen: slot 69 (the screen's own XML loader) ran and did NOT
+    produce a component tree, so the port REFUSED the open and said why.
+    No crash.  That is the guard doing exactly its job.
+  * UpgradesScreen: slot 69 DID build a tree (children=1), so the port went
+    on to OpenScreen.
+
+**=>=> AND THE OPEN STILL KILLS THE GUEST.**  The log ends on that
+"calling=1" line.  So the missing build was necessary but not sufficient:
+a screen with ONE child is built but not laid out, and something further
+down OpenScreen's path still walks a null.
+
+**=>=> WHAT IS STILL UNKNOWN, AND WHERE TO LOOK.**  OpenScreen does two
+bookkeeping calls before the switch:
+
+    0x10bb9c0  (screen, mgr)
+    0x14a44b8  (mgr, screen)   -- and this one calls the screen's vtable
+                                    slot 73 (the NAME getter) and looks that
+                                    name up in a table of 24-byte entries
+
+So the open needs the screen to be REGISTERED BY THAT NAME in the manager's
+own table, and it needs the flags word that the guest's own callers pass
+(the descriptor's byte at +0x10 is flags & 1).  Those are the two candidates
+for the next attempt, and both are one-line experiments.
+
+**AND NOTHING OF THIS IS ACTIVE BY DEFAULT.**  The card's rr3-open.txt ships
+with every line commented out, so the delivered card changes nothing.

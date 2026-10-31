@@ -40,6 +40,15 @@
 # NOTHING IS ACTIVE BY DEFAULT.  Every line below is a comment, so the
 # shipped card changes nothing.  Uncomment a name to open that screen.
 #
+# TWO LEVELS, ON PURPOSE.
+#   Without "open=1", a name on a line of its own makes the port BUILD that
+#   screen (the guest's own XML loader, vtable slot 69) and report whether
+#   the build worked.  That is PROVEN SAFE (measured in q51).
+#   With "open=1", the port also calls the guest's OpenScreen.  That is NOT
+#   proven -- in q51 it killed the guest even for a screen that had built.
+#   So the open has to be asked for by name, in the same file, on purpose.
+#
+# open=1
 # CommunityScreen
 # CarPurchaseScreen
 # CarCustomisationScreen

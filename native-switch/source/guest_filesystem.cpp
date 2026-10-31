@@ -3879,6 +3879,54 @@ void emitAstStreamLine(const char* guestPath, const char* servedPath, const char
                         unsigned long long fileSizeAtOpen, unsigned long long bytesHanded,
                         const char* handedDigest);
 
+// Put a buffer into the bulk-read cache under a path.
+//
+// WHY THIS EXISTS.  The guest asks for the 4.2 MB base asset list TWICE:
+// once from the ROMFS volume and once from the card's rewritten copy -- and
+// the second ask is the one that kills the round.
+//
+// MEASURED 2026-10-31 (q43, q44, q49): the run stalls with no log line for
+// 120 s and the CPU still climbing.  The last thing the port did was
+// "fopen-other size=4212795 served=sdmc:/switch/rr3-native-rehost/cache/
+// asset_list_base.txtCache.txt", and Eden's last line is a
+// GetFileTimeStampRaw on that very file: the port was serving the card's
+// copy through the ORDINARY path, so the guest's reads went one small piece
+// at a time through the port's per-call interception, over the emulated SD
+// card.  Whether the ring happened to hold that path was LUCK: in q42 it did
+// (a "bulk-cache-hit" line) and the round was fine; in q43, q44 and q49 it
+// did not, and the round died.
+//
+// So the card's copy is REGISTERED HERE, at the moment the port writes it,
+// from the very bytes it wrote.  The guest's second ask then hits the ring
+// every time, because the port put it there on purpose.
+//
+// The buffer is never freed: a guest FILE* handed out later points into it,
+// and the port cannot know when the guest closed that stream.
+void registerBulkRead(const char* path, const char* data, size_t size) {
+    if (path == nullptr || path[0] == '\0' || size == 0) {
+        return;
+    }
+    void* buffer = std::malloc(size);
+    if (buffer == nullptr) {
+        return;
+    }
+    std::memcpy(buffer, data, size);
+    BulkReadEntry& entry = gBulkReads[gBulkReadNext];
+    gBulkReadNext = (gBulkReadNext + 1) % kBulkReadSlots;
+    std::snprintf(entry.path, sizeof(entry.path), "%s", path);
+    entry.data = buffer;
+    entry.size = size;
+    gBulkReadTotalBytes += size;
+    ++gBulkReadCount;
+    char details[768];
+    std::snprintf(details, sizeof(details),
+                  "path=%s size=%zu registered=1 slot=%u reads=%u held=%llu",
+                  path, size, (gBulkReadNext + kBulkReadSlots - 1) % kBulkReadSlots,
+                  gBulkReadCount, gBulkReadTotalBytes);
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "bulk-registered", 0, 0, details);
+}
+
 // Open a large file into memory and hand back a memory-backed stream.
 //
 // Returns false when the file is not bulk-worthy, or when the bulk path is
@@ -6250,13 +6298,31 @@ bool buildConsistentBaseList(unsigned* rewrittenOut, unsigned* unresolvedOut) {
     if (baseListCacheIsCurrent(overrideKey)) {
         const uint64_t elapsedMs = (armGetSystemTick() - startTick) * 1000ULL /
                                    (tickFreq != 0 ? tickFreq : 1);
+        // AND PUT THE CARD'S COPY IN THE BULK RING.
+        //
+        // This branch writes nothing, and it is the branch the round takes
+        // when the card's list is ALREADY the rewritten one -- which is the
+        // common case after the first run.  Without this, the guest's second
+        // ask for the 4.2 MB file has to be served from the SD card one small
+        // piece at a time, and the round dies with no log line for 120 s
+        // (measured in q43, q44 and q49; see registerBulkRead()).
+        //
+        // bulkOpenFile reads the file into memory AND registers it under the
+        // path it was given, so one call does both.
+        std::FILE* cached = nullptr;
+        const bool cachedRead =
+            bulkOpenFile(kConsistentBaseListPath, "rb", &cached);
+        if (cached != nullptr) {
+            std::fclose(cached);
+        }
         char diag[768];
         std::snprintf(diag, sizeof(diag),
                       "entries=0 rewritten=0 overrides=%zu bytes=0 ms=%llu "
-                      "overrides_ms=%llu written=1 cached=1 key=%.32s out=%s",
+                      "overrides_ms=%llu written=1 cached=1 key=%.32s out=%s "
+                      "ring=%d",
                       overrides.size(), (unsigned long long)elapsedMs,
                       (unsigned long long)overridesMs, overrideKey,
-                      kConsistentBaseListPath);
+                      kConsistentBaseListPath, cachedRead ? 1 : 0);
         appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                             "baselist-rewrite", 0, 0, diag);
         if (rewrittenOut != nullptr) {
@@ -6420,6 +6486,11 @@ bool buildConsistentBaseList(unsigned* rewrittenOut, unsigned* unresolvedOut) {
                 if (!landed) {
                     writeErrno = ETIMEDOUT;
                 }
+                // AND REGISTER THE BYTES WE JUST WROTE, so the guest's second
+                // ask for this file is served from MEMORY instead of from the
+                // SD card.  See registerBulkRead() for what the alternative
+                // costs: a round that dies with no log line for 120 s.
+                registerBulkRead(kConsistentBaseListPath, out.data(), out.size());
             }
         }
     }

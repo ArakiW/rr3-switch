@@ -124,6 +124,38 @@ constexpr uintptr_t kCompRectOff      = 0x180ULL;
 // segment; the port's named-command mechanism uses the same bound.
 constexpr uintptr_t kOpenScreenVa = 0x14A4820ULL;
 constexpr uintptr_t kGuestTextEndVa = 0x1E19AE0ULL;
+// The guest's VTABLES are in .data.rel.ro, which is ABOVE the executable
+// region:  .text 0x988000..0x1e17af0, .plt 0x1e17af0..0x1e19ae0,
+// .data.rel.ro 0x1e1aae0..0x1f6cd80.
+constexpr uintptr_t kVtableSectionLo = 0x1E1AAE0ULL;
+constexpr uintptr_t kVtableSectionHi = 0x1F6CD80ULL;
+
+// THE SCREEN'S XML LOADER: vtable slot 69.
+//
+// MEASURED 2026-10-31 (q48): opening a screen that had never been built
+// CRASHED the guest -- writes to 0x30/0x34/0x48 of a null pointer, i.e. the
+// guest walked a null component root while building the screen.  The missing
+// step is the screen's own loader, and the guest calls it through this
+// virtual:
+//
+//     0xdb8c90  EventMapScreen's slot 69:
+//         0xdb8cb4  adrp x8, #0x1f6d000
+//         0xdb8cb8  ldr  x8, [x8, #0x840]      ; the manager
+//         0xdb8cbc  ldr  x8, [x8]
+//         0xdb8cc0  mov  x0, x8
+//         0xdb8cc4  bl  0x13833cc              ; the front-end gate
+//         0xdb8cc8  tbz w0, #0, ...
+//         0xdb8cd4  adrp x1, #0x449000          ; "EventMapScreen.xml"
+//         0xdb8cd8  add  x1, x1, #0x765
+//
+// So the loader takes NO argument: each screen's own override knows its own
+// XML file, and it checks the front-end gate before loading.  Slot 73 (the
+// vtable entry at +0x248) is the screen's NAME getter, which the manager
+// uses to find a screen by name.
+//
+// Slot 69 is at vtable + 69*8 = vtable + 0x228.
+constexpr uintptr_t kScreenLoadSlot = 69;
+constexpr uintptr_t kScreenNameSlot = 73;
 
 // ---- the walk's limits ----------------------------------------------------
 //
@@ -886,7 +918,7 @@ void uiControlServeRequest(const char* name) {
 // ---------------------------------------------------------------------------
 // OPENING A SCREEN BY ITS NAME
 // ---------------------------------------------------------------------------
-bool uiScreenOpen(const char* name) {
+bool uiScreenOpen(const char* name, bool allowOpen) {
     if (name == nullptr || name[0] == '\0') {
         return false;
     }
@@ -917,21 +949,27 @@ bool uiScreenOpen(const char* name) {
     // THE INSTANCE PROVES ITSELF BEFORE IT IS CALLED WITH.
     //
     // A screen object starts with its vtable pointer, and the guest's
-    // vtables live in their own section (0x1e1aae0 .. 0x1e19ae0 in the
-    // image).  So a first word that is NOT in that range is not a screen and
-    // is refused here rather than called with.  This is a pure read.
+    // vtables live in .data.rel.ro (0x1e1aae0 .. 0x1f6cd80 in the image).
+    // So a first word that is NOT in that range is not a screen and is
+    // refused here rather than called with.  This is a pure read.
     //
-    // MEASURED 2026-10-31 (q48): the first attempt at opening a screen
-    // CRASHED the guest -- the log stops right after the "calling=1" line,
-    // and Eden reports writes to 0x30/0x34/0x48 of a null pointer.  The
-    // guest was building a screen that had never been built, so it walked a
-    // null root.  The build step is the guest's own vtable slot 69 (the
-    // screen's XML loader), and that is the next thing to wire up.
+    // MEASURED 2026-10-31: the FIRST version of this check used the guest's
+    // TEXT end (0x1e19ae0) as the vtable section's upper bound, which is
+    // BELOW the vtable section's start -- an EMPTY range, so every instance
+    // was refused and the reason line said "not a screen object" for screens
+    // that are.  The sections of the image are:
+    //
+    //     .text        0x988000 .. 0x1e17af0
+    //     .plt         0x1e17af0 .. 0x1e19ae0     <- the executable region ends
+    //     .data.rel.ro 0x1e1aae0 .. 0x1f6cd80     <- THE VTABLES ARE HERE
+    //
+    // A predicate that is always true is a predicate that has never been
+    // true, and it refuses everything.
     const uintptr_t bias0 = resolveMainImageLoadBias();
     uint64_t vptr = 0;
     if (bias0 == 0 || !readU64(instance, &vptr) ||
-        static_cast<uintptr_t>(vptr) < bias0 + 0x1E1AAE0ULL ||
-        static_cast<uintptr_t>(vptr) >= bias0 + kGuestTextEndVa) {
+        static_cast<uintptr_t>(vptr) < bias0 + kVtableSectionLo ||
+        static_cast<uintptr_t>(vptr) >= bias0 + kVtableSectionHi) {
         char details[224];
         std::snprintf(details, sizeof(details),
                       "screen=\"%.80s\" inst=0x%llx refused=1 "
@@ -941,6 +979,59 @@ bool uiScreenOpen(const char* name) {
         return false;
     }
     const uintptr_t bias = bias0;
+
+    // BUILD THE SCREEN FIRST.
+    //
+    // The guest's own vtable slot 69 is the screen's XML loader, and a
+    // screen that has never been built has no components.  Opening it
+    // without building it walks a null root and kills the guest (measured in
+    // q48), so the build comes first and it is VERIFIED: if the screen still
+    // has no component tree afterwards, the open is refused rather than
+    // attempted.
+    uint64_t loadSlot = 0;
+    if (!readU64(static_cast<uintptr_t>(vptr) + kScreenLoadSlot * 8, &loadSlot) ||
+        static_cast<uintptr_t>(loadSlot) < bias ||
+        static_cast<uintptr_t>(loadSlot) >= bias + kGuestTextEndVa) {
+        char details[224];
+        std::snprintf(details, sizeof(details),
+                      "screen=\"%.80s\" inst=0x%llx refused=1 "
+                      "reason=no-usable-xml-loader-slot",
+                      name, static_cast<unsigned long long>(instance));
+        appendGuestBootLine(kGuestViewLogPath, "ui-open", 140, 0, details);
+        return false;
+    }
+    {
+        GuestTlsScope tls;
+        using LoadScreenFn = void (*)(uintptr_t);
+        reinterpret_cast<LoadScreenFn>(static_cast<uintptr_t>(loadSlot))(instance);
+    }
+    // AND CHECK THAT THE BUILD HAPPENED.
+    uintptr_t builtChildren = 0;
+    int builtCount = 0;
+    if (!readChildren(instance, &builtChildren, &builtCount) || builtCount == 0) {
+        char details[224];
+        std::snprintf(details, sizeof(details),
+                      "screen=\"%.80s\" inst=0x%llx refused=1 "
+                      "reason=the-screen-did-not-build",
+                      name, static_cast<unsigned long long>(instance));
+        appendGuestBootLine(kGuestViewLogPath, "ui-open", 140, 0, details);
+        return false;
+    }
+    char built[224];
+    std::snprintf(built, sizeof(built),
+                  "screen=\"%.80s\" inst=0x%llx built=1 children=%d open=%d",
+                  name, static_cast<unsigned long long>(instance), builtCount,
+                  allowOpen ? 1 : 0);
+    appendGuestBootLine(kGuestViewLogPath, "ui-open", 141, 0, built);
+
+    // AND ONLY NOW, WITH THE CARD'S EXPLICIT "open=1", IS THE SCREEN OPENED.
+    //
+    // MEASURED 2026-10-31 (q51): with the screen built, OpenScreen was
+    // called and the guest died.  So the open is still not proven, and it
+    // must not be one keystroke away from a screen name.
+    if (!allowOpen) {
+        return true;
+    }
     const uintptr_t fn = bias + kOpenScreenVa;
     if (bias == 0 || fn < bias || fn >= bias + kGuestTextEndVa) {
         char details[192];
@@ -988,6 +1079,7 @@ struct ScreenRequest {
 ScreenRequest g_screenRequests[kMaxScreenRequests];
 int g_screenRequestCount = 0;
 bool g_screenRequestsRead = false;
+bool g_screenOpenAllowed = false;
 
 void readScreenRequestFile() {
     g_screenRequestsRead = true;
@@ -1013,6 +1105,14 @@ void readScreenRequestFile() {
         char* name = text;
         while (*name == ' ' || *name == '\t') {
             ++name;
+        }
+        // THE "open=1" LINE IS WHAT TURNS THE OPEN ON.  Without it the port
+        // only BUILDS the named screens and reports whether the build
+        // worked, which is proven safe (q51); with it the port also calls the
+        // guest's OpenScreen, which is NOT proven (q51 killed the guest).
+        if (std::strncmp(name, "open=", 5) == 0) {
+            g_screenOpenAllowed = (std::strcmp(name + 5, "1") == 0);
+            continue;
         }
         char* end = name + std::strlen(name);
         while (end > name && (end[-1] == ' ' || end[-1] == '\t')) {
@@ -1070,7 +1170,7 @@ void pumpUiScreenOpen(unsigned long long frame) {
         if (g_screenRequests[i].done) {
             continue;
         }
-        if (!uiScreenOpen(g_screenRequests[i].name)) {
+        if (!uiScreenOpen(g_screenRequests[i].name, g_screenOpenAllowed)) {
             // A screen that is not in the registry will never be there, so
             // the request is finished rather than retried forever.
             g_screenRequests[i].done = true;

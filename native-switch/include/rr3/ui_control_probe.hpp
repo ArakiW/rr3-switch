@@ -184,7 +184,15 @@ void uiControlServeRequest(const char* name);
 //
 // Returns TRUE when the screen was found and the call was made.  A screen
 // that is not in the registry is reported, not guessed at.
-bool uiScreenOpen(const char* name);
+//
+// allowOpen GATES THE DANGEROUS HALF.  MEASURED 2026-10-31 (q51): the
+// build step works -- UpgradesScreen's XML loader produced a component tree
+// -- and OpenScreen was called, and the guest DIED.  So the open is not
+// proven, and a capability that can take the guest down must not be one
+// keystroke away: with allowOpen false the port BUILDS the screen and
+// VERIFIES the tree and stops there, and only the card's "open=1" line
+// turns the open on.
+bool uiScreenOpen(const char* name, bool allowOpen = false);
 
 // Serves the card's rr3-open.txt: one registered screen name per line, and
 // the port opens them one at a time, in order, when the front end is up.
