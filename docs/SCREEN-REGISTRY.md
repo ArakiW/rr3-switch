@@ -346,3 +346,38 @@ by hand.
 **AND THE ENTRY'S OWN SCREEN NAME IS THE ANCHOR, NOT ITS ADDRESS.**  The
 xref machinery is the same one that proved the vtable slots: scan .text for
 the adrp/add pair that forms the literal's address.
+
+---
+
+## THE PER-SCREEN ENTRIES, FOUND (q53)
+
+**THE SCANNER.**  An entry is the function that REFERENCES a screen's name
+literal AND calls the guest's ScreenManager::Find (0x14a7d5c).  The scan is
+register-aware, and the adrp's immediate in capstone is the ABSOLUTE page of
+the target, so the target is `adrp_imm + add_imm` -- with nothing from the
+instruction's own page and no shift.  (The harness's annotate() gets this
+wrong, which is why its string comments came out "off by one".)
+
+**THE POSITIVE CONTROL, AND IT PASSES.**  The scanner finds the event map's
+entry at 0xa679a0, which is the guest's own front-end entry for that screen.
+
+    EventMapScreen           0x3fcc66  ->  0xa679a0  (control: PASS)
+    UpgradesScreen           0x3fec1e  ->  0xea6988, 0xef8e28, 0x1526758
+    CarCustomisationScreen   0x47a4ff  ->  0xaa5f54, 0xaa672c, 0xaa732c,
+                                            0xe3c7c0, 0xe78e94, 0xe78f54
+    MyGarageScreen           0x4503be  ->  0xd50494, 0xd68d1c, 0xd69364,
+                                            0xdda6ac, 0xddbcac, 0x14c27f8
+    CarPurchaseScreen        0x3a87fe  ->  (none)
+    CommunityScreen          0x4175e4  ->  (none)
+
+**=>=> SO THE PORT CAN CALL THE GUEST'S OWN ENTRY FOR A SCREEN**, and the
+guest then does its own Find, its own __dynamic_cast and its own Enter, with
+every precondition it needs.  That is the whole point: the port could not
+reproduce those preconditions by hand (q48, q51: the open killed the guest),
+but the guest can do them for itself.
+
+**=>=> AND TWO SCREENS HAVE NO ENTRY BY THIS ROUTE.**  CarPurchaseScreen and
+CommunityScreen are not opened by Find(name) -- they are reached by other
+means (a menu item's own handler, or a deep link).  That is a fact, not a
+failure: the scanner looked at 35,278 distinct referenced literals and 199
+functions that call Find, and neither screen's name is among them.
