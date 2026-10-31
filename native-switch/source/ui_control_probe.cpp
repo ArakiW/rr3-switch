@@ -289,18 +289,29 @@ uint64_t hashControls(const std::vector<UiControl>& controls) {
 }
 
 void logSample(unsigned long long frame, const UiControlSample& sample) {
-    char detail[1024];
+    // The buffer holds every pressable control the walk found, because a
+    // round is five minutes and the point of the log is to say WHICH
+    // controls a driver could use.  Listing only the first ten made the
+    // search for a target a guessing game.
+    char detail[3072];
+    int pressable = 0;
+    for (int i = 0; i < sample.count; ++i) {
+        if (isPressable(sample.items[i])) {
+            ++pressable;
+        }
+    }
     int written = std::snprintf(detail, sizeof(detail),
-                                "f=%llu screen=%s controls=%d screens=%d live=%d vp=%dx%d",
+                                "f=%llu screen=%s controls=%d pressable=%d "
+                                "screens=%d live=%d vp=%dx%d",
                                 frame, sample.screen[0] ? sample.screen : "-",
-                                sample.count, sample.screensRegistered,
-                                sample.screensLive, sample.viewportW,
-                                sample.viewportH);
+                                sample.count, pressable,
+                                sample.screensRegistered, sample.screensLive,
+                                sample.viewportW, sample.viewportH);
     // The PRESSABLE controls come first: they are the ones a driver can
     // actually use, so they are what a reader needs to see.
     int shown = 0;
-    for (int pass = 0; pass < 2 && shown < 10; ++pass) {
-        for (int i = 0; i < sample.count && shown < 10; ++i) {
+    for (int pass = 0; pass < 2 && shown < 44; ++pass) {
+        for (int i = 0; i < sample.count && shown < 44; ++i) {
             const UiControl& control = sample.items[i];
             if (isPressable(control) != (pass == 0)) {
                 continue;
@@ -572,15 +583,26 @@ void pumpUiControlProbe(unsigned long long frame) {
         return;
     }
 
-    // WHICH SCREEN IS LIVE.
+    // WHICH SCREEN IS LIVE, AND WHICH CONTROLS ARE IN PLAY.
     //
-    // The registry holds every screen the guest knows, but only the ones that
-    // are up have a component tree with children.  So each screen's CHILDREN
-    // container is read first (three words each, so the whole sweep is cheap)
-    // and only the trees that have any are walked.
+    // The registry holds every screen the guest knows, and MORE THAN ONE of
+    // them is up at a time: the front end has the event map AND the main
+    // menu AND the status icon bar, each with its own component tree.
+    //
+    // The first version of this probe walked only ONE tree -- the one with
+    // the most named controls -- and that is why the main menu's toolbar
+    // (BTN_TOOLBAR_COMMUNITY, BTN_TOOLBAR_PROFILE, ...) was never found:
+    // the toolbar lives in the SettingsToolbar screen's tree, and the event
+    // map's tree was bigger.  Measured in q45.
+    //
+    // So every live tree is walked and the controls are MERGED.  Merging is
+    // safe because the pressable test is applied to each control on its own
+    // (the centre has to be inside the view), so a control from a screen
+    // that is not on top simply is not pressable.
     int liveScreens = 0;
     char liveName[64] = {0};
-    std::vector<UiControl> bestControls;
+    int liveMost = 0;
+    std::vector<UiControl> merged;
     for (int i = 0; i < screenCount; ++i) {
         uintptr_t children = 0;
         int childCount = 0;
@@ -596,13 +618,14 @@ void pumpUiControlProbe(unsigned long long frame) {
         if (controls.empty()) {
             continue;
         }
-        if (controls.size() > bestControls.size()) {
-            bestControls.swap(controls);
+        if (static_cast<int>(controls.size()) > liveMost) {
+            liveMost = static_cast<int>(controls.size());
             std::memcpy(liveName, screens[i].name, sizeof(liveName));
         }
+        merged.insert(merged.end(), controls.begin(), controls.end());
     }
     sample.screensLive = liveScreens;
-    if (bestControls.empty()) {
+    if (merged.empty()) {
         ++g_walkCount;
         if (g_walkCount % 10ULL == 1ULL) {
             char detail[256];
@@ -621,7 +644,7 @@ void pumpUiControlProbe(unsigned long long frame) {
         return;
     }
 
-    g_controls.swap(bestControls);
+    g_controls.swap(merged);
     sample.count = static_cast<int>(g_controls.size());
     sample.items = g_controls.data();
     std::memcpy(sample.screen, liveName, sizeof(sample.screen));

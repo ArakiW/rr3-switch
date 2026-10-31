@@ -17,8 +17,8 @@ inventory is READABLE, and a run says which of it it touched.
 |---|---|
 | the guest's whole inventory | **40864 assets** in **1090 features** |
 | the UI feature files (`gui/processed/*`) | **967** |
-| what a full run (q39) actually opened | **58 of 967** UI features (6%) |
-| distinct asset paths the run touched | 8967 |
+| what a full run (rr3-q47-open-new-screen) actually opened | **59 of 967** UI features (6%) |
+| distinct asset paths the run touched | 9818 |
 
 **=>=> SO THE HONEST ANSWER TO "how much is left" IS THIS: the
 racing half of the game works and the meta half is untouched.**
@@ -27,8 +27,9 @@ screen and the store menu -- and it has never opened a single
 bank, garage-customisation, crew, community, friends,
 leaderboard, multiplayer or quest screen.
 
-## WHAT THE RUN DID OPEN (58)
+## WHAT THE RUN DID OPEN (59)
 
+- `/gui/processed/AssistsPopupper`
 - `/gui/processed/BackButtonLayout`
 - `/gui/processed/BuyCarBar`
 - `/gui/processed/CarFilterScreen`
@@ -52,8 +53,8 @@ leaderboard, multiplayer or quest screen.
 - `/gui/processed/GlobalStyles`
 - `/gui/processed/GuiOptionSlider`
 - `/gui/processed/Hud_Objective`
+- `/gui/processed/Hud_Opponent`
 - `/gui/processed/InGameScreen`
-- `/gui/processed/Lemans_car_lend_popup_Legacy_crew_image`
 - `/gui/processed/LimitedEditionCallout`
 - `/gui/processed/LoadingScreen_Firemint`
 - `/gui/processed/LoadingScreen_Init`
@@ -62,6 +63,7 @@ leaderboard, multiplayer or quest screen.
 - `/gui/processed/Main_menu_foursquare_shadow`
 - `/gui/processed/MotorsportsBanner_foursquare`
 - `/gui/processed/PauseScreen`
+- `/gui/processed/PreRaceScreen`
 - `/gui/processed/PreRace_Intro_SoloItem`
 - `/gui/processed/SettingsMenu`
 - `/gui/processed/SettingsToolbar_ProfileSocial`
@@ -84,11 +86,10 @@ leaderboard, multiplayer or quest screen.
 - `/gui/processed/limited_time_series`
 - `/gui/processed/main_menu`
 - `/gui/processed/pitlanebar`
-- `/gui/processed/rental`
 - `/gui/processed/rookie_championship`
 - `/gui/processed/ultimate_driver`
 
-## WHAT IS STILL UNTOUCHED (909), BY FAMILY
+## WHAT IS STILL UNTOUCHED (908), BY FAMILY
 
 | family | untouched features |
 |---|---|
@@ -99,13 +100,13 @@ leaderboard, multiplayer or quest screen.
 | **lemans** | 22 |
 | **Speedrush** | 16 |
 | **Eagle** | 13 |
-| **PreRaceScreen** | 13 |
 | **gte** | 13 |
 | **n** | 13 |
 | **nascar** | 13 |
 | **renault** | 13 |
 | **LeaderboardRow** | 12 |
 | **Pack** | 12 |
+| **PreRaceScreen** | 12 |
 | **asterions** | 12 |
 | **countach** | 12 |
 | **lions** | 12 |
@@ -134,6 +135,7 @@ leaderboard, multiplayer or quest screen.
 | **TimeTrialTournament** | 5 |
 | **AwardsScreen** | 4 |
 | **FirstRacePopup** | 4 |
+| **Lemans** | 4 |
 | **MDollarPopupBonus** | 4 |
 | **SponsorCollectionPopup** | 4 |
 | **TutorialScreen** | 4 |
@@ -142,7 +144,6 @@ leaderboard, multiplayer or quest screen.
 | **Bootcamp** | 3 |
 | **CarPurchase** | 3 |
 | **CarUnlockRequirementRow** | 3 |
-| **Lemans** | 3 |
 | **Maserati** | 3 |
 | **Orientation** | 3 |
 | **RaceTeamEventLabel** | 3 |
@@ -195,7 +196,6 @@ leaderboard, multiplayer or quest screen.
 | **AppleTVBluetoothControllerScreen** | 1 |
 | **AppleTVSupportPopup** | 1 |
 | **AssetDownloadScreen** | 1 |
-| **AssistsPopupper** | 1 |
 | **AutoPlayAd** | 1 |
 | **AwardScreen** | 1 |
 | **BankScrollerScreen** | 1 |
@@ -284,7 +284,6 @@ leaderboard, multiplayer or quest screen.
 | **HTMLViewerPopup** | 1 |
 | **HUD** | 1 |
 | **HelpScreen** | 1 |
-| **Hud** | 1 |
 | **HyundaiCompetitionPopup** | 1 |
 | **InspectCar** | 1 |
 | **InterstitialAdPopup** | 1 |
@@ -479,6 +478,7 @@ leaderboard, multiplayer or quest screen.
 | **prize** | 1 |
 | **quests** | 1 |
 | **racers** | 1 |
+| **rental** | 1 |
 | **reward** | 1 |
 | **select** | 1 |
 | **sesto** | 1 |
@@ -511,7 +511,7 @@ python tools/build_feature_matrix.py  # this file
 The inventory comes from the card's
 `.depot/asset_list_base.txtCache.txt` (the guest's own list of
 every asset it expects); the coverage comes from the guest log of
-a real run (`20261031-031607-eden-rr3-q39-alias-heapall`).
+a real run (`20261031-132546-eden-rr3-q47-open-new-screen`).
 
 **A FEATURE IS "OPENED" WHEN THE GUEST OPENED ONE OF ITS FILES.**
 That is deliberately conservative: it says the guest RENDERED it,

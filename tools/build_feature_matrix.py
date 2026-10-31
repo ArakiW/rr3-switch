@@ -2,9 +2,20 @@
 """Generate docs/FEATURE-MATRIX.md from the guest's own inventory.
 
 Run:  python tools/build_feature_matrix.py
+      python tools/build_feature_matrix.py --run 20261031-130511-eden-rr3-q45-semantic-retry2
+      python tools/build_feature_matrix.py --run latest
+
+WHICH RUN COUNTS
+----------------
+The matrix answers "what has the port actually opened", so it has to be
+measured against a REAL run, and the run has to be chosen deliberately: a run
+that stalled early opened less, and a run that reached the meta screens
+opened more.  So the run is an argument, and the document says which one it
+is.
 (the analysis scripts live in .build/ ; this file is the generated artifact)
 """
 
+import argparse
 import io
 import os
 import re
@@ -15,8 +26,7 @@ REPO = r"E:\AI\RealRacing3-switch"
 CARD = r"E:\Eden-rr3\user\sdmc\switch\rr3-native-rehost\.depot"
 BASE = os.path.join(CARD, "asset_list_base.txtCache.txt")
 RUN_DIR = os.path.join(REPO, ".build", "eden-runs")
-LOG_NAME = "20261031-031607-eden-rr3-q39-alias-heapall"
-LOG = os.path.join(RUN_DIR, LOG_NAME, "rr3-native-rehost.guest-view.log")
+DEFAULT_RUN = "20261031-031607-eden-rr3-q39-alias-heapall"
 OUT = os.path.join(REPO, "docs", "FEATURE-MATRIX.md")
 
 TOKEN_RE = re.compile(r"(\S+\.(?:gui|atlas|dds|pvr|nct|dat|bin|txt|otf)(?:\.z)?)")
@@ -58,6 +68,29 @@ def family(name):
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Generate docs/FEATURE-MATRIX.md from the guest's own "
+                    "inventory and a real run's log.")
+    parser.add_argument("--run", default=DEFAULT_RUN,
+                        help="the archive directory name under .build/eden-runs, "
+                             "or 'latest' for the newest one")
+    args = parser.parse_args()
+    run_name = args.run
+    if run_name == "latest":
+        candidates = sorted(d for d in os.listdir(RUN_DIR)
+                            if os.path.isdir(os.path.join(RUN_DIR, d)))
+        if not candidates:
+            print("no runs under %s" % RUN_DIR, file=sys.stderr)
+            return 2
+        run_name = candidates[-1]
+    log = os.path.join(RUN_DIR, run_name, "rr3-native-rehost.guest-view.log")
+    if not os.path.exists(log):
+        print("no guest log for that run: %s" % log, file=sys.stderr)
+        return 2
+    # The label the document prints: the run's own tag, so a reader can find
+    # the archive again.
+    parts = run_name.split("-")
+    tag = "-".join(parts[3:]) if len(parts) > 3 else run_name
     if not os.path.exists(BASE):
         print("the asset list is not on the card: %s" % BASE, file=sys.stderr)
         return 2
@@ -76,7 +109,7 @@ def main():
 
     touched = defaultdict(set)
     seen = set()
-    with io.open(LOG, "r", encoding="utf-8", errors="replace") as handle:
+    with io.open(log, "r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
             for match in TOKEN_RE.finditer(line):
                 path = normalize(match.group(1))
@@ -114,8 +147,8 @@ def main():
     lines.append("| the guest's whole inventory | **%d assets** in **%d features** |"
                  % (total, len(inventory)))
     lines.append("| the UI feature files (`gui/processed/*`) | **%d** |" % len(screens))
-    lines.append("| what a full run (q39) actually opened | **%d of %d** UI features "
-                 "(%.0f%%) |" % (len(opened), len(screens),
+    lines.append("| what a full run (%s) actually opened | **%d of %d** UI features "
+                 "(%.0f%%) |" % (tag, len(opened), len(screens),
                                   100.0 * len(opened) / max(1, len(screens))))
     lines.append("| distinct asset paths the run touched | %d |" % len(seen))
     lines.append("")
@@ -156,7 +189,7 @@ def main():
     lines.append("The inventory comes from the card's")
     lines.append("`.depot/asset_list_base.txtCache.txt` (the guest's own list of")
     lines.append("every asset it expects); the coverage comes from the guest log of")
-    lines.append("a real run (`%s`)." % LOG_NAME)
+    lines.append("a real run (`%s`)." % run_name)
     lines.append("")
     lines.append("**A FEATURE IS \"OPENED\" WHEN THE GUEST OPENED ONE OF ITS FILES.**")
     lines.append("That is deliberately conservative: it says the guest RENDERED it,")
@@ -169,7 +202,8 @@ def main():
     with io.open(OUT, "w", encoding="utf-8", newline="\n") as handle:
         handle.write("\n".join(lines))
     print("wrote %s (%d bytes)" % (OUT, os.path.getsize(OUT)))
-    print("UI features: %d in the inventory, %d opened by q39" % (len(screens), len(opened)))
+    print("UI features: %d in the inventory, %d opened by %s"
+          % (len(screens), len(opened), run_name))
     return 0
 
 

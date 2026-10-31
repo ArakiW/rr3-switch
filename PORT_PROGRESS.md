@@ -10046,3 +10046,90 @@ half -- the bank, the garage customisation, the crew, the community, the
 friends list, the leaderboard, the online multiplayer menus -- is now a
 matter of a list of control ids, and the tool that finds them is
 tools/gui_index.py.
+
+=========================================================================
+THE META HALF, BY NAME: THREE ROUNDS THAT SAY WHAT THE KEY IS AND IS NOT
+=========================================================================
+
+MEASURED 2026-10-31, rounds q46 (crew presses), q47 (service/upgrade
+presses), against the q39 baseline (colour driver only).
+
+    q39   colour driver only            58 of 967 UI features opened
+    q46   + 4 crew presses              50 of 967
+    q47   + 6 service/upgrade presses   59 of 967
+
+THE PRESSES WORK.  The probe finds the control by the name the guest gives
+it, and the port touches the centre of the rectangle the guest's own screen
+tree gave it.  q47's log:
+
+    phase=ui-press ordinal=251 kind=semantic id=BTN_SERVICE_NOW
+                x=477 y=332 w=352 h=47 cx=653 cy=355 screen=CarSelectScreen
+    phase=ui-press ordinal=251 kind=semantic id=BTN_SECONDARY_SERVICE_NOW
+                x=121 y=332 w=345 h=47 cx=293 cy=355
+    phase=ui-press ordinal=251 kind=semantic id=EA_SQU_BUTTON_SERVICE
+                x=839 y=332 w=320 h=46 cx=999 cy=355
+    phase=ui-press ordinal=251 kind=semantic id=CALLOUT_UPGRADE_PR_BTN
+                x=669 y=100 w=600 h=126 cx=969 cy=163
+    phase=ui-press ordinal=251 kind=semantic id=BTN_UPGRADE_NOW
+                x=642 y=185 w=335 h=35 cx=809 cy=202
+    phase=ui-press ordinal=251 kind=semantic id=CALLOUT_FIRST_CAR_BTN
+                x=113 y=95 w=1043 h=67 cx=634 cy=128
+
+WHAT THE PRESSES DID NOT DO: OPEN A NEW SCREEN
+-----------------------------------------------
+q47 opened THREE features q39 did not -- AssistsPopupper, Hud_Opponent and
+PreRaceScreen -- so the presses moved the port FURTHER down the racing flow.
+They did not open the car shop.  The feature matrix says why: a button that
+switches a panel INSIDE the current file does not move the number.  The crew
+panel lives inside CarSelect.gui (the ancestor chain is CarSelect > ANIM_IN >
+FRAME > CREW_FRAME > CREW_BTN_1), so pressing CREW_BTN_1 opened nothing.
+
+**=>=> AND THE REMAINING 908 ARE NOT ALL ALIKE.**  The biggest untouched
+families are per-track and per-series event cards (Eagle_ 13, gte_ 13,
+nascar_ 13, renault_ 13, lemans_ 22, asterions_ 12, countach_ 12, ...),
+LoadingScreen_ 36 (one per track), the store's packs (Pack 12, PackScreen
+11), the long-press ContextMenu_ 11, and the ONLINE rows (LeaderboardRow
+12, RaceTeamListRow 11).  The last group needs a server, so it may be
+unreachable whatever the port does.  The group that matters and is OFFLINE is
+the garage: the customisation screens, the upgrade screens and the car shop.
+
+=>=> SO THE NEXT LEVER IS NOT "PRESS ANOTHER BUTTON".  It IS "OPEN A SCREEN
+BY ITS NAME" -- the guest's own screen registry holds 62 names, and the
+guest's own front-end entry opens a screen by calling Find(name) and then
+the screen's Enter.  That is a CALL, and the port already calls guest code on
+the frame-loop thread (tools/guest_action.cpp:821 does exactly that, every
+run).
+
+THE TWO FIXES THIS ROUND ALSO FOUND
+-----------------------------------
+1. THE PROBE WALKED ONLY ONE SCREEN'S TREE, AND THE TOOLBAR WAS INVISIBLE.
+   More than one screen is up at a time -- the event map AND the main menu
+   AND the status bar -- and each has its own component tree.  The first
+   version kept the tree with the MOST controls, so the toolbar
+   (BTN_TOOLBAR_COMMUNITY and friends, which live in the SettingsToolbar
+   screen) was never in the set.  Now every live tree is walked and the
+   controls are MERGED; the pressable test is applied per control, so a
+   control from a screen that is not on top is simply not pressable.
+   Measured effect: the control count on the car-select screen went from 452
+   to 1200, and the EventsScreen has 516 PRESSABLE controls.
+2. THE BIG-READ CACHE HAD A CLIFF, AND IT FAILED SILENTLY.  The guest asks
+   for the 4.2 MB base asset list TWICE -- once from the ROMFS volume and
+   once from the card's rewritten copy -- and the second ask is supposed to
+   be served from an in-memory ring.  The ring's budget was 32 MB and the
+   counter that tracks it only ever grows, so once a run had bulk-read more
+   than ~28 MB the budget was spent and the second ask took the ORDINARY
+   fopen path: the guest then read 4.2 MB through the port's per-call
+   interception, thousands of small reads over the emulated SD card, and the
+   run LOOKED FROZEN -- no log line for 120 s, the CPU still climbing --
+   while it was in fact crawling.  That is what killed q43 and q44 (the
+   same binary ran fine in q42 and q45, which is how it was told apart from
+   a regression).
+   The budget is now 128 MB, the ring has 8 slots instead of 4, and -- the
+   part that actually cost two rounds -- THE REJECTION IS LOGGED.  A cap
+   that fails silently cannot be diagnosed.
+
+AND THE MATRIX CAN NOW BE MEASURED AGAINST ANY RUN
+--------------------------------------------------
+tools/build_feature_matrix.py takes --run <archive> (or --run latest), so
+"how much has the port opened" is a question with an answer per round
+instead of a number frozen at q39.

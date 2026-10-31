@@ -3823,7 +3823,22 @@ constexpr unsigned long long kBulkReadMinBytes = 256ull * 1024ull;
 // Above this the buffer is not worth holding.
 constexpr unsigned long long kBulkReadMaxFileBytes = 8ull * 1024ull * 1024ull;
 // The total the bulk path is allowed to hold at once.
-constexpr unsigned long long kBulkReadMaxTotalBytes = 32ull * 1024ull * 1024ull;
+//
+// MEASURED 2026-10-31: 32 MB was too small, and the failure it caused was
+// silent and remote.  The guest asks for the 4.2 MB base asset list TWICE --
+// once from the ROMFS volume and once from the card's rewritten copy -- and
+// the second ask is served from the in-memory ring.  Once the run had
+// bulk-read more than ~28 MB, the budget was spent and the second ask took
+// the ORDINARY fopen path instead: the guest then read 4.2 MB through the
+// port's per-call interception, which is thousands of small reads over the
+// emulated SD card, and the run looked FROZEN (no log line for 120 s, the
+// CPU still climbing) while it was in fact crawling.
+//
+// So the budget is raised, the ring gets more slots so a file read early is
+// still there when the guest asks for it again, and -- the part that
+// actually cost two rounds -- THE REJECTION IS NOW LOGGED.  A cap that
+// fails silently is a cap that cannot be diagnosed.
+constexpr unsigned long long kBulkReadMaxTotalBytes = 128ull * 1024ull * 1024ull;
 // The starting piece size, and the largest one tried.
 constexpr size_t kBulkReadStartChunk = 64 * 1024;
 constexpr size_t kBulkReadMaxChunk = 1024 * 1024;
@@ -3841,7 +3856,7 @@ struct BulkReadEntry {
     void* data{};
     size_t size{};
 };
-constexpr unsigned kBulkReadSlots = 4;
+constexpr unsigned kBulkReadSlots = 8;
 BulkReadEntry gBulkReads[kBulkReadSlots]{};
 unsigned gBulkReadNext = 0;
 unsigned long long gBulkReadTotalBytes = 0;
@@ -3930,6 +3945,18 @@ bool bulkOpenFile(const char* candidate, const char* mode, std::FILE** out) {
     const size_t total = static_cast<size_t>(info.st_size);
     if (gBulkReadTotalBytes + total > kBulkReadMaxTotalBytes) {
         ::close(fd);
+        // THE REJECTION IS LOGGED.  It used to be silent, and the run it
+        // caused looked like a freeze 120 s later, with no way back to this
+        // line.  A cap that fails silently cannot be diagnosed.
+        char diag[768];
+        std::snprintf(diag, sizeof(diag),
+                      "path=%s size=%zu held=%llu budget=%llu slots=%u "
+                      "reads=%u why=budget-exhausted -> the ordinary path "
+                      "will answer",
+                      candidate, total, gBulkReadTotalBytes,
+                      kBulkReadMaxTotalBytes, kBulkReadSlots, gBulkReadCount);
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "bulk-rejected", 0, 0, diag);
         return false;
     }
     void* buffer = std::malloc(total);
