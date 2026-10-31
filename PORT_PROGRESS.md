@@ -10532,7 +10532,27 @@ Same screen, same frame index (the safety notice on the loading screen):
         line 1: y = 600..637  h=38
         gap    = 11 rows
 
-### The English safety notice: from 2910 px wide to 364 px
+### Why the event card has never been photographed -- and what to do about it
+
+The port's frame capture runs every ~100 frames (30, 120, 300, 600, ...), but
+the screens that carry the card live for about ninety frames:
+
+    q66: f=180 screen=EventMapScreen
+         f=270 screen=EventMapScreen
+         f=330 screen=EventsScreen
+         f=360 screen=EventsScreen
+         f=420 screen=CarSelectScreen
+
+So the event map is live from frame 180 to 270 and the next capture lands at
+frame 300 -- after the screen is gone.  **That is the whole reason the card's
+own `CARD_TRACK` / `CARD_TRACK_2` boxes have never been seen in a frame;** it
+is not that the card is unreachable.
+
+The fix is an instrument, not a guess: the ui-ctl probe already knows the live
+screen on every frame, so it can ask for a PNG when the live screen CHANGES.
+One capture per screen transition is cheap, and it would put the event card,
+the daily-reward popup and the loading notice on disk every run.
+
 
 The same notice's English paragraph is one long string, and the guest draws it
 into one quad.  The destination rectangle in the port's text-quad probe:
@@ -10564,4 +10584,91 @@ The Chinese ink is 131 px and the old line box was 140 px: three rows of
 breathing room at the size the guest draws it, which is what "the two lines
 touch" looks like.  The leading is not cosmetic -- it is where the room comes
 from, and the arithmetic closes on the measurement to the row.
+
+## 2026-11-01 (02:20): THE PICTURE QUALITY -- WHAT IS ACTUALLY IN CHARGE, AND WHY THE HD VIEW IS OFF AGAIN
+
+### The questions
+
+The user asked for the HD materials ("车身贴图还糊糊的，能不能高清化") and then
+for the split ("能不能只把高清素材用在车辆和环境上，不用再UI上").
+
+### What the view size really controls (MEASURED, runs q66 and q67)
+
+The same build; the only difference is `rr3-screen.txt`'s `view=`:
+
+| | q66 `view=1280x720` | q67 `view=2048x1152` |
+|---|---|---|
+| guest `Res base` | 1280x720 | 2048x1152 |
+| guest `Res order` first | `gui_assets/960x640/` | **`gui_assets/2048x1536/`** |
+| `gui_assets/960x640` requests | 2840 | 317 |
+| `gui_assets/2048x1536` requests | 288 | **825** |
+| 3D tree `assets_2048x1536` requests | **352** | 358 |
+| 3D render viewport | 1280x720 | **2048x1152** |
+| frames in ~306 s | 3720 | **1680 (45%)** |
+
+**⇒ The view size flips ONE tree: the 2D UI atlas.**  The guest's own filter
+(`cc::ImageResManager`, ELF 0x10f8ec8) keeps a resolution folder only if
+`width <= screenW || height <= screenH`, and the screen is the view size.  So
+1920x1080 is NOT enough for the HD tree either (2048 > 1920 AND
+1536 > 1080 -- both fail).
+
+**⇒ The 3D tree does NOT flip.**  The vehicles and the track read
+`assets_2048x1536` in EVERY run (352 opens at 1280x720, 358 at 2048x1152),
+because the 3D asset tree is chosen by the DEVICE PROFILE's quality tier
+(`AndroidHigh.plist` = High), not by the view.  **So the split the user asked
+for -- HD vehicles and environment, UI left alone -- is already the status
+quo at 1280x720.**
+
+### The HD view is MEASURED BROKEN, and that is why the card goes back to 1280x720
+
+q67 is the only round that ever ran the old `view=2048x1152` default.  The
+guest took the HD tree and rendered with a 2048x1152 viewport -- and the
+picture was WRONG: `frames/frame-000300.png` of that archive is 2048x1152
+and the guest's content occupies only the BOTTOM LEFT 1280x720 of it, the
+rest of the buffer blank.
+
+The cause is in the port's EGL shim: `source/gfx/gfx_egl.cpp:381-388`
+answers `eglQuerySurface(EGL_WIDTH/EGL_HEIGHT)` with the VIEW size, but the
+surface the guest renders into is the 1280x720 window.  A viewport bigger
+than the buffer draws only the part that fits, so the picture lands in a
+corner and the rest is never drawn.  The present path cannot rescue it: the
+pixels are gone.
+
+The HD view needs a surface that really IS 2048x1152 -- the port owns an
+offscreen target and blits it into the window, scaled, at present time.  The
+`glBlitFramebuffer` code for that is already written
+(`source/guest_view_probe.cpp:8569-8641`); what is missing is the offscreen
+target, and the guard it hangs on (`lastBoundFramebuffer != 0`) is false
+because the guest never binds an FBO.
+
+**⇒ Until that exists, a bigger view is a crop, not a scale, so the shipped
+`rr3-screen.txt` goes back to `view=1280x720`** -- which is also the layout
+every measurement in this project was taken on, and the layout the touch
+script's pixel coordinates belong to.
+
+### What the user sees, and the one-line fix
+
+The user's own screenshot is a race scene in an Eden window whose game area is
+about 1830 px wide.  The game renders 1280x720 and the emulator upscales
+that into the window -- a 1.43x stretch, which is exactly "糊".  The
+materials are HD; the SAMPLING is not.
+
+**⇒ Run the Eden window at exactly 1280x720 and the picture is 1:1.**  On the
+real Switch the framebuffer is 1280x720 anyway, so nothing is stretched.
+
+### The next step for a real HD picture
+
+The port owns a target of the view size, the guest renders into it, and the
+present blits it down:
+
+  1. create an FBO (colour texture + depth renderbuffer) at the view size;
+  2. bind it as the draw framebuffer before the guest's frame -- the guest
+     never binds a framebuffer itself, so it stays bound;
+  3. the existing `glBlitFramebuffer` path then scales it into the window.
+
+Cost, measured: 1680 frames in 305 s against 3720 in 306 s at 1280x720, i.e.
+**45% of the frame rate on Eden's software renderer**; on the Switch's own GPU
+it is a different story.  The 2D UI atlas also becomes the HD tree at that
+view size, which is a one-off cost (VRAM and load time), not a per-frame one.
+
 

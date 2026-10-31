@@ -60,8 +60,8 @@
 # present path keeps the aspect ratio and puts black bars on the sides, and
 # the 3D scene loses 160 pixels of width for nothing.
 #
-# view=2048x1152 -- the 16:9 view.  MEASURED, GOOD (archive
-# 20261028-211808-eden-q7):
+# view=2048x1152 -- the 16:9 view.  The ATLAS half is MEASURED GOOD
+# (archive 20261028-211808-eden-q7):
 #
 #   Res base: 2048x1152
 #   Res order:
@@ -71,11 +71,9 @@
 #   share) Current res: 2048, 1152
 #   view=2048x1152  present=0,0 1280x720
 #
-# Three independent instruments agree that the picture is fixed: the atlas
-# load failures went 125 -> 0, the LocalStyles failures disappeared, and the
-# 240 asset digests matched with src=rr3gui0: (the real HD volume).  The
-# present rect is the whole 1280x720 screen with no black bars, because
-# 2048/1152 and 1280/720 are both 16:9.
+# Three independent instruments agree that the HD atlas loads: the atlas load
+# failures went 125 -> 0, the LocalStyles failures disappeared, and the 240
+# asset digests matched with src=rr3gui0: (the real HD volume).
 #
 # WHY 16:9 STILL PICKS THE 4:3 ATLAS.  The guest's own comparator
 # (ELF 0x10f9948) compares the node's HEIGHT first and its WIDTH second --
@@ -84,12 +82,15 @@
 # 2048x1536 passes it because the VIEW is 2048x1152 (1536 > 1152 is not
 # required; the filter is an OR).
 #
-# TO GO BACK TO THE OLD PICTURE: change the three lines below to 1280x720
-# and redeploy.  That is the layout the touch script's pixel coordinates were
-# measured on.
+# BUT THE PICTURE HALF OF IT IS MEASURED BROKEN (2026-11-01, run q67, archive
+# 20261101-020018-eden-rr3-q67-hd2048): the guest rendered with a 2048x1152
+# viewport into the 1280x720 window and the picture landed in the bottom left
+# corner with the rest of the buffer blank.  The full account is at the END
+# of this file; the short version is that the port has no surface of the view
+# size, so a bigger view is a crop, not a scale.
 #
 # ---------------------------------------------------------------------------
-# THE ACTIVE CONFIGURATION: 2048x1152 -- THE PICTURE THE PORT IS FOR
+# THE ACTIVE CONFIGURATION: 1280x720 -- SEE THE END OF THIS FILE
 #
 # WHY IT IS HERE NOW.  The HD tree and the HD quality are PROVEN (q7 above).
 # The lap counter was measured on the OLD layout, because the touch script's
@@ -108,8 +109,10 @@
 # 125,841 spline units and stopped against something, and the port's
 # autopilot reversed itself 24 times without getting free.
 #
-# SO THE LAYOUT IS NO LONGER THE BLOCKER, and the card goes back to the HD
-# configuration, which is the picture the port is for.
+# SO THE LAYOUT IS NO LONGER THE BLOCKER.  (The HD configuration it went back
+# to was measured BROKEN afterwards -- see the end of this file -- and the
+# card is back on the 1280x720 layout, which is the layout everything else in
+# this project was measured on.)
 #
 # WHAT IS STILL LAYOUT-DEPENDENT: the touch script (rr3-touch.txt) is a list
 # of PIXEL coordinates measured on the 1280x720 layout.  At 2048x1152 the
@@ -119,6 +122,52 @@
 # guest's own red glove cursor shows where it wants to be pressed (measured
 # in the q7 frames at about (762, 138)).
 #
-platform=2048x1152
-ui=2048x1152
-view=2048x1152
+# ---------------------------------------------------------------------------
+# 2026-11-01: THE HD VIEW IS BACK TO 1280x720, BECAUSE IT IS MEASURED BROKEN
+#
+# MEASURED (archive 20261101-020018-eden-rr3-q67-hd2048, run q67, the ONLY
+# round that ever ran this file's old 2048x1152 default):
+#
+#   phase=guest-log-any Res base: 2048x1152
+#   phase=guest-log-any Res order:
+#     (2048.000000, 1536.000000) - 1.333333 - gui_assets/2048x1536/   <-- FIRST
+#     (960.000000, 640.000000) - 1.500000 - gui_assets/960x640/
+#     (480.000000, 320.000000) - 1.500000 - gui_assets/480x320/
+#   phase=scissor ... viewport=0,0,2048,1152
+#
+# So the guest DID take the HD tree and DID render with a 2048x1152 viewport.
+# And the picture was WRONG: frames/frame-000300.png of that archive is
+# 2048x1152 and the guest's content occupies only the BOTTOM LEFT 1280x720 of
+# it, with the rest of the buffer blank.
+#
+# WHY.  The port answers eglQuerySurface(EGL_WIDTH/EGL_HEIGHT) with the VIEW
+# size (source/gfx/gfx_egl.cpp:381-388) -- but the surface the guest renders
+# into is the 1280x720 window.  A viewport bigger than the buffer draws only
+# the part that fits: the picture lands in a corner and the rest is never
+# drawn.  The present path cannot rescue it, because the pixels are gone.
+#
+# The HD view needs a surface that REALLY IS 2048x1152 -- the port owns an
+# offscreen target and blits it into the window, scaled, at present time.
+# That is the next work item; until it exists, a bigger view is a broken
+# picture, not a sharper one.
+#
+# WHAT 1280x720 GIVES, AND IT IS NOT A PICTURE QUALITY LOSS:
+#   * the 3D vehicles and the track use the HD materials already.  The guest
+#     reads assets_2048x1536 in EVERY run (measured: 352 opens in the 1280x720
+#     run q66, 358 in the HD run q67 -- the same), because the 3D asset tree
+#     is chosen by the DEVICE PROFILE's quality tier (AndroidHigh = High),
+#     NOT by the view size;
+#   * the 2D UI atlas is the 960x640 one, which is exactly the split the
+#     screenshot asked for: HD on the vehicles and the environment, the UI
+#     left alone;
+#   * the picture is correct, 1:1, and it costs 45% less than the broken HD
+#     view (measured: 3720 frames in 306 s at 1280x720, 1680 frames in
+#     305 s at 2048x1152).
+#
+# ON EDEN: the window is usually bigger than 1280x720, and the emulator
+# upscales the framebuffer into it, which is what makes the picture look
+# soft.  Run the Eden window at exactly 1280x720 and the picture is 1:1.
+#
+platform=1280x720
+ui=1280x720
+view=1280x720
