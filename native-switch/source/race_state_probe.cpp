@@ -953,49 +953,118 @@ void fillCarState(RaceMetricsSample* out) {
         (out->carX > -400000 && out->carX < 400000) &&
         (out->carY > -400000 && out->carY < 400000) &&
         (out->carZ > -20000 && out->carZ < 20000);
+    // THE TARGET'S OWN GATE.
+    //
+    // MEASURED 2026-11-01 (q81): the offset read for the aim target holds
+    // 8992131 in its Y word -- 35 km -- while the car itself is at
+    // (20590, 53003), i.e. 80 m and 207 m from the origin.  A target that
+    // is not gated is a target that steers the car on noise, so the
+    // pursuit is REFUSED when the target fails:
+    //
+    //   |tx|,|ty| < 400000     the same range as the position
+    //   0.05 m < distance < 500 m   a point ahead of the car, not on it and
+    //                              not across the map
+    {
+        const double dx = (static_cast<double>(out->carTargetX) -
+                           static_cast<double>(out->carX)) / 256.0;
+        const double dy = (static_cast<double>(out->carTargetY) -
+                           static_cast<double>(out->carY)) / 256.0;
+        const double distance = std::sqrt(dx * dx + dy * dy);
+        out->targetPlausible =
+            out->positionPlausible &&
+            (out->carTargetX > -400000 && out->carTargetX < 400000) &&
+            (out->carTargetY > -400000 && out->carTargetY < 400000) &&
+            distance > 0.05 && distance < 500.0;
+        out->targetDistance = distance;
+    }
     // The car's own number, which the guest reads at 0xb35ca8
     // (`ldr w1,[x9,#0x49c]`).  It is a cheap identity check: the value has
     // to be the same one the guest would read, and it changes when the
     // player changes car.
     readDword(car + 0x49cULL, &out->carNumber);
-    // THE CAR'S OWN LAYOUT, DUMPED.
+    // THE CAR'S OWN LAYOUT, AS A DIFF.
     //
-    // MEASURED 2026-10-29, q21: the node index, the world position and the
-    // aim target all read as zero or noise (cnode=0, cpos=2,33,0,
-    // ctgt=0,0,0), while CAR_STATE's node index and distance ARE right
-    // (snode=290, sdist=13508).  So the offsets the port uses on the CAR
-    // are not the fields it thinks they are.
+    // MEASURED 2026-11-01 (q81, archive 20261101-055835-eden-rr3-q81-final-
+    // 720p, the full race-state line):
     //
-    // Rather than guess again, this prints the CAR object's own bytes, the
-    // same way the metrics modifier is dumped: 32-bit words with "%08x",
-    // which byte-swaps each group of four relative to memory, so a reader
-    // must undo it.  One round of this settles where the position is.
+    //   cpos=20590,53003,1  posok=1     the world position IS readable
+    //   ctgt=312,8992131,-19347          the aim target is NOT (8992131/256
+    //                                     = 35 km)
+    //   cnode=696696                     the node index is NOT either
+    //   perr=0.0000 pur=0                so the pure-pursuit error is
+    //                                     identically zero and the
+    //                                     controller steers on the swept
+    //                                     magnitude alone
+    //   stalls=11 brk=1                  the car found the first barrier and
+    //                                     stayed there
     //
-    // It is a DIAGNOSTIC, and it is bounded: 0x120 bytes at a fixed rate.
+    // So the ONE missing field is a POINT AHEAD OF THE CAR, and the car has
+    // everything else it needs (its position is exact).  Rather than guess an
+    // offset again -- guessing is what produced cpos=2,33,0 and ctgt=0,0,0 --
+    // this records WHICH WORDS OF THE CAR MOVE while the car drives.  The
+    // position moves, the velocity moves, and a target point moves too; the
+    // words that move together, in the same 1/256 metre unit, a little way
+    // ahead of the car, ARE the aim target.
+    //
+    // The range covers the car itself and the camera controller that hangs
+    // off it (CAR+0x448), and the record is a DIFF, so it stays readable: one
+    // line per tick, only the words that changed, each with its integer and
+    // its float reading.
     {
         // The probe is pumped once per frame by the frame loop, so a local
         // counter is the frame number.  It is a LOCAL static on purpose:
         // this file has no global pump counter, and borrowing one from
         // another translation unit would couple two unrelated files.
-        static unsigned long long s_dumpAt = 0;
+        constexpr int kWords = 0x600 / 4;
+        static uint32_t s_prev[kWords];
+        static bool s_havePrev = false;
         static unsigned long long s_calls = 0;
+        static unsigned long long s_dumpAt = 0;
         const unsigned long long now = ++s_calls;
         if (now >= s_dumpAt) {
-            s_dumpAt = now + 600ULL;
-            char raw[2048];
-            int written = std::snprintf(raw, sizeof(raw), "car=0x%llx w=",
+            s_dumpAt = now + 30ULL;
+            uint32_t cur[kWords];
+            for (int i = 0; i < kWords; ++i) {
+                cur[i] = 0;
+                readDword(car + static_cast<uintptr_t>(i * 4), &cur[i]);
+            }
+            char raw[3072];
+            int written = std::snprintf(raw, sizeof(raw), "car=0x%llx",
                                         static_cast<unsigned long long>(car));
-            for (int off = 0x00; off < 0x120; off += 4) {
-                if (written <= 0 || written >= static_cast<int>(sizeof(raw)) - 12) {
+            int changed = 0;
+            for (int i = 0; i < kWords && changed < 40; ++i) {
+                if (s_havePrev && cur[i] == s_prev[i]) {
+                    continue;
+                }
+                ++changed;
+                if (written <= 0 ||
+                    written >= static_cast<int>(sizeof(raw)) - 96) {
                     break;
                 }
-                uint32_t word = 0;
-                readDword(car + static_cast<uintptr_t>(off), &word);
+                const int32_t asInt =
+                    static_cast<int32_t>(s_havePrev ? s_prev[i] : 0u);
+                const int32_t asIntNow = static_cast<int32_t>(cur[i]);
+                float asFloat = 0.0f;
+                std::memcpy(&asFloat, &cur[i], sizeof(asFloat));
                 written += std::snprintf(raw + written,
                                          sizeof(raw) - static_cast<size_t>(written),
-                                         "%08x", word);
+                                         " +%03x:%d>%d(f=%.3g)",
+                                         i * 4, asInt, asIntNow,
+                                         static_cast<double>(asFloat));
             }
-            appendGuestBootLine(kGuestViewLogPath, "car-raw", 103, 0, raw);
+            if (changed >= 40) {
+                written += std::snprintf(raw + written,
+                                         sizeof(raw) - static_cast<size_t>(written),
+                                         " ...+%d more",
+                                         changed - 40);
+            }
+            std::snprintf(raw + written, sizeof(raw) - static_cast<size_t>(written),
+                          " changed=%d", changed);
+            appendGuestBootLine(kGuestViewLogPath, "car-diff", 103, 0, raw);
+            for (int i = 0; i < kWords; ++i) {
+                s_prev[i] = cur[i];
+            }
+            s_havePrev = true;
         }
     }
     // The previous node index is the camera controller's, and the camera
@@ -1009,6 +1078,89 @@ void fillCarState(RaceMetricsSample* out) {
     out->trackStateAddress = static_cast<uintptr_t>(carState);
     readDword(carState + 0x1a8ULL, &out->splineNode);
     readDword(carState + 0x1c8ULL, &out->splineDistance);
+    // THE CAR_STATE, AS A DIFF.
+    //
+    // MEASURED 2026-11-01 (q82, archive 20261101-060733-eden-rr3-q82-cardiff):
+    // the car's own memory holds exactly ONE sane position-like triple --
+    // the car's position at +0xc8/+0xcc/+0xd0 -- and every other word that
+    // moves is a float3 of a quaternion (0.998, +-0.0643, 1.0, -0.00134:
+    // the car's orientation).  **THE AIM TARGET IS NOT ON THE CAR OBJECT.**
+    //
+    // The next place is the CAR_STATE: the guest's own per-car state, which
+    // the port already trusts for the spline node index (+0x1a8) and the
+    // distance travelled (+0x1c8), and which is where a racing line or a
+    // target point would live.  Same diff, same unit, same discipline.
+    {
+        constexpr int kWords = 0x400 / 4;
+        static uint32_t s_prev[kWords];
+        static bool s_havePrev = false;
+        static unsigned long long s_calls = 0;
+        static unsigned long long s_dumpAt = 0;
+        const unsigned long long now = ++s_calls;
+        if (now >= s_dumpAt) {
+            s_dumpAt = now + 30ULL;
+            uint32_t cur[kWords];
+            for (int i = 0; i < kWords; ++i) {
+                cur[i] = 0;
+                readDword(carState + static_cast<uintptr_t>(i * 4), &cur[i]);
+            }
+            char raw[3072];
+            int written = 0;
+            if (!s_havePrev) {
+                // THE FIRST RECORD IS THE WHOLE OBJECT, in hex.  The diffs
+                // that follow only show what MOVES, and the things that do
+                // not move are exactly the POINTERS -- and a pointer into
+                // the track's racing line is what this hunt is looking for.
+                written = std::snprintf(raw, sizeof(raw), "cs=0x%llx full=",
+                                        static_cast<unsigned long long>(carState));
+                for (int i = 0; i < kWords; ++i) {
+                    if (written <= 0 ||
+                        written >= static_cast<int>(sizeof(raw)) - 12) {
+                        break;
+                    }
+                    written += std::snprintf(raw + written,
+                                             sizeof(raw) - static_cast<size_t>(written),
+                                             "%08x", cur[i]);
+                }
+            } else {
+                written = std::snprintf(raw, sizeof(raw), "cs=0x%llx",
+                                        static_cast<unsigned long long>(carState));
+            }
+            int changed = 0;
+            for (int i = 0; i < kWords && changed < 40; ++i) {
+                if (s_havePrev && cur[i] == s_prev[i]) {
+                    continue;
+                }
+                ++changed;
+                if (written <= 0 ||
+                    written >= static_cast<int>(sizeof(raw)) - 96) {
+                    break;
+                }
+                const int32_t asInt =
+                    static_cast<int32_t>(s_havePrev ? s_prev[i] : 0u);
+                const int32_t asIntNow = static_cast<int32_t>(cur[i]);
+                float asFloat = 0.0f;
+                std::memcpy(&asFloat, &cur[i], sizeof(asFloat));
+                written += std::snprintf(raw + written,
+                                         sizeof(raw) - static_cast<size_t>(written),
+                                         " +%03x:%d>%d(f=%.3g)",
+                                         i * 4, asInt, asIntNow,
+                                         static_cast<double>(asFloat));
+            }
+            if (changed >= 40) {
+                written += std::snprintf(raw + written,
+                                         sizeof(raw) - static_cast<size_t>(written),
+                                         " ...+%d more", changed - 40);
+            }
+            std::snprintf(raw + written, sizeof(raw) - static_cast<size_t>(written),
+                          " changed=%d", changed);
+            appendGuestBootLine(kGuestViewLogPath, "carstate-diff", 103, 0, raw);
+            for (int i = 0; i < kWords; ++i) {
+                s_prev[i] = cur[i];
+            }
+            s_havePrev = true;
+        }
+    }
 }
 
 void fillMetrics(RaceMetricsSample* out, uintptr_t address) {
@@ -1648,7 +1800,14 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
             const double dLen = std::sqrt(dx * dx + dy * dy);
             // 0.05 m: below that the car is standing still or the target is
             // on top of it, and the heading is noise.
-            if (hLen > 0.05 && dLen > 0.05) {
+            //
+            // AND THE TARGET HAS TO PASS ITS OWN GATE.  MEASURED 2026-11-01
+            // (q81): the target the port reads was 35 km away, and a
+            // pursuit that aims at a point 35 km away is not a pursuit, it
+            // is a steering command derived from noise.  With the gate the
+            // pursuit stays OFF (pur=0) instead of turning the car at
+            // random.
+            if (hLen > 0.05 && dLen > 0.05 && m.targetPlausible) {
                 const double ax = hx / hLen;
                 const double ay = hy / hLen;
                 const double bx = dx / dLen;
@@ -1742,7 +1901,8 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             "totalF=%.3f speed=%u speedF=%.3f time=%u timeF=%.3f "
             "rate=%.6f prog=%.3f from_total=%d sawprog=%d "
             "car=0x%llx cnum=%u cnode=%u cprev=%u cpos=%d,%d,%d ctgt=%d,%d,%d "
-            "snode=%u sdist=%u tsok=%d posok=%d perr=%.4f pur=%d ident=0x%llx "
+            "snode=%u sdist=%u tsok=%d posok=%d ctok=%d ctdist=%.2f "
+            "perr=%.4f pur=%d ident=0x%llx "
             "drive=%d steer=%.3f mag=%.3f sign=%d best=%.6f flips=%d stalls=%d "
             "thr=%d brk=%d",
             frame, static_cast<unsigned long long>(g_cglobal),
@@ -1776,6 +1936,7 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             m.splineNode, m.splineDistance,
             m.positionPlausible ? 1 : 0,
             m.trackStateAddress != 0 ? 1 : 0,
+            m.targetPlausible ? 1 : 0, m.targetDistance,
             static_cast<double>(g_drive.steerError), g_drive.pursuit ? 1 : 0,
             static_cast<unsigned long long>(m.membersIdentified),
             g_drive.enabled ? 1 : 0, static_cast<double>(g_drive.steer),

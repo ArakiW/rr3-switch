@@ -129,6 +129,18 @@ struct RaceMetricsSample {
     // reported so that a run which read the wrong object says so in the
     // log instead of driving on noise.
     bool positionPlausible{false};
+    // Whether the AIM TARGET that was just read is plausible: inside the
+    // guest's 1/256 metre range AND a sensible distance AHEAD of the car.
+    //
+    // MEASURED 2026-11-01 (q81): the offset the port reads for the target
+    // holds 8992131 -- 35 km -- so a target that is not gated would steer
+    // the car on noise.  The pursuit has to be refused, not merely
+    // unhelpful, when the target fails this.
+    bool targetPlausible{false};
+    // How far the target is from the car, in metres, when the two are
+    // believed to be in the same units.  Reported so a run can say "the
+    // target is 35 km away" instead of leaving it to be deduced.
+    double targetDistance{};
     uintptr_t trackStateAddress{};
     uint32_t splineNode{};
     uint32_t splineDistance{};

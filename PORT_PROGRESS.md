@@ -11191,3 +11191,151 @@ round, same frame, two numbers.
     in 306 s -> **55% of the frame rate**.  The cost is pixels, not the blit.
   * q78 (with the redirect): the frame rate is the same; the redirect costs
     nothing measurable.
+
+## 2026-11-01  The race is REACHED and RENDERED; the car crashes because the port cannot read the aim target
+
+### The picture first
+
+The shipping path (view=1280x720) now plays the race.  q81's captures show the
+full 3D scene: the car with its livery, the circuit, the grandstands, the
+ferris wheel behind the start line, the Aramco barriers, the sky, the HUD
+(pause button top-left, F1 mark top-right) and the Chinese tutorial prompt
+「按住刹车来倒车」.  The car's textures are DETAILED (the tyre lettering, the
+carbon weave, the "REAL RACING" wordmark) -- which is the direct answer to
+"are the car textures blurry": they are not, and what the user saw was the
+emulator magnifying a 1280x720 picture.
+
+### What the race-state line says (q81, the full line)
+
+```
+laps=4294967295 lapF=-1.000 lapd=1298432 total=92183 speed=10720 time=100893
+rate=6.941667 prog=92183.000 sawprog=1
+car=0x213668a810 cnum=0 cnode=696696 cpos=20590,53003,1 ctgt=312,8992131,-19347
+snode=542 sdist=7145 tsok=1 posok=1 perr=0.0000 pur=0
+drive=1 steer=0.600 mag=0.590 sign=-1 best=0.000000 flips=0 stalls=11 thr=0 brk=1
+```
+
+  * `cpos=20590,53003,1 posok=1` -- **the car's world position IS read
+    correctly** (80 m, 207 m, 4 mm, in the guest's 1/256 metre unit).
+  * `ctgt=312,8992131,-19347` -- **the aim target is garbage**: 8992131/256 is
+    35 km.
+  * `cnode=696696` -- the node index at that offset is garbage too.
+  * `perr=0.0000 pur=0` -- so the pure-pursuit error is identically zero and
+    **the pursuit is never used**; the controller steers on the swept
+    magnitude alone, which is "go straight with a slowly sweeping wheel".
+  * `stalls=11 brk=1` -- the car found the first barrier and stayed there,
+    reversing out of it eleven times.  `laps=-1` follows: no lap.
+
+⇒ **THE ONE MISSING FIELD IS A POINT AHEAD OF THE CAR.**  The car has its
+position exactly; it has no target; so it cannot follow a curve.
+
+### What changed in the port
+
+  * **The aim target is gated.**  A target that is not inside the guest's
+    1/256 metre range, or that is not between 0.05 m and 500 m ahead of the
+    car, is REFUSED: the pursuit stays off (`pur=0`) instead of turning the
+    wheel at random.  The verdict and the distance are reported
+    (`ctok=`, `ctdist=`), so a run says "the target is 35 km away" instead of
+    leaving it to be deduced from a car that will not move.
+  * **The car's memory is recorded as a DIFF.**  Every 30 frames the probe
+    reads the first 0x600 bytes of the CAR object (the car itself and the
+    camera controller hanging off it at +0x448) and logs only the words that
+    CHANGED, with their integer and their float reading.  The position
+    moves, the velocity moves, and a target point moves too: the words that
+    move together, in the same unit, a little way ahead of the car, ARE the
+    aim target.  This is how the offset gets MEASURED instead of guessed --
+    guessing is what produced `cpos=2,33,0` and `ctgt=0,0,0` in the first
+    place (q21, 2026-10-29).
+  * A contract test (`test_race_state_probe.py`, section 7) now holds the
+    probe to the gate: the flag has to exist, the pursuit has to require it,
+    the gate has to have bounds, and the log has to report the verdict.
+
+### Next
+
+Read the diff, pick the target, and then the pursuit drives by the racing
+line.  Two things the round after that will have to settle:
+
+  * the SIGN of the steering axis.  The guest's own converter NEGATES Y
+    (`mov w8,#-0x3c800000` at 0xf05600), so the world's Y axis runs the other
+    way than the arithmetic assumes and the cross product's sign follows it.
+    `steersign` in rr3-drive.txt is the knob, and one round settles it.
+  * the LOOKAHEAD LENGTH.  The target's distance from the car decides how
+    twitchy the steering is; the diff reports it.
+
+### The ad path: mapped, not implemented (and why it is not the blocker)
+
+The "ads have zero observability" item is now EXPLAINED, and it is not the
+thing standing between the port and a playable game.
+
+  * the guest ships the **Glu** SDK (`GluCentralServices 7.3.0-2d3b0bd`) and
+    uses its NATIVE half: it registers JNI natives on
+    `csdk/gluads/GluAdsNativeBridge` (15 methods),
+    `csdk/glucentralservices/util/AndroidPlatform` (10) and
+    `csdk/glucentralservices/eventbus/ServerEventBus` (7);
+  * the port implements NONE of the `csdk/*` Java classes -- there is not one
+    in the port's class registry -- so every call the guest's native code
+    makes into Java lands on nothing:
+    `cc-dispatch ... class=csdk/gluads/GluAdsNativeBridge
+    method=setAdvertisingListener -> no class, no unique name`;
+  * in a 300 s run the guest made **two** such calls (`createGluAds`,
+    `setAdvertisingListener`), and the game's own config keys
+    (`ADS_GoogleNativeAdsEnabled`, `ADS_GoogleNativeAdReward`,
+    `ADS_GoogleNativeAdMaxRewardCountDaily`, `ADS_GoogleNativeAdBannerCooldownSec`)
+    and its config files (`GluAdsConfigDebug/Prod.json`) are all present.
+
+⇒ The port's dispatch log ALREADY observes every ad call (that is the
+"no class, no unique name" line), so the path is not invisible; what is
+missing is the port-side implementation.  A no-op Java surface for the three
+classes would close the loop: the guest's ad calls would succeed, no ad
+would ever be shown, and the game would be unaffected -- which is the right
+behaviour for this build anyway.
+
+⇒ NOT DONE, and deliberately so: the Glu Java surface is dozens of methods
+wide, the game reaches the race without it, and the only thing it buys is a
+cleaner ad path.  It is parked as a bounded, well-specified task.
+
+### Where the aim target is NOT (measured, q82 and q84)
+
+The car's memory was recorded as a DIFF (every 30 frames, the first 0x600
+bytes of the CAR object and the first 0x400 bytes of the CAR_STATE, only the
+words that CHANGED, with their integer and float readings).
+
+  * **The CAR object holds exactly ONE sane position-like triple** -- the
+    car's own position at +0xc8/+0xcc/+0xd0.  Every other word that moves
+    is a float3 of a quaternion (0.998, +-0.0643, 1.0, -0.00134: the car's
+    orientation, the camera's, the wheels').  **THE AIM TARGET IS NOT ON THE
+    CAR OBJECT.**
+  * **The CAR_STATE holds one moving sane triple too**: +0xdc/+0xe0/+0xe4,
+    which reads (144, 592, 16) in the 1/256 metre unit -- 0.6 m, 2.3 m,
+    0.06 m.  That is the car's VELOCITY (2.3 m per frame is about 266 km/h,
+    which is a race car), not a point ahead of the car.
+  * The CAR_STATE has **no guest pointers** at all in its first kilobyte.
+
+⇒ So the port has the car's position AND its velocity (hence its heading),
+and it is still missing the one thing a steering controller needs: **a point
+ahead of the car on the racing line.**
+
+### The three places that point could still be
+
+  1. **The track's own data files, which the port ALREADY HAS ON THE CARD.**
+     `processed/<name>.spline` (the spline) and `processed/<name>.rr_ai`
+     (the AI's racing line) are mirrored there by the tracks-volume fix, and
+     the guest loads them from there.  **The AI line is exactly the racing
+     line the AI cars follow.**  The cost is the format: both files are the
+     guest's own container (a header, an MD5, and named chunks -- the spline
+     file's first chunk is literally `centre_spline`), and the chunk bodies
+     are compressed, so reading them means reversing the guest's loader.
+  2. **The guest's memory**, wherever the guest keeps the line it steers the
+     AI cars by.  The diffs above rule out the car and the car state; the
+     next candidates are the track object the race-metrics modifier points
+     at, and the camera controller's own `m_vLastKnownTarget`.
+  3. **The device profile's settings.**  The guest has its own
+     `ADS_*` and driving-assist keys, and the port's settings layer writes
+     the profile -- so a driving-assist or auto-steer key might exist that
+     makes the guest drive the PLAYER's car by its own racing line, which
+     would be better than any controller the port could write.
+
+⇒ The port's own steering is now safe rather than clever: with the target
+gated, a target that fails the gate keeps the pursuit OFF (`pur=0`) instead
+of turning the wheel at random, and the log says how far the target was and
+that it was refused.

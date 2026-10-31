@@ -405,12 +405,45 @@ def main() -> int:
     assert "racemetrics" in source, (
         "the probe does not carry the map key it cross-checks")
 
+    # 7. THE AIM TARGET'S GATE.
+    #
+    #    MEASURED 2026-11-01 (q81, archive 20261101-055835-eden-rr3-q81-final-
+    #    720p): the offset the probe reads for the aim target held 8992131 --
+    #    35 km -- while the car itself was at (20590, 53003), i.e. 80 m and
+    #    207 m from the origin.  A pursuit that aims at a point 35 km away is
+    #    not a pursuit; it is a steering command derived from noise.
+    #
+    #    The value is only knowable at runtime, so this is a contract on the
+    #    SOURCE: the gate has to exist, it has to have bounds, and the
+    #    pursuit has to REFUSE a target that failed the gate (otherwise the
+    #    gate is decoration).
+    assert "targetPlausible" in header, (
+        "the probe's header does not carry the aim target's plausibility flag")
+    assert "targetPlausible" in source, (
+        "the probe does not compute the aim target's plausibility")
+    pursuit_lines = [l for l in source.splitlines() if "dLen > 0.05" in l]
+    assert pursuit_lines, (
+        "the pure-pursuit block is not where this test expects it "
+        "(no 'dLen > 0.05' line)")
+    assert any("m.targetPlausible" in l for l in pursuit_lines), (
+        "the pure pursuit does not require a plausible target, so a target "
+        "35 km away would still steer the car")
+    assert "400000" in source, (
+        "the aim target's gate has no sane-range bound")
+    assert "500.0" in source, (
+        "the aim target's gate has no distance bound in metres")
+    # The verdict has to be REPORTED, so a run can say "the target is 35 km
+    # away" instead of leaving it to be deduced from a missing picture.
+    assert "ctok=%d" in source and "ctdist=" in source, (
+        "the race-state log does not report the target's verdict and distance")
+
     print("PASS: the race-state probe's vtables and member offsets agree with "
           "the guest binary "
           f"({len(expected_classes)} classes, {len(expected_members)} members); "
           f"the GameMode chain gives CGlobal+0x{game_mode_offset:x}; "
           f"{len(mode_classes)} concrete game-mode classes, none of them the "
-          "abstract base")
+          "abstract base; the aim target is gated and the pursuit refuses a "
+          "target that failed the gate")
     return 0
 
 
