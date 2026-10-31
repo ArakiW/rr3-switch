@@ -9069,7 +9069,21 @@ void* frameLoopDriver(void* opaque) {
                 }
             }
 
-            static const unsigned kScheduleHead[] = { 30u, 120u, 300u, 600u, 1000u };
+            // THE EVENT MAP LIVES IN THE GAP BETWEEN 120 AND 300.
+            //
+            // The guest's own screen tree says the front end goes
+            // EventMapScreen at frame 180 and EventsScreen at frame 330, so the
+            // event card -- the screen the user's screenshot is of -- is on
+            // screen from about frame 180 to 270 and is gone before the 300
+            // capture.  The schedule had 120 and then 300, so the card was
+            // never on disk: three runs in a row produced no picture of it,
+            // and "the card's labels overlap" could not be checked against the
+            // card itself.
+            //
+            // 200 is inside that window.  One more capture costs about eight
+            // seconds of PNG encoding under a software renderer, once.
+            static const unsigned kScheduleHead[] = { 30u, 120u, 200u,  300u,
+                                                      600u, 1000u };
             constexpr unsigned kScheduleFrom = 1200u;
             constexpr unsigned kScheduleStep = 200u;
             constexpr unsigned kScheduleLast = 12000u;
