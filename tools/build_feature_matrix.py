@@ -26,7 +26,7 @@ REPO = r"E:\AI\RealRacing3-switch"
 CARD = r"E:\Eden-rr3\user\sdmc\switch\rr3-native-rehost\.depot"
 BASE = os.path.join(CARD, "asset_list_base.txtCache.txt")
 RUN_DIR = os.path.join(REPO, ".build", "eden-runs")
-DEFAULT_RUN = "20261031-031607-eden-rr3-q39-alias-heapall"
+DEFAULT_RUN = "20261031-132546-eden-rr3-q47-open-new-screen"
 OUT = os.path.join(REPO, "docs", "FEATURE-MATRIX.md")
 
 TOKEN_RE = re.compile(r"(\S+\.(?:gui|atlas|dds|pvr|nct|dat|bin|txt|otf)(?:\.z)?)")
