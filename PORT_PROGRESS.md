@@ -10876,6 +10876,40 @@ the MAIN MENU and frame 600 had no card at all, even though the probe called
 frames 330..360 "EventsScreen".  So a capture inside the window is necessary
 but not sufficient -- the frame has to be LOOKED AT, not trusted.
 
+### 2026-11-01 (02:50): THE EVENT CARD, PHOTOGRAPHED -- AND IT PASSES
+
+Run q71 (the schedule now has a slot at 340) captured it:
+
+    archive 20261101-024317-eden-rr3-q71-card340
+    frames/frame-000340.png   (1.16 MB)
+
+It is the 「选择赛事」 (CHOOSE EVENT) screen with its three cards, and the
+card's label column measures:
+
+    ink band 0: y = 457..474  h=18      (CARD_TYPE,   box 455..475 20 px)
+    ink band 1: y = 485..499  h=15      (CARD_TRACK,  box 485..501 16 px)
+    ink band 2: y = 513..528  h=16      (CARD_TRACK_2,box 512..528 16 px)
+    gap 0/1 = 10 rows
+    gap 1/2 = 13 rows
+
+**⇒ THE INK IS 15 AND 16 PIXELS -- THE BOX HEIGHT -- NOT THE 40 PIXEL INK.**
+The guest scales the text into the label's box, and with the real Font
+metrics the scale is right; the two labels are 10 and 13 rows apart instead
+of running together.
+
+That closes the acceptance the user asked for: the screen in their
+screenshot (a card whose 「滨海湾市街赛道」 and 「大奖赛赛道」 were drawn on top
+of each other) now renders with the two lines separate and the glyphs at
+their proper size.
+
+**⇒ AND IT CONFIRMS THE MECHANISM.**  The card's labels are measured as 42 px
+CJK lines (boundsH=42) in 16 px boxes, the guest never clips them (8981
+scissor rectangles, none 257 wide and none <= 20 tall), so the only way they
+can be 27 px apart on screen is if the guest scales the text into the box --
+and the scale comes from the Font metrics the port hands it.  With the
+synthetic 48 px Font that scale was 2.6x too big; with the real metrics it
+is right.
+
 
 
 
