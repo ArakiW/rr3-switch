@@ -10499,3 +10499,69 @@ described.
   the synthetic 48 px set.  They are only read after `loadGlyph()`, and the
   guest's use of them is not yet instrumented.
 * The HD tree is still unreachable (see above).
+
+## 2026-11-01 (02:40): WHAT THE FONT FIELD PROBE SAYS, AND TWO MORE MEASUREMENTS
+
+### The probe: the guest reads EXACTLY the six metrics we now measure
+
+`jni_bridge.cpp` now logs every Font field the guest reads, once each.  Run
+q65 (archive `20261101-014847-eden-rr3-q65-fontfields`) says:
+
+    phase=jni-font-field field=ascent
+    phase=jni-font-field field=descent
+    phase=jni-font-field field=height
+    phase=jni-font-field field=top
+    phase=jni-font-field field=bottom
+    phase=jni-font-field field=leading
+
+**Six fields, and no others.**  The guest never reads `glyphOffX`,
+`glyphOffY`, `glyphWidth`, `glyphHeight`, `glyphAdvance` or the `bmp*`
+fields, so the per-glyph set can stay synthetic: the guest's layout is driven
+by the six metrics, and those are now the real face's numbers.
+
+### The loading notice: the two Chinese lines stopped touching
+
+Same screen, same frame index (the safety notice on the loading screen):
+
+    q63 frame-000120, band x 140..1170 y 530..650:
+        line 0: y = 550..588  h=39
+        line 1: y = 592..629  h=38
+        gap    = 3 rows          (at a 120 threshold the two merge into one)
+    q64 frame-000120:
+        line 0: y = 550..588  h=39
+        line 1: y = 600..637  h=38
+        gap    = 11 rows
+
+### The English safety notice: from 2910 px wide to 364 px
+
+The same notice's English paragraph is one long string, and the guest draws it
+into one quad.  The destination rectangle in the port's text-quad probe:
+
+    q63: rect=(593,290) 2910 x 162     -> 2910 px wide: most of it off-screen
+    q64: rect=(593,290)  364 x 162     ->  on screen
+
+So the English paragraph was ALSO mis-sized before, and the Font fix moved it
+back onto the screen.  It is a separate defect from the Chinese overlap (a
+nine-line paragraph in a label that wants a small font), and it is now the
+open item rather than the fixed one.
+
+### WHY THE LEADING IS THE FIX, NOT A NICETY -- the arithmetic
+
+The guest scales the whole paragraph texture into the label's box, so the gap
+the user sees between two lines is
+
+    (lineHeight - inkHeight) * scale
+
+The CJK ink of the notice is 131 px at 140 px (measured with fontTools against
+the shipped face).  The line advance was the font size, 140 px, before and is
+the real line box, 168 px, now.  The measured gaps fit exactly:
+
+    q63: (140 - 131) * 0.33 =  3 rows      <- measured  3
+    q64: (168 - 131) * 0.30 = 11 rows      <- measured 11
+
+**So the nine pixels of slack the old line box left were the whole problem.**
+The Chinese ink is 131 px and the old line box was 140 px: three rows of
+breathing room at the size the guest draws it, which is what "the two lines
+touch" looks like.  The leading is not cosmetic -- it is where the room comes
+from, and the arithmetic closes on the measurement to the row.
+
