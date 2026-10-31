@@ -342,6 +342,116 @@ void hostDrawMagentaQuad() {
 bool g_glStatsEnabled = false;
 GuestViewGlStats g_glStats{};
 
+// THE PORT'S OWN BINDS.  Set while the port binds a framebuffer for its own
+// reasons (the blit into the window), so the tracer does not redirect them.
+static bool g_hostBinding = false;
+
+void guestViewSetHostBinding(bool hostBinding) {
+    g_hostBinding = hostBinding;
+}
+
+bool guestViewHostBinding() {
+    return g_hostBinding;
+}
+
+// THE SIZE OF THE GUEST'S RENDER TARGETS, FROM THE GUEST'S OWN CALLS.
+//
+// Two small tables: the size of every texture the guest creates, and the
+// texture every framebuffer has attached to it.  Together they give the size
+// of the guest's scene framebuffer -- which is the number the present path
+// has to scale, and the number that says whether the view is bigger than the
+// screen.
+//
+// No GL query is involved on purpose.  The devkitPro GLES2 header has no
+// glGetTexLevelParameteriv, and the alternative (binding the texture to a
+// texture unit to ask it) would change state in the middle of the guest's
+// frame.  The guest already told us everything, in calls we are wrapping
+// anyway.
+namespace {
+struct GuestTextureSize {
+    uint32_t id;
+    uint32_t width;
+    uint32_t height;
+};
+constexpr size_t kMaxGuestTextures = 64;
+GuestTextureSize g_guestTextures[kMaxGuestTextures];
+size_t g_guestTextureCount = 0;
+
+struct GuestFramebufferAttachment {
+    uint32_t fbo;
+    uint32_t texture;
+};
+constexpr size_t kMaxGuestAttachments = 32;
+GuestFramebufferAttachment g_guestAttachments[kMaxGuestAttachments];
+size_t g_guestAttachmentCount = 0;
+
+void guestRememberTextureSize(uint32_t id, uint32_t width, uint32_t height) {
+    for (size_t i = 0; i < g_guestTextureCount; ++i) {
+        if (g_guestTextures[i].id == id) {
+            g_guestTextures[i].width = width;
+            g_guestTextures[i].height = height;
+            return;
+        }
+    }
+    if (g_guestTextureCount < kMaxGuestTextures) {
+        g_guestTextures[g_guestTextureCount].id = id;
+        g_guestTextures[g_guestTextureCount].width = width;
+        g_guestTextures[g_guestTextureCount].height = height;
+        g_guestTextureCount += 1;
+    }
+}
+
+void guestRememberAttachment(uint32_t fbo, uint32_t texture) {
+    for (size_t i = 0; i < g_guestAttachmentCount; ++i) {
+        if (g_guestAttachments[i].fbo == fbo) {
+            g_guestAttachments[i].texture = texture;
+            return;
+        }
+    }
+    if (g_guestAttachmentCount < kMaxGuestAttachments) {
+        g_guestAttachments[g_guestAttachmentCount].fbo = fbo;
+        g_guestAttachments[g_guestAttachmentCount].texture = texture;
+        g_guestAttachmentCount += 1;
+    }
+}
+
+uint32_t guestTextureWidth(uint32_t texture) {
+    for (size_t i = 0; i < g_guestTextureCount; ++i) {
+        if (g_guestTextures[i].id == texture) {
+            return g_guestTextures[i].width;
+        }
+    }
+    return 0;
+}
+
+uint32_t guestTextureHeight(uint32_t texture) {
+    for (size_t i = 0; i < g_guestTextureCount; ++i) {
+        if (g_guestTextures[i].id == texture) {
+            return g_guestTextures[i].height;
+        }
+    }
+    return 0;
+}
+} // namespace
+
+uint32_t guestFramebufferTextureWidth(uint32_t fbo) {
+    for (size_t i = 0; i < g_guestAttachmentCount; ++i) {
+        if (g_guestAttachments[i].fbo == fbo) {
+            return guestTextureWidth(g_guestAttachments[i].texture);
+        }
+    }
+    return 0;
+}
+
+uint32_t guestFramebufferTextureHeight(uint32_t fbo) {
+    for (size_t i = 0; i < g_guestAttachmentCount; ++i) {
+        if (g_guestAttachments[i].fbo == fbo) {
+            return guestTextureHeight(g_guestAttachments[i].texture);
+        }
+    }
+    return 0;
+}
+
 void enableGuestViewGlTrace(const char* progressPath) {
     g_progressPath = progressPath;
     g_lastStage = 0;
@@ -762,6 +872,16 @@ void guestViewTracedGlDrawArrays(GLenum mode, GLint first, GLsizei count) {
         ++g_glStats.drawArrays;
         g_glStats.lastDrawMode = mode;
         g_glStats.lastDrawElementsCount = static_cast<uint32_t>(count);
+        // DID THIS DRAW LAND IN THE PORT'S OFFSCREEN TARGET?  See the note
+        // in guestViewTracedGlDrawElements: the port's blit may only scale a
+        // target the guest actually drew into.
+        {
+            const uint32_t offscreen = guestViewOffscreenTargetFbo();
+            if (offscreen != 0 &&
+                g_glStats.lastBoundFramebuffer == static_cast<GLuint>(offscreen)) {
+                ++g_glStats.drawsIntoOffscreenTarget;
+            }
+        }
         // The arguments, not just the tally. With flr=1 (archive
         // 20261012-021130-flr1) the guest draws 46,630 times -- about two per
         // presented frame -- and the full-buffer readback is a single flat
@@ -826,6 +946,20 @@ void guestViewTracedGlDrawElements(GLenum mode, GLsizei count, GLenum type,
         ++g_glStats.drawElements;
         g_glStats.lastDrawMode = mode;
         g_glStats.lastDrawElementsCount = static_cast<uint32_t>(count);
+        // DID THIS DRAW LAND IN THE PORT'S OFFSCREEN TARGET?
+        //
+        // The port's blit scales that target into the window, so it may only
+        // run when the guest really drew into it this frame.  Otherwise the
+        // blit copies a stale or cleared target over the picture the guest
+        // drew into the window -- which is exactly what made the screen go
+        // flat in q76 and q78.
+        {
+            const uint32_t offscreen = guestViewOffscreenTargetFbo();
+            if (offscreen != 0 &&
+                g_glStats.lastBoundFramebuffer == static_cast<GLuint>(offscreen)) {
+                ++g_glStats.drawsIntoOffscreenTarget;
+            }
+        }
         if (g_glStats.drawElements <= 8) {
             guestViewWideLog("drawElements",
                              (static_cast<unsigned long long>(mode) << 32) |
@@ -841,6 +975,12 @@ void guestViewTracedGlTexImage2D(GLenum target, GLint level, GLint internalforma
                                  GLenum format, GLenum type, const void* pixels) {
     if (g_glStatsEnabled) {
         ++g_glStats.texImage2D;
+        // The size of the texture the guest is creating, against the texture
+        // it has bound.  This is how the size of the guest's scene
+        // framebuffer is known without asking GL anything.
+        guestRememberTextureSize(g_glStats.lastBoundTexture,
+                                 static_cast<uint32_t>(width),
+                                 static_cast<uint32_t>(height));
         // 512x0 is the broken guest upload (empty atlas slot). Replace with a
         // valid 128x128 magenta/black image so the texture object is complete.
         if ((width <= 0 || height <= 0) && pixels == nullptr) {
@@ -884,6 +1024,12 @@ void guestViewTracedGlCompressedTexImage2D(GLenum target, GLint level,
                                            GLsizei imageSize, const void* data) {
     if (g_glStatsEnabled) {
         ++g_glStats.compressedTexImage2D;
+        // Same as glTexImage2D: the size of the texture being created, so the
+        // framebuffer it is attached to has a size that is known without a
+        // GL query.
+        guestRememberTextureSize(g_glStats.lastBoundTexture,
+                                 static_cast<uint32_t>(width),
+                                 static_cast<uint32_t>(height));
         if (g_glStats.compressedTexImage2D <= 8) {
             guestViewWideLog("ctexImage2D",
                              (static_cast<unsigned long long>(width) << 16) |
@@ -897,27 +1043,85 @@ void guestViewTracedGlCompressedTexImage2D(GLenum target, GLint level,
 }
 
 void guestViewTracedGlBindFramebuffer(GLenum target, GLuint framebuffer) {
+    // THE GUEST'S "BIND THE DEFAULT FRAMEBUFFER" MEANS "BIND THE PORT'S
+    // TARGET", WHEN THE PORT HAS ONE.
+    //
+    // MEASURED 2026-11-01 (q76): the guest renders into its own scene
+    // framebuffer and composites into the DEFAULT one.  The port bound its
+    // target in front of the guest's frame, but the guest's own bind undid
+    // that: the composite went to the 1280x720 window, and the port's blit
+    // then wiped the window with the target's clear colour.  The window came
+    // out empty (one colour, rgba(0,0,0,0)) while the target held the
+    // guest's clear colour -- the guest's picture had been painted over.
+    //
+    // Redirecting the guest's bind is what makes the two agree on ONE
+    // framebuffer: the guest composites into the target (a surface of the
+    // view size, with the guest's own viewport), and the port scales that
+    // into the window.
+    //
+    // Only GL_FRAMEBUFFER and GL_DRAW_FRAMEBUFFER are redirected.  A READ
+    // bind of the default framebuffer must stay the default framebuffer: the
+    // guest reading the window back is a different question from the guest
+    // drawing into it.
+    //
+    // The port's own binds are excluded: the port's blit has to reach the
+    // real window, and it says so with guestViewSetHostBinding(true).
+    static constexpr GLenum kGlFramebuffer = 0x8D40;
+    static constexpr GLenum kGlDrawFramebuffer = 0x8CA9;
+    GLuint bindFrame = framebuffer;
+    bool redirected = false;
+    if (!g_hostBinding && framebuffer == 0 &&
+        (target == kGlFramebuffer || target == kGlDrawFramebuffer)) {
+        const uint32_t offscreen = guestViewOffscreenTargetFbo();
+        if (offscreen != 0) {
+            bindFrame = offscreen;
+            redirected = true;
+        }
+    }
     if (g_glStatsEnabled) {
         ++g_glStats.bindFramebuffer;
-        g_glStats.lastBoundFramebuffer = framebuffer;
-        // gui15 refuted the scissor explanation by logging the rectangle
-        // instead of just the count: glScissor x=0 y=0 w=1280 h=720 covers
-        // the whole screen and clips nothing, while the full-buffer readback
-        // is still lit=0 of 921600 at both frame 30 and frame 3000.
+        // THE COMPARISON HAS TO HAPPEN BEFORE THE ASSIGNMENT.
         //
-        // What survives that refutation: fbo=23/0 with fboChecks=0. The guest
-        // binds a framebuffer 23 times and NEVER checks completeness. Our
-        // readback samples the DEFAULT framebuffer (fb=0). If the guest draws
-        // into an FBO and never blits it out, the screen stays black while
-        // everything else -- 128 mmaps, 78 opens, 95 programs, 191 compressed
-        // textures -- is genuinely fine.
-        //
-        // So name the target. The full-buffer readback is the independent check:
-        // if fb 0 is black and this is non-zero, the guest is rendering into a
-        // texture nobody presents.
-        if (g_glStats.bindFramebuffer <= 4 || framebuffer != g_glStats.lastBoundFramebuffer) {
+        // MEASURED 2026-11-01: the old order assigned lastBoundFramebuffer
+        // first and compared afterwards, so `framebuffer != lastBoundFramebuffer`
+        // was ALWAYS false and the log only ever held the first four binds.
+        // The conclusion drawn from it -- "the guest binds fb=0 once at
+        // start-up and never binds an FBO again" -- was an artefact of the
+        // instrument, and it is what the whole offscreen-target design was
+        // built on.  A criterion that is always false is a criterion that was
+        // never tested.
+        const GLuint previous = g_glStats.lastBoundFramebuffer;
+        const bool changed = (bindFrame != previous);
+        g_glStats.lastBoundFramebuffer = bindFrame;
+        if (changed) {
+            ++g_glStats.fboBindChanges;
+        }
+        if (bindFrame != 0) {
+            // Remember the guest's scene target and how big it is.  This is
+            // the framebuffer the port's present path has to scale, and its
+            // size is what decides whether the view is bigger than the
+            // screen (a downscale) or smaller (an upscale).
+            //
+            // THE SIZE COMES FROM A TABLE, NOT FROM A GL QUERY.  The devkitPro
+            // GLES2 header has no glGetTexLevelParameteriv and no
+            // GL_TEXTURE_WIDTH, and querying a texture's size would mean
+            // binding it to a texture unit -- a state change in the middle of
+            // the guest's frame.  The guest's own calls already say the
+            // answer: it creates the texture (with its size) and then attaches
+            // it to the framebuffer.  Two small tables turn that into the
+            // framebuffer's size, with no perturbation at all.
+            g_glStats.lastNonZeroFramebuffer = bindFrame;
+            const uint32_t w = guestFramebufferTextureWidth(bindFrame);
+            const uint32_t h = guestFramebufferTextureHeight(bindFrame);
+            g_glStats.lastNonZeroFboWidth = w;
+            g_glStats.lastNonZeroFboHeight = h;
+        }
+        // The volume is bounded: a change record per bind per frame is
+        // thousands of lines a run, and the first two hundred cover the
+        // shape of the frame.  The CENSUS (fboBindChanges) covers the rest.
+        if (g_glStats.fboBindChanges <= 200) {
             GLenum status = GL_NONE;
-            if (framebuffer != 0) {
+            if (bindFrame != 0) {
                 status = ::glCheckFramebufferStatus(GL_FRAMEBUFFER);
                 g_glStats.fboChecks += 1;
                 g_glStats.lastFboStatus = status;
@@ -927,19 +1131,21 @@ void guestViewTracedGlBindFramebuffer(GLenum target, GLuint framebuffer) {
             }
             char diag[224];
             __builtin_snprintf(diag, sizeof(diag),
-                "bindFramebuffer target=0x%x fbo=%u status=0x%x vp=%u,%u,%u,%u"
-                " sc=%u,%u,%u,%u draws=%u",
-                target, framebuffer, status,
+                "bindFramebuffer target=0x%x fbo=%u%s status=0x%x vp=%u,%u,%u,%u"
+                " sc=%u,%u,%u,%u draws=%u size=%ux%u",
+                target, bindFrame, redirected ? "(redirected)" : "",
+                status,
                 g_glStats.lastViewport[0], g_glStats.lastViewport[1],
                 g_glStats.lastViewport[2], g_glStats.lastViewport[3],
                 g_glStats.lastScissor[0], g_glStats.lastScissor[1],
                 g_glStats.lastScissor[2], g_glStats.lastScissor[3],
-                g_glStats.drawArrays);
+                g_glStats.drawArrays,
+                g_glStats.lastNonZeroFboWidth, g_glStats.lastNonZeroFboHeight);
             appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                                 "fbo-bind", 249, 0, diag);
         }
     }
-    ::glBindFramebuffer(target, framebuffer);
+    ::glBindFramebuffer(target, bindFrame);
 }
 
 void guestViewTracedGlGenFramebuffers(GLsizei n, GLuint* framebuffers) {
@@ -954,6 +1160,11 @@ void guestViewTracedGlFramebufferTexture2D(GLenum target, GLenum attachment,
                                            GLint level) {
     if (g_glStatsEnabled) {
         ++g_glStats.framebufferTexture2D;
+        // WHICH TEXTURE IS ON WHICH FRAMEBUFFER.  Together with the texture
+        // sizes this gives the size of the guest's scene framebuffer.
+        if (g_glStats.lastBoundFramebuffer != 0) {
+            guestRememberAttachment(g_glStats.lastBoundFramebuffer, texture);
+        }
     }
     ::glFramebufferTexture2D(target, attachment, textarget, texture, level);
 }
@@ -974,12 +1185,70 @@ void guestViewTracedGlUseProgram(GLuint program) {
 void guestViewTracedGlViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
     if (g_glStatsEnabled) {
         ++g_glStats.viewports;
+        const bool changed =
+            (g_glStats.lastViewport[2] != static_cast<uint32_t>(width) ||
+             g_glStats.lastViewport[3] != static_cast<uint32_t>(height));
         g_glStats.lastViewport[0] = static_cast<uint32_t>(x);
         g_glStats.lastViewport[1] = static_cast<uint32_t>(y);
         g_glStats.lastViewport[2] = static_cast<uint32_t>(width);
         g_glStats.lastViewport[3] = static_cast<uint32_t>(height);
+        if (changed) {
+            ++g_glStats.viewportChanges;
+        }
+        // The viewport the guest uses, and WHICH framebuffer it is aimed at.
+        //
+        // MEASURED 2026-11-01 (q76/q77): the guest's viewport came out
+        // 1280x720 while its layout was 2048x1152 (the port told it so in
+        // onViewChangedJNI, and the guest printed "Res base: 2048x1152" and
+        // scissored in 2048x1152 coordinates).  A viewport smaller than the
+        // layout is the "the picture lands in a corner" symptom, so the
+        // viewport has to be measured against the framebuffer it is aimed at
+        // -- which is what this line says.
+        if (g_glStats.viewportChanges <= 200) {
+            char diag[192];
+            __builtin_snprintf(diag, sizeof(diag),
+                "glViewport x=%d y=%d w=%d h=%d (change #%u, fbo=%u)",
+                x, y, width, height, g_glStats.viewportChanges,
+                g_glStats.lastBoundFramebuffer);
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                "viewport", 249, 0, diag);
+        }
     }
-    ::glViewport(x, y, width, height);
+    // THE VIEWPORT MUST MATCH THE FRAMEBUFFER IT DRAWS INTO.
+    //
+    // MEASURED 2026-11-01 (q77/q78): the guest lays its 2D UI out in a
+    // 2048x1152 space -- its scissor rectangles are in 2048x1152
+    // coordinates -- and then draws it through a 1280x720 viewport, which
+    // is the size of the WINDOW.  The UI therefore lands outside the
+    // viewport and the screen shows nothing but the background: the HD view
+    // came out as a flat sky blue, every frame.
+    //
+    // The guest cannot know the right number, because the framebuffer it is
+    // drawing into is the PORT's offscreen target -- the guest thinks it is
+    // drawing into the 1280x720 window.  So when the framebuffer bound at
+    // this moment IS the port's target, the viewport is the target's size.
+    //
+    // Only that one framebuffer is touched.  The guest's own framebuffers
+    // are the guest's business: it sizes them itself and it has been
+    // getting that right (its scene target is 2048x1152, measured).
+    GLint useWidth = width;
+    GLint useHeight = height;
+    if (!g_hostBinding) {
+        const uint32_t offscreen = guestViewOffscreenTargetFbo();
+        if (offscreen != 0 &&
+            g_glStats.lastBoundFramebuffer == static_cast<GLuint>(offscreen)) {
+            uint32_t targetWidth = 0;
+            uint32_t targetHeight = 0;
+            guestViewOffscreenTargetSize(&targetWidth, &targetHeight);
+            if (targetWidth != 0 && targetHeight != 0 &&
+                (useWidth != static_cast<GLint>(targetWidth) ||
+                 useHeight != static_cast<GLint>(targetHeight))) {
+                useWidth = static_cast<GLint>(targetWidth);
+                useHeight = static_cast<GLint>(targetHeight);
+            }
+        }
+    }
+    ::glViewport(x, y, useWidth, useHeight);
 }
 
 void guestViewTracedGlScissor(GLint x, GLint y, GLsizei width, GLsizei height) {

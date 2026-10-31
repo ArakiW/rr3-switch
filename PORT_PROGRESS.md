@@ -11068,3 +11068,126 @@ size exactly as before.
 
 
 
+
+## 2026-11-01  The HD path is measured, the instrument was broken, and the honest answer to "can the car textures be sharper"
+
+### The verdict first
+
+**The port's own offscreen target cannot deliver a correct HD picture.**  Five
+runs measured it end to end, and the shipping configuration stays at
+`view=1280x720`, where the picture is verified correct.
+
+**The user's question has a measured answer, and it is mostly about the
+emulator window, not about the assets:**
+
+  * the car/environment assets are ALREADY the HD tree in every run
+    (`assets_2048x1536`, 352 vs 358 requests in q66/q67);
+  * the guest renders its 3D scene into **its own framebuffer whose size is
+    the view size** -- 1280x720 at the shipped view, **2048x1152** at the HD
+    view (q77 vs q79, the same instrument on both);
+  * so at the shipped view the 3D is rendered at 720p and Eden then magnifies
+    the 1280x720 window into a ~1830 px window (1.43x).  **Running Eden at
+    1280x720 is 1:1 and costs nothing.**
+  * "HD for the vehicles and the environment, not for the UI" is already the
+    case: the 3D asset tree is chosen by the device profile's quality tier
+    (`AndroidHigh` -> `assets_2048x1536`), the 2D UI atlas by the view size.
+
+### What the guest actually does (measured, q77 + q79)
+
+  * it binds framebuffers **every frame** -- about 1.8 binds and 1.8 viewport
+    changes per frame -- renders the scene into its own FBO and composites
+    into the default framebuffer;
+  * its scene FBO is the size of the **view** (1280x720 shipped, 2048x1152 HD);
+  * it never asks the EGL surface for its size (the `surface-size` log has
+    **zero** lines in a 300 s run), so `eglQuerySurface` is not the channel;
+  * it lays its 2D UI out in the view space (scissor rectangles in
+    2048x1152 coordinates) and draws it through a viewport of its own.
+
+### The instrument that was broken, and what it cost
+
+The `fbo-bind` tracer did
+
+```cpp
+g_glStats.lastBoundFramebuffer = framebuffer;              // assign FIRST
+if (g_glStats.bindFramebuffer <= 4 ||
+    framebuffer != g_glStats.lastBoundFramebuffer) { ... }  // compare AFTER
+```
+
+so the comparison was **always false** and the log only ever held the first
+four binds.  From that, the project concluded -- in a source comment, and
+built the whole offscreen design on it -- that "the guest binds fb=0 once at
+start-up and never binds an FBO again".  **The premise was false.**  A
+criterion that is always false is a criterion that was never tested.
+
+⇒ The tracer now compares before it assigns, and the bind log records every
+change (capped at 200) with the framebuffer's size (from two small tables
+the guest's own calls fill in: texture sizes and FBO->texture attachments --
+no GL query, because the devkitPro `GLES2/gl2.h` has no
+`glGetTexLevelParameteriv` and asking a texture for its size would mean
+binding it in the middle of the guest's frame).
+
+⇒ New instruments, all read-only: a per-frame census (bound framebuffer,
+viewport, scene FBO and its size, bind/viewport change counts, draw counts),
+a viewport-change log with the framebuffer it was aimed at, an
+`eglQuerySurface` log, a `present-path` log, and a three-way pixel readback
+at one frame (window / port target / whatever the guest left bound).
+
+### The five rounds, in order
+
+  q76  the target read back as ONE flat colour (the guest's sky, 13,31,89)
+       and the window as one flat colour (0,0,0,0).  **The guest drew into
+       the target; the window had nothing.**  And the FBO bind log was found
+       to be broken.
+
+  q77  the census (with the fixed log): the guest's scene FBO is 2048x1152,
+       it changes framebuffers every frame, and it ends its frame bound to
+       the default framebuffer -- i.e. **it presents itself**.  The port's
+       `present-path` block has the guard `lastBoundFramebuffer != 0`, which
+       the guest's own final bind makes false: **that block has never run.**
+
+  q78  the guest's "bind the default framebuffer" is now redirected into the
+       port's target (the tracer records `fbo=1(redirected)`), and the
+       viewport follows the framebuffer (the guest's viewport changes drop
+       from 3535 per run to 22).  The target still reads flat.
+
+  q79  the shipped 1280x720 path with the same instruments: **the picture is
+       correct** (the event card measures 18/15/16 px of ink with 10 and 13
+       rows between the labels -- the same as the verified run q71) and the
+       guest's scene FBO is **1280x720**.
+
+  q80  the UI's own text quads are recorded **with the framebuffer they were
+       aimed at**: the two event-card labels drew into `fbo=1` -- the port's
+       target -- and the readback right after the draw saw the ink.  **So the
+       UI really is drawn into the target, and the target still reads flat at
+       every capture frame.**  Something later in the frame takes it away.
+
+⇒ The port does not own a second framebuffer for the guest any more
+(`kEnableOffscreenTarget = false`, and it says so in the log).  The view is
+clamped to the real surface, the guest's own framebuffer is the one it
+renders into, and the picture is correct.
+
+### What is still open, and the instrument that settles it
+
+The open question is narrow and now well posed: **the UI is drawn into the
+target with ink, and the target reads flat a few frames later.**  So the
+answer is in what happens between the UI draw and the capture:
+
+  * who clears the target after the UI (the guest's own composite pass? the
+    port's `present-path` block, which now runs because the redirect makes
+    `lastBoundFramebuffer != 0`?);
+  * or whether the capture reads a different moment than the UI draw (the
+    HD path runs at 55% of the 720p frame rate, so the UI may be drawn only
+    in frames the capture schedule misses).
+
+The instrument that settles it: **log the target's content at the moment the
+UI is drawn** (the text-quad probe already reads a 256x64 patch back -- make
+that read the WHOLE target and record a coverage number), and record the
+clear/glClear calls with the framebuffer they were aimed at.  One more
+round, same frame, two numbers.
+
+### Cost of the HD path, for the record
+
+  * q73 (offscreen, 2048x1152): 2040 frames in 305 s; q66 (720p): 3720 frames
+    in 306 s -> **55% of the frame rate**.  The cost is pixels, not the blit.
+  * q78 (with the redirect): the frame rate is the same; the redirect costs
+    nothing measurable.

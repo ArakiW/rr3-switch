@@ -410,6 +410,26 @@ extern "C" EGLBoolean __wrap_eglQuerySurface(EGLDisplay dpy, EGLSurface surface,
         } else {
             *value = attribute == EGL_WIDTH ? viewWidth : viewHeight;
         }
+        // WHO ASKED, AND WHAT DID IT HEAR.
+        //
+        // MEASURED 2026-11-01 (q76): the guest's viewport came out 1280x720
+        // while its layout was 2048x1152.  The viewport is the number that
+        // decides whether the picture fills the target or lands in a corner
+        // of it, and this call is one of the places it comes from -- so the
+        // question "when does the guest ask, and what is the answer then?"
+        // has to be answerable from the log instead of from an argument.
+        //
+        // The first sixteen calls are recorded; after that the count keeps
+        // rising and the answer never changes, which is itself the point.
+        {
+            static unsigned s_calls = 0;
+            ++s_calls;
+            if (s_calls <= 16) {
+                gfxNoteSurfaceSize(s_calls, static_cast<unsigned>(attribute),
+                                   static_cast<int>(*value),
+                                   static_cast<int>(real), viewWidth, viewHeight);
+            }
+        }
         return EGL_TRUE;
     }
     return __real_eglQuerySurface(dpy, surface, attribute, value);

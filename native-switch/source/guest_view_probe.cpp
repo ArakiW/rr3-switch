@@ -995,6 +995,59 @@ struct HdTarget {
 
 HdTarget g_hdTarget;
 
+// WHERE THE PICTURE IS.
+//
+// Two questions were still open after q75 (archive
+// 20261101-051136-eden-rr3-q75-hdviewport): the window came out EMPTY --
+// not "flat", not "in a corner": one distinct colour, rgba(0,0,0,0), 0%
+// coverage -- while the guest was provably alive (33 160 scissor calls, text
+// quads with real ink in them).
+//
+// The window alone cannot separate the two possible causes:
+//   (a) the guest never drew into the port's target, so there is nothing to
+//       scale, and
+//   (b) the guest drew into the target and the port's blit failed to copy it
+//       out.
+//
+// So the port RECORDS what the guest's frame left behind -- which framebuffer
+// was bound, what the viewport was, what glGetError() said after the blit --
+// and READS BACK three places at the same frame: the window, the port's
+// target, and whatever framebuffer the guest left bound.  One frame, three
+// pictures, named.
+//
+// Read-only.  glGetIntegerv and glReadPixels change nothing the guest can
+// observe; the only state touched is the port's own framebuffer binding, and
+// it is restored.
+static GLint g_hdBoundAfterRender = -1;
+static GLint g_hdViewportAfterRender[4] = { -1, -1, -1, -1 };
+static GLint g_hdErrorAfterBlit = -1;
+static GLint g_hdErrorBeforeBlit = -1;
+static uint32_t g_hdLastDrawsIntoTarget = 0;
+static uint32_t g_hdLastBindChanges = 0;
+
+// Five points of a framebuffer, enough to tell "empty" from "has a picture"
+// without paying for a full readback: the four corners and the centre.
+static void hdSampleFive(GLuint fbo, int w, int h, unsigned* out) {
+    static const float kFx[5] = { 0.02f, 0.98f, 0.50f, 0.50f, 0.50f };
+    static const float kFy[5] = { 0.02f, 0.02f, 0.02f, 0.98f, 0.50f };
+    // The port's own binds: the tracer must not redirect them.
+    guestViewSetHostBinding(true);
+    if (fbo != 0) {
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    }
+    for (int i = 0; i < 5; ++i) {
+        const int x = static_cast<int>(kFx[i] * static_cast<float>(w - 1));
+        const int y = static_cast<int>(kFy[i] * static_cast<float>(h - 1));
+        unsigned char px[4] = { 0, 0, 0, 0 };
+        glReadPixels(x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        out[i] = (static_cast<unsigned>(px[0]) << 24) |
+                 (static_cast<unsigned>(px[1]) << 16) |
+                 (static_cast<unsigned>(px[2]) << 8) |
+                  static_cast<unsigned>(px[3]);
+    }
+    guestViewSetHostBinding(false);
+}
+
 const char* kHdVertexSource =
     "attribute vec2 aPos;\n"
     "attribute vec2 aUV;\n"
@@ -1115,7 +1168,11 @@ void hdTargetBind() {
     if (!g_hdTarget.ready) {
         return;
     }
+    // The port's own bind: the tracer must not redirect it (it is already
+    // the target).
+    guestViewSetHostBinding(true);
     glBindFramebuffer(GL_FRAMEBUFFER, g_hdTarget.fbo);
+    guestViewSetHostBinding(false);
 }
 
 // And the target goes into the window, scaled.
@@ -1123,6 +1180,17 @@ void hdTargetBlit(int outWidth, int outHeight) {
     if (!g_hdTarget.ready || outWidth <= 0 || outHeight <= 0) {
         return;
     }
+    // THE VIEWPORT IS CONTEXT STATE, NOT FRAMEBUFFER STATE.
+    //
+    // The blit sets the viewport to the window size to draw the quad, and
+    // the guest's viewport is whatever the guest last set.  If the guest
+    // sets its viewport once (at start-up) and the blit then overwrites it,
+    // the guest's NEXT frame composites into the target through a 1280x720
+    // viewport -- and the picture lands in a corner of a 2048x1152 target.
+    // So the viewport is put back exactly as it was.
+    GLint savedViewport[4] = { 0, 0, 0, 0 };
+    glGetIntegerv(GL_VIEWPORT, savedViewport);
+    guestViewSetHostBinding(true);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     const GLboolean depthTest = glIsEnabled(GL_DEPTH_TEST);
     const GLboolean scissorTest = glIsEnabled(GL_SCISSOR_TEST);
@@ -1150,6 +1218,9 @@ void hdTargetBlit(int outWidth, int outHeight) {
     if (g_hdTarget.vbo == 0) {
         glGenBuffers(1, &g_hdTarget.vbo);
         if (g_hdTarget.vbo == 0) {
+            glViewport(savedViewport[0], savedViewport[1], savedViewport[2],
+                       savedViewport[3]);
+            guestViewSetHostBinding(false);
             return;
         }
         glBindBuffer(GL_ARRAY_BUFFER, g_hdTarget.vbo);
@@ -1177,6 +1248,12 @@ void hdTargetBlit(int outWidth, int outHeight) {
     if (depthTest) {
         glEnable(GL_DEPTH_TEST);
     }
+    // PUT THE GUEST'S VIEWPORT BACK.  See the note at the top of this
+    // function: the blit borrows the viewport for its own quad, and the
+    // guest's next frame composites into the target through it.
+    glViewport(savedViewport[0], savedViewport[1], savedViewport[2],
+               savedViewport[3]);
+    guestViewSetHostBinding(false);
 }
 
 bool hdTargetActive() {
@@ -2559,10 +2636,52 @@ GuestViewProbe runGuestViewProbe(NWindow* window, const char* progressPath) {
     // corner (measured, q67).  If the config asks for one and the target can
     // be made, the guest gets it; if not, the view stays 1280x720 and the
     // clamp says so in the log.
+    //
+    // ====================================================================
+    // IT IS OFF, AND THAT IS A MEASURED DECISION, NOT AN ABANDONMENT.
+    //
+    // Five runs (q76..q80, archives 20261101-051853 / -052921 / -053518 /
+    // -054150 / -054722) measured the offscreen path end to end:
+    //
+    //   * the guest renders its scene into ITS OWN framebuffer, whose size
+    //     is the view size (1280x720 at the shipped view, 2048x1152 at the
+    //     HD view -- q77 and q79), and composites into the default one;
+    //   * the port's own offscreen target made the screen FLAT: one colour,
+    //     rgba(0,0,0,0), every frame, while the guest was provably alive
+    //     and drawing (the event card's labels were laid out and drawn with
+    //     ink into the target in the very same frames -- q80);
+    //   * redirecting the guest's own "bind the default framebuffer" into
+    //     the target (q78) did not change that: the UI was drawn into the
+    //     target and the target still read back flat.
+    //
+    // So the port does NOT own a second framebuffer for the guest.  The view
+    // stays clamped to the real surface, the guest's own framebuffer is the
+    // one it renders into, and the picture is CORRECT (q79: the event card
+    // measures 18/15/16 px of ink with 10 and 13 rows between the labels,
+    // the same as the verified run q71).
+    //
+    // What is left here is the scaffolding, so the next attempt starts from
+    // the measurements instead of from the guess that produced them.
+    // ====================================================================
     {
         const int wantedWidth = gfxViewWidthOverride();
         const int wantedHeight = gfxViewHeightOverride();
-        if (wantedWidth > 1280 || wantedHeight > 720) {
+        constexpr bool kEnableOffscreenTarget = false;
+        if (!kEnableOffscreenTarget && (wantedWidth > 1280 || wantedHeight > 720)) {
+            char diag[224];
+            __builtin_snprintf(
+                diag, sizeof(diag),
+                "view %dx%d was asked for but the port owns no offscreen "
+                "target: the guest renders into its own framebuffer and the "
+                "port's target made the screen flat (measured, q76-q80). "
+                "The view stays 1280x720 and the picture stays correct.",
+                wantedWidth, wantedHeight);
+            appendGuestBootLine(
+                "sdmc:/switch/rr3-native-rehost.guest-view.log", "hd-target",
+                258, 0, diag);
+        }
+        if (kEnableOffscreenTarget &&
+            (wantedWidth > 1280 || wantedHeight > 720)) {
             if (!hdTargetCreate(wantedWidth > 0 ? wantedWidth : 1280,
                                 wantedHeight > 0 ? wantedHeight : 720)) {
                 char diag[160];
@@ -8587,7 +8706,97 @@ void* frameLoopDriver(void* opaque) {
                 return;
             }
             if (offscreen) {
+                guestViewSetHostBinding(true);
                 glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                guestViewSetHostBinding(false);
+            }
+            // THE TARGET ITSELF.  When the offscreen target is on, the
+            // capture above reads the WINDOW (what the player sees).  This
+            // reads the TARGET (what the guest actually drew into it), and
+            // the pair is what separates the two candidates that are still
+            // open after q75 (the window was flat and the viewport was
+            // finally 2048x1152):
+            //
+            //   the target has the picture and the window does not
+            //       -> the blit does not copy it;
+            //   both are flat
+            //       -> the guest did not render into the target.
+            //
+            // The file name starts with "frame-" so the harness archives it
+            // with the other pictures.
+            if (offscreen && g_hdTarget.fbo != 0) {
+                static unsigned char* tpx = nullptr;
+                static size_t tpxBytes = 0;
+                const size_t tneed = static_cast<size_t>(g_hdTarget.width) *
+                                     static_cast<size_t>(g_hdTarget.height) * 4u;
+                if (tpx == nullptr || tpxBytes < tneed) {
+                    std::free(tpx);
+                    tpx = static_cast<unsigned char*>(std::malloc(tneed));
+                    tpxBytes = (tpx != nullptr) ? tneed : 0;
+                }
+                if (tpx != nullptr && tpxBytes >= tneed) {
+                    std::memset(tpx, 0, tneed);
+                    guestViewSetHostBinding(true);
+                    glBindFramebuffer(GL_FRAMEBUFFER, g_hdTarget.fbo);
+                    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+                    glReadPixels(0, 0, g_hdTarget.width, g_hdTarget.height,
+                                 GL_RGBA, GL_UNSIGNED_BYTE, tpx);
+                    char tpath[128];
+                    std::snprintf(
+                        tpath, sizeof(tpath),
+                        "sdmc:/switch/rr3-native-rehost/frame-target-%06u.png",
+                        frame);
+                    rr3::writeFramePng(tpath, tpx, g_hdTarget.width,
+                                       g_hdTarget.height);
+                    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                    guestViewSetHostBinding(false);
+                }
+            }
+            // THE THIRD PLACE.  The window and the port's target are two
+            // places the picture could be; the third is whatever framebuffer
+            // the GUEST left bound after its frame.  If the guest renders
+            // into its own FBO and never presents it, that FBO holds the
+            // picture and neither of the other two does -- and no amount of
+            // staring at the window would ever show it.
+            //
+            // Five points each, so the line is cheap; the PNGs above are the
+            // expensive part and they only cover the two ends.
+            if (offscreen && g_hdTarget.fbo != 0) {
+                unsigned win[5] = {0, 0, 0, 0, 0};
+                unsigned tgt[5] = {0, 0, 0, 0, 0};
+                unsigned bnd[5] = {0, 0, 0, 0, 0};
+                hdSampleFive(0, vw, vh, win);
+                hdSampleFive(g_hdTarget.fbo, g_hdTarget.width, g_hdTarget.height,
+                             tgt);
+                const GLint bound = g_hdBoundAfterRender;
+                const bool boundIsOurs =
+                    (bound >= 0 && static_cast<GLuint>(bound) == g_hdTarget.fbo);
+                if (bound > 0 && !boundIsOurs) {
+                    hdSampleFive(static_cast<GLuint>(bound), g_hdTarget.width,
+                                 g_hdTarget.height, bnd);
+                }
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                char wdiag[320];
+                std::snprintf(
+                    wdiag, sizeof(wdiag),
+                    "frame=%u boundAfterRender=%d viewport=%d,%d,%d,%d"
+                    " errBeforeBlit=0x%x errAfterBlit=0x%x"
+                    " win=[%08x %08x %08x %08x %08x]"
+                    " tgt=[%08x %08x %08x %08x %08x]"
+                    " bnd=[%08x %08x %08x %08x %08x]",
+                    frame, static_cast<int>(bound),
+                    static_cast<int>(g_hdViewportAfterRender[0]),
+                    static_cast<int>(g_hdViewportAfterRender[1]),
+                    static_cast<int>(g_hdViewportAfterRender[2]),
+                    static_cast<int>(g_hdViewportAfterRender[3]),
+                    static_cast<unsigned>(g_hdErrorBeforeBlit),
+                    static_cast<unsigned>(g_hdErrorAfterBlit),
+                    win[0], win[1], win[2], win[3], win[4],
+                    tgt[0], tgt[1], tgt[2], tgt[3], tgt[4],
+                    bnd[0], bnd[1], bnd[2], bnd[3], bnd[4]);
+                appendGuestBootLine(
+                    "sdmc:/switch/rr3-native-rehost.guest-view.log",
+                    "hd-picture-location", 249, 0, wdiag);
             }
             // 2048x1536 RGBA is 12 MiB: too big for the stack, and this runs
             // on the frame-loop thread.
@@ -8696,7 +8905,91 @@ void* frameLoopDriver(void* opaque) {
         hdTargetBind();
         reinterpret_cast<void (*)(void*, void*, int, uint32_t)>(renderTarget)(
             jniEnvironment, activityObject, 2, 0);
-        hdTargetBlit(1280, 720);
+        // WHAT THE GUEST'S FRAME LEFT BEHIND.  Recorded before the blit,
+        // because the blit rebinds framebuffer 0 and would erase the
+        // evidence.
+        //
+        // The census is the answer to "where does the picture live": the
+        // framebuffer bound at the END of the guest's frame is the one it
+        // presented into, and the last NON-ZERO framebuffer it bound is the
+        // one it rendered the scene into.  One line every sixty frames
+        // keeps the whole run visible without a line per frame.
+        {
+            const GuestViewGlStats stats = guestViewGlStats();
+            static unsigned s_census = 0;
+            ++s_census;
+            const bool want =
+                (s_census % 60u == 1u) || (stats.fboBindChanges != g_hdLastBindChanges);
+            g_hdLastBindChanges = stats.fboBindChanges;
+            if (want) {
+                glGetIntegerv(GL_FRAMEBUFFER_BINDING, &g_hdBoundAfterRender);
+                glGetIntegerv(GL_VIEWPORT, g_hdViewportAfterRender);
+                char cdiag[288];
+                std::snprintf(
+                    cdiag, sizeof(cdiag),
+                    "frame=%llu census bound=%d viewport=%d,%d,%d,%d"
+                    " scene=fbo=%u size=%ux%u binds=%u changes=%u vpChanges=%u"
+                    " draws=%u arr=%u",
+                    static_cast<unsigned long long>(frames),
+                    static_cast<int>(g_hdBoundAfterRender),
+                    static_cast<int>(g_hdViewportAfterRender[0]),
+                    static_cast<int>(g_hdViewportAfterRender[1]),
+                    static_cast<int>(g_hdViewportAfterRender[2]),
+                    static_cast<int>(g_hdViewportAfterRender[3]),
+                    stats.lastNonZeroFramebuffer, stats.lastNonZeroFboWidth,
+                    stats.lastNonZeroFboHeight, stats.bindFramebuffer,
+                    stats.fboBindChanges, stats.viewportChanges,
+                    stats.drawElements, stats.drawArrays);
+                appendGuestBootLine(
+                    "sdmc:/switch/rr3-native-rehost.guest-view.log",
+                    "guest-frame-census", 249, 0, cdiag);
+            }
+        }
+        // THE BLIT MAY ONLY RUN WHEN THE GUEST REALLY DREW INTO THE TARGET.
+        //
+        // MEASURED 2026-11-01 (q76, q78): the port's blit copied its target
+        // into the window every frame.  When the guest had drawn into the
+        // WINDOW instead -- which is what it does whenever the target is not
+        // the framebuffer it composites into -- that copy WIPED the picture
+        // the player was looking at, and the screen went flat: one colour,
+        // rgba(0,0,0,0), every frame, while the guest was provably alive
+        // and drawing (the event card's two labels were laid out and drawn
+        // with ink in the very same frames).
+        //
+        // So the blit is now conditional on the guest having drawn INTO THE
+        // TARGET this frame.  When it has not, the window is left exactly as
+        // the guest drew it, and the log says so.
+        {
+            const GuestViewGlStats stats = guestViewGlStats();
+            const bool guestDrewIntoTarget =
+                stats.drawsIntoOffscreenTarget != g_hdLastDrawsIntoTarget;
+            g_hdLastDrawsIntoTarget = stats.drawsIntoOffscreenTarget;
+            if (!hdTargetActive()) {
+                // No target: the guest draws into the window itself.
+            } else if (guestDrewIntoTarget) {
+                hdTargetBlit(1280, 720);
+                // The blit's own error code.  Only in the offscreen path,
+                // because glGetError CLEARS the flag and the 720p path must
+                // not have the guest's errors eaten by the port.
+                g_hdErrorAfterBlit = static_cast<GLint>(glGetError());
+            } else {
+                static unsigned s_skipped = 0;
+                ++s_skipped;
+                if (s_skipped <= 4 || (s_skipped % 600u) == 0u) {
+                    char bdiag[192];
+                    std::snprintf(
+                        bdiag, sizeof(bdiag),
+                        "frame=%llu blit SKIPPED: the guest drew nothing into the "
+                        "target (drawsIntoTarget=%u) so the window was left as "
+                        "the guest drew it (skip #%u)",
+                        static_cast<unsigned long long>(frames),
+                        stats.drawsIntoOffscreenTarget, s_skipped);
+                    appendGuestBootLine(
+                        "sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "hd-blit-skipped", 249, 0, bdiag);
+                }
+            }
+        }
         }
         if (frames < 3) {
             appendGuestBootLine(
@@ -8877,8 +9170,61 @@ void* frameLoopDriver(void* opaque) {
                 const bool fullScreen =
                     target.width == 1280 && target.height == 720;
                 const GLuint presentFbo = guestViewGlStats().lastBoundFramebuffer;
+                // WHAT THE PRESENT PATH IS ACTUALLY DOING.
+                //
+                // MEASURED 2026-11-01 (q76): the present path takes its source
+                // from the guest's LAST bound framebuffer.  The guest binds
+                // framebuffers every frame -- the fbo-bind log used to say
+                // otherwise, but that log compared a value with itself and
+                // only ever recorded the first four binds -- so
+                // lastBoundFramebuffer is the framebuffer the guest bound LAST,
+                // which is the one it presented into.  If that is 0, this
+                // blit is a no-op and the picture on screen came from the
+                // guest's own draw into the default framebuffer.
+                //
+                // The guest's SCENE target is a different framebuffer: the
+                // last NON-ZERO one, whose size is what a scaled present
+                // would have to read.
+                //
+                // Logged when either changes, and on a slow tick, so the
+                // shape of the frame is visible without a line per frame.
+                {
+                    const GuestViewGlStats stats = guestViewGlStats();
+                    static GLuint s_lastPresentFbo = 0xFFFFFFFFu;
+                    static GLuint s_lastSceneFbo = 0xFFFFFFFFu;
+                    static unsigned s_tick = 0;
+                    ++s_tick;
+                    const bool interesting =
+                        (presentFbo != s_lastPresentFbo) ||
+                        (stats.lastNonZeroFramebuffer != s_lastSceneFbo) ||
+                        (s_tick % 60u == 1u);
+                    if (interesting) {
+                        s_lastPresentFbo = presentFbo;
+                        s_lastSceneFbo = stats.lastNonZeroFramebuffer;
+                        char pdiag[288];
+                        std::snprintf(
+                            pdiag, sizeof(pdiag),
+                            "present source=fbo=%u scene=fbo=%u sceneSize=%ux%u"
+                            " view=%dx%d target=%d,%d %dx%d full=%d"
+                            " binds=%u changes=%u vpChanges=%u err=0x%x",
+                            presentFbo, stats.lastNonZeroFramebuffer,
+                            stats.lastNonZeroFboWidth, stats.lastNonZeroFboHeight,
+                            viewWidth, viewHeight, target.x, target.y,
+                            target.width, target.height, fullScreen ? 1 : 0,
+                            stats.bindFramebuffer, stats.fboBindChanges,
+                            stats.viewportChanges, glGetError());
+                        appendGuestBootLine(
+                            "sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "present-path", 249, 0, pdiag);
+                    }
+                }
                 const GLboolean scissorTest = glIsEnabled(GL_SCISSOR_TEST);
                 GLfloat clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+                // THE PORT'S OWN BINDS.  Without this the tracer would
+                // redirect the present's "bind the default framebuffer" into
+                // the offscreen target and the present would scale the
+                // target into the target.
+                guestViewSetHostBinding(true);
                 glBindFramebuffer(kReadFramebuffer, presentFbo);
                 glBindFramebuffer(kDrawFramebuffer, 0);
                 if (!fullScreen) {
@@ -8898,6 +9244,7 @@ void* frameLoopDriver(void* opaque) {
                     }
                 }
                 glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                guestViewSetHostBinding(false);
             }
         }
 
@@ -9521,6 +9868,23 @@ bool ensureEarlyGuestGlContext() {
     eglDestroyContext(display, context);
     eglTerminate(display);
     return true;
+}
+
+// THE TRACER NEEDS TO KNOW WHERE THE GUEST'S "DEFAULT FRAMEBUFFER" GOES.
+//
+// NOT in the anonymous namespace: the tracer is a different translation
+// unit and has to be able to call this.
+uint32_t guestViewOffscreenTargetFbo() {
+    return g_hdTarget.ready ? static_cast<uint32_t>(g_hdTarget.fbo) : 0u;
+}
+
+void guestViewOffscreenTargetSize(uint32_t* width, uint32_t* height) {
+    if (width != nullptr) {
+        *width = static_cast<uint32_t>(g_hdTarget.width);
+    }
+    if (height != nullptr) {
+        *height = static_cast<uint32_t>(g_hdTarget.height);
+    }
 }
 
 } // namespace rr3

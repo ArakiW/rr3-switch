@@ -130,6 +130,36 @@ struct GuestViewGlStats {
     uint32_t scissorEnabled{};
     uint32_t lastBoundFramebuffer{};
     uint32_t lastFboStatus{};
+    // The LAST NON-ZERO framebuffer the guest bound, and the size of its
+    // colour attachment.  These two answer the question the broken
+    // fbo-bind log could not: where does the guest render the scene, and how
+    // big is that render target?
+    //
+    // MEASURED 2026-11-01 (q76): the fbo-bind log only ever recorded the
+    // first FOUR binds, because the tracer assigned lastBoundFramebuffer
+    // BEFORE comparing it with the new value -- so "the guest never binds an
+    // FBO again" was an artefact of the instrument, not a fact about the
+    // guest.  The guest binds framebuffers every frame.
+    uint32_t lastNonZeroFramebuffer{};
+    uint32_t lastNonZeroFboWidth{};
+    uint32_t lastNonZeroFboHeight{};
+    // How many times the guest CHANGED the bound framebuffer, and how many
+    // times it changed the viewport.  Both are read by the port's frame
+    // loop as a census, not as a log.
+    uint32_t fboBindChanges{};
+    uint32_t viewportChanges{};
+    // How many draws the guest issued while the PORT'S OFFSCREEN TARGET was
+    // the bound framebuffer.  This is the "did the guest really draw into
+    // the thing the port is going to scale" question, and it is answered by
+    // the guest's own draws rather than by a guess.
+    //
+    // MEASURED 2026-11-01 (q76/q78): the port's blit copied its target into
+    // the window every frame, and when the guest had drawn into the WINDOW
+    // instead, that copy WIPED the picture the player was looking at -- the
+    // screen went flat (one colour, rgba(0,0,0,0)) while the guest was
+    // provably alive and drawing.  A blit that is only allowed to run when
+    // the target really holds this frame's picture cannot do that.
+    uint32_t drawsIntoOffscreenTarget{};
 };
 GuestViewGlStats guestViewGlStats();
 void resetGuestViewGlStats();
@@ -153,6 +183,36 @@ void guestViewTracedGlFramebufferTexture2D(GLenum target, GLenum attachment,
 void guestViewTracedGlUseProgram(GLuint program);
 void guestViewTracedGlViewport(GLint x, GLint y, GLsizei width, GLsizei height);
 void guestViewTracedGlScissor(GLint x, GLint y, GLsizei width, GLsizei height);
+
+// THE PORT'S OWN BINDS ARE NOT THE GUEST'S.
+//
+// Every GL entry point the port uses is ALSO wrapped (see the Makefile's
+// GFX_WRAP_SYMBOLS), so the tracer sees the port's calls and the guest's
+// calls in one stream.  When the port has to redirect the guest's "bind the
+// default framebuffer" into its own offscreen target, it must be able to
+// say "this bind is mine, do not redirect it".
+void guestViewSetHostBinding(bool hostBinding);
+bool guestViewHostBinding();
+
+// The port's offscreen target, or 0 when it has none.
+//
+// When it exists, the DEFAULT framebuffer the guest binds IS the target:
+// the guest's own composite then lands in a surface of the view size
+// instead of the 1280x720 window, and the port scales that down.
+//
+// MEASURED 2026-11-01 (q76/q77): the guest binds framebuffers EVERY frame --
+// it renders into its own scene framebuffer and composites into the default
+// one.  The port used to bind its target in front of the guest's frame, but
+// the guest's own bind of the default framebuffer undid that, so the
+// composite went to the window while the port's blit then wiped the window
+// with the target's clear colour.  Redirecting the guest's bind is what
+// makes the target and the guest agree on one framebuffer.
+//
+// Defined by guest_view_probe.cpp.
+uint32_t guestViewOffscreenTargetFbo();
+
+// The size of that target, so the viewport can be made to match it.
+void guestViewOffscreenTargetSize(uint32_t* width, uint32_t* height);
 GLenum guestViewTracedGlCheckFramebufferStatus(GLenum target);
 void guestViewTracedGlBindBuffer(GLenum target, GLuint buffer);
 void guestViewTracedGlBindTexture(GLenum target, GLuint texture);

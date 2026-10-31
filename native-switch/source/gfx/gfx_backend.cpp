@@ -1142,11 +1142,21 @@ void gfxSetOffscreenTargetReady(bool ready) {
 // of the buffer and the rest of it is blank.
 //
 // The port owns no offscreen target by default -- it does not own an FBO, and
-// the guest renders into the default framebuffer (the guest binds fb=0 once at
-// start-up and never binds an FBO again; see the fbo-bind lines in a
-// guest-view log).  Until the port owns one, a bigger view is a broken
-// picture, not a sharper one, so the view is CLAMPED.  With the target there
-// IS a surface of the view size, and the view may exceed the window.
+// the guest renders into the default framebuffer.  Until the port owns one, a
+// bigger view is a broken picture, not a sharper one, so the view is CLAMPED.
+// With the target there IS a surface of the view size, and the view may
+// exceed the window.
+//
+// MEASURED 2026-11-01 (run q77, archive 20261101-052921-eden-rr3-q77-census):
+// the guest binds framebuffers EVERY frame -- about 1.8 binds per frame and
+// 1.8 viewport changes per frame -- and its scene framebuffer is the size of
+// the VIEW (1280x720 at the shipped view, 2048x1152 at the HD view).  The
+// claim that used to sit here, "the guest binds fb=0 once at start-up and
+// never binds an FBO again", was an artefact of the fbo-bind log: the tracer
+// assigned lastBoundFramebuffer BEFORE comparing it with the new value, so
+// the comparison was always false and the log only ever held the first four
+// binds.  A criterion that is always false is a criterion that was never
+// tested, and an architecture built on it cost five runs to undo.
 //
 // The clamp is LOUD on purpose: a silent clamp is the "silent fallback" that
 // hides the difference between "the picture is 720p because that is what the
@@ -1325,6 +1335,16 @@ void gfxNoteUnknownProc(const char* name) {
         std::snprintf(details, sizeof(details), " name=%s answer=generic-stub", name);
         writeLine("gfx-proc", 304, s_unknownCount, details);
     }
+}
+
+void gfxNoteSurfaceSize(unsigned call, unsigned attribute, int answered,
+                        int real, int viewWidth, int viewHeight) {
+    char details[192];
+    std::snprintf(details, sizeof(details),
+                  "eglQuerySurface call #%u attribute=0x%x answered=%d "
+                  "(real=%d, view=%dx%d)",
+                  call, attribute, answered, real, viewWidth, viewHeight);
+    writeLine("surface-size", 0, 0, details);
 }
 
 void gfxNoteShaderCreated(uint32_t shader, uint32_t type) {

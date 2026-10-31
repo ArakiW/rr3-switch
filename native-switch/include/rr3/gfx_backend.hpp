@@ -338,6 +338,16 @@ void* gfxProcAddressIfWrapped(const char* name);
 // log answers "which of the 321 does it really use" instead of guessing.
 void gfxNoteUnknownProc(const char* name);
 
+// The guest asking how big the surface is.
+//
+// MEASURED 2026-11-01 (q76): the guest's viewport came out 1280x720 while
+// its layout was 2048x1152, and "where does the viewport come from" was
+// unanswerable from the log.  This records every eglQuerySurface for the
+// surface size, with the answer AND the real driver's answer, so the
+// question can be settled by measurement instead of by argument.
+void gfxNoteSurfaceSize(unsigned call, unsigned attribute, int answered,
+                        int real, int viewWidth, int viewHeight);
+
 } // namespace rr3
 
 #endif // RR3_GFX_BACKEND_HPP

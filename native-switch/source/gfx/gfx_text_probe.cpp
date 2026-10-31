@@ -1751,6 +1751,20 @@ void gfxTextProbeDrawFinished() {
              g_pending.rect[3], g_pending.onScreen ? 1 : 0);
     appendText(details, sizeof(details), part);
 
+    // WHICH FRAMEBUFFER IS THIS DRAW GOING INTO?
+    //
+    // MEASURED 2026-11-01 (q78): the 2D UI drew with ink (the readback
+    // below saw it), but neither the window nor the port's offscreen target
+    // held it.  So the UI went into some OTHER framebuffer -- the guest's own
+    // -- and the number that says which one is the one this line adds.
+    // Read-only: a query, not a state change.
+    {
+        GLint bound = -1;
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &bound);
+        snprintf(part, sizeof(part), " fbo=%d", static_cast<int>(bound));
+        appendText(details, sizeof(details), part);
+    }
+
     // The pixels, AFTER the draw. The same rectangle was read before the
     // draw, so the difference between the two reads is what the draw did.
     uint8_t pixels[256 * 64 * 4];
