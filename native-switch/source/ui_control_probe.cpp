@@ -547,6 +547,15 @@ bool readChildren(uintptr_t component, uintptr_t* out, int* count) {
 
 struct WalkState {
     std::vector<UiControl>* controls;
+    // The screen whose tree this control came from.  MEASURED 2026-10-31
+    // (q55): the guest opens StatusIconBar, SettingsToolbar_Settings,
+    // SettingsToolbar_ProfileSocial, BuyCarBar, StoreMenu and
+    // main_menu_twosquare AT STARTUP -- the navigation the port needs is
+    // there -- but the probe reported only EventMapScreen, because it kept
+    // the tree with the MOST controls and threw the others away.  So the
+    // screen a control came from is recorded, and each screen's own ids are
+    // logged.
+    const char* screen;
     int nodes;
 };
 
@@ -834,6 +843,9 @@ void pumpUiControlProbe(unsigned long long frame) {
     char liveName[64] = {0};
     int liveMost = 0;
     std::vector<UiControl> merged;
+    // The per-screen breakdown, so one line says what is in EACH live tree.
+    char breakdown[3072];
+    int bdWritten = std::snprintf(breakdown, sizeof(breakdown), "f=%llu screens=", frame);
     for (int i = 0; i < screenCount; ++i) {
         uintptr_t children = 0;
         int childCount = 0;
@@ -845,9 +857,28 @@ void pumpUiControlProbe(unsigned long long frame) {
         std::vector<UiControl> controls;
         WalkState state{};
         state.controls = &controls;
+        state.screen = screens[i].name;
         walkComponent(screens[i].instance, &state, 0);
         if (controls.empty()) {
             continue;
+        }
+        if (bdWritten > 0 && bdWritten < static_cast<int>(sizeof(breakdown)) - 120) {
+            bdWritten += std::snprintf(breakdown + bdWritten,
+                                       sizeof(breakdown) - static_cast<size_t>(bdWritten),
+                                       "%s[%u", screens[i].name,
+                                       static_cast<unsigned>(controls.size()));
+            for (const UiControl& c : controls) {
+                if (bdWritten <= 0 ||
+                    bdWritten >= static_cast<int>(sizeof(breakdown)) - 60) {
+                    break;
+                }
+                bdWritten += std::snprintf(breakdown + bdWritten,
+                                           sizeof(breakdown) - static_cast<size_t>(bdWritten),
+                                           " %s", c.name);
+            }
+            bdWritten += std::snprintf(breakdown + bdWritten,
+                                       sizeof(breakdown) - static_cast<size_t>(bdWritten),
+                                       "];");
         }
         if (static_cast<int>(controls.size()) > liveMost) {
             liveMost = static_cast<int>(controls.size());
@@ -896,6 +927,9 @@ void pumpUiControlProbe(unsigned long long frame) {
         g_lastCount = sample.count;
         g_lastHash = hash;
         logSample(frame, sample);
+        if (bdWritten > 0) {
+            appendGuestBootLine(kGuestViewLogPath, "ui-trees", 143, 0, breakdown);
+        }
     }
 }
 
