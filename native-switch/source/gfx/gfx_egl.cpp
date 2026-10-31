@@ -382,11 +382,32 @@ extern "C" EGLBoolean __wrap_eglQuerySurface(EGLDisplay dpy, EGLSurface surface,
             // answered.  See rr3/gfx_backend.hpp.
             //
             // gfxViewWidth() is the EFFECTIVE view, already clamped to the
-            // real surface: a viewport bigger than the buffer draws the
-            // picture in a corner (measured, q67).  The null backend must
-            // answer the same number the mesa path's real EGL answers.
+            // real surface UNLESS the port owns an offscreen target of the
+            // view size -- and with that target the view IS the size of the
+            // surface the guest renders into.  So this is the TRUTH on both
+            // paths, not a lie: without a target the view is clamped to the
+            // window, and with one the guest really renders into a surface of
+            // that size.
+            //
+            // The MESA path has to answer the same thing: the guest sets its
+            // viewport from this answer, so if it heard 1280x720 while the
+            // layout was 2048x1152, it drew only a corner of the layout.
             const int viewWidth = gfxViewWidth();
             const int viewHeight = gfxViewHeight();
+            *value = attribute == EGL_WIDTH ? viewWidth : viewHeight;
+        }
+        return EGL_TRUE;
+    }
+    if (value != nullptr && (attribute == EGL_WIDTH || attribute == EGL_HEIGHT)) {
+        // Same answer on the real driver, for the same reason: the guest's
+        // viewport must match the surface it renders into.
+        const int viewWidth = gfxViewWidth();
+        const int viewHeight = gfxViewHeight();
+        EGLint real = 0;
+        __real_eglQuerySurface(dpy, surface, attribute, &real);
+        if (real == viewWidth || real == viewHeight) {
+            *value = real;
+        } else {
             *value = attribute == EGL_WIDTH ? viewWidth : viewHeight;
         }
         return EGL_TRUE;
