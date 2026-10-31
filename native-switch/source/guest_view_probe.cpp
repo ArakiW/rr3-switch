@@ -984,6 +984,7 @@ struct HdTarget {
     GLuint color = 0;
     GLuint depth = 0;
     GLuint program = 0;
+    GLuint vbo = 0;
     GLint aPos = -1;
     GLint aUV = -1;
     GLint uTex = -1;
@@ -1140,15 +1141,32 @@ void hdTargetBlit(int outWidth, int outHeight) {
         -1.0f,  1.0f, 0.0f, 1.0f,
          1.0f,  1.0f, 1.0f, 1.0f,
     };
+    // GLES2 HAS NO CLIENT-SIDE VERTEX ARRAYS.  The quad has to live in a
+    // buffer object: glVertexAttribPointer with a null buffer is invalid and
+    // the draw produces NOTHING.  MEASURED, run q73 (archive
+    // 20261101-030012-eden-rr3-q73-hdverify): with a client-side array every
+    // capture came out nearly blank (20 kB for a 1280x720 picture) while the
+    // target itself was fine.
+    if (g_hdTarget.vbo == 0) {
+        glGenBuffers(1, &g_hdTarget.vbo);
+        if (g_hdTarget.vbo == 0) {
+            return;
+        }
+        glBindBuffer(GL_ARRAY_BUFFER, g_hdTarget.vbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(kQuad), kQuad, GL_STATIC_DRAW);
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, g_hdTarget.vbo);
     glEnableVertexAttribArray(static_cast<GLuint>(g_hdTarget.aPos));
     glEnableVertexAttribArray(static_cast<GLuint>(g_hdTarget.aUV));
     glVertexAttribPointer(static_cast<GLuint>(g_hdTarget.aPos), 2, GL_FLOAT,
-                           GL_FALSE, sizeof(kQuad), kQuad);
+                           GL_FALSE, sizeof(kQuad), nullptr);
     glVertexAttribPointer(static_cast<GLuint>(g_hdTarget.aUV), 2, GL_FLOAT,
-                           GL_FALSE, sizeof(kQuad), kQuad + 2);
+                           GL_FALSE, sizeof(kQuad),
+                           reinterpret_cast<const void*>(2 * sizeof(GLfloat)));
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glDisableVertexAttribArray(static_cast<GLuint>(g_hdTarget.aPos));
     glDisableVertexAttribArray(static_cast<GLuint>(g_hdTarget.aUV));
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
     glUseProgram(0);
     if (blend) {
         glEnable(GL_BLEND);
