@@ -11000,6 +11000,69 @@ the picture is already 1:1 there -- and the vehicle and track materials are
 already the HD ones (they are chosen by the device profile's quality tier,
 not by the view size).
 
+## 2026-11-01 (05:20): THE HD PATH IS BUILT, AND THREE MORE DEFECTS CAME OUT OF IT -- THE PICTURE IS STILL NOT RIGHT
+
+The offscreen target is implemented (c7b7a0dc) and three defects were found
+and fixed by measurement.  The picture is STILL not right, and the remaining
+defect is now localised.
+
+    c7b7a0dc  the FBO (colour texture + depth renderbuffer), the blit, and
+              the clamp that only opens when the target exists
+    5b2e8d36  THE BLIT NEEDS A BUFFER OBJECT: GLES2 has no client-side
+              vertex arrays, so glVertexAttribPointer with a null buffer
+              draws NOTHING -- silently, with no error.  The pattern came
+              from graphics_probe.cpp, which has the same bug and only ever
+              checked glGetError(), so it never noticed.
+    22e15b76  THE GUEST'S VIEWPORT MUST MATCH THE SURFACE: the null
+              backend answered eglQuerySurface with the view size, but the
+              MESA path forwarded to the real EGL, which reports the TRUE
+              window size (1280x720).  So on Eden -- the only backend that
+              draws -- the guest never heard about the 2048x1152 surface and
+              its viewport stayed 1280x720 while its layout was 2048x1152.
+
+### What each round measured
+
+    q72  the target is created ("offscreen target 2048x1152 created"), the
+         guest's Res base is 2048x1152 -- and the run hit the KNOWN 4.2 MB
+         asset-list stall before the first capture (that stall is
+         stochastic and unrelated; q65 hit it too).
+
+    q73  the target works and the cost is as predicted (2040 frames in
+         305 s, 55% of the 1280x720 rate -- the cost is pixels).  BUT every
+         capture was 19757..26840 bytes for a 1280x720 picture: nearly
+         blank.  The blit drew nothing.
+
+    q74  after the buffer object: the window shows the flat background
+         colour (13,31,89) -- so the blit DOES draw -- and the scissor is
+         2048x1152 while the VIEWPORT is still 1280x720.  The guest laid
+         out for 2048x1152 and drew a corner of that layout.
+
+    q75  after the viewport fix: the viewport is 2048x1152 at last, and the
+         captures are STILL flat (16158..19817 bytes).  So the guest now
+         renders the whole layout into the target, and what reaches the
+         window is still not the picture.
+
+### Where that leaves it, and the one instrument that settles it
+
+Two candidates remain, and they are separated by ONE readback:
+
+  a) the guest's picture is NOT in the target (it drew somewhere else), or
+  b) it IS in the target and the blit does not copy it.
+
+**⇒ THE INSTRUMENT: read the TARGET back, not the window.**  The capture
+currently reads the default framebuffer (the window) after the blit.  The
+next round should ALSO read the target (bind the FBO, glReadPixels at the
+view size) and write it as a second PNG.  If the target PNG has the picture
+and the window PNG does not, the blit is broken; if both are flat, the guest
+did not render into the target.
+
+⇒ Until that is settled, the shipping configuration stays at view=1280x720,
+which is VERIFIED CORRECT (the event card's labels measure 15 and 16 px with
+10 and 13 rows between them, 982979ae) and where the whole HD path is inert:
+no target is created, the clamp holds, and the readback keeps using the view
+size exactly as before.
+
+
 
 
 
