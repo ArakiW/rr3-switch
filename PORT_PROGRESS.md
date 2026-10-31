@@ -10323,3 +10323,80 @@ for the next attempt, and both are one-line experiments.
 
 **AND NOTHING OF THIS IS ACTIVE BY DEFAULT.**  The card's rr3-open.txt ships
 with every line commented out, so the delivered card changes nothing.
+
+## 2026-11-01 (00:40): THE CHARACTER SIZE WAS THE DEVICE PROFILE'S GUI_LAYOUT_EXTENSION, NOT THE FONT
+
+### The symptom
+
+The user attached a screenshot of the event-selection screen: the two Chinese
+lines under each card ("滨海湾市街赛道" and "大奖赛赛道") are drawn on top of
+each other.  On the main menu the same defect shows as a title whose two lines
+almost touch.
+
+### What it is NOT
+
+* **It is not the atlas upscale.**  The port renders ALL text itself
+  (`glyph_vector.cpp`, FreeType + `NotoSansCJKsc-RR3Bootstrap.otf`), so the
+  Chinese in the screenshot is VECTOR, and it is sharp.  The "1.33x upscale of
+  every sprite and glyph" claim in older entries is wrong for glyphs: only the
+  SPRITES come out of the 960x640 atlas.  (Verified by the verifier audit and by
+  reading the frames.)
+* **It is not `EXPECTED_SCREEN_WIDTH/HEIGHT`.**  MEASURED, archive
+  `20261031-235302-eden-rr3-q61-exp-screen`: the settings layer really did
+  write the profile (`settings-profile ... changed=2 written=1`, the guest then
+  read `cache/eds-AndroidHigh.plist`), and the font sizes stayed 14/28/42/70/140
+  and the frames stayed byte-identical.  A negative result, properly measured.
+* **It is not the font size the guest asks for.**  The guest asks for 140 px
+  for these strings in every configuration tried.
+
+### What it IS
+
+The device profile's `GUI_LAYOUT_EXTENSION` decides in which space the guest
+LAYOUTS the UI.  `AndroidHigh.plist` says `_480x320`, so the guest lays the
+front end out for a 480x320 GUI while the port renders a 1280x720 view -- a
+factor of 2.667.  The CJK line box is 1.407 em (Noto Sans CJK) against the
+Latin face's 1.007 em, so the Chinese ink overruns the line advance the guest
+computed in its own space and consecutive labels collide.
+
+MEASURED, archive `20261101-001630-eden-rr3-q62-layout-ext`, the ONLY change
+being `GUI_LAYOUT_EXTENSION = _960x640` (a tree the volumes ship, and the one
+the guest's own `Res order:` ranks first):
+
+    如果你想在现实世界赛车，请前往你本地的赛道。请确认
+    你的车经过安全检查，并时刻戴好头盔、系好安全带。
+
+Two lines, correct size, correct spacing.  The font sizes the guest asks for did
+not change (still 140); the LAYOUT did, and the layout is what was wrong.
+
+### The instrument
+
+`.build/measure_cjk.py` measures the on-screen height of the main menu's two
+Chinese strings.  Baseline (extension `_480x320`): grey bar 36 px, title 62/70 px.
+`.build/measure_overlap.py` measures a PNG band line by line.
+
+### THE COST, STATED PLAINLY
+
+The layout moved, so every pixel coordinate in `rr3-touch.txt` has to be
+re-measured against the new frames.  That is the same price as switching the
+view to 2048x1152, and it is the reason the card shipped at 1280x720.
+
+### What is still open
+
+* The event card from the user's screenshot was NOT reached in q62 (the run got
+  as far as the loading screen and the daily-reward screen, both correct).  The
+  acceptance test is one round that reaches the event map and a frame of it.
+* The HD tree is still unreachable: `view=2048x1152` makes the guest pick
+  `gui_assets/2048x1536`, but the present blit's guard
+  (`lastBoundFramebuffer != 0`, `guest_view_probe.cpp:8569`) is always false
+  because the guest renders into fb0, so a bigger view CROPS instead of
+  scaling.  No HD picture has ever been seen.  Fixing that is four files: an
+  offscreen FBO at view size, the blit guard, the readback target, and
+  `eglQuerySurface` reporting the view size on the Mesa path.
+* `glyph_vector.cpp` still has a sign error: `metricsOf()` returns a NEGATIVE
+  ascent (Android's FontMetrics convention) and the line height is computed as
+  `ascent + descent`, which is negative, so the `lineHeight <= 0` fallback
+  silently substitutes `sizePx`.  The real line height is `-ascent + descent`
+  (141 at 140 px for Conduit, 197 for Noto CJK).
+* The `Font` object the port hands the guest still carries SYNTHETIC 48 px
+  metrics (`ascent 39 / descent -9 / height 30 / top 40 / bottom 11 / leading
+  6`), not the real face at the real size.

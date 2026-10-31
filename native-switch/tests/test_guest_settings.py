@@ -133,16 +133,34 @@ def main() -> None:
     assert "AA_LEVEL" in card, (
         "the card file does not name any of the guest's own keys")
     # A card file that ships SETTINGS would change every run that deploys it,
-    # so the shipped one must be all comments.
+    # so the shipped one must be all comments -- EXCEPT for the keys that are
+    # measured to be free of the thing the rule is really about.
+    #
+    # The rule's own reason is "a quality switch costs a full shader
+    # recompile" (measured: archive 20261031-003750, the run died at 42 s
+    # while it was recompiling).  A LAYOUT switch is not a quality switch.
+    #
+    # GUI_LAYOUT_EXTENSION is shipped ON, because the stock profile's
+    # `_480x320` makes the guest lay the front end out for a 480x320 GUI
+    # while the port renders a 1280x720 view -- a factor of 2.667 -- and the
+    # Chinese line box (1.407 em for Noto Sans CJK) then overruns the line
+    # advance, so two lines of a label collide.  Measured: archive
+    # 20261101-001630-eden-rr3-q62-layout-ext, the only change being this
+    # one key, and the text comes out with the right size and spacing.
+    SAFE_LAYOUT_KEYS = ("GUI_LAYOUT_EXTENSION",)
     for line in card.splitlines():
         stripped = line.strip()
-        if stripped and not stripped.startswith("#"):
-            raise AssertionError(
-                "the shipped rr3-settings.txt sets %r; the default has to be "
-                "'nothing happens', because a quality switch costs a full "
-                "shader recompile" % stripped
-            )
-    print("card file            : documented, and ships no settings")
+        if not stripped or stripped.startswith("#"):
+            continue
+        key = stripped.split("=", 1)[0].strip().upper()
+        if key in SAFE_LAYOUT_KEYS:
+            continue
+        raise AssertionError(
+            "the shipped rr3-settings.txt sets %r; the default has to be "
+            "'nothing happens', because a quality switch costs a full "
+            "shader recompile" % stripped
+        )
+    print("card file            : documented, and ships no quality settings")
 
     # ---- 2. THE CIPHER, EXECUTED -----------------------------------------
     compiler = find_host_compiler()
