@@ -10712,5 +10712,48 @@ mesa path's real EGL answers, so the two backends agree.
 **⇒ The port's picture is now honest, and the HD path is a missing feature
 rather than a broken one.**
 
+#### What the fbo-bind log actually says (and one thing I had backwards)
+
+    phase=fbo-bind bindFramebuffer target=0x8ca9 fbo=0 status=0x0
+    phase=fbo-bind bindFramebuffer target=0x8d40 fbo=1 status=0x8cd5
+    phase=fbo-bind bindFramebuffer target=0x8d40 fbo=2 status=0x8cd5
+    phase=fbo-bind bindFramebuffer target=0x8d40 fbo=3 status=0x8cd5
+
+`0x8CD5` IS `GL_FRAMEBUFFER_COMPLETE` -- the guest's own FBOs are fine.  All
+four binds happen at start-up (draws=0, viewport=0,0,0,0) and the guest binds
+nothing afterwards, so in steady state it renders into the DEFAULT
+framebuffer (fb0) and `lastBoundFramebuffer` is reset to 0 every frame.
+
+**⇒ The present path's scaled blit has NEVER RUN** -- not once, in any run:
+`fbo-present` appears zero times in the q66 and q67 logs, and the guard
+`lastBoundFramebuffer != 0` is false in every frame that matters.
+
+**⇒ So the blit is not the missing piece; the missing piece is the TARGET.**
+The port has to own one:
+
+  1. create an FBO at the view size: a colour texture plus a DEPTH
+     renderbuffer (the guest's 3D scene needs depth -- a colour-only FBO
+     would render the scene without depth testing);
+  2. bind it as the draw framebuffer before the guest's frame -- the guest
+     binds nothing in steady state, so it stays bound for the whole frame
+     (this is the whole reason it works: nothing else can unbind it);
+  3. after the guest's frame, scale it into fb0 and unbind, so that
+     eglSwapBuffers presents fb0.
+  4. the clamp then has to let the view exceed the surface again -- but ONLY
+     when the offscreen target was really created, so a failure degrades to
+     720p instead of to a corner crop.
+
+The blit itself cannot be `glBlitFramebuffer`: the context is GLES2, and the
+port compiles against `<GLES2/gl2.h>`, which has no such entry point.  The
+port needs its own blit -- a texture and a full-screen quad -- or an ES3
+context.
+
+Measured cost when the guest DID render at 2048x1152 (q67): 1680 frames in
+305 s against 3720 in 306 s at 1280x720, i.e. **45% of the frame rate on
+Eden's software renderer**; the 2D UI atlas also becomes the HD tree at that
+view size, which is a one-off cost (VRAM and load time), not a per-frame
+one.
+
+
 
 
