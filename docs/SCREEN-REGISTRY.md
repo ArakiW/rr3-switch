@@ -143,8 +143,55 @@ So there is one step missing, and it is the guest's own:
 **SO THE NEXT STEP IS: build the screen first (slot 69), then open it.**
 
 Until that is done the port REFUSES rather than crashes: the instance's
-first word must point into the guest's vtable section, or the request is
-reported and skipped.
+first word must point into the guest's vtable section (0x1e1aae0 ..
+0x1f6cd80, which is .data.rel.ro -- ABOVE the executable region, so the
+text's end is NOT the vtables' end), or the request is reported and skipped.
 
 **NOTHING IS ACTIVE BY DEFAULT.**  The card's rr3-open.txt ships with every
 line commented out.
+
+---
+
+## AFTER THE BUILD: MEASURED (q51)
+
+    phase=ui-open screen="CarPurchaseScreen" refused=1
+              reason=the-screen-did-not-build
+    phase=ui-open screen="UpgradesScreen" built=1 children=1
+    phase=ui-open screen="UpgradesScreen" calling=1          <- and then nothing
+
+**=>=> THE BUILD STEP WORKS.**  UpgradesScreen's own XML loader (slot 69)
+DID produce a component tree, and the port went on to OpenScreen -- and the
+guest died with writes to 0x30/0x34/0x48 of a null pointer.
+
+**=>=> SO THE MISSING BUILD WAS NECESSARY BUT NOT SUFFICIENT.**  A screen
+with ONE child is built but not laid out.
+
+**AND THE TWO CANDIDATES FOR WHAT IS STILL MISSING.**  OpenScreen runs two
+bookkeeping calls before the switch, and the second one is where the answer
+is:
+
+    0x14a44b8  mgr-bookkeeping(mgr, screen)
+        0x14a44e4  ldr  x8, [x1]            ; the screen's vtable
+        0x14a44f0  ldr  x8, [x8, #0x248]    ; slot 73 -- the NAME getter
+        0x14a44f4  blr  x8
+        0x14a44fc  bl   0x1e17bf0            ; the NAME -> INDEX
+        0x14a450c  cmp  x0, #0x17            ; and the index is 0..23
+
+**=>=> THE MANAGER KEEPS A TABLE OF 24 SCREENS, AND OpenScreen FINDS THE
+SCREEN IN THAT TABLE BY ITS NAME.**  So the open needs TWO names that are
+not necessarily the same string:
+
+  1. the screen's REGISTRY name (the port already has this), and
+  2. the screen to BE IN THE MANAGER'S OWN TABLE, under the name that its
+     slot 73 reports.
+
+The registry and the table are different things, and the two names may
+differ.  That is the first thing to check.
+
+The other candidate is the flags word: the descriptor's byte at +0x10 is
+`flags & 1`, and the port passes 0.  It is a one-bit experiment.
+
+**AND UNTIL THE OPEN IS PROVEN, IT IS TWO LEVELS.**  A screen name on a
+line of its own makes the port BUILD the screen and report whether the
+build worked -- which IS proven.  The card's "open=1" line is what turns
+the open on.
