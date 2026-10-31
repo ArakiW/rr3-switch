@@ -10754,6 +10754,66 @@ Eden's software renderer**; the 2D UI atlas also becomes the HD tree at that
 view size, which is a one-off cost (VRAM and load time), not a per-frame
 one.
 
+## 2026-11-01 (02:25): THE EVENT CARD'S LABELS ARE 42 px TEXTS IN 16 px BOXES -- SO THE OVERLAP IS A CLIP, NOT A FONT
+
+### Why the card has never been photographed
+
+The port's frame capture runs every ~100 frames (30, 120, 300, 600, ...), but
+the screens that carry the card live for about ninety frames:
+
+    q66: f=180 screen=EventMapScreen
+         f=270 screen=EventMapScreen
+         f=330 screen=EventsScreen
+         f=360 screen=EventsScreen
+         f=420 screen=CarSelectScreen
+
+The event map is live from frame 180 to 270 and the next capture lands at
+frame 300 -- after the screen is gone.  **That is the whole reason the card's
+own `CARD_TRACK` / `CARD_TRACK_2` boxes have never been seen in a frame;** it
+is not that the card is unreachable.  The card IS reached: in the q66 log the
+event map window (lines 99744..118685) holds 25 text quads and the card's
+own strings, measured over and over:
+
+    phase=glyph-vector method=init textLen=21 size=42.0 lines=1
+        offsetX=-2.0 offsetY=-6.0 boundsW=284.0 boundsH=42.0
+        text="滨海湾市街赛道"
+    phase=glyph-vector method=init textLen=15 size=42.0 lines=1
+        offsetX=-2.0 offsetY=-6.0 boundsW=202.0 boundsH=42.0
+        text="大奖赛赛道"
+
+### What that says, and what it does NOT say
+
+The label boxes are `CARD_TRACK(206,485) 257x16` and
+`CARD_TRACK_2(206,512) 257x16` -- 27 px apart -- and a 42 px CJK line has a
+40 px ink box (`boundsH=42`).  **So the text is 2.6x its box, and two of them
+27 px apart MUST touch unless something clips them.**
+
+  1. the size the guest asks for is 42, and it comes from a FIXED table
+     (14/28/42/56/70/84/98/140): q61 changed the device profile's
+     `EXPECTED_SCREEN_*` and the sizes did NOT move, so the table is not
+     scaled by the profile;
+  2. the port publishes the ink box (`boundsH=42`) exactly as the game's
+     `GlyphVector.init()` does (`m_bounds.height()`), so the port is
+     faithful here -- this is NOT a metrics bug;
+  3. **⇒ the card's overlap is a CLIP question, not a font question.**  In
+     the real game the label's rect is a clip rect, and the 40 px line is cut
+     to its 16 px box -- which is also what keeps the two labels 27 px apart
+     instead of touching.
+
+The next measurement is therefore: does the guest ever set a scissor for
+those labels?  The port logs every `glScissor`
+(`phase=scissor ... glScissor x=.. y=.. w=.. h=.. (call #N, viewport=...)`),
+and around the card in q66 the rectangles seen were full-window ones
+(`0,0,1280,720`), never a per-label one.  So either the guest does not clip
+the label text (and the game really does overlap on Android -- possible, the
+card's boxes may be a scroll window), or the clip is done by the label's own
+draw call and the port has to honour it.
+
+And the capture has to happen ON A SCREEN CHANGE, or the card is never on
+disk at all: the ui-ctl probe already knows the live screen on every frame,
+so one capture per transition is cheap.
+
+
 
 
 
