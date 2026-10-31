@@ -98,6 +98,14 @@
     presses the wrong thing -- and this switch is how a round asks for a
     named control without editing the repository.
 
+.PARAMETER OpenFile
+    Deploy THIS file as the card's rr3-open.txt, instead of the repository's.
+    The open file is the SCREEN request list: one registered screen name per
+    line ("CarPurchaseScreen"), and the port opens that screen through the
+    guest's own OpenScreen().  The repository's copy ships NO requests at
+    all, because opening the wrong screen takes the guest somewhere the
+    round did not ask for.
+
 .EXAMPLE
     .\Deploy-RR3CardScripts.ps1 -Apply
 .EXAMPLE
@@ -113,7 +121,8 @@ param(
     [ValidateSet('legacy', 'glove')]
     [string]$TouchMode = 'legacy',
     [string]$SettingsFile = '',
-    [string]$UiFile = ''
+    [string]$UiFile = '',
+    [string]$OpenFile = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -122,7 +131,7 @@ $sourceRoot = Join-Path $projectRoot 'native-switch\card'
 $appDir = Join-Path (Join-Path (Join-Path $EmulatorRoot 'user\sdmc') 'switch') 'rr3-native-rehost'
 
 $scripts = @('rr3-touch.txt', 'rr3-drive.txt', 'rr3-pad.txt', 'rr3-action.txt',
-    'rr3-screen.txt', 'rr3-settings.txt', 'rr3-ui.txt')
+    'rr3-screen.txt', 'rr3-settings.txt', 'rr3-ui.txt', 'rr3-open.txt')
 
 # --- the screen override ------------------------------------------------------
 #
@@ -233,6 +242,9 @@ $plan = foreach ($name in $scripts) {
     }
     if ($name -eq 'rr3-ui.txt' -and $UiFile -ne '') {
         $source = $UiFile
+    }
+    if ($name -eq 'rr3-open.txt' -and $OpenFile -ne '') {
+        $source = $OpenFile
     }
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
         Write-Host ("preflight: MISSING {0} in {1}" -f $name, $sourceRoot)

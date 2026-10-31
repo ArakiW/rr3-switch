@@ -1,0 +1,50 @@
+# rr3-open.txt -- OPEN A SCREEN BY ITS NAME.
+#
+# The guest's front end keeps a registry of 59 screens, and the guest has
+# its own OpenScreen(manager, screen, flags) -- ELF 0x14a4820 -- which is what
+# pushes a screen onto the front end's stack.  The port can call it, because
+# it already knows each registered screen's instance by name (the semantic UI
+# probe walks the same registry).
+#
+# So this file is a list of SCREEN NAMES, one per line, and the port opens
+# them one at a time, in order, once the front end is up.
+#
+# The names are the guest's own -- they are what the guest calls the screens
+# in its registry.  The registry currently holds:
+#
+#   AchievementScreen              GARAGE_OVERVIEW_SCREEN     MainMenuPromotional
+#   AppleTVBluetoothControllerScreen  GhostChallengeMenu        ManufacturerDemo*
+#   AssetDownloadScreen            HelpMenu                    MOTORSPORT_*
+#   CarCustomisationScreen         LegalAndPrivacySettingsScreen  MyGarageScreen
+#   CarFilterScreen                LtsSyncScreen               NewCarPurchasedScreen
+#   CarPurchaseScreen              MainMenuPromotional         OrbitModeScreen
+#   CarSelectScreen                MotorsportJourneyHubScreen  PartyPlayLocalScreen
+#   CareerGroupScreen              MotorsportsExclusiveSeriesScreen  PowerLegacyMultiCarSelectScreen
+#   CHAMPIONSHIP_ROUND_HUB_SCREEN  MotorsportsSeriesScreen     ProfileLoadSaveScreen
+#   CommunityScreen                MOTORSPORT_CREW_*           ProfileMenu
+#   DebugRaceSelectScreen          MOTORSPORT_QUEST_*          ProfileMenuFriendCompare
+#   DriverSelectScreen             MainMenuPromotional         QuestEventScreen
+#   Early Access Hub               ...                         QuestIntroScreen
+#   EventMapScreen                 ...                         QuestMultiCarSelectScreen
+#   EventsScreen                   ...                         QuestOutroScreen
+#   ExclusiveSeriesScreen          ...                         RepairsScreen
+#   F12019GPMultiCarSelectScreen   ...                         ROUND_REWARDS_SCREEN
+#   FrontEndAwardScreen            ...                         SeriesScreen
+#   TUNING_SCREEN                  ...                         TrophyUnlockScreen
+#   UpgradesScreen                 ...                         YourGarageScreen
+#
+# Use tools/gui_index.py to see which controls a screen has, and the
+# semantic probe's log ("phase=ui-ctl") to see the controls that are ON
+# SCREEN right now.
+#
+# NOTHING IS ACTIVE BY DEFAULT.  Every line below is a comment, so the
+# shipped card changes nothing.  Uncomment a name to open that screen.
+#
+# CommunityScreen
+# CarPurchaseScreen
+# CarCustomisationScreen
+# UpgradesScreen
+# AchievementScreen
+# ProfileMenu
+# MyGarageScreen
+# GARAGE_OVERVIEW_SCREEN

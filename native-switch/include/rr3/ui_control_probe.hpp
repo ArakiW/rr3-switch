@@ -147,4 +147,50 @@ bool uiControlNextRequest(UiControl* out);
 // Marks a request as done, after the port has pressed it.
 void uiControlServeRequest(const char* name);
 
+// ---------------------------------------------------------------------------
+// OPENING A SCREEN BY ITS NAME
+//
+// THE RECIPE (measured in the guest's own binary, and re-derived
+// independently by a second pass):
+//
+//   0x14a4820  FrontEnd2::Manager::OpenScreen(Screen* screen, int flags)
+//       0x14a4858  ldr  w8, [x0, #0x3b8]        ; the screen stack's depth
+//       0x14a4864  mov  w9, #0x30
+//       0x14a4868  umaddl x8, w8, w9, x19      ; mgr + (depth-1)*0x30
+//       0x14a486c  ldr  x8, [x8, #0xb8]        ; the screen on TOP
+//       0x14a4870  cmp  x8, x21                 ; already the one we want?
+//       0x14a4874  b.eq  ...                   ; then there is nothing to do
+//       0x14a4880  bl   0x10bb9c0              ; (screen, mgr) bookkeeping
+//       0x14a488c  bl   0x14a44b8              ; (mgr, screen) bookkeeping
+//       0x14a4890  and  w8, w20, #1             ; flags & 1
+//       0x14a4898  mov  x1, sp                  ; the DESCRIPTOR
+//       0x14a48a0  str  wzr, [sp]              ; kind  = 0
+//       0x14a48a4  str  x21, [sp, #8]          ; the screen instance
+//       0x14a48a8  strb w8, [sp, #0x10]        ; flags & 1
+//       0x14a48ac  str  w9, [sp, #0x14]        ; 1
+//       0x14a48b0  bl   0x14a48ec              ; the switch itself
+//
+// The descriptor is 24 bytes: {u32 kind; u32 pad; u64 screen; u8 flag; u32 one}.
+//
+// The screen INSTANCE is already known by name: the guest's registry holds 59
+// screens, and the port walks it to find one.  So the port can open any of
+// them -- CarPurchaseScreen, CarCustomisationScreen, UpgradesScreen,
+// CommunityScreen, MyGarageScreen -- without hunting for pixels.
+//
+// THE CALL IS A CALL INTO GUEST CODE, so it happens on the guest's own
+// thread (the input pump is inside the frame loop, which IS the guest's
+// thread) and with the guest's TLS installed, exactly like the port's
+// existing named-command mechanism in source/guest_action.cpp.
+//
+// Returns TRUE when the screen was found and the call was made.  A screen
+// that is not in the registry is reported, not guessed at.
+bool uiScreenOpen(const char* name);
+
+// Serves the card's rr3-open.txt: one registered screen name per line, and
+// the port opens them one at a time, in order, when the front end is up.
+//
+// Nothing is active by default: the repository's rr3-open.txt is all
+// comments.
+void pumpUiScreenOpen(unsigned long long frame);
+
 }  // namespace rr3

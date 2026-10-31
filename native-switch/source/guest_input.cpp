@@ -448,6 +448,19 @@ void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
     // inside the probe, and the frame loop reads only the cached sample.
     pumpUiControlProbe(g_frameCounter);
 
+    // OPEN A SCREEN BY NAME.
+    //
+    // The guest's registry holds 59 screens and the guest has its own
+    // OpenScreen(mgr, screen, flags) at ELF 0x14a4820.  The port already
+    // knows each screen's INSTANCE by name (the probe walks the registry),
+    // so the card can name a screen and the port opens it -- CarPurchase,
+    // CarCustomisation, Upgrades, Community, MyGarage -- instead of the port
+    // hunting for pixels that lead there.
+    //
+    // This is a CALL INTO the guest, so it is pumped from the input pump,
+    // which is the guest's own thread, and it installs the guest's TLS.
+    pumpUiScreenOpen(g_frameCounter);
+
     const bool driving = raceStateDriveEnabled();
     const RaceDriveState& drive = raceDriveState();
 

@@ -69,6 +69,7 @@
 #include <rr3/gfx_backend.hpp>
 #include <rr3/race_state_probe.hpp>
 #include <rr3/recovery_guard.hpp>
+#include <rr3/tls_probe.hpp>
 
 #include <cstdio>
 #include <cstdlib>
@@ -109,6 +110,20 @@ constexpr uintptr_t kCompIdOff        = 0x34ULL;
 constexpr uintptr_t kCompNameOff      = 0x38ULL;
 constexpr uintptr_t kCompChildrenOff  = 0x138ULL;
 constexpr uintptr_t kCompRectOff      = 0x180ULL;
+
+// ---- opening a screen by its name -----------------------------------------
+//
+// The guest's own FrontEnd2::Manager::OpenScreen, at ELF 0x14a4820.  The
+// recipe is in the header; the short version is that it takes the manager,
+// the screen INSTANCE and a flags word, and it is the only thing in the
+// guest that pushes a screen onto the front end's stack.
+//
+// The guest's text ends here (the vtables start at 0x1e1aae0), so a function
+// pointer inside [bias, bias + 0x1e19ae0) is a CODE pointer.  The check is
+// what keeps a corrupt address from turning into a jump into the data
+// segment; the port's named-command mechanism uses the same bound.
+constexpr uintptr_t kOpenScreenVa = 0x14A4820ULL;
+constexpr uintptr_t kGuestTextEndVa = 0x1E19AE0ULL;
 
 // ---- the walk's limits ----------------------------------------------------
 //
@@ -365,6 +380,43 @@ void collectRegistry(uintptr_t node, ScreenEntry* out, int* count, int depth) {
     if (readU64(node + kTreeRightOff, &right)) {
         collectRegistry(static_cast<uintptr_t>(right), out, count, depth + 1);
     }
+}
+
+// Finds one registered screen's INSTANCE by its name.
+//
+// The registry node holds the name at +0x20 and the instance at +0x38, so
+// the walk compares the name it reads against the one asked for.  The walk
+// stops at the first match, and the caller gets the instance the guest
+// itself published -- not one the port guessed.
+uintptr_t findRegistryInstance(uintptr_t node, const char* wanted,
+                               int depth) {
+    if (node == 0 || depth > 32 || wanted == nullptr || wanted[0] == '\0') {
+        return 0;
+    }
+    char name[64] = {0};
+    if (readGuestString(node + kTreeNameOff, name, sizeof(name)) &&
+        std::strcmp(name, wanted) == 0) {
+        uint64_t instance = 0;
+        if (readU64(node + kTreeInstanceOff, &instance) &&
+            pointerSane(static_cast<uintptr_t>(instance))) {
+            return static_cast<uintptr_t>(instance);
+        }
+        return 0;
+    }
+    uint64_t left = 0;
+    uint64_t right = 0;
+    if (readU64(node + kTreeLeftOff, &left)) {
+        const uintptr_t found =
+            findRegistryInstance(static_cast<uintptr_t>(left), wanted, depth + 1);
+        if (found != 0) {
+            return found;
+        }
+    }
+    if (readU64(node + kTreeRightOff, &right)) {
+        return findRegistryInstance(static_cast<uintptr_t>(right), wanted,
+                                    depth + 1);
+    }
+    return 0;
 }
 
 // ---- the component tree ----------------------------------------------------
@@ -828,6 +880,204 @@ void uiControlServeRequest(const char* name) {
             g_requests[i].served = true;
             return;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OPENING A SCREEN BY ITS NAME
+// ---------------------------------------------------------------------------
+bool uiScreenOpen(const char* name) {
+    if (name == nullptr || name[0] == '\0') {
+        return false;
+    }
+    const uintptr_t g = raceStateResolveGlobal();
+    if (g == 0) {
+        return false;
+    }
+    uint64_t manager = 0;
+    if (!readU64(g + kManagerOff, &manager) ||
+        !pointerSane(static_cast<uintptr_t>(manager))) {
+        return false;
+    }
+    uint64_t root = 0;
+    if (!readU64(static_cast<uintptr_t>(manager) + kRegistryRootOff, &root) ||
+        root == 0) {
+        return false;
+    }
+    const uintptr_t instance =
+        findRegistryInstance(static_cast<uintptr_t>(root), name, 0);
+    if (instance == 0) {
+        char details[192];
+        std::snprintf(details, sizeof(details),
+                      "screen=\"%.80s\" refused=1 reason=not-in-the-registry",
+                      name);
+        appendGuestBootLine(kGuestViewLogPath, "ui-open", 140, 0, details);
+        return false;
+    }
+    // THE INSTANCE PROVES ITSELF BEFORE IT IS CALLED WITH.
+    //
+    // A screen object starts with its vtable pointer, and the guest's
+    // vtables live in their own section (0x1e1aae0 .. 0x1e19ae0 in the
+    // image).  So a first word that is NOT in that range is not a screen and
+    // is refused here rather than called with.  This is a pure read.
+    //
+    // MEASURED 2026-10-31 (q48): the first attempt at opening a screen
+    // CRASHED the guest -- the log stops right after the "calling=1" line,
+    // and Eden reports writes to 0x30/0x34/0x48 of a null pointer.  The
+    // guest was building a screen that had never been built, so it walked a
+    // null root.  The build step is the guest's own vtable slot 69 (the
+    // screen's XML loader), and that is the next thing to wire up.
+    const uintptr_t bias0 = resolveMainImageLoadBias();
+    uint64_t vptr = 0;
+    if (bias0 == 0 || !readU64(instance, &vptr) ||
+        static_cast<uintptr_t>(vptr) < bias0 + 0x1E1AAE0ULL ||
+        static_cast<uintptr_t>(vptr) >= bias0 + kGuestTextEndVa) {
+        char details[224];
+        std::snprintf(details, sizeof(details),
+                      "screen=\"%.80s\" inst=0x%llx refused=1 "
+                      "reason=the-instance-is-not-a-screen-object",
+                      name, static_cast<unsigned long long>(instance));
+        appendGuestBootLine(kGuestViewLogPath, "ui-open", 140, 0, details);
+        return false;
+    }
+    const uintptr_t bias = bias0;
+    const uintptr_t fn = bias + kOpenScreenVa;
+    if (bias == 0 || fn < bias || fn >= bias + kGuestTextEndVa) {
+        char details[192];
+        std::snprintf(details, sizeof(details),
+                      "screen=\"%.80s\" refused=1 reason=not-in-the-guest-text",
+                      name);
+        appendGuestBootLine(kGuestViewLogPath, "ui-open", 140, 0, details);
+        return false;
+    }
+    // The line BEFORE the call, so a call that takes the guest down still
+    // leaves a record of WHICH screen was being opened.
+    char before[256];
+    std::snprintf(before, sizeof(before),
+                  "screen=\"%.80s\" inst=0x%llx fn=0x%llx calling=1",
+                  name, static_cast<unsigned long long>(instance),
+                  static_cast<unsigned long long>(fn));
+    appendGuestBootLine(kGuestViewLogPath, "ui-open", 140, 0, before);
+    {
+        // The guest's own thread and the guest's own TLS: this is a call INTO
+        // the guest, exactly like the port's named-command mechanism in
+        // source/guest_action.cpp.
+        GuestTlsScope tls;
+        using OpenScreenFn = void (*)(uintptr_t, uintptr_t, int);
+        reinterpret_cast<OpenScreenFn>(fn)(static_cast<uintptr_t>(manager),
+                                           instance, 0);
+    }
+    char after[288];
+    std::snprintf(after, sizeof(after), "%s called=1", before);
+    appendGuestBootLine(kGuestViewLogPath, "ui-open", 140, 0, after);
+    return true;
+}
+
+namespace {
+
+// ---- the card's screen list ------------------------------------------------
+constexpr const char* kScreenRequestPath =
+    "sdmc:/switch/rr3-native-rehost/rr3-open.txt";
+constexpr int kMaxScreenRequests = 16;
+
+struct ScreenRequest {
+    char name[64]{};
+    bool done{};
+};
+
+ScreenRequest g_screenRequests[kMaxScreenRequests];
+int g_screenRequestCount = 0;
+bool g_screenRequestsRead = false;
+
+void readScreenRequestFile() {
+    g_screenRequestsRead = true;
+    g_screenRequestCount = 0;
+    FILE* file = std::fopen(kScreenRequestPath, "rb");
+    if (file == nullptr) {
+        return;
+    }
+    char line[256];
+    while (g_screenRequestCount < kMaxScreenRequests &&
+           std::fgets(line, sizeof(line), file) != nullptr) {
+        char* text = line;
+        char* hash = std::strchr(text, '#');
+        if (hash != nullptr) {
+            *hash = '\0';
+        }
+        for (char* p = text; *p != '\0'; ++p) {
+            if (*p == '\r' || *p == '\n') {
+                *p = '\0';
+                break;
+            }
+        }
+        char* name = text;
+        while (*name == ' ' || *name == '\t') {
+            ++name;
+        }
+        char* end = name + std::strlen(name);
+        while (end > name && (end[-1] == ' ' || end[-1] == '\t')) {
+            --end;
+        }
+        *end = '\0';
+        if (name[0] == '\0') {
+            continue;
+        }
+        bool good = true;
+        for (const char* p = name; *p != '\0'; ++p) {
+            if (!isNameChar(*p)) {
+                good = false;
+                break;
+            }
+        }
+        if (!good) {
+            continue;
+        }
+        std::memcpy(g_screenRequests[g_screenRequestCount].name, name,
+                    sizeof(g_screenRequests[g_screenRequestCount].name));
+        g_screenRequests[g_screenRequestCount].done = false;
+        ++g_screenRequestCount;
+    }
+    std::fclose(file);
+}
+
+}  // namespace
+
+void pumpUiScreenOpen(unsigned long long frame) {
+    if (!g_screenRequestsRead) {
+        readScreenRequestFile();
+    }
+    if (g_screenRequestCount == 0) {
+        return;
+    }
+    // THE FRONT END HAS TO BE UP.  Opening a screen while the guest is still
+    // loading would push a screen onto a stack that does not exist yet, and
+    // the probe's own sample says whether the front end is up: a live
+    // component tree means it is.
+    if (!g_sample.ok) {
+        return;
+    }
+    // ONE SCREEN EVERY COUPLE OF SECONDS.  The guest has to BUILD the screen
+    // it was given -- load its .gui, build its controls, lay it out -- and a
+    // screen opened on top of the one before it has finished is a screen
+    // that never appears.
+    static unsigned long long lastOpenFrame = 0;
+    constexpr unsigned long long kOpenPeriodFrames = 120ULL;
+    if (frame < lastOpenFrame + kOpenPeriodFrames) {
+        return;
+    }
+    lastOpenFrame = frame;
+    for (int i = 0; i < g_screenRequestCount; ++i) {
+        if (g_screenRequests[i].done) {
+            continue;
+        }
+        if (!uiScreenOpen(g_screenRequests[i].name)) {
+            // A screen that is not in the registry will never be there, so
+            // the request is finished rather than retried forever.
+            g_screenRequests[i].done = true;
+            continue;
+        }
+        g_screenRequests[i].done = true;
+        return;
     }
 }
 

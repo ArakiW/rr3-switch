@@ -10133,3 +10133,103 @@ AND THE MATRIX CAN NOW BE MEASURED AGAINST ANY RUN
 tools/build_feature_matrix.py takes --run <archive> (or --run latest), so
 "how much has the port opened" is a question with an answer per round
 instead of a number frozen at q39.
+
+=========================================================================
+OPENING A SCREEN BY ITS NAME: THE RECIPE, THE ADDRESS BOOK, AND THE CRASH
+=========================================================================
+
+MEASURED 2026-10-31, round q48.
+
+THE RECIPE (measured in the guest's binary)
+-------------------------------------------
+    0x14a4820  FrontEnd2::Manager::OpenScreen(Screen* screen, int flags)
+
+        0x14a4858  ldr  w8, [x0, #0x3b8]        ; the screen stack's depth
+        0x14a4864  mov  w9, #0x30
+        0x14a4868  umaddl x8, w8, w9, x19      ; mgr + (depth-1)*0x30
+        0x14a486c  ldr  x8, [x8, #0xb8]        ; the screen on TOP
+        0x14a4870  cmp  x8, x21                 ; already the one we want?
+        0x14a4874  b.eq  ...                   ; then there is nothing to do
+        0x14a4880  bl   0x10bb9c0              ; (screen, mgr) bookkeeping
+        0x14a488c  bl   0x14a44b8              ; (mgr, screen) bookkeeping
+        0x14a4890  and  w8, w20, #1             ; flags & 1
+        0x14a4898  mov  x1, sp                  ; the DESCRIPTOR
+        0x14a48a0  str  wzr, [sp]              ; kind  = 0
+        0x14a48a4  str  x21, [sp, #8]          ; the screen instance
+        0x14a48a8  strb w8, [sp, #0x10]        ; flags & 1
+        0x14a48ac  str  w9, [sp, #0x14]        ; 1
+        0x14a48b0  bl   0x14a48ec              ; the switch itself
+
+    The descriptor is 24 bytes: {u32 kind; u32 pad; u64 screen; u8 flag;
+    u32 one}.  The screen INSTANCE is already known by name, because the
+    port's semantic probe walks the guest's registry to find it.
+
+    The screen stack is at mgr+0x3b8 (depth) and mgr+0xb8 + i*0x30 (the
+    entries) -- which is what the probe's own header had said, and which a
+    second, independent pass over the binary confirmed.
+
+THE ADDRESS BOOK (59 screens)
+-----------------------------
+The guest registers 65 screens in MainMenuManager::RegisterAllScreens
+(ELF 0x14bfb0c), 59 distinct names, each with the offset in the manager
+where that screen's instance lives.  It is written out in full in
+docs/SCREEN-REGISTRY.md, and it contains every screen the feature matrix
+says has never been opened:
+
+    CarPurchaseScreen        the car shop
+    CarCustomisationScreen   the garage / paint shop
+    UpgradesScreen           the upgrades
+    CommunityScreen          the community
+    AchievementScreen        the achievements
+    ProfileMenu              the profile
+    MyGarageScreen / YourGarageScreen / GARAGE_OVERVIEW_SCREEN / TUNING_SCREEN
+    RepairsScreen, DriverSelectScreen, QuestEventScreen, MOTORSPORT_*, ...
+
+    SettingsToolbar is NOT registered, which is why the main menu's toolbar
+    (BTN_TOOLBAR_COMMUNITY and friends) was never in the live tree: the
+    probe walks registered screens, and there is no such screen.
+
+WHAT HAPPENED (q48)
+-------------------
+The port called it.  The log shows the call going out:
+
+    phase=ui-open ordinal=140 screen="CarPurchaseScreen" inst=0x212c1238d0
+                  fn=0x2109c31820 calling=1
+
+and then the log STOPS -- there is no "called=1" line, because the guest
+died inside the call.  Eden says what kind of death:
+
+    Unmapped Write32 @ 0x48 = 0x0000000000080000
+    Unmapped Write32 @ 0x34 = 0x000000003F21866C
+    Unmapped Write32 @ 0x30 = 0x0000000046EA6000
+    Unmapped Read32  @ 0x48
+
+i.e. writes to 0x30/0x34/0x48 of a NULL pointer, in a tight loop.
+
+**=>=> THE CAUSE IS IN THE RECIPE'S OWN TERMS: A SCREEN THAT HAS NEVER BEEN
+BUILT HAS NO COMPONENTS.**  The guest was building the screen's component
+tree and walking a null root.
+
+So one step is missing, and it is the guest's own:
+
+    vtable slot 69       the screen's XML LOADER
+                        (EventMapScreen's is at 0xdb8c90, and it loads
+                         "EventMapScreen.xml" after the front-end gate)
+    vtable slot 73       the screen's NAME getter
+                        (0x9faa1c in the base, 0xdb97dc in EventMapScreen)
+
+**=>=> THE NEXT STEP IS: BUILD THE SCREEN FIRST (slot 69), THEN OPEN IT.**
+
+AND THE PORT DOES NOT CRASH THE SHIPPED GAME
+--------------------------------------------
+Nothing is active by default: the card's rr3-open.txt ships with every line
+commented out, so the delivered card changes nothing.  And the request path
+now REFUSES rather than crashes: the instance's first word must point into
+the guest's vtable section (0x1e1aae0 .. 0x1e19ae0), or the request is
+reported and skipped.  A probe that can take the guest down is a probe that
+must not be the default.
+
+**=>=> AND THE POINT OF THE WHOLE EXERCISE STANDS.**  The capability is
+there: the port knows every screen's name, has every screen's instance, and
+has the guest's own call to open one.  What is missing is one virtual call
+in front of it.
