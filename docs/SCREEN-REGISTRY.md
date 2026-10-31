@@ -174,8 +174,13 @@ is:
         0x14a44e4  ldr  x8, [x1]            ; the screen's vtable
         0x14a44f0  ldr  x8, [x8, #0x248]    ; slot 73 -- the NAME getter
         0x14a44f4  blr  x8
-        0x14a44fc  bl   0x1e17bf0            ; the NAME -> INDEX
-        0x14a450c  cmp  x0, #0x17            ; and the index is 0..23
+        0x14a44fc  bl   0x1e17bf0            ; an EXTERNAL function (a PLT
+                                           ; thunk into the GOT at
+                                           ; 0x1f7e890 -- so this is a
+                                           ; C++ library call, not a
+                                           ; guest-internal lookup)
+        0x14a450c  cmp  x0, #0x17            ; and its result is used as an
+                                           ; index, and the index is 0..23
 
 **=>=> THE MANAGER KEEPS A TABLE OF 24 SCREENS, AND OpenScreen FINDS THE
 SCREEN IN THAT TABLE BY ITS NAME.**  So the open needs TWO names that are
@@ -186,7 +191,8 @@ not necessarily the same string:
      slot 73 reports.
 
 The registry and the table are different things, and the two names may
-differ.  That is the first thing to check.
+differ.  That is the first thing to check -- and the table's index is the
+thing to read, not the function that computes it.
 
 The other candidate is the flags word: the descriptor's byte at +0x10 is
 `flags & 1`, and the port passes 0.  It is a one-bit experiment.
