@@ -10804,10 +10804,54 @@ The next measurement is therefore: does the guest ever set a scissor for
 those labels?  The port logs every `glScissor`
 (`phase=scissor ... glScissor x=.. y=.. w=.. h=.. (call #N, viewport=...)`),
 and around the card in q66 the rectangles seen were full-window ones
-(`0,0,1280,720`), never a per-label one.  So either the guest does not clip
-the label text (and the game really does overlap on Android -- possible, the
-card's boxes may be a scroll window), or the clip is done by the label's own
-draw call and the port has to honour it.
+(`0,0,1280,720`), never a per-label one.
+
+### MEASURED (q66): THE GUEST NEVER CLIPS THE CARD'S LABELS
+
+Every `glScissor` in the whole q66 run -- 8981 of them -- was counted:
+
+    distinct rectangles, by frequency:
+       0,0,1280,720   x4272      (the whole window)
+       0,0,512,512     x3254
+       0,49,1280,619   x280
+       994,667,187,53  x217       (a button)
+       780,667,232,53  x217       (a button)
+       1083,77,142,574 x100
+       0,208,1280,423  x66
+       102,74,1076,28  x66
+       ...
+    rectangles 257 wide:      NONE
+    rectangles <= 20 tall:    NONE  (only 556x1 separators)
+
+**⇒ The guest never clips a label to its box.**  The card's labels are
+42 px lines in 16 px boxes, and the two boxes are 27 px apart, so the only
+way they can be 27 px apart on screen is if the guest SCALES the text into
+the box -- and the scale it uses comes from the Font metrics the port hands
+it.
+
+**⇒⇒⇒ WHICH MEANS THE CARD'S OVERLAP IS THE SAME BUG AS THE SCREENSHOT'S.**
+With the synthetic Font (getSize=48, height=30) the scale was wrong by
+2.6x, the text overflowed its box, and the two labels ran together.  The
+Font fix (real metrics) should put the card right as well -- and the
+acceptance for it is the ink gap between the two labels, measured on a frame
+of the event screen.
+
+### How the card gets on disk at all (no code change needed)
+
+The port's own capture schedule is far too coarse (30, 120, 300, 600, ...),
+but the INPUT driver takes its own picture whenever the pushed input changes
+(`rr3_InputDoors.cpp:564`, `frame-9NNNNN.png`), and it takes the PREVIOUS
+frame -- the one the guest drew last.
+
+And the touch script already contains the hop that reaches the event picker:
+
+    at 4100 335 450 down      (the "越野赛" card title on the event picker)
+    at 4140 335 450 up
+
+q66 ran 3720 frames in 306 s, so frame 4100 was never reached and the hop
+never fired -- which is exactly why no `frame-9041*.png` exists in that
+archive.  **A run long enough to reach frame 4100 photographs the event
+screen without touching the code.**
 
 And the capture has to happen ON A SCREEN CHANGE, or the card is never on
 disk at all: the ui-ctl probe already knows the live screen on every frame,
