@@ -961,6 +961,211 @@ void releaseEgl(EGLDisplay display, EGLSurface surface, EGLContext context) {
 }
 
 // ---------------------------------------------------------------------------
+// The offscreen target: a surface of the VIEW size.
+//
+// The guest lays out for the view size and sets its viewport to it, so the
+// target has to be that big -- the 1280x720 window cannot hold it.  The port
+// therefore owns an FBO of the view size (a colour texture AND a depth
+// renderbuffer, because the 3D scene needs depth), binds it before the
+// guest's frame -- the guest never binds a framebuffer itself, so nothing can
+// unbind it -- and scales it into the window after the frame with a texture
+// and a full-screen quad.
+//
+// glBlitFramebuffer is NOT available: the context is GLES2 and the port
+// compiles against <GLES2/gl2.h>, which has no such entry point.  So the blit
+// is the port's own, and it is the pattern graphics_probe.cpp already uses
+// (a texture, a program, a client-side quad, glDrawArrays).
+//
+// EVERY STEP IS GATED.  If the target or the program cannot be made, the port
+// says so and the view stays 1280x720: the game then runs exactly as before,
+// and never as a corner crop.
+struct HdTarget {
+    GLuint fbo = 0;
+    GLuint color = 0;
+    GLuint depth = 0;
+    GLuint program = 0;
+    GLint aPos = -1;
+    GLint aUV = -1;
+    GLint uTex = -1;
+    int width = 0;
+    int height = 0;
+    bool ready = false;
+};
+
+HdTarget g_hdTarget;
+
+const char* kHdVertexSource =
+    "attribute vec2 aPos;\n"
+    "attribute vec2 aUV;\n"
+    "varying vec2 vUV;\n"
+    "void main() { vUV = aUV; gl_Position = vec4(aPos, 0.0, 1.0); }\n";
+
+const char* kHdFragmentSource =
+    "precision mediump float;\n"
+    "varying vec2 vUV;\n"
+    "uniform sampler2D uTex;\n"
+    "void main() { gl_FragColor = texture2D(uTex, vUV); }\n";
+
+bool hdCompileProgram() {
+    GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+    if (vs == 0) {
+        return false;
+    }
+    glShaderSource(vs, 1, &kHdVertexSource, nullptr);
+    glCompileShader(vs);
+    GLint ok = GL_FALSE;
+    glGetShaderiv(vs, GL_COMPILE_STATUS, &ok);
+    if (ok != GL_TRUE) {
+        return false;
+    }
+    GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+    if (fs == 0) {
+        return false;
+    }
+    glShaderSource(fs, 1, &kHdFragmentSource, nullptr);
+    glCompileShader(fs);
+    glGetShaderiv(fs, GL_COMPILE_STATUS, &ok);
+    if (ok != GL_TRUE) {
+        return false;
+    }
+    const GLuint program = glCreateProgram();
+    if (program == 0) {
+        return false;
+    }
+    glAttachShader(program, vs);
+    glAttachShader(program, fs);
+    glBindAttribLocation(program, 0, "aPos");
+    glBindAttribLocation(program, 1, "aUV");
+    glLinkProgram(program);
+    glGetProgramiv(program, GL_LINK_STATUS, &ok);
+    if (ok != GL_TRUE) {
+        return false;
+    }
+    g_hdTarget.program = program;
+    g_hdTarget.aPos = glGetAttribLocation(program, "aPos");
+    g_hdTarget.aUV = glGetAttribLocation(program, "aUV");
+    g_hdTarget.uTex = glGetUniformLocation(program, "uTex");
+    return g_hdTarget.aPos >= 0 && g_hdTarget.aUV >= 0 && g_hdTarget.uTex >= 0;
+}
+
+bool hdTargetCreate(int width, int height) {
+    if (width <= 0 || height <= 0) {
+        return false;
+    }
+    if (g_hdTarget.ready) {
+        return true;
+    }
+    if (!hdCompileProgram()) {
+        char diag[128];
+        __builtin_snprintf(diag, sizeof(diag),
+                           "the blit program did not build; the view stays "
+                           "1280x720");
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "hd-target", 258, 0, diag);
+        return false;
+    }
+    glGenTextures(1, &g_hdTarget.color);
+    glBindTexture(GL_TEXTURE_2D, g_hdTarget.color);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glGenFramebuffers(1, &g_hdTarget.fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_hdTarget.fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                           g_hdTarget.color, 0);
+    glGenRenderbuffers(1, &g_hdTarget.depth);
+    glBindRenderbuffer(GL_RENDERBUFFER, g_hdTarget.depth);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, width, height);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER,
+                             g_hdTarget.depth);
+    const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        char diag[128];
+        __builtin_snprintf(diag, sizeof(diag),
+                           "offscreen target %dx%d is INCOMPLETE (status=0x%x); "
+                           "the view stays 1280x720",
+                           width, height, static_cast<unsigned>(status));
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "hd-target", 258, 0, diag);
+        return false;
+    }
+    g_hdTarget.width = width;
+    g_hdTarget.height = height;
+    g_hdTarget.ready = true;
+    // Now the view may exceed the surface: there IS a surface of the view
+    // size.  gfxViewWidth() stops clamping because of this.
+    gfxSetOffscreenTargetReady(true);
+    char diag[160];
+    __builtin_snprintf(diag, sizeof(diag),
+                       "offscreen target %dx%d created: the guest renders into "
+                       "it and the port scales it into the window",
+                       width, height);
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "hd-target", 258, 0, diag);
+    return true;
+}
+
+// The guest's frame goes into the target, if there is one.
+void hdTargetBind() {
+    if (!g_hdTarget.ready) {
+        return;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, g_hdTarget.fbo);
+}
+
+// And the target goes into the window, scaled.
+void hdTargetBlit(int outWidth, int outHeight) {
+    if (!g_hdTarget.ready || outWidth <= 0 || outHeight <= 0) {
+        return;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    const GLboolean depthTest = glIsEnabled(GL_DEPTH_TEST);
+    const GLboolean scissorTest = glIsEnabled(GL_SCISSOR_TEST);
+    const GLboolean blend = glIsEnabled(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    glViewport(0, 0, outWidth, outHeight);
+    glUseProgram(g_hdTarget.program);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, g_hdTarget.color);
+    glUniform1i(g_hdTarget.uTex, 0);
+    static const GLfloat kQuad[] = {
+        -1.0f, -1.0f, 0.0f, 0.0f,
+         1.0f, -1.0f, 1.0f, 0.0f,
+        -1.0f,  1.0f, 0.0f, 1.0f,
+         1.0f,  1.0f, 1.0f, 1.0f,
+    };
+    glEnableVertexAttribArray(static_cast<GLuint>(g_hdTarget.aPos));
+    glEnableVertexAttribArray(static_cast<GLuint>(g_hdTarget.aUV));
+    glVertexAttribPointer(static_cast<GLuint>(g_hdTarget.aPos), 2, GL_FLOAT,
+                           GL_FALSE, sizeof(kQuad), kQuad);
+    glVertexAttribPointer(static_cast<GLuint>(g_hdTarget.aUV), 2, GL_FLOAT,
+                           GL_FALSE, sizeof(kQuad), kQuad + 2);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisableVertexAttribArray(static_cast<GLuint>(g_hdTarget.aPos));
+    glDisableVertexAttribArray(static_cast<GLuint>(g_hdTarget.aUV));
+    glUseProgram(0);
+    if (blend) {
+        glEnable(GL_BLEND);
+    }
+    if (scissorTest) {
+        glEnable(GL_SCISSOR_TEST);
+    }
+    if (depthTest) {
+        glEnable(GL_DEPTH_TEST);
+    }
+}
+
+bool hdTargetActive() {
+    return g_hdTarget.ready;
+}
+
+// ---------------------------------------------------------------------------
 // Host PC sampler: the program counter of the frozen main thread.
 //
 // Why this instrument exists: Eden's HW.Memory fault lines carry no PC and no
@@ -2327,6 +2532,32 @@ GuestViewProbe runGuestViewProbe(NWindow* window, const char* progressPath) {
     }
     probe.madeCurrent = true;
     appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "view-egl-current-ok", 257, 0);
+
+    // THE OFFSCREEN TARGET, BEFORE THE GUEST'S FIRST VIEW CALLBACK.
+    //
+    // The guest is told the view size in onViewChangedJNI and it lays out for
+    // it AND sets its viewport to it, so a view bigger than the 1280x720
+    // window needs a real surface of that size -- or the picture lands in a
+    // corner (measured, q67).  If the config asks for one and the target can
+    // be made, the guest gets it; if not, the view stays 1280x720 and the
+    // clamp says so in the log.
+    {
+        const int wantedWidth = gfxViewWidthOverride();
+        const int wantedHeight = gfxViewHeightOverride();
+        if (wantedWidth > 1280 || wantedHeight > 720) {
+            if (!hdTargetCreate(wantedWidth > 0 ? wantedWidth : 1280,
+                                wantedHeight > 0 ? wantedHeight : 720)) {
+                char diag[160];
+                __builtin_snprintf(diag, sizeof(diag),
+                                   "offscreen target %dx%d could not be made; "
+                                   "the view stays 1280x720",
+                                   wantedWidth, wantedHeight);
+                appendGuestBootLine(
+                    "sdmc:/switch/rr3-native-rehost.guest-view.log", "hd-target",
+                    258, 0, diag);
+            }
+        }
+    }
 
     // First exercise the exact host GLES call that the guest's first View
     // initialization uses. This is deliberately outside GuestTlsScope so a
@@ -8327,10 +8558,18 @@ void* frameLoopDriver(void* opaque) {
             // the guest was drawing its 2D UI at the atlas' own pixel size.
             // A capture that lies about what is on screen is worse than no
             // capture: the glove detector reads the SAME buffer.
-            const int vw = gfxViewWidth();
-            const int vh = gfxViewHeight();
+            // With the offscreen target the guest's picture has ALREADY been
+            // scaled into the window by the blit, so the capture must read the
+            // WINDOW, at the OUTPUT size.  Reading the view size out of a
+            // 1280x720 buffer is how q67's capture came out mostly blank.
+            const bool offscreen = hdTargetActive();
+            const int vw = offscreen ? 1280 : gfxViewWidth();
+            const int vh = offscreen ? 720 : gfxViewHeight();
             if (vw <= 0 || vh <= 0) {
                 return;
+            }
+            if (offscreen) {
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
             }
             // 2048x1536 RGBA is 12 MiB: too big for the stack, and this runs
             // on the frame-loop thread.
@@ -8423,8 +8662,10 @@ void* frameLoopDriver(void* opaque) {
                 "sdmc:/switch/rr3-native-rehost.guest-view.log",
                 "second-render: frame=30 invoking onViewRenderJNI a second time",
                 0, 0);
+            hdTargetBind();
             reinterpret_cast<void (*)(void*, void*, int, uint32_t)>(renderTarget)(
                 jniEnvironment, activityObject, 2, 0);
+            hdTargetBlit(1280, 720);
             appendGuestBootLine(
                 "sdmc:/switch/rr3-native-rehost.guest-view.log",
                 "second-render: frame=30 RETURNED", 0, 0);
@@ -8434,8 +8675,10 @@ void* frameLoopDriver(void* opaque) {
         }
 
         if (RR3_FRAME_LOOP_RENDER) {
+        hdTargetBind();
         reinterpret_cast<void (*)(void*, void*, int, uint32_t)>(renderTarget)(
             jniEnvironment, activityObject, 2, 0);
+        hdTargetBlit(1280, 720);
         }
         if (frames < 3) {
             appendGuestBootLine(

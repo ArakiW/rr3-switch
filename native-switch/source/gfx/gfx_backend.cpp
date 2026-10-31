@@ -1123,8 +1123,16 @@ int gfxViewHeightOverride() {
 constexpr int kRealSurfaceWidth = 1280;
 constexpr int kRealSurfaceHeight = 720;
 
-// The view size, clamped to the real surface, and SAID OUT LOUD when it is
-// clamped.
+// Whether the port owns an offscreen target of the view size.  The view probe
+// sets it once the FBO and its blit program are really there.
+static bool s_offscreenTargetReady = false;
+
+void gfxSetOffscreenTargetReady(bool ready) {
+    s_offscreenTargetReady = ready;
+}
+
+// The view size, clamped to the real surface UNLESS the port owns an
+// offscreen target of the view size, and SAID OUT LOUD when it is clamped.
 //
 // The guest asks the surface how big it is (eglQuerySurface) and sets its
 // viewport to the answer, so a view bigger than the buffer draws only the
@@ -1133,11 +1141,12 @@ constexpr int kRealSurfaceHeight = 720;
 // view=2048x1152 the guest's content occupies only the bottom left 1280x720
 // of the buffer and the rest of it is blank.
 //
-// The port owns no offscreen target of the view size yet -- it does not own an
-// FBO, and the guest renders into the default framebuffer (the guest binds
-// fb=0 once at start-up and never binds an FBO again; see the fbo-bind lines
-// in a guest-view log).  Until the port owns one, a bigger view is a broken
-// picture, not a sharper one, so the view is CLAMPED.
+// The port owns no offscreen target by default -- it does not own an FBO, and
+// the guest renders into the default framebuffer (the guest binds fb=0 once at
+// start-up and never binds an FBO again; see the fbo-bind lines in a
+// guest-view log).  Until the port owns one, a bigger view is a broken
+// picture, not a sharper one, so the view is CLAMPED.  With the target there
+// IS a surface of the view size, and the view may exceed the window.
 //
 // The clamp is LOUD on purpose: a silent clamp is the "silent fallback" that
 // hides the difference between "the picture is 720p because that is what the
@@ -1146,7 +1155,8 @@ constexpr int kRealSurfaceHeight = 720;
 void gfxViewSize(int* width, int* height) {
     int w = gfxViewWidthOverride() > 0 ? gfxViewWidthOverride() : kRealSurfaceWidth;
     int h = gfxViewHeightOverride() > 0 ? gfxViewHeightOverride() : kRealSurfaceHeight;
-    if (w > kRealSurfaceWidth || h > kRealSurfaceHeight) {
+    if (!s_offscreenTargetReady &&
+        (w > kRealSurfaceWidth || h > kRealSurfaceHeight)) {
         static bool s_loggedClamp = false;
         if (!s_loggedClamp) {
             s_loggedClamp = true;

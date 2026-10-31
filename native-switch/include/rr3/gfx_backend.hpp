@@ -205,6 +205,17 @@ int gfxUiScreenHeightOverride();
 int gfxViewWidthOverride();
 int gfxViewHeightOverride();
 
+// Whether the port OWNS an offscreen target of the view size.
+//
+// A view bigger than the surface is only safe when there is a real surface of
+// that size to draw into: the guest lays out for the view and sets its
+// viewport to it, so a viewport bigger than the buffer draws the picture in a
+// corner and the rest is never drawn.  The probe creates that target (an FBO
+// with a colour texture and a depth renderbuffer) before the guest's first
+// view callback, and says so here; until it does, gfxViewWidth() clamps the
+// view to the surface.
+void gfxSetOffscreenTargetReady(bool ready);
+
 // The view size with the port's historical default applied.  1280x720 is what
 // this port has always told the guest, and an absent rr3-screen.txt must keep
 // meaning that.
