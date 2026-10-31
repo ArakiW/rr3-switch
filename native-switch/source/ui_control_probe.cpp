@@ -772,6 +772,78 @@ uintptr_t guestScreenEntry(const char* name) {
     return 0;
 }
 
+
+// THE FRONT END'S OWN SCREEN STACK -- AND THE NAVIGATION TREE.
+//
+// MEASURED 2026-10-31 (q57): the guest OPENS the toolbar's .gui at startup
+// (SettingsToolbar_Settings.gui, SettingsToolbar_ProfileSocial.gui,
+// StatusIconBar.gui, main_menu_twosquare.gui), and those .gui files carry
+// the navigation into the meta half (BTN_TOOLBAR_COMMUNITY,
+// BTN_TOOLBAR_PROFILE, ...).  But naming those controls in the card's
+// rr3-ui.txt pressed NOTHING: the live screens are only EventMapScreen,
+// EventsScreen and CarSelectScreen, so the toolbar's controls are not in
+// any registry screen's tree.
+//
+// So the navigation tree hangs off something else.  The front end keeps a
+// stack of screens at mgr+0xb8 (and a second array at mgr+0x88), both with
+// 0x30-byte entries, and the depth at mgr+0x3b8.  The TOP entry is the
+// most likely owner: it is the screen the front end is actually showing.
+//
+// And a screen's entry may hold a COMPONENT ROOT: a pointer whose own name
+// reads as a control id and whose children container is a consistent
+// vector.  Those are the SAME two tests the probe already applies to a
+// component, so they are reused here.
+struct StackRoot {
+    uintptr_t address;
+    uintptr_t children;
+    int childCount;
+    char name[64];
+};
+
+// Reads the stack, finds the component roots in it, and returns them.
+int findStackRoots(uintptr_t manager, StackRoot* out, int maxOut) {
+    uint32_t depth = 0;
+    if (!readU32(manager + 0x3B8ULL, &depth) || depth == 0 || depth > 32) {
+        return 0;
+    }
+    int found = 0;
+    // BOTH 0x30-stride arrays: which one holds the screen pointers depends on
+    // the transition type, so both are read and neither is assumed.
+    for (int which = 0; which < 2 && found < maxOut; ++which) {
+        const uintptr_t base = manager + (which == 0 ? 0xB8ULL : 0x88ULL);
+        for (uint32_t i = 0; i < depth && found < maxOut; ++i) {
+            const uintptr_t entry = base + static_cast<uintptr_t>(i) * 0x30ULL;
+            for (size_t k = 0; k < 0x30 && found < maxOut; k += 8) {
+                uint64_t word = 0;
+                if (!readU64(entry + k, &word) || word == 0) {
+                    continue;
+                }
+                const uintptr_t candidate = static_cast<uintptr_t>(word);
+                if (!pointerSane(candidate)) {
+                    continue;
+                }
+                char name[64] = {0};
+                if (!readGuestString(candidate + kCompNameOff, name, sizeof(name)) ||
+                    !isControlId(name)) {
+                    continue;
+                }
+                uintptr_t children = 0;
+                int childCount = 0;
+                if (!readChildren(candidate, &children, &childCount) || childCount == 0) {
+                    continue;
+                }
+                out[found].address = candidate;
+                out[found].children = children;
+                out[found].childCount = childCount;
+                std::memcpy(out[found].name, name, sizeof(out[found].name));
+                ++found;
+                break;
+            }
+        }
+    }
+    return found;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -887,6 +959,38 @@ void pumpUiControlProbe(unsigned long long frame) {
         merged.insert(merged.end(), controls.begin(), controls.end());
     }
     sample.screensLive = liveScreens;
+
+    // AND THE FRONT END'S OWN SCREEN STACK, because the navigation tree is
+    // NOT in any registry screen's tree (measured in q57).
+    StackRoot roots[8];
+    const int rootCount =
+        findStackRoots(static_cast<uintptr_t>(manager), roots, 8);
+    if (rootCount > 0) {
+        char stackLine[1024];
+        int sw = std::snprintf(stackLine, sizeof(stackLine),
+                               "f=%llu roots=%d", frame, rootCount);
+        for (int i = 0; i < rootCount; ++i) {
+            std::vector<UiControl> controls;
+            WalkState state{};
+            state.controls = &controls;
+            state.screen = roots[i].name;
+            walkComponent(roots[i].address, &state, 0);
+            if (!controls.empty()) {
+                merged.insert(merged.end(), controls.begin(), controls.end());
+            }
+            if (sw > 0 && sw < static_cast<int>(sizeof(stackLine)) - 80) {
+                sw += std::snprintf(stackLine + sw,
+                                    sizeof(stackLine) - static_cast<size_t>(sw),
+                                    " %s@0x%llx(%d children -> %u controls);",
+                                    roots[i].name,
+                                    static_cast<unsigned long long>(roots[i].address),
+                                    roots[i].childCount,
+                                    static_cast<unsigned>(controls.size()));
+            }
+        }
+        appendGuestBootLine(kGuestViewLogPath, "ui-stack", 144, 0, stackLine);
+    }
+
     if (!g_displayNamesLogged && liveScreens > 0) {
         g_displayNamesLogged = true;
         logScreenDisplayNames(screens, screenCount,
