@@ -10910,6 +10910,97 @@ and the scale comes from the Font metrics the port hands it.  With the
 synthetic 48 px Font that scale was 2.6x too big; with the real metrics it
 is right.
 
+## 2026-11-01 (02:55): THE REAL HD PATH, WRITTEN DOWN SO IT CAN BE BUILT
+
+Everything below is MEASURED or read out of the source; the two pieces that
+are not in the tree yet are marked.
+
+### What the guest does, and what it does not do
+
+    phase=fbo-bind bindFramebuffer target=0x8ca9 fbo=0 status=0x0
+    phase=fbo-bind bindFramebuffer target=0x8d40 fbo=1 status=0x8cd5
+    phase=fbo-bind bindFramebuffer target=0x8d40 fbo=2 status=0x8cd5
+    phase=fbo-bind bindFramebuffer target=0x8d40 fbo=3 status=0x8cd5
+
+All four binds are at start-up (draws=0, viewport=0,0,0,0) and the guest binds
+NOTHING afterwards, so in steady state it renders into the DEFAULT
+framebuffer (fb0 = the 1280x720 window) and the per-frame stats reset
+`lastBoundFramebuffer` to 0.  **⇒ the present path's scaled blit has never
+run** ("fbo-present" appears zero times in the q66 and q67 logs).
+
+⇒ The missing piece is the TARGET, not the blit call.
+
+### The four steps, in order
+
+1. **An FBO at the view size.**  A colour texture (GL_RGBA, the view size)
+   plus a DEPTH renderbuffer (GL_DEPTH_COMPONENT16) -- the 3D scene needs
+   depth, and a colour-only FBO would draw it without depth testing.  Then
+   `glFramebufferTexture2D` + `glFramebufferRenderbuffer` and
+   `glCheckFramebufferStatus`; if it is not `GL_FRAMEBUFFER_COMPLETE`, give
+   up on the FBO (see the fallback).
+
+2. **Bind it before the guest's frame.**  In the frame loop in
+   `guest_view_probe.cpp` (the same place the present runs, a few hundred
+   lines above it), `glBindFramebuffer(GL_FRAMEBUFFER, fbo)` before the
+   guest's `onViewRenderJNI` call.  **This works because the guest never binds
+   a framebuffer itself**, so nothing can unbind it between the bind and the
+   guest's draw.
+
+3. **Scale it into the window at present time.**  `glBlitFramebuffer` is NOT
+   available: the context is GLES2 and the port compiles against
+   `<GLES2/gl2.h>`.  So the port needs its own blit -- a texture and a
+   full-screen quad:
+
+       attribute vec2 a_Position;   // -1..1
+       varying vec2 v_Tex;
+       uniform sampler2D u_Tex;
+       void main() { v_Tex = a_Position * 0.5 + 0.5; gl_Position = vec4(a_Position, 0.0, 1.0); }
+
+       precision mediump float;
+       varying vec2 v_Tex;
+       uniform sampler2D u_Tex;
+       void main() { gl_FragColor = texture2D(u_Tex, v_Tex); }
+
+   with the colour texture filtered LINEAR (it already is, for the guest's own
+   draws) and the viewport set to the output size.  The port already has the
+   GL wrappers (`__wrap_glGenFramebuffers`, `__wrap_glFramebufferTexture2D`,
+   `__wrap_glBindFramebuffer`, ...) and the ES3 entry point is resolved by
+   hand elsewhere, so the same pattern applies.
+
+4. **Let the view exceed the surface again -- but ONLY if the target really
+   exists.**  The clamp added in 880ca598 has to become: "the view may be
+   bigger than the surface when the port owns an offscreen target of that
+   size".  A failure has to degrade to 720p, not to a corner crop.
+
+### What it is worth
+
+    view=2048x1152, q67: 1680 frames in 305 s
+    view=1280x720,  q66: 3720 frames in 306 s      -> 45% of the frame rate
+
+on Eden's SOFTWARE renderer.  On the Switch's own GPU the same pixels are
+nothing.  And the 2D UI atlas becomes the 2048x1536 tree at that view size,
+which is a one-off cost (VRAM and load time), not a per-frame one.
+
+### The acceptance
+
+  * the log shows the target was created and the blit ran;
+  * the capture is 1280x720 and COMPLETE (q67's was a 2048x1152 buffer with
+    the content in the bottom-left corner);
+  * the frames per second is back to the 1280x720 level (the cost is pixels,
+    not the blit);
+  * the text still measures the same (the Font fix must not move): the event
+    card's labels 15 and 16 px with 10 and 13 rows between them.
+
+### And the cheaper thing to tell the player
+
+On Eden the framebuffer is 1280x720 and the emulator scales it into whatever
+size the host window is.  **A host window of 1280x720 makes the picture
+1:1 and costs nothing.**  On the real Switch the framebuffer IS 1280x720, so
+the picture is already 1:1 there -- and the vehicle and track materials are
+already the HD ones (they are chosen by the device profile's quality tier,
+not by the view size).
+
+
 
 
 
