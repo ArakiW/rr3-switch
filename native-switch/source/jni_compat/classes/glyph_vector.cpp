@@ -340,13 +340,21 @@ struct Metrics {
     float leading;  // extra leading the face asks for
 };
 
+// FreeType's FT_Size_Metrics already carries the signs the layout wants:
+// sm.ascender is POSITIVE (it points UP from the baseline) and sm.descender is
+// NEGATIVE.  The port used to negate the ascender, so the ascent came out
+// negative, the line height (ascent + descent) came out negative, and the
+// `lineHeight <= 0` fallback below quietly replaced it with the font size.
+// That is the "silent fallback is worse than a wrong number" case: the
+// published boundsH was the font size instead of the real line box, and the
+// two sign errors cancelled inside the rasteriser, so nothing looked broken.
 Metrics metricsOf(FT_Face face) {
     Metrics m{0.f, 0.f, 0.f};
     if (face == nullptr || face->size == nullptr) {
         return m;
     }
     const FT_Size_Metrics& sm = face->size->metrics;
-    const float ascent = static_cast<float>(-sm.ascender) / 64.0f;
+    const float ascent = static_cast<float>(sm.ascender) / 64.0f;
     const float descent = static_cast<float>(-sm.descender) / 64.0f;
     const float height = static_cast<float>(sm.height) / 64.0f;
     m.ascent = ceilf(ascent);
@@ -772,12 +780,17 @@ void noteFace(const char* romfsPath, FT_Face face, FT_Error error, float sizePx,
     const float em = face != nullptr && face->size != nullptr
                          ? static_cast<float>(face->units_per_EM)
                          : 0.f;
+    // The ascent is POSITIVE here, like every other place in the port: the
+    // face's ascender points up from the baseline and FreeType already stores
+    // it that way.  The log used to print it negated, which hid the sign error
+    // in metricsOf() behind a plausible-looking negative number.
     const float ascent = face != nullptr && face->size != nullptr
-                             ? static_cast<float>(-face->size->metrics.ascender) / 64.f
+                             ? static_cast<float>(face->size->metrics.ascender) / 64.f
                              : 0.f;
     const float descent = face != nullptr && face->size != nullptr
                               ? static_cast<float>(-face->size->metrics.descender) / 64.f
                               : 0.f;
+    const float lineHeight = ascent + descent;
     // THE FACE THAT WAS REALLY OPENED. `romfsPath` is what the guest asked
     // for; the face may be a different file entirely, and the difference
     // has to be visible in the log.
@@ -785,12 +798,12 @@ void noteFace(const char* romfsPath, FT_Face face, FT_Error error, float sizePx,
     char details[384];
     snprintf(details, sizeof(details),
              "req=%s face=%s substituted=%d symbol=%d openErr=%d sizeErr=%d "
-             "size=%.1f upem=%.0f ascentPx=%.1f descentPx=%.1f scalable=%d "
-             "glyphs=%ld",
+             "size=%.1f upem=%.0f ascentPx=%.1f descentPx=%.1f lineH=%.1f "
+             "scalable=%d glyphs=%ld",
              romfsPath, actual,
              (actual != nullptr && strcmp(actual, romfsPath) != 0) ? 1 : 0,
              isNonTextFace(basenameOf(romfsPath)) ? 1 : 0,
-             (int)error, (int)sizeError, sizePx, em, ascent, descent,
+             (int)error, (int)sizeError, sizePx, em, ascent, descent, lineHeight,
              face != nullptr ? (face->face_flags & FT_FACE_FLAG_SCALABLE) ? 1 : 0 : 0,
              face != nullptr ? static_cast<long>(face->num_glyphs) : 0L);
     rr3::guestViewWideLog("glyph-face", 0, 0, details);
@@ -1112,8 +1125,29 @@ void renderText(uintptr_t self, uintptr_t fontHandle, const char* text,
                         paragraph ? wrapWidth : 0.f, alignment, &layout);
     }
     const Metrics metrics = layout.metrics;
-    float lineHeight = metrics.ascent + metrics.descent;
+    // Android's Layout.getDesiredLineHeight() is the font's ascent + descent +
+    // leading, and the game's StaticLayout is built with spacingmult = 1.0 and
+    // spacingadd = 0.0 (GlyphVector.java:118), so the line advance IS that
+    // height.
+    //
+    // The metrics come from the PRIMARY typeface -- the one the guest named --
+    // exactly as Paint.getFontMetrics() does on Android.  The CJK fallback
+    // supplies GLYPHS only; it does not move the line box.  (The CJK ink is
+    // 0.94 em and the Latin line box is 1.007 em, or 1.207 em with Conduit's
+    // 0.2 em leading, so the ink fits either way.)
+    float lineHeight = metrics.ascent + metrics.descent + metrics.leading;
     if (lineHeight <= 0.f) {
+        // The face could not be measured.  SAY SO: a silent fallback here is
+        // what hid the ascent sign error -- the line height came out negative,
+        // the fallback replaced it with the font size, and every published
+        // boundsH was the font size instead of the real line box.
+        static bool s_loggedNoLineHeight = false;
+        if (!s_loggedNoLineHeight) {
+            s_loggedNoLineHeight = true;
+            rr3::guestViewWideLog("glyph-para", 0, 0,
+                                   "NO LINE HEIGHT: the face could not be measured; "
+                                   "falling back to the font size");
+        }
         lineHeight = request.sizePx > 0.f ? request.sizePx : 1.f;
     }
 
@@ -1751,6 +1785,50 @@ void fontRequest(uintptr_t fontHandle, FontRequest* out) {
     // in jni_bridge.cpp.
     rr3::glyphFontRequest(fontHandle, &out->sizePx, &out->widthScale, &out->bold,
                      out->path, sizeof(out->path));
+}
+
+// The metrics of the face the guest named, at the size it asked for.
+//
+// This is Font.init()'s Paint.getFontMetrics(), in the convention Font.java
+// stores it in (the signs are spelled out in glyph_vector.h).  The face is the
+// one the guest NAMED -- the same face the paragraph is measured with -- so
+// the guest's layout and the paragraph agree on how tall the font is.
+//
+// It is measured from the PRIMARY typeface only.  On Android the CJK glyphs
+// come from the system's fallback font, but Paint.getFontMetrics() still
+// reports the primary typeface's metrics, and so does this.
+bool fontMetricsFor(const char* path, bool bold, float sizePx, FontMetrics* out) {
+    if (out == nullptr) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    if (sizePx <= 0.f) {
+        return false;
+    }
+    mutexLock(&g_glyphMutex);
+    if (g_library == nullptr && FT_Init_FreeType(&g_library) != 0) {
+        g_library = nullptr;
+    }
+    FT_Face face = nullptr;
+    if (g_library != nullptr) {
+        face = openFaceFor(path, bold);
+        if (face != nullptr) {
+            sizeFace(face, sizePx);
+        }
+    }
+    bool ok = false;
+    if (face != nullptr && face->size != nullptr) {
+        const Metrics m = metricsOf(face);
+        out->ascent = m.ascent;    // Font.java:82  -fm.ascent  -> positive
+        out->descent = m.descent;  // Font.java:84   fm.descent -> positive
+        out->height = m.ascent + m.descent;  // Font.java:85
+        out->top = m.ascent;       // Font.java:86  -fm.top     -> positive
+        out->bottom = m.descent;   // Font.java:87   fm.bottom  -> positive
+        out->leading = m.leading;  // Font.java:88
+        ok = true;
+    }
+    mutexUnlock(&g_glyphMutex);
+    return ok;
 }
 
 }  // namespace glyphvector

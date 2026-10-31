@@ -1357,31 +1357,44 @@ uintptr_t jniUnregisterNatives(uintptr_t /*env*/, uintptr_t clazz) {
 // ---- Font state -----------------------------------------------------------
 //
 // Synthetic but self-consistent metrics for com.firemint.realracing.Font at
-// 48 px. The units are a 2048-unit em, which is the one head field that
-// survives the file's obfuscation (r3_symbols.ttf reports unitsPerEm = 2048);
-// the hhea ascent/descent/lineGap that a real init() would read are scrambled,
-// so the split below is the conventional 0.8 / 0.2 Latin em box and NOT a
-// measurement of this font. Rasterisation is a separate, unimplemented step:
-// every value here is a plausible constant, and none of them is a pixel.
+// 48 px, kept as the FALLBACK for a face that cannot be opened.
 //
-// Derived once, at S = 48 px, scale = 48 / 2048 = 0.0234375 px/unit:
+// THE SIGNS ARE THE GAME'S, NOT FreeType's.
+//
+// Android's Paint.FontMetrics is documented as: ascent and top NEGATIVE,
+// descent and bottom POSITIVE, leading POSITIVE.  Font.java (reverse/java/
+// sources/com/firemint/realracing/Font.java:80-88) stores
+//
+//     this.ascent  = -fontMetrics.ascent;   -> POSITIVE, px above the baseline
+//     this.descent =  fontMetrics.descent;   -> POSITIVE, px below the baseline
+//     this.height  =  this.ascent + this.descent;
+//     this.top     = -fontMetrics.top;      -> POSITIVE
+//     this.bottom  =  fontMetrics.bottom;   -> POSITIVE
+//     this.leading =  fontMetrics.leading;   -> POSITIVE
+//
+// The port used to answer DESCENT = -9 here, which made height 39 + (-9) = 30
+// instead of 48, and made the guest size its labels against a font that was
+// 38% shorter than the one the paragraph was laid out with.
+//
+// The values themselves come from r3_symbols.ttf's hhea at 48 px (scale =
+// 48 / 2048 = 0.0234375 px/unit):
 //   ascent   = ceil (1664 u * 0.0234375) = ceil(39.00)  =  39   (0.8125 em)
-//   descent  = floor(-384 u * 0.0234375) = floor(-9.00) =  -9   (0.1875 em)
-//   height   = ascent + descent            =  39 + (-9)  =  30   (Font.java:85
+//   descent  = ceil ( 384 u * 0.0234375) = ceil( 9.00)  =   9   (0.1875 em)
+//   height   = ascent + descent            =  39 + 9     =  48   (Font.java:85
 //              assigns exactly this, so height == ascent+descent by
-//              construction, which satisfies "height >= ascent + descent")
+//              construction)
 //   top      =  40  ( >= ascent 39, one px of font-box overshoot )
-//   bottom   =  11  ( >= |descent| 9 )
+//   bottom   =  11  ( >= descent 9 )
 //   leading  =   6  ( lineGap 256 u, the space between successive line boxes )
 //
-// Glyph box, from the same getTextBounds/getTextWidths pair Font.java calls:
+// The glyph box, from the same getTextBounds/getTextWidths pair Font.java calls:
 //   glyphOffY    = 39   (ink top sits on the ascent line: -rect.top)
 //   glyphHeight  = 35   (ink bottom 4 px above the baseline: -rect.bottom = 4)
 //   glyphWidth   = 24   (0.5 em ink box: rect.right - rect.left)
 //   glyphAdvance = 24   (getTextWidths of a 0.5 em symbol glyph)
 //   glyphOffX    =  0   (Paint.Align.LEFT, so rect.left = 0)
 //   -> ink rect = (left 0, top -39, right 24, bottom -4)
-//   -> 35 <= height + leading (36) and <= ascent - descent (48): the ink fits.
+//   -> 35 <= height + leading (54) and <= ascent - descent (30): the ink fits.
 //
 // Bitmap box, from loadBitmapDynamic's own arithmetic with f=0, f2=0, f3=0 and
 // outline mode OUTLINE_NONE (i2=0, so f4 = 1.0):
@@ -1404,8 +1417,8 @@ uintptr_t jniUnregisterNatives(uintptr_t /*env*/, uintptr_t clazz) {
 // be reflected in what the guest gets back. Documented, not silent.
 constexpr int32_t kFontSizeX100 = 4800;  // 48.00 px, getSize()
 constexpr float kFontAscent = 39.0f;
-constexpr float kFontDescent = -9.0f;
-constexpr float kFontHeight = 30.0f;
+constexpr float kFontDescent = 9.0f;
+constexpr float kFontHeight = 48.0f;
 constexpr float kFontTop = 40.0f;
 constexpr float kFontBottom = 11.0f;
 constexpr float kFontLeading = 6.0f;
@@ -1434,6 +1447,18 @@ struct FakeFont {
     uint32_t bold;
     uint32_t italic;
     char path[96];
+    // The REAL metrics of the face the guest named, at the size it asked
+    // for.  Font.init() reads Paint.getFontMetrics() of that face, and the
+    // guest's own layout reads these six numbers back, so they have to be
+    // measured rather than assumed.  measured == 0 keeps the synthetic
+    // fallback (a face that could not be opened).
+    float ascent;
+    float descent;
+    float height;
+    float top;
+    float bottom;
+    float leading;
+    uint32_t measured;
 };
 
 constexpr uint32_t kFakeFontMagic = 0x4F544E46;  // FNTO
@@ -1469,6 +1494,13 @@ FakeFont* allocateFakeFont() {
     font.widthScale = 1.0f;
     font.bold = 0;
     font.italic = 0;
+    font.ascent = kFontAscent;
+    font.descent = kFontDescent;
+    font.height = kFontHeight;
+    font.top = kFontTop;
+    font.bottom = kFontBottom;
+    font.leading = kFontLeading;
+    font.measured = 0;
     font.path[0] = '\0';
     return &font;
 }
@@ -1527,16 +1559,48 @@ uintptr_t fontBmpData(FakeFont* font) {
     return font->bmpData;
 }
 
+// Which of the Font's fields the guest actually reads.
+//
+// The port can only make a field right if the guest reads it, so this says
+// which ones it reads, once each.  Without it, a field that the guest never
+// touches and a field that drives the whole layout look the same: both are
+// answered, and both are plausible.
+void fontNoteFieldRead(const char* name) {
+    if (name == nullptr) {
+        return;
+    }
+    static char seen[24][32];
+    static size_t seenCount = 0;
+    for (size_t i = 0; i < seenCount; ++i) {
+        if (rawEquals(seen[i], name)) {
+            return;
+        }
+    }
+    if (seenCount >= 24) {
+        return;
+    }
+    rawCopy(seen[seenCount], sizeof(seen[seenCount]), name);
+    ++seenCount;
+    char details[64];
+    __builtin_snprintf(details, sizeof(details), "field=%s", name);
+    guestViewWideLog("jni-font-field", 0, 0, details);
+}
+
 float fontFloatField(const FakeFont* font, const char* name) {
     if (font == nullptr || name == nullptr) {
         return 0.f;
     }
-    if (rawEquals(name, "ascent")) return kFontAscent;
-    if (rawEquals(name, "descent")) return kFontDescent;
-    if (rawEquals(name, "height")) return kFontHeight;
-    if (rawEquals(name, "top")) return kFontTop;
-    if (rawEquals(name, "bottom")) return kFontBottom;
-    if (rawEquals(name, "leading")) return kFontLeading;
+    fontNoteFieldRead(name);
+    // The real face at the real size when it could be measured; the synthetic
+    // 48 px set otherwise.  Both are in the game's signs: ascent, descent,
+    // top, bottom and leading positive, height == ascent + descent.
+    const bool real = font->measured != 0;
+    if (rawEquals(name, "ascent")) return real ? font->ascent : kFontAscent;
+    if (rawEquals(name, "descent")) return real ? font->descent : kFontDescent;
+    if (rawEquals(name, "height")) return real ? font->height : kFontHeight;
+    if (rawEquals(name, "top")) return real ? font->top : kFontTop;
+    if (rawEquals(name, "bottom")) return real ? font->bottom : kFontBottom;
+    if (rawEquals(name, "leading")) return real ? font->leading : kFontLeading;
     if (rawEquals(name, "glyphOffX")) return kFontGlyphOffX;
     if (rawEquals(name, "glyphOffY")) return kFontGlyphOffY;
     if (rawEquals(name, "glyphWidth")) return kFontGlyphWidth;
@@ -1549,6 +1613,7 @@ int32_t fontIntField(const FakeFont* font, const char* name) {
     if (font == nullptr || name == nullptr) {
         return 0;
     }
+    fontNoteFieldRead(name);
     if (rawEquals(name, "bmpLeft")) return kFontBmpLeft;
     if (rawEquals(name, "bmpTop")) return kFontBmpTop;
     if (rawEquals(name, "bmpWidth")) return kFontBmpWidth;
@@ -1614,25 +1679,37 @@ void fontNoteGlyph() {
 // The end-of-setup line: every value this object hands the guest, so a run can
 // be diffed against the arithmetic in the comment above. Once, via the
 // no-fsync guest-view log.
-void fontNoteSummary(uintptr_t bmpData) {
+//
+// The six metrics are the REAL ones (the face the guest named, at the size it
+// asked for) when the face could be opened, and the synthetic 48 px set when
+// it could not.  "measured=1" says which one this line is.
+void fontNoteSummary(const FakeFont* font, uintptr_t bmpData) {
     if (g_fontLoggedSummary) {
         return;
     }
     g_fontLoggedSummary = true;
     int32_t bytes = 0;
     const uint8_t* probe = byteArrayBytes(bmpData, &bytes);
+    const bool real = font != nullptr && font->measured != 0;
+    const float size = font != nullptr ? font->size : kFontSizeX100 / 100.0f;
+    const float ascent = real ? font->ascent : kFontAscent;
+    const float descent = real ? font->descent : kFontDescent;
+    const float height = real ? font->height : kFontHeight;
+    const float top = real ? font->top : kFontTop;
+    const float bottom = real ? font->bottom : kFontBottom;
+    const float leading = real ? font->leading : kFontLeading;
     char details[384];
     __builtin_snprintf(
         details, sizeof(details),
-        "SYNTHETIC-NO-RASTER size=%.2f ascent=%.0f descent=%.0f height=%.0f "
+        "measured=%d size=%.2f ascent=%.0f descent=%.0f height=%.0f "
         "top=%.0f bottom=%.0f leading=%.0f glyphOffX=%.0f glyphOffY=%.0f "
         "glyphWidth=%.0f glyphHeight=%.0f glyphAdvance=%.0f bmpLeft=%d "
         "bmpTop=%d bmpWidth=%d bmpHeight=%d bmpPitch=%d bmpDataBytes=%d "
         "bmpDataReadable=%d",
-        kFontSizeX100 / 100.0, kFontAscent, kFontDescent, kFontHeight, kFontTop,
-        kFontBottom, kFontLeading, kFontGlyphOffX, kFontGlyphOffY,
-        kFontGlyphWidth, kFontGlyphHeight, kFontGlyphAdvance, kFontBmpLeft,
-        kFontBmpTop, kFontBmpWidth, kFontBmpHeight, kFontBmpPitch, bytes,
+        real ? 1 : 0, size, ascent, descent, height, top, bottom, leading,
+        kFontGlyphOffX, kFontGlyphOffY, kFontGlyphWidth, kFontGlyphHeight,
+        kFontGlyphAdvance, kFontBmpLeft, kFontBmpTop, kFontBmpWidth,
+        kFontBmpHeight, kFontBmpPitch, bytes,
         probe != nullptr ? 1 : 0);
     guestViewWideLog("jni-font-metrics", static_cast<unsigned long long>(kFontBmpBytes),
                      0, details);
@@ -3084,15 +3161,28 @@ int64_t jniCallLongMethod(uintptr_t /*env*/, uintptr_t /*object*/,
     return 0;
 }
 
-// Non-V CallFloatMethod (slot 55). getSize() on a Font reports the em size the
-// metrics above were derived at; every other float method still answers 0.f.
+// Non-V CallFloatMethod (slot 55).  getSize() on a Font reports the size the
+// guest asked for in Font.init(), and getWidthScale() the horizontal scale it
+// asked for; every other float method still answers 0.f.
+//
+// getSize() USED TO ANSWER A CONSTANT 48 px.  The guest's own layout reads
+// getSize() back, so it sized every label against a 48 px font while the port
+// rasterised the text at the size the guest had asked for (140 px for the UI
+// labels).  The text therefore came out far too large and collided with the
+// label below it.
+//
+// getWidthScale() used to answer 0.f, which is the same bug wearing another
+// hat: a zero horizontal scale is not a scale.
 float jniCallFloatMethod(uintptr_t /*env*/, uintptr_t object,
                          uintptr_t methodId, ...) {
     FakeFont* font = asFontObject(object);
     if (font != nullptr) {
         const char* name = jniMethodName(methodId);
         if (rawEquals(name, "getSize")) {
-            return kFontSizeX100 / 100.0f;
+            return font->size;
+        }
+        if (rawEquals(name, "getWidthScale")) {
+            return font->widthScale;
         }
     }
     return 0.f;
@@ -3140,6 +3230,47 @@ static constexpr size_t kMaxGuestVarArgs = 16;
 static size_t decodeGuestVarArgs(const void* block, const char* signature,
                                  jvalue* out, size_t maxOut);
 
+// The Font's real metrics.
+//
+// Font.init() builds a Paint with the typeface at the requested size and reads
+// Paint.getFontMetrics() off it (Font.java:72-89).  The guest's own layout
+// reads those six numbers back, so they have to be the face's own numbers at
+// the requested size -- the same face the paragraph is measured with.
+//
+// Before this, the port answered a 48 px set for EVERY font, and the guest
+// therefore sized every label against a 48 px font while the port rasterised
+// the text at the size the guest had asked for (140 px).  That mismatch is
+// what made the Chinese labels come out far too large and collide with the
+// label below them.
+//
+// A face that cannot be opened keeps the synthetic fallback, and the fact is
+// logged rather than hidden.
+void measureFontMetrics(FakeFont* font) {
+    if (font == nullptr) {
+        return;
+    }
+    font->measured = 0;
+    glyphvector::FontMetrics metrics{};
+    if (!glyphvector::fontMetricsFor(font->path, font->bold != 0, font->size,
+                                     &metrics)) {
+        static bool s_loggedNoMetrics = false;
+        if (!s_loggedNoMetrics) {
+            s_loggedNoMetrics = true;
+            guestViewWideLog("jni-font-metrics", 0, 0,
+                              "NO FACE METRICS: the face could not be opened; the "
+                              "synthetic 48 px set is being used");
+        }
+        return;
+    }
+    font->ascent = metrics.ascent;
+    font->descent = metrics.descent;
+    font->height = metrics.height;
+    font->top = metrics.top;
+    font->bottom = metrics.bottom;
+    font->leading = metrics.leading;
+    font->measured = 1;
+}
+
 // Font.init(String path, boolean bold, boolean italic, float size, float
 // widthScale) -- the only place the typeface and the text size come from.
 //
@@ -3162,6 +3293,7 @@ void captureFontInit(FakeFont* font, const jvalue* argv, size_t argc, void* args
         if (path != nullptr) {
             rawCopy(font->path, sizeof(font->path), path);
         }
+        measureFontMetrics(font);
         return;
     }
     if (!guestBlock && args != nullptr) {
@@ -3184,6 +3316,7 @@ void captureFontInit(FakeFont* font, const jvalue* argv, size_t argc, void* args
         if (path != nullptr) {
             rawCopy(font->path, sizeof(font->path), path);
         }
+        measureFontMetrics(font);
     }
 }
 
@@ -3272,7 +3405,7 @@ int32_t jniCallBooleanMethodV(uintptr_t env, uintptr_t object,
                 rawLog(details);
                 rawLog("\n");
             }
-            fontNoteSummary(bmpData);
+            fontNoteSummary(font, bmpData);
         }
         return 1;
     }

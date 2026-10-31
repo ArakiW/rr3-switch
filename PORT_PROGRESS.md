@@ -10393,3 +10393,109 @@ Chinese line overruns the line box the guest computed by 40%.
   (`lastBoundFramebuffer != 0`, `guest_view_probe.cpp:8569`) is always false
   because the guest renders into fb0, so a bigger view CROPS instead of
   scaling.  No HD picture has ever been seen.
+
+## 2026-11-01 (02:05): THE CHARACTER SIZE IS FIXED -- THE PORT'S FONT WAS A FAKE
+
+### What the previous entry got wrong
+
+It named two defects and stopped there.  Both are real, but they were the
+*smaller* half: the previous entry assumed the guest's font size reached the
+port correctly.  It did not.
+
+### The three defects, in the order the guest meets them
+
+The port's `com.firemint.realracing.Font` was a fake in three ways at once,
+and the guest's own native layout reads all three.
+
+1. **`Font.getSize()` answered a constant 48 for EVERY font.**
+   `jni_bridge.cpp:3095` returned `kFontSizeX100 / 100.0f`.  The guest asked
+   for 140 px, the port rasterised the text at 140 px -- but the guest's
+   layout was told the font was 48 px, so it sized every label against a 48 px
+   font.  The text came out 140/48 = 2.9x too large, overflowed its box, and
+   ran into the label below it.  **This is the "字符太大" the user reported.**
+2. **The six metrics the guest reads back were the same 48 px set for every
+   font and every face**, and they were in the WRONG SIGNS.  Android's
+   `Paint.FontMetrics` has `descent` POSITIVE, so `Font.java:84` stores a
+   positive descent and `Font.java:85` makes `height = ascent + descent`.  The
+   port stored `descent = -9`, so its `height` was 39 + (-9) = **30** instead
+   of 48: the guest sized its labels against a font 38% shorter than the one
+   the paragraph was laid out with.
+3. **`glyph_vector.cpp`'s `metricsOf()` NEGATED the FreeType ascender.**
+   `sm.ascender` is already positive, so the ascent came out negative, the
+   line height came out negative, and the `lineHeight <= 0` branch silently
+   substituted the font size.  Every published `boundsH` was the font size
+   instead of the real line box.  The raster survived because the two sign
+   errors cancel inside it -- which is exactly why this stayed invisible.
+
+### The fix
+
+* `glyph_vector.cpp`: the ascent is positive, the leading is
+  `height - (ascent + descent)`, and the line height is
+  `ascent + descent + leading` -- what Android's `Layout.getDesiredLineHeight()`
+  returns, and what the game's `StaticLayout` (spacingmult 1.0, spacingadd 0.0,
+  `GlyphVector.java:118`) uses.  The no-line-height fallback is no longer
+  silent.
+* `glyph_vector.cpp`: a new `fontMetricsFor()` measures the face the guest
+  NAMED, at the size it asked for, and hands the numbers to the bridge.
+* `jni_bridge.cpp`: `Font.init()` measures that face; the six metrics the guest
+  reads back are the measured ones; the synthetic 48 px set stays as the
+  fallback for a face that cannot be opened, in the game's signs.
+* `jni_bridge.cpp`: `Font.getSize()` answers the size the guest asked for.
+
+### Measured (run q64, archive `20261101-013937-eden-rr3-q64-fontmetrics`)
+
+    phase=jni-font-metrics measured=1 size=113.00 ascent=80 descent=34
+        height=114 top=80 bottom=34 leading=22
+    phase=glyph-face ... size=140.0 ascentPx=99.0 descentPx=42.0 lineH=141.0
+    phase=glyph-para ... size=140.0 boundsW=966.0 boundsH=168.0
+        text="滨海湾市街赛道"
+
+`measured=1` (the face was measured, not assumed), `descent` positive,
+`height == ascent + descent`, and the published `boundsH` is now the real line
+box (168 = 141 + Conduit's 27 px leading) instead of the font size (140).
+
+### The acceptance, on the user's own screen
+
+The race-loading splash carries the same three strings ("大奖赛赛道",
+"滨海湾市街赛道", and the location).  Measured on the captured frames, the
+title column of the q63 splash is ONE merged ink band:
+
+    q63 frame-000600, band x 30..700 y 460..620:
+        line 0: y = 493..581   (89 rows, the two texts fused)
+
+and the q64 splash is THREE separate bands with real gaps:
+
+    q64 frame-000600, band x 330..830 y 140..400:
+        line 0: y = 183..216   h=34    (大奖赛赛道)
+        line 1: y = 235..294   h=60    (滨海湾市街赛道)
+        line 2: y = 334..356   h=23    (新加坡 滨海湾)
+        gap 0/1 = 18 rows
+        gap 1/2 = 39 rows
+
+The overlap is gone and the glyph size is right.  The before/after crop is
+`.build/title_before_after.png`.
+
+### The criterion, checked numerically against the shipped fonts
+
+`native-switch/tests/test_font_metrics_contract.py` (new) pins the contract
+AND checks the criterion against the faces the port actually ships, with
+fontTools:
+
+    Conduit at 140 px: ascent 99 descent 42 leading 28  ->  line box 141
+    CJK ink of "滨海湾市街赛道" at 140 px: 131 px
+
+The Chinese ink fits the Latin line box (141 px, or 169 px with the leading),
+so two lines of Chinese text cannot touch -- which is the criterion the user
+described.
+
+### Still open
+
+* The **event card** itself (`CARD_TRACK` / `CARD_TRACK_2` at 206,485 and
+  206,512, boxes 257x16) has still not been captured in a frame: the rounds
+  reach the front end but the card screen is not where the card's ink is
+  sampled from yet.  The splash acceptance above is on the same text pipeline,
+  but the card's own 16 px boxes are not yet confirmed on screen.
+* The Font's per-glyph fields (`glyphOffX/OffY/Width/Height/Advance`) are still
+  the synthetic 48 px set.  They are only read after `loadGlyph()`, and the
+  guest's use of them is not yet instrumented.
+* The HD tree is still unreachable (see above).

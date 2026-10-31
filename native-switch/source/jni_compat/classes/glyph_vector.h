@@ -136,6 +136,52 @@ struct FontRequest {
 
 void fontRequest(uintptr_t fontHandle, FontRequest* out);
 
+/*
+ * The metrics of a REAL face at a REAL size, in the convention the guest's
+ * Font class uses.
+ *
+ * WHY THE BRIDGE NEEDS THIS
+ * -------------------------
+ * com.firemint.realracing.Font.init() builds a Paint with the typeface at the
+ * requested size and then reads Paint.getFontMetrics() (reverse/java/sources/
+ * com/firemint/realracing/Font.java:80-88).  The guest's own layout reads
+ * those fields back, so the port has to answer them with the numbers the Java
+ * would have produced -- for the face the guest NAMED and the size it asked
+ * for, not with a constant.
+ *
+ * THE SIGNS, which are the whole point
+ * ------------------------------------
+ * Android's Paint.FontMetrics is documented as: ascent and top NEGATIVE,
+ * descent and bottom POSITIVE, leading POSITIVE.  Font.java then stores
+ *
+ *     this.ascent  = -fontMetrics.ascent;   -> POSITIVE, px above the baseline
+ *     this.descent =  fontMetrics.descent;   -> POSITIVE, px below the baseline
+ *     this.height  =  this.ascent + this.descent;
+ *     this.top     = -fontMetrics.top;      -> POSITIVE
+ *     this.bottom  =  fontMetrics.bottom;   -> POSITIVE
+ *     this.leading =  fontMetrics.leading;   -> POSITIVE
+ *
+ * The port used to answer a synthetic 48 px set in which DESCENT WAS NEGATIVE
+ * (-9), so height came out as 39 + (-9) = 30 instead of 48, and the guest
+ * sized its labels against a font that was 38% shorter than the one the
+ * paragraph was actually laid out with.
+ */
+struct FontMetrics {
+    float ascent;   // px above the baseline (positive)
+    float descent;  // px below the baseline (positive)
+    float height;   // ascent + descent -- the game's Font.height
+    float top;      // px above the baseline to the font box top
+    float bottom;   // px below the baseline to the font box bottom
+    float leading;  // the extra leading the face asks for (positive)
+};
+
+/*
+ * The metrics of the face the guest named, at the size it asked for. Returns
+ * false when the face cannot be opened, in which case the caller keeps its
+ * own fallback.
+ */
+bool fontMetricsFor(const char* path, bool bold, float sizePx, FontMetrics* out);
+
 }  // namespace glyphvector
 
 /*
