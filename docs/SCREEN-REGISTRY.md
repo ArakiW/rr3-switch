@@ -182,17 +182,36 @@ is:
         0x14a450c  cmp  x0, #0x17            ; and its result is used as an
                                            ; index, and the index is 0..23
 
-**=>=> THE MANAGER KEEPS A TABLE OF 24 SCREENS, AND OpenScreen FINDS THE
-SCREEN IN THAT TABLE BY ITS NAME.**  So the open needs TWO names that are
-not necessarily the same string:
+**=>=> AND THE NAMES ARE NOT THE SAME STRING.**  Slot 73 returns a plain
+`const char*`, and for EventMapScreen it returns
 
-  1. the screen's REGISTRY name (the port already has this), and
-  2. the screen to BE IN THE MANAGER'S OWN TABLE, under the name that its
-     slot 73 reports.
+    0xdb97dc  adrp x0, #0x39f000        ; "Stream Selection"
+    0xdb97e0  add  x0, x0, #0xb1b
+    0xdb97e4  ret
 
-The registry and the table are different things, and the two names may
-differ.  That is the first thing to check -- and the table's index is the
-thing to read, not the function that computes it.
+-- "Stream Selection", NOT "EventMapScreen".  The base class's slot 73
+(0x9faa1c) returns another string.  **=>=> SO A SCREEN HAS TWO NAMES: the
+name it is REGISTERED under (the registry, which the port has) and the name
+it CALLS ITSELF (slot 73).  They are not the same string.**
+
+**=>=> AND WHAT THE GUEST DOES WITH THE SECOND NAME.**  The external call
+returns an INDEX, and the code checks it:
+
+    0x14a44fc  bl   0x1e17bf0        ; the screen's own name -> an index
+    0x14a450c  cmp  x0, #0x17        ; and the index must be < 23
+    0x14a4510  b.hs 0x14a452c        ; otherwise: the error path
+
+So the front end has a table of at most 24 FRONT-END screens, and a screen
+that is not one of them cannot be opened this way.  **There are 59
+registered screens and only 24 front-end slots, so most of the meta screens
+are NOT openable this way -- and the open is done by the screen's DISPLAY
+name, not by its registry name.**
+
+**=>=> THE NEXT STEP IS THEREFORE A RUNTIME READ, NOT MORE GUESSING.**
+The port can call slot 73 (a plain getter, no side effects) to learn each
+screen's display name, and it can read the front end's table to see which
+of the 59 screens have a slot at all.  Both are reads.  Until that is done
+the open stays off.
 
 The other candidate is the flags word: the descriptor's byte at +0x10 is
 `flags & 1`, and the port passes 0.  It is a one-bit experiment.
