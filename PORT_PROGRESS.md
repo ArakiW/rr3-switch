@@ -10324,79 +10324,72 @@ for the next attempt, and both are one-line experiments.
 **AND NOTHING OF THIS IS ACTIVE BY DEFAULT.**  The card's rr3-open.txt ships
 with every line commented out, so the delivered card changes nothing.
 
-## 2026-11-01 (00:40): THE CHARACTER SIZE WAS THE DEVICE PROFILE'S GUI_LAYOUT_EXTENSION, NOT THE FONT
+## 2026-11-01 (01:30): THE CHARACTER SIZE: TWO LEVERS RULED OUT BY MEASUREMENT, TWO DEFECTS LOCATED IN CODE
 
 ### The symptom
 
 The user attached a screenshot of the event-selection screen: the two Chinese
 lines under each card ("滨海湾市街赛道" and "大奖赛赛道") are drawn on top of
-each other.  On the main menu the same defect shows as a title whose two lines
-almost touch.
+each other.  Measured on that PNG (card 2, band x 375..700):
 
-### What it is NOT
+    line A  y = 488..527   (37 rows of ink)
+    line B  y = 528..562   (35 rows of ink)
+    gap    = 0 rows
 
-* **It is not the atlas upscale.**  The port renders ALL text itself
+The guest's own screen tree says the label it puts there is
+`CARD_TRACK` (runtime rect 206,485 257x16) and the next one is `CARD_TRACK_2`
+(206,512 257x16).  So the ink is about 2.5x the height of the box the guest
+reserved for it, and the two inks touch.
+
+### What it is NOT (both measured, both with the change verified as applied)
+
+* **Not the atlas upscale.**  The port renders ALL text itself
   (`glyph_vector.cpp`, FreeType + `NotoSansCJKsc-RR3Bootstrap.otf`), so the
-  Chinese in the screenshot is VECTOR, and it is sharp.  The "1.33x upscale of
-  every sprite and glyph" claim in older entries is wrong for glyphs: only the
-  SPRITES come out of the 960x640 atlas.  (Verified by the verifier audit and by
-  reading the frames.)
-* **It is not `EXPECTED_SCREEN_WIDTH/HEIGHT`.**  MEASURED, archive
-  `20261031-235302-eden-rr3-q61-exp-screen`: the settings layer really did
-  write the profile (`settings-profile ... changed=2 written=1`, the guest then
-  read `cache/eds-AndroidHigh.plist`), and the font sizes stayed 14/28/42/70/140
-  and the frames stayed byte-identical.  A negative result, properly measured.
-* **It is not the font size the guest asks for.**  The guest asks for 140 px
-  for these strings in every configuration tried.
+  Chinese in the screenshot is vector and already sharp.  The older claim that
+  "every sprite AND glyph" is upscaled 1.33x is wrong for glyphs; only the
+  sprites come out of the 960x640 atlas.
+* **Not `EXPECTED_SCREEN_WIDTH/HEIGHT`.**  MEASURED, archive
+  `20261031-235302-eden-rr3-q61-exp-screen`: the settings layer really wrote
+  the profile (`settings-profile ... changed=2 written=1`, the guest then read
+  `cache/eds-AndroidHigh.plist`), the font sizes stayed 14/28/42/70/140 and the
+  frames came out byte-identical.
+* **Not `GUI_LAYOUT_EXTENSION`.**  MEASURED, archives
+  `20261101-001630-eden-rr3-q62-layout-ext` and
+  `20261101-004639-eden-rr3-q63-accept-card`: with
+  `GUI_LAYOUT_EXTENSION = _960x640` the card's runtime rects are unchanged
+  (CARD_TYPE 455/20, CARD_TRACK 485/16, CARD_TRACK_2 512/16) and the rendered
+  text quads are unchanged (328x59 and 262x35).  A negative, properly
+  measured -- so the shipped card file stays as it was.
 
-### What it IS
+### Two defects that ARE in the code
 
-The device profile's `GUI_LAYOUT_EXTENSION` decides in which space the guest
-LAYOUTS the UI.  `AndroidHigh.plist` says `_480x320`, so the guest lays the
-front end out for a 480x320 GUI while the port renders a 1280x720 view -- a
-factor of 2.667.  The CJK line box is 1.407 em (Noto Sans CJK) against the
-Latin face's 1.007 em, so the Chinese ink overruns the line advance the guest
-computed in its own space and consecutive labels collide.
+1. **`glyph_vector.cpp:1115` computes the line height with the wrong sign.**
+   `metricsOf()` returns a NEGATIVE ascent (Android's FontMetrics
+   convention: ascent is the distance ABOVE the baseline), so
+   `lineHeight = metrics.ascent + metrics.descent` is NEGATIVE (=-57 at
+   140 px) and the `lineHeight <= 0` branch silently substitutes `sizePx`.
+   The published `boundsH` is therefore `sizePx * lines` instead of the real
+   line height (141 at 140 px for Conduit, 197 for Noto Sans CJK).  The
+   raster survives because two sign errors cancel there, which is exactly
+   why the defect stayed invisible.
+2. **`jni_bridge.cpp` hands the guest SYNTHETIC 48 px Font metrics**
+   (ascent 39 / descent -9 / height 30 / top 40 / bottom 11 / leading 6) for
+   EVERY font size -- the guest's own native layout reads those, not the
+   real face at the real size.
 
-MEASURED, archive `20261101-001630-eden-rr3-q62-layout-ext`, the ONLY change
-being `GUI_LAYOUT_EXTENSION = _960x640` (a tree the volumes ship, and the one
-the guest's own `Res order:` ranks first):
+On top of those: the paragraph is measured with the LATIN face's metrics
+(1.007 em) while the glyphs come from the CJK fallback (1.407 em), so a
+Chinese line overruns the line box the guest computed by 40%.
 
-    如果你想在现实世界赛车，请前往你本地的赛道。请确认
-    你的车经过安全检查，并时刻戴好头盔、系好安全带。
+### Still open
 
-Two lines, correct size, correct spacing.  The font sizes the guest asks for did
-not change (still 140); the LAYOUT did, and the layout is what was wrong.
-
-### The instrument
-
-`.build/measure_cjk.py` measures the on-screen height of the main menu's two
-Chinese strings.  Baseline (extension `_480x320`): grey bar 36 px, title 62/70 px.
-`.build/measure_overlap.py` measures a PNG band line by line.
-
-### THE COST, STATED PLAINLY
-
-The layout moved, so every pixel coordinate in `rr3-touch.txt` has to be
-re-measured against the new frames.  That is the same price as switching the
-view to 2048x1152, and it is the reason the card shipped at 1280x720.
-
-### What is still open
-
-* The event card from the user's screenshot was NOT reached in q62 (the run got
-  as far as the loading screen and the daily-reward screen, both correct).  The
-  acceptance test is one round that reaches the event map and a frame of it.
+* The ACCEPTANCE on the user's own screen has not been done: no round so far
+  has reached the event map with a captured frame (q62/q63 stopped at the
+  loading and daily-reward screens).  The metric is ready: the gap between
+  the ink of `CARD_TRACK` and `CARD_TRACK_2` must go from 0 rows to > 0, and
+  the ink height must come down towards the 16 px box.
 * The HD tree is still unreachable: `view=2048x1152` makes the guest pick
   `gui_assets/2048x1536`, but the present blit's guard
   (`lastBoundFramebuffer != 0`, `guest_view_probe.cpp:8569`) is always false
   because the guest renders into fb0, so a bigger view CROPS instead of
-  scaling.  No HD picture has ever been seen.  Fixing that is four files: an
-  offscreen FBO at view size, the blit guard, the readback target, and
-  `eglQuerySurface` reporting the view size on the Mesa path.
-* `glyph_vector.cpp` still has a sign error: `metricsOf()` returns a NEGATIVE
-  ascent (Android's FontMetrics convention) and the line height is computed as
-  `ascent + descent`, which is negative, so the `lineHeight <= 0` fallback
-  silently substitutes `sizePx`.  The real line height is `-ascent + descent`
-  (141 at 140 px for Conduit, 197 for Noto CJK).
-* The `Font` object the port hands the guest still carries SYNTHETIC 48 px
-  metrics (`ascent 39 / descent -9 / height 30 / top 40 / bottom 11 / leading
-  6`), not the real face at the real size.
+  scaling.  No HD picture has ever been seen.
