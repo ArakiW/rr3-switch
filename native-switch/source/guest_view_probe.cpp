@@ -9080,10 +9080,19 @@ void* frameLoopDriver(void* opaque) {
             // and "the card's labels overlap" could not be checked against the
             // card itself.
             //
-            // 200 is inside that window.  One more capture costs about eight
-            // seconds of PNG encoding under a software renderer, once.
-            static const unsigned kScheduleHead[] = { 30u, 120u, 200u,  300u,
-                                                      600u, 1000u };
+            // 200 and 340 are inside the two windows the front end spends its
+            // first frames in, and both are measured, not guessed:
+            //   q70: f=150..270 screen=EventMapScreen   (the map's 3D flythrough)
+            //        f=330..360 screen=EventsScreen     (the card list)
+            // The schedule had 120 and then 300, so the card list was never
+            // on disk: three runs in a row produced no picture of it, and
+            // "the card's two labels overlap" could not be checked against the
+            // card itself.
+            //
+            // One more capture costs about eight seconds of PNG encoding under
+            // a software renderer, once.
+            static const unsigned kScheduleHead[] = { 30u,  120u, 200u, 300u,
+                                                      340u, 600u, 1000u };
             constexpr unsigned kScheduleFrom = 1200u;
             constexpr unsigned kScheduleStep = 200u;
             constexpr unsigned kScheduleLast = 12000u;

@@ -10853,9 +10853,28 @@ never fired -- which is exactly why no `frame-9041*.png` exists in that
 archive.  **A run long enough to reach frame 4100 photographs the event
 screen without touching the code.**
 
-And the capture has to happen ON A SCREEN CHANGE, or the card is never on
-disk at all: the ui-ctl probe already knows the live screen on every frame,
-so one capture per transition is cheap.
+And the capture has to happen INSIDE the card list's live window.  The
+ui-ctl probe reports the live screen per frame, and in q70 it says:
+
+    f=150 screen=EventMapScreen      (the map's 3D flythrough)
+    f=180 screen=EventMapScreen
+    f=270 screen=EventMapScreen
+    f=330 screen=EventsScreen        (the card list)
+    f=360 screen=EventsScreen
+    f=420 screen=CarSelectScreen
+
+so the CARD LIST is live from frame 330 to 360, and the capture schedule had
+300 and then 600.  The card list was never on disk.  Two slots were added --
+200 (the map's flythrough) and 340 (the card list) -- and the measurement
+script is `.build/measure_card_labels.py`: the criterion is two ink bands in
+the label column with a GAP > 0, each band about the 16 px box height rather
+than the 40 px ink.
+
+**A CAUTION FOR THE NEXT ROUND: the ui-ctl "screen" is the screen whose
+component tree is LIVE, not the one that is VISIBLE.**  In q70, frame 300 was
+the MAIN MENU and frame 600 had no card at all, even though the probe called
+frames 330..360 "EventsScreen".  So a capture inside the window is necessary
+but not sufficient -- the frame has to be LOOKED AT, not trusted.
 
 
 
