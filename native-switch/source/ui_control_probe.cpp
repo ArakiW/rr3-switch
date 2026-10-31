@@ -710,6 +710,59 @@ void logScreenDisplayNames(const ScreenEntry* screens, int screenCount,
     appendGuestBootLine(kGuestViewLogPath, "ui-names", 142, 0, line);
 }
 
+
+// THE GUEST'S OWN "OPEN THIS SCREEN" ENTRIES.
+//
+// The guest opens a screen by Find(name) -> __dynamic_cast -> Enter(1), and
+// it has an entry function for every screen it can open.  Calling THAT is
+// what works: the port could not reproduce the preconditions by hand -- the
+// descriptor path (OpenScreen, ELF 0x14a4820) killed the guest in q48 and in
+// q51 -- but the guest does its own Find, its own cast and its own Enter,
+// with every precondition it needs.
+//
+// MEASURED 2026-10-31 (q53): the entries were found by scanning .text for the
+// functions that (a) reference the screen's name literal and (b) call the
+// guest's ScreenManager::Find (0x14a7d5c) and its __dynamic_cast
+// (0x1e17c80).  The scanner's POSITIVE CONTROL is the event map's entry,
+// which was already known to be 0xa679a0 -- and the control passes.
+//
+// More than one entry exists for a screen because the front end has variants
+// (with an animation, with a transition).  They all reference the SAME name,
+// so they all open the same screen; the first one is the one to try.
+struct GuestScreenEntry {
+    const char* name;
+    uintptr_t entry;
+};
+constexpr GuestScreenEntry kGuestScreenEntries[] = {
+    {"EventMapScreen", 0xA679A0ULL},          // the control: the known entry
+    {"UpgradesScreen", 0xEA6988ULL},
+    {"UpgradesScreen", 0xEF8E28ULL},
+    {"CarCustomisationScreen", 0xAA732CULL},
+    {"CarCustomisationScreen", 0xE3C7C0ULL},
+    {"CarCustomisationScreen", 0xE78E94ULL},
+    {"MyGarageScreen", 0xD50494ULL},
+    {"MyGarageScreen", 0xD68D1CULL},
+    {"MyGarageScreen", 0xD69364ULL},
+    {"MyGarageScreen", 0xDDA6ACULL},
+    {"MyGarageScreen", 0xDDBCACULL},
+    {"MyGarageScreen", 0x14C27F8ULL},
+};
+
+// The guest's own entry for a screen, or 0 when the front end has no such
+// entry (CarPurchaseScreen and CommunityScreen do not: they are reached by
+// their own menu handlers or by a deep link, not by Find(name)).
+uintptr_t guestScreenEntry(const char* name) {
+    if (name == nullptr) {
+        return 0;
+    }
+    for (const GuestScreenEntry& e : kGuestScreenEntries) {
+        if (std::strcmp(e.name, name) == 0) {
+            return e.entry;
+        }
+    }
+    return 0;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -1159,6 +1212,58 @@ bool uiScreenOpen(const char* name, bool allowOpen) {
     if (!allowOpen) {
         return true;
     }
+    // AND NOW, WITH THE CARD'S EXPLICIT "open=1", OPEN IT -- THROUGH THE
+    // GUEST'S OWN ENTRY, NOT THROUGH THE DESCRIPTOR.
+    //
+    // The descriptor path (OpenScreen, ELF 0x14a4820) killed the guest in
+    // q48 and in q51 even with the screen built, because its bookkeeping
+    // wants a name in the front end's own table and the screen does not
+    // have one there.  The guest's per-screen entry does the Find and the
+    // cast and the Enter the way the front end does it, so it satisfies
+    // whatever those need.
+    const uintptr_t entry = guestScreenEntry(name);
+    if (entry == 0) {
+        char details[224];
+        std::snprintf(details, sizeof(details),
+                      "screen=\"%.80s\" refused=1 reason=no-guest-entry-"
+                      "for-this-screen",
+                      name);
+        appendGuestBootLine(kGuestViewLogPath, "ui-open", 140, 0, details);
+        return false;
+    }
+    // THE ENTRY IS AN ELF VADDR; THE RUNTIME ADDRESS IS bias + entry.
+    //
+    // MEASURED 2026-10-31 (q54): the first version compared the ENTRY
+    // against the bias directly, so every entry looked "outside the guest
+    // text" and every request was refused.  The guard did its job -- it
+    // refused instead of jumping into nonsense -- but for the wrong reason.
+    const uintptr_t bias2 = resolveMainImageLoadBias();
+    const uintptr_t runtime = bias2 + entry;
+    if (bias2 == 0 || runtime < bias2 || runtime >= bias2 + kGuestTextEndVa) {
+        char details[224];
+        std::snprintf(details, sizeof(details),
+                      "screen=\"%.80s\" entry=0x%llx runtime=0x%llx refused=1 "
+                      "reason=the-entry-is-not-in-the-guest-text",
+                      name, static_cast<unsigned long long>(entry),
+                      static_cast<unsigned long long>(runtime));
+        appendGuestBootLine(kGuestViewLogPath, "ui-open", 140, 0, details);
+        return false;
+    }
+    {
+        // The guest's own thread and the guest's own TLS: this is a call INTO
+        // the guest, exactly like the port's named-command mechanism in
+        // source/guest_action.cpp.
+        GuestTlsScope tls;
+        using OpenEntryFn = void (*)(void);
+        reinterpret_cast<OpenEntryFn>(runtime)();
+    }
+    char opened[288];
+    std::snprintf(opened, sizeof(opened),
+                  "screen=\"%.80s\" entry=0x%llx runtime=0x%llx called=1",
+                  name, static_cast<unsigned long long>(entry),
+                  static_cast<unsigned long long>(runtime));
+    appendGuestBootLine(kGuestViewLogPath, "ui-open", 140, 0, opened);
+    return true;
     const uintptr_t fn = bias + kOpenScreenVa;
     if (bias == 0 || fn < bias || fn >= bias + kGuestTextEndVa) {
         char details[192];
@@ -1176,15 +1281,10 @@ bool uiScreenOpen(const char* name, bool allowOpen) {
                   name, static_cast<unsigned long long>(instance),
                   static_cast<unsigned long long>(fn));
     appendGuestBootLine(kGuestViewLogPath, "ui-open", 140, 0, before);
-    {
-        // The guest's own thread and the guest's own TLS: this is a call INTO
-        // the guest, exactly like the port's named-command mechanism in
-        // source/guest_action.cpp.
-        GuestTlsScope tls;
-        using OpenScreenFn = void (*)(uintptr_t, uintptr_t, int);
-        reinterpret_cast<OpenScreenFn>(fn)(static_cast<uintptr_t>(manager),
-                                           instance, 0);
-    }
+    // (The descriptor path -- OpenScreen, ELF 0x14a4820 -- is NOT called any
+    // more.  It killed the guest in q48 and in q51 even with the screen
+    // built, because its bookkeeping wants the screen's DISPLAY name in the
+    // front end's own table and most screens do not have one there.)
     char after[288];
     std::snprintf(after, sizeof(after), "%s called=1", before);
     appendGuestBootLine(kGuestViewLogPath, "ui-open", 140, 0, after);

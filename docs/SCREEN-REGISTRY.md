@@ -381,3 +381,65 @@ CommunityScreen are not opened by Find(name) -- they are reached by other
 means (a menu item's own handler, or a deep link).  That is a fact, not a
 failure: the scanner looked at 35,278 distinct referenced literals and 199
 functions that call Find, and neither screen's name is among them.
+
+---
+
+## q54 AND q55: TWO MORE THINGS THE GUEST WILL NOT LET THE PORT DO
+
+**q54 -- A BIAS BUG, CAUGHT BY THE GUARD.**  The port compares the entry
+address against the guest's load bias, but the entry is an ELF VADDR, so the
+RUNTIME address is bias + entry.  Every request was therefore refused with
+"the entry is not in the guest text".
+
+**=>=> THE GUARD DID ITS JOB: IT REFUSED INSTEAD OF JUMPING INTO NOTHING.**
+That is the whole reason the open path has a check at all, and it is the same
+shape as the earlier empty-range bug: the instrument reported a failure, and
+the failure was real, and the REASON was wrong.
+
+**q55 -- AND EVEN THE GUEST'S OWN ENTRY KILLS THE GUEST.**  With the bias
+fixed, the port called the guest's own entry for UpgradesScreen
+(0xea6988) and the guest died again, at
+
+    phase=census-pc pc=0x836d0bbc pc_img=other-mapping
+             pc_elfva=host+0x8c1bbc lr_img=host-nro
+
+i.e. the program counter ended up in a mapping that is neither the guest nor
+the port's code.
+
+**=>=> SO THE CONSTRAINT IS NOT "WHICH FUNCTION" AND NOT "WHICH NAME".  IT IS
+"IN WHAT CONTEXT".**  The guest's own screen entry is called from the
+guest's own event handling, with the front end in the state it expects.  A
+port calling it from the input pump, in the middle of its own frame, is not
+the same thing at all -- and the port has now tried that three ways (the
+descriptor, the entry, the slot-69 loader) and the guest has refused to be
+driven from outside.
+
+**=>=> WHICH LEAVES THE ONE ROUTE THAT IS MEASURED TO WORK: MAKE THE GUEST
+PRESS ITS OWN BUTTON.**  The semantic control driver already does that, and
+q45 proved it: the guest's own onTouchBeginJNI received the touch at exactly
+the coordinates the guest's own tree gave.
+
+**AND HERE IS WHY THAT IS NOT YET ENOUGH.**  The screens the port reaches
+have almost no buttons.  EventMapScreen.gui declares FOUR, and none of them
+is navigation:
+
+    REMOTE_TUTORIAL_REMOTE_HORIZONTAL   GuiSymbolLabel
+    REMOTE_TUTORIAL_REMOTE_VERTICAL     GuiSymbolLabel
+    CALLOUT_TSM_LEADERBOARD_BTN         GuiButton
+    BTN_DEBUG_RACE                      ImageButton
+
+The navigation -- the toolbar (BTN_TOOLBAR_COMMUNITY, BTN_TOOLBAR_PROFILE,
+...) and the status icon bar -- belongs to the MAIN MENU, and the main menu is
+NOT one of the screens the port's flow passes through: the port goes
+EventMapScreen -> EventsScreen -> CarSelectScreen -> the race.  The probe
+reports exactly those three, and the main menu is never among them.
+
+**=>=> SO THE NEXT STEP IS NOT "PRESS A DIFFERENT BUTTON".  IT IS "GET TO
+THE MAIN MENU", and the main menu's own controls are the ones that lead
+everywhere.**  The .gui index already has every one of them, and the
+semantic driver can press any of them by name.
+
+**AND NOTHING IS ACTIVE BY DEFAULT.**  The card's rr3-open.txt ships with
+every line commented out, and the open path stays behind the card's own
+"open=1" line, because a call that can take the guest down must not be one
+keystroke away from a screen name.
