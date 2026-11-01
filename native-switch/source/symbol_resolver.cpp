@@ -6,6 +6,7 @@
 #include "rr3/fmod_audio_stub.hpp"
 #include "rr3/fmod_shim.hpp"
 #include "rr3/guest_filesystem.hpp"
+#include "rr3/guest_strto.hpp"
 #include "rr3/guest_view_trace.hpp"
 #include "rr3/libcxx_shims.hpp"
 #include "rr3/jump_bridge.hpp"
@@ -1395,9 +1396,9 @@ const HostSymbol kHostSymbols[] = {
     RR3_BIND(atan2),
     RR3_BIND(atan2f),
     RR3_BIND(atanf),
-    RR3_BIND(atof),
-    RR3_BIND(atoi),
-    RR3_BIND(atol),
+    RR3_SHIM("atof", guestAtof),
+    RR3_SHIM("atoi", guestAtoi),
+    RR3_SHIM("atol", guestAtol),
     RR3_BIND(calloc),
     RR3_BIND(clearerr),
     RR3_SHIM("close", censusClose),
@@ -1489,14 +1490,14 @@ const HostSymbol kHostSymbols[] = {
     RR3_BIND(strrchr),
     RR3_BIND(strspn),
     RR3_BIND(strstr),
-    RR3_BIND(strtod),
-    RR3_BIND(strtof),
+    RR3_SHIM("strtod", guestStrtod),
+    RR3_SHIM("strtof", guestStrtof),
     RR3_BIND(strtok),
     RR3_BIND(strtok_r),
-    RR3_BIND(strtol),
-    RR3_BIND(strtoll),
-    RR3_BIND(strtoul),
-    RR3_BIND(strtoull),
+    RR3_SHIM("strtol", guestStrtol),
+    RR3_SHIM("strtoll", guestStrtoll),
+    RR3_SHIM("strtoul", guestStrtoul),
+    RR3_SHIM("strtoull", guestStrtoull),
     RR3_BIND(tanf),
     RR3_BIND(time),
     RR3_SHIM("unlink", guestUnlink),
