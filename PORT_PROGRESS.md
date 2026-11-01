@@ -12392,3 +12392,42 @@ conf -- was exercised once, end to end, the way the user will run it.
 
 A verification step that only checks what the script names is a restatement
 of the script.  It has to compare something the script did not choose.
+## THE ARCHIVE GREW PAST THE SIZE OF THE PACKAGE, AND THAT IS HOW THE COPY WAS FOUND
+
+The release package is copied out of the emulator's SD card, archived, and
+cut into parts.  While the first archive was being built it was noticed that
+it was **larger than the package it was supposed to contain**: 7.90 GiB for
+the first archive, and the second one had passed 9.24 GiB and was still
+growing.
+
+The cause was a **copy of the package inside the package**:
+`dist\rr3-switch-fulltest-20261102\rr3-switch-fulltest-20261102\` -- 10,551
+files, 11.21 GiB, a real directory and not a link, with the package's own
+file timestamps on it.  The archive was packing the package twice.
+
+A watch test ruled the obvious suspect out: running the installer against a
+fresh card directory and counting the package's files before and after left
+the package **unchanged** (10,551 files before, 10,551 after, no nested
+directory), so the install step was not growing it.  The copy's creation
+time fell inside the archive step instead.
+
+The interesting part is not which command did it.  It is that **the archive
+was measurably bigger than its contents**, and that is a check anybody can
+make:
+
+- the packer now refuses to run when the package contains a directory with
+  the package's own name;
+- and after the archive is written it reads every member's uncompressed size
+  back and compares the total with the package's total bytes.  A copy inside
+  the package shows up there as twice the size.
+
+⇒ **an archive's uncompressed size is a property of its CONTENTS, and the
+package's size is a property of the PACKAGE.  Comparing the two is a check
+that needs no knowledge of what went wrong.**
+
+The same shape as the previous finding: a name-based check ("are the seven
+volumes there?") can only confirm the names someone thought of; a
+quantity-based check ("is it exactly as big as the thing it came from?")
+confirms the thing itself.  The missing `rr3-data-manifest.json` was found
+by bytes, the duplicated package was found by bytes, and the copied `.depot`
+tree would have been found by bytes too.
