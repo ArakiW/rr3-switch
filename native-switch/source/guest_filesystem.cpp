@@ -3902,9 +3902,48 @@ void emitAstStreamLine(const char* guestPath, const char* servedPath, const char
 //
 // The buffer is never freed: a guest FILE* handed out later points into it,
 // and the port cannot know when the guest closed that stream.
+//
+// THE PINNED SLOT.  The base asset list is 4.2 MB and the ring has EIGHT
+// slots that the big atlases compete for as well, so the list's entry could
+// be evicted before the guest's second ask -- and then the round stalls with
+// no log line and the CPU still climbing.  MEASURED: the stall killed five
+// rounds on 2026-11-01 alone (q65, q72, q83, q85, q86), each one with the
+// same last line, "fopen-other size=4212795 served=.../cache/
+// asset_list_base.txtCache.txt".  The ring's own budget (128 MB) and slot
+// count (8) were raised and it made no difference: the list is not too big,
+// it is SHARED.
+//
+// So the list gets a slot of its own, outside the ring, and nothing can take
+// it.  This is the fix the memory recorded as "the right answer" and the
+// code did not have: the registration existed, but the RESIDENCY did not.
+struct PinnedRead {
+    char path[256]{};
+    char* data{nullptr};
+    size_t size{0};
+};
+PinnedRead g_pinnedRead;
+
+void pinBulkRead(const char* path, const char* data, size_t size) {
+    if (path == nullptr || data == nullptr || size == 0) {
+        return;
+    }
+    void* buffer = std::malloc(size);
+    if (buffer == nullptr) {
+        return;
+    }
+    std::memcpy(buffer, data, size);
+    // The old buffer is not freed: a guest FILE* may still point into it.
+    std::snprintf(g_pinnedRead.path, sizeof(g_pinnedRead.path), "%s", path);
+    g_pinnedRead.data = static_cast<char*>(buffer);
+    g_pinnedRead.size = size;
+}
+
 void registerBulkRead(const char* path, const char* data, size_t size) {
     if (path == nullptr || path[0] == '\0' || size == 0) {
         return;
+    }
+    if (std::strcmp(path, kConsistentBaseListPath) == 0) {
+        pinBulkRead(path, data, size);
     }
     void* buffer = std::malloc(size);
     if (buffer == nullptr) {
@@ -3939,6 +3978,33 @@ bool bulkOpenFile(const char* candidate, const char* mode, std::FILE** out) {
         return false;
     }
     // Already read? Then reuse the bytes rather than paying for them again.
+    //
+    // THE PINNED SLOT IS CHECKED FIRST.  It holds the one file whose loss
+    // costs a whole round: the 4.2 MB base asset list.  The ring has eight
+    // slots and the atlases take them; the pinned slot cannot be taken.
+    if (g_pinnedRead.data != nullptr &&
+        std::strcmp(g_pinnedRead.path, candidate) == 0) {
+        std::FILE* stream = ::fmemopen(g_pinnedRead.data, g_pinnedRead.size, "rb");
+        if (stream != nullptr) {
+            char pinnedDigest[33]{};
+            {
+                Md5 md5;
+                md5.begin();
+                md5.update(g_pinnedRead.data, g_pinnedRead.size);
+                md5.finish(pinnedDigest);
+            }
+            char details[768];
+            std::snprintf(details, sizeof(details),
+                          "path=%s size=%zu PINNED md5=%.32s",
+                          candidate, g_pinnedRead.size, pinnedDigest);
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                "bulk-cache-hit", 99, 0, details);
+            emitAstStreamLine(nullptr, candidate, mode, g_pinnedRead.size,
+                              g_pinnedRead.size, pinnedDigest);
+            *out = stream;
+            return true;
+        }
+    }
     for (unsigned index = 0; index < kBulkReadSlots; ++index) {
         const BulkReadEntry& entry = gBulkReads[index];
         if (entry.data != nullptr && std::strcmp(entry.path, candidate) == 0) {
@@ -4080,6 +4146,12 @@ bool bulkOpenFile(const char* candidate, const char* mode, std::FILE** out) {
     entry.size = total;
     gBulkReadTotalBytes += total;
     ++gBulkReadCount;
+    // AND PIN IT, if it is the base asset list.  The ring's slot can be taken
+    // by the next atlas; the pinned slot cannot, and this is the file whose
+    // loss costs a whole round.
+    if (std::strcmp(candidate, kConsistentBaseListPath) == 0) {
+        pinBulkRead(candidate, static_cast<const char*>(buffer), total);
+    }
     // The first few, and then every sixteenth, so the line is there without
     // turning into a log of its own.
     if (gBulkReadCount <= 4 || (gBulkReadCount % 16) == 0) {

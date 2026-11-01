@@ -11339,3 +11339,115 @@ ahead of the car on the racing line.**
 gated, a target that fails the gate keeps the pursuit OFF (`pur=0`) instead
 of turning the wheel at random, and the log says how far the target was and
 that it was refused.
+
+## 2026-11-01  Anti-aliasing: the guest already has a switch, and the view size is TWO switches, not one
+
+### The complaint
+
+The user sent a zoom of their own screenshot: the ferris wheel's spokes at the
+start line are mush.  Two separate causes, and only one of them is the port's:
+
+  * the picture is rendered at 1280x720 and the emulator magnifies it (1.43x
+    in their window) -- so of course thin geometry is soft;
+  * **there is no anti-aliasing at all**: the guest renders its 3D scene into
+    its own framebuffer, and the port never asked for samples.
+
+MEASURED (the ferris wheel's region of a 1280x720 race frame, x=495,y=135,
+130x130): **12.7% to 20.6% of the pixels are single-pixel spikes** (a
+Laplacian over 60), peak 444.  That is aliasing, not blur: the spokes are
+one pixel wide and they jump.
+
+### THE SWITCH ALREADY EXISTS, AND IT IS THE GUEST'S, NOT THE PORT'S
+
+`rr3-settings.txt` has always documented it, commented out:
+
+    #AA_LEVEL = 4
+    ...
+    #   msaa                  -> AA_LEVEL                    （写 2x / 4x）
+
+The port's settings layer translates `msaa` (or the guest's native
+`AA_LEVEL`) into the guest's own encrypted device profile, and the guest
+reads it with its own int getter.  **The anti-aliasing is therefore the
+guest's own business: it decides how many samples its SCENE framebuffer has,
+and the port's EGL config has nothing to say about it** (the port's config
+asks for no samples, but the scene is not drawn into the default framebuffer
+anyway -- so asking for samples there would only anti-alias the 2D UI, and
+in ES2 a multisampled default framebuffer makes glReadPixels an
+INVALID_OPERATION, which would break the port's own captures).
+
+⇒ `AA_LEVEL = 4` is now ON in the shipped settings file, as a per-item
+override.  **Not as a quality tier**: the guest's own HD tier (`xtralto`)
+carries AA too, but changing the tier changes the whole shader set and the
+guest recompiles it -- measured in q27, 42 seconds and still not finished,
+then dead.  `AA_LEVEL` alone leaves the shader set alone.
+
+### THE VIEW SIZE IS TWO SWITCHES, AND THAT IS THE WHOLE ANSWER TO "HD 3D, NOT HD UI"
+
+`rr3-screen.txt` carries three sizes, and they mean different things:
+
+  * `view=WxH`  -- what the port tells the guest in `onViewChangedJNI`:
+    the LAYOUT, the viewport, the touch coordinate space, and (measured,
+    q77/q79) the size of the framebuffer the guest renders its 3D scene into.
+  * `ui=WxH`    -- what the port answers to
+    `CCUserInterfaceManager.getScreenWidth/getScreenHeight`: the GUI atlas
+    filter (a tree survives only when it is not bigger in BOTH dimensions)
+    and the UI's own screen size.
+  * `platform=WxH` -- the platform's screen size.
+
+⇒ **`view=2048x1152` with `ui=1280x720` is "the vehicles and the
+environment at 2048x1152, the UI at 1280x720"** -- which is what the user
+asked for in the first place.  And because the guest renders its scene into
+a 2048x1152 framebuffer and composites it into the 1280x720 window, that
+composite IS a downscale: **supersampling, which is anti-aliasing for free**
+-- the same thing AA_LEVEL buys, but for the 3D as a whole and without the
+guest having to multisample anything.
+
+⇒ THE PORT'S OFFSCREEN TARGET IS NOT NEEDED FOR THAT.  It was an attempt to
+build the same thing from the outside, and it is what broke the picture
+(q76..q80).
+
+### The 4.2 MB stall, finally fixed
+
+Five rounds died on it on 2026-11-01 alone (q65, q72, q83, q85, q86), all
+with the same last line: `fopen-other size=4212795 served=.../cache/
+asset_list_base.txtCache.txt`.  The port serves the card's rewritten copy of
+the base asset list, the guest asks for it TWICE, and the second ask was
+served by the ordinary path -- so the guest's reads went one small piece at a
+time through the port's per-call interception, over the emulated SD card,
+which takes so long that the round looks frozen (no log line for 120 s, CPU
+still climbing).
+
+The bulk-read ring existed and the port DID register the file in it -- but
+the ring has EIGHT slots and the big atlases take them, so whether the list
+was still in the ring when the guest came back for it was LUCK.  The memory
+of this project recorded that as "the right answer" and the code did not
+have it: the REGISTRATION existed, the RESIDENCY did not.
+
+⇒ **THE BASE ASSET LIST NOW HAS A PINNED SLOT** of its own, outside the
+ring, checked before the ring and never evicted.  The log line says
+`PINNED` so a round can say where its bytes came from.
+
+### MEASURED (q87, archive 20261101-152036-eden-rr3-q87-aa4-pinned)
+
+  * AA_LEVEL = 4 in the shipped settings file, and the game runs: the run
+    reached the race (the HUD draws its lap counter "1/99"), so the guest
+    accepted the setting and its multisampled scene target works.
+  * **ALIASING**: the ferris wheel's region, median over the run's frames --
+    AA off (q84): **6.78%** of the pixels are single-pixel spikes;
+    AA on (q87): **1.55%**.  **-77%.**
+  * **COST**: 1260 frames in 300 s against 4280 without AA -- **29% of the
+    frame rate**, on Eden, where the guest's GL is Mesa's SOFTWARE renderer.
+    On the Switch the same 4x MSAA is hardware, and the cost is not this.
+  * The 4.2 MB stall is gone: q87 ran the full 300 s where q85 and q86 (same
+    binary, same settings) both died at the same line.  The pinned slot is
+    what changed.
+
+⇒ THE CHEAPER HALF OF THE SAME MEDICINE: iew=2048x1152 with
+ui=1280x720 makes the guest render the scene at 2048x1152 and composite it
+into the 1280x720 window -- a 2x downscale, which is supersampling, which is
+anti-aliasing for the 3D WITHOUT multisampling (measured in q73: 2040 frames
+in 305 s, i.e. about 55% of the 720p rate rather than 29%).
+
+⇒ THE DEPLOY SWITCH CANNOT EXPRESS THAT YET: -ScreenView rewrites all
+THREE size lines (platform, ui, view) to one value.  It needs a way to set
+them independently.

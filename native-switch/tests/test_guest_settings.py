@@ -132,17 +132,32 @@ def main() -> None:
         "the card file does not name any of the guest's own keys")
     assert "AA_LEVEL" in card, (
         "the card file does not name any of the guest's own keys")
-    # A card file that ships SETTINGS would change every run that deploys it,
-    # so the shipped one must be all comments.
+    # A card file that ships a QUALITY TIER would change every run that
+    # deploys it: the tier decides the guest's whole shader set, and the
+    # guest recompiles all of it.  Measured in q27: 42 seconds and still not
+    # finished, then dead.  So the shipped file must not set `calidad`.
+    #
+    # AA_LEVEL IS NOT A TIER, AND IT WAS MEASURED (2026-11-01, q87, archive
+    # 20261101-152036-eden-rr3-q87-aa4-pinned): with `AA_LEVEL = 4` the run
+    # went the full 300 s, the game reached the race (the HUD draws its lap
+    # counter), and nothing was recompiled.  The anti-aliasing worked too:
+    # the single-pixel spikes in the ferris wheel's region fell from 6.78% to
+    # 1.55% (-77%), at 29% of the frame rate on Eden, where the guest's GL is
+    # Mesa's SOFTWARE renderer.  So the setting is allowed to ship, and the
+    # guard is narrowed to what it was really about: the tier.
     for line in card.splitlines():
         stripped = line.strip()
-        if stripped and not stripped.startswith("#"):
+        if not stripped or stripped.startswith("#"):
+            continue
+        key = stripped.split("=", 1)[0].strip().lower()
+        if key in ("calidad", "perfil", "profile", "tier"):
             raise AssertionError(
-                "the shipped rr3-settings.txt sets %r; the default has to be "
-                "'nothing happens', because a quality switch costs a full "
-                "shader recompile" % stripped
+                "the shipped rr3-settings.txt sets %r; the quality tier has "
+                "to be the default 'nothing happens', because it changes the "
+                "guest's whole shader set and the recompile killed q27 after "
+                "42 seconds" % stripped
             )
-    print("card file            : documented, and ships no settings")
+    print("card file            : documented, ships no quality tier")
 
     # ---- 2. THE CIPHER, EXECUTED -----------------------------------------
     compiler = find_host_compiler()

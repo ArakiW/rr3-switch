@@ -118,6 +118,7 @@ param(
     [string]$EmulatorRoot = 'E:\Eden',
     [switch]$Apply,
     [string]$ScreenView = '',
+    [string]$ScreenUi = '',
     [ValidateSet('legacy', 'glove')]
     [string]$TouchMode = 'legacy',
     [string]$SettingsFile = '',
@@ -139,10 +140,27 @@ $scripts = @('rr3-touch.txt', 'rr3-drive.txt', 'rr3-pad.txt', 'rr3-action.txt',
 # lines rewritten.  The rewrite happens on a COPY inside the workspace, so
 # the repository's file is never touched and the hash in the plan is the hash
 # of what is actually written.
+#
+# -ScreenUi sets the UI's size line ALONE, which is the pair that matters:
+#
+#   view=2048x1152   the guest renders its 3D scene into a framebuffer of
+#                    this size (measured: the scene FBO is the view size),
+#                    and composites it into the 1280x720 window -- a 2x
+#                    downscale, i.e. supersampling, i.e. anti-aliasing;
+#   ui=1280x720      the guest's UI screen size: the GUI atlas filter and
+#                    the UI's own layout.
+#
+# So "the vehicles and the environment at 2048x1152, the UI at 1280x720" is
+# -ScreenView 2048x1152 -ScreenUi 1280x720, and -ScreenView alone would
+# rewrite BOTH (which is what it always did).
 $screenOverrideFile = $null
-if ($ScreenView -ne '') {
-    if ($ScreenView -notmatch '^\d+x\d+$') {
+if ($ScreenView -ne '' -or $ScreenUi -ne '') {
+    if ($ScreenView -ne '' -and $ScreenView -notmatch '^\d+x\d+$') {
         Write-Host ("refused  : -ScreenView '{0}' is not WIDTHxHEIGHT" -f $ScreenView)
+        exit 1
+    }
+    if ($ScreenUi -ne '' -and $ScreenUi -notmatch '^\d+x\d+$') {
+        Write-Host ("refused  : -ScreenUi '{0}' is not WIDTHxHEIGHT" -f $ScreenUi)
         exit 1
     }
     $original = Join-Path $sourceRoot 'rr3-screen.txt'
@@ -152,17 +170,31 @@ if ($ScreenView -ne '') {
     }
     $scratchDir = Join-Path $projectRoot '.build'
     New-Item -ItemType Directory -Force -Path $scratchDir | Out-Null
-    $screenOverrideFile = Join-Path $scratchDir ('rr3-screen-override-{0}.txt' -f ($ScreenView -replace '[^0-9x]', ''))
+    $tag = '{0}-{1}' -f ($ScreenView -replace '[^0-9x]', ''), ($ScreenUi -replace '[^0-9x]', '')
+    $screenOverrideFile = Join-Path $scratchDir ('rr3-screen-override-{0}.txt' -f $tag)
     $rewritten = foreach ($line in (Get-Content -LiteralPath $original)) {
         if ($line -match '^\s*(platform|ui|view)=') {
-            "{0}={1}" -f $Matches[1], $ScreenView
+            $key = $Matches[1]
+            if ($key -eq 'ui' -and $ScreenUi -ne '') {
+                "{0}={1}" -f $key, $ScreenUi
+            } elseif ($ScreenView -ne '') {
+                "{0}={1}" -f $key, $ScreenView
+            } else {
+                $line
+            }
         } else {
             $line
         }
     }
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllLines($screenOverrideFile, [string[]]$rewritten, $utf8NoBom)
-    Write-Host ("screen  : -ScreenView {0} (the repository's rr3-screen.txt is NOT modified)" -f $ScreenView)
+    if ($ScreenView -ne '' -and $ScreenUi -ne '') {
+        Write-Host ("screen  : -ScreenView {0} -ScreenUi {1} (the repository's rr3-screen.txt is NOT modified)" -f $ScreenView, $ScreenUi)
+    } elseif ($ScreenUi -ne '') {
+        Write-Host ("screen  : -ScreenUi {0} (the repository's rr3-screen.txt is NOT modified)" -f $ScreenUi)
+    } else {
+        Write-Host ("screen  : -ScreenView {0} (the repository's rr3-screen.txt is NOT modified)" -f $ScreenView)
+    }
 }
 
 # --- the touch-mode override --------------------------------------------------
