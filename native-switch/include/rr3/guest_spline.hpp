@@ -90,7 +90,17 @@ struct SplineFile {
     std::string guid;
     std::vector<SplineChunk> chunks;
 
-    const SplineChunk* chunk(const char* chunkName) const;
+    // INLINE on purpose: the header has to be usable by a HOST test that
+    // links the fit without the guest's filesystem layer (and its libnx
+    // dependencies), and this is the only piece of the type that the fit
+    // needs.
+    const SplineChunk* chunk(const char* chunkName) const {
+        if (chunkName == nullptr) return nullptr;
+        for (const SplineChunk& candidate : chunks) {
+            if (candidate.name == chunkName) return &candidate;
+        }
+        return nullptr;
+    }
 };
 
 // The bytes of a .spline file.  False when the bytes are not a spline.
@@ -101,6 +111,11 @@ bool splineLoad(const char* hostPath, SplineFile* out);
 
 // WHAT THE GUEST LAST OPENED.  Null until the guest opens a .spline.
 const SplineFile* splineLastOpened();
+
+// Bumped every time the guest opens a different spline.  A consumer that
+// fitted the line has to know whether its fit still belongs to the current
+// track.
+uint32_t splineGeneration();
 
 // Called by the filesystem layer when the guest opens a .spline.  It reads
 // the file the guest is about to read and decodes it.  The guest's own

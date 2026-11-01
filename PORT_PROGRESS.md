@@ -11684,3 +11684,91 @@ guest's target read at :935 and the plausibility gate at :967).  With the
 target taken from the captured racing line, the existing gate and the
 existing pursuit code apply unchanged, and `updateDrive` needs NO change
 at all.  The survey that establishes this is in `.build/drive_path_survey.md`.
+
+### 2026-11-01 (20:30): THE RACING LINE IS IN THE PORT'S HANDS, AND THE PURSUIT AIMS AT IT
+
+#### THE HOOK WAS ON THE WRONG API, AND THE PORT'S OWN LOG SAID SO
+
+The port decodes the guest's `.spline` (the previous entry) and takes the
+bytes when the guest opens the file.  Round `q91` (archive
+`20261101-201308-eden-rr3-q91-spline-capture`) captured **zero** splines,
+and the log says why without any guessing:
+
+```
+phase=map-app      rr3track:/files/.depot/Tracks/Bathurst/processed/bathurst.spline
+phase=stat-layout  true=50664 ... rr3track:/files/.depot/Tracks/Bathurst/processed/bathurst.spline
+```
+
+⇒ The guest **stat**s the file (the port resolves it, size 50664) and
+**never opens it through the `fopen` path**.  It uses `open()`.  A hook that
+only covered `fopen` therefore never ran -- and the port never saw the
+racing line.  The hook is now on BOTH paths, and the POSIX one is the one
+that fires.
+
+⇒ AND THE GUEST LOOKS FOR THE WRONG NAME FIRST.  It asks for
+`bathurst_noon.spline` (the time-of-day variant) in four places, gets
+ENOENT in all of them, and only then asks for `bathurst.spline`, which the
+card has.  So the file is eventually found -- but the four misses are the
+guest paying for a name the port's asset layout does not carry.  **The
+variant suffix is dropped somewhere in the asset pipeline**, and that is
+worth chasing on its own: every track is asked for four times before it is
+found.
+
+#### THE FIT: SCALE, OFFSET AND AXES, ALL PER TRACK
+
+The `.spline` nodes are in the guest's stored unit and the guest's axes;
+the port's car position is in 1/256 m with the Y NEGATED (the converter at
+0xf05600).  So the target has to be mapped, and the mapping is a property
+of the TRACK.  The only thing that can fix it is the car's own positions:
+**the car has to lie ON the line.**
+
+⇒ `source/race_line.cpp` fits it at run time: the scale is searched over the
+powers of two around the measured value (16) and refined, the eight axis
+variants are tried, the translation is aligned by ICP (each car's nearest
+point on the line, mean of the differences, a few iterations), and the
+residual says how well it fits.  The line is used only when the residual is
+small, and the target only when the car is within 25 m of it.
+
+**THE POSITIVE CONTROL CAUGHT A REAL DEFECT BEFORE IT REACHED THE PORT.**
+`tests/host/race_line_selftest.cpp` builds a circle whose answer is KNOWN
+(radius 1000 stored units, scale 16, swap+flipX, 11 samples spread over
+the loop) and compiles and runs it on the host.  The first version aligned
+the line by its CENTROID and left a residual of **37.8 m on a circle of
+radius 62.5 m** -- because a car that has driven half a lap has its
+centroid nowhere near the line's.  With the ICP alignment:
+
+```
+scale=16.0000 residual=0.0757 m swap=1 flipX=1 flipY=0
+the target is 20 m ahead          ok
+a car far from the line is refused  ok
+```
+
+⇒ **A test with a known answer found the bug; a test that only checked the
+source's shape would not have.**
+
+#### THE PURSUIT AIMS AT THE LINE NOW
+
+`fillCarState` takes the target from the line when the line is usable, and
+the EXISTING plausibility gate then applies to it unchanged, and
+`updateDrive` needs no change at all:
+
+```
+readDword(car + 0x1a8ULL, &out->carNode);
+... position plausibility ...
+if (out->positionPlausible) {
+    rememberRaceLinePosition(out->carX, out->carY);
+    if (spline != nullptr && refreshRaceLine(frame)) {
+        raceLineTarget(..., 20 m, &tx, &ty);
+        out->carTargetX = (int32_t)tx;  out->carTargetY = (int32_t)ty;
+        out->targetFromLine = true;  out->lineResidual = ...;
+    }
+}
+```
+
+The race-state line now says WHICH target it used -- `line=1 lres=...` --
+so a run can never claim the line is in use when the line was refused.
+
+⇒ **WHAT IS STILL TO BE MEASURED**: whether the car, now aimed at the
+centre line, completes a lap (the lap counter has been -1 since the start
+of this work).  The next round answers that, and the numbers to read are
+`line=`, `lres=`, `pur=`, `perr=` and `laps=`.

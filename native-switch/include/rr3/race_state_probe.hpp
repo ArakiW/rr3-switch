@@ -141,6 +141,22 @@ struct RaceMetricsSample {
     // believed to be in the same units.  Reported so a run can say "the
     // target is 35 km away" instead of leaving it to be deduced.
     double targetDistance{};
+    // Whether the target was taken from the TRACK'S RACING LINE rather than
+    // from the guest's own memory.
+    //
+    // MEASURED 2026-11-01 (q81): the guest's own aim target is unreadable
+    // (8992131 in its Y word -- 35 km -- while the car is at 207 m from the
+    // origin), so the target comes from the `.spline` the guest opened, and
+    // the port fits that line to the car's own positions at run time
+    // (source/race_line.cpp).  This flag says which of the two the target
+    // actually came from, so a run cannot claim the line is in use when the
+    // line was refused.
+    bool targetFromLine{false};
+    // The fit's residual, in metres: the mean distance from the car's own
+    // positions to the fitted line.  On a real circuit this is the car's
+    // lateral offset from the centre line; with a WRONG scale it is
+    // hundreds of metres, which is what tells the two apart.
+    double lineResidual{};
     uintptr_t trackStateAddress{};
     uint32_t splineNode{};
     uint32_t splineDistance{};

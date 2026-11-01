@@ -64,6 +64,17 @@ def main() -> None:
     # bytes.
     assert call < fs.index("file = std::fopen(candidate, mode);", hook)
 
+    # 3b. AND ON THE POSIX open() PATH.  MEASURED 2026-11-01 (q91): the guest
+    #     reads the .spline with open(), not with fopen() -- the log shows
+    #     the file being stat'ed and never opened through the fopen path --
+    #     so a hook that only covered fopen never ran.
+    open_hook = fs.index('std::strstr(candidate, ".spline")', call)
+    open_call = fs.index("rr3::splineObserveGuestOpen(path, candidate)", open_hook)
+    assert open_hook > call
+    assert open_call < fs.index("fd = (flags & O_CREAT) != 0", open_hook)
+    # The lambda has to capture the path it reports.
+    assert "[&fd, flags, mode, path]" in fs
+
     # 4. The unit is NOT silently assumed: the log says it is unknown.
     assert "unit=UNKNOWN" in source
 

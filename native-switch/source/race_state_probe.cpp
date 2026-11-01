@@ -77,7 +77,9 @@
 #include "rr3/race_state_probe.hpp"
 
 #include "rr3/elf_preflight.hpp"
+#include "rr3/guest_spline.hpp"
 #include "rr3/member_value_store.hpp"
+#include "rr3/race_line.hpp"
 #include "rr3/race_metrics_probe.hpp"
 #include "rr3/recovery_guard.hpp"
 
@@ -871,6 +873,112 @@ unsigned long long g_lastFlipFrame = 0;
 // its projection rather than storing it.  The position and the node index
 // are what the offset would be computed FROM.
 //
+// THE RACING LINE, FITTED AT RUN TIME.
+//
+// WHY IT IS FITTED AND NOT READ: the `.spline` nodes are in the GUEST's
+// stored unit and the guest's own axes, and the port's car position is in
+// the port's 1/256 metre unit with the Y NEGATED (the converter at
+// 0xf05600).  The scale, the offset and the axis variant are therefore
+// properties of the TRACK, and the only thing that can fix them is the
+// car's own positions: the car has to lie ON the line.
+//
+// WHY THE SAMPLES ARE A RING: the fit needs the car's positions over a
+// stretch of the track, not one point, and a car that is stationary before
+// the race would give the fit nothing to work with -- so a sample is only
+// taken when the car has MOVED.
+//
+// WHY THE FIT IS DONE ONCE PER TRACK: the track's geometry does not change
+// while the car drives on it, so refitting every frame would be a lot of
+// arithmetic for the same answer.
+constexpr double kRaceLineLookAheadMetres = 20.0;
+constexpr size_t kRaceLineSamples = 48;
+constexpr size_t kRaceLineMinSamples = 12;
+constexpr uint64_t kRaceLineRefitFrames = 600;
+
+struct RaceLineState {
+    double x[kRaceLineSamples]{};
+    double y[kRaceLineSamples]{};
+    size_t count = 0;
+    size_t head = 0;
+    double lastX = 0.0;
+    double lastY = 0.0;
+    bool haveLast = false;
+    uint32_t generation = 0;
+    uint64_t lastFitFrame = 0;
+    bool fitted = false;
+    rr3::RaceLine line{};
+};
+
+RaceLineState gRaceLine;
+unsigned long long gRaceLineFrame = 0;
+
+// Remembers the car's position, and fits the line when it is worth doing.
+bool refreshRaceLine(unsigned long long frame) {
+    gRaceLineFrame = frame;
+    const rr3::SplineFile* spline = rr3::splineLastOpened();
+    if (spline == nullptr) {
+        return false;
+    }
+    const uint32_t generation = rr3::splineGeneration();
+    if (gRaceLine.fitted && gRaceLine.generation == generation &&
+        frame - gRaceLine.lastFitFrame < kRaceLineRefitFrames) {
+        return true;
+    }
+    if (gRaceLine.count < kRaceLineMinSamples) {
+        return false;
+    }
+    // The ring, oldest first.
+    double xs[kRaceLineSamples];
+    double ys[kRaceLineSamples];
+    size_t n = 0;
+    for (size_t i = 0; i < gRaceLine.count; ++i) {
+        const size_t index = (gRaceLine.head + i) % kRaceLineSamples;
+        xs[n] = gRaceLine.x[index];
+        ys[n] = gRaceLine.y[index];
+        ++n;
+    }
+    rr3::RaceLine line;
+    if (!rr3::raceLineFit(*spline, "centre_spline", xs, ys, n, &line)) {
+        return false;
+    }
+    // THE RESIDUAL IS THE DISCRIMINATOR.  With the right scale the residual
+    // is the car's lateral offset from the centre line -- metres.  With a
+    // wrong scale the line does not pass near the car at all, and the
+    // residual is hundreds of metres.  So the line is only used when the
+    // residual says the car is on it.
+    if (line.residual > 25.0) {
+        return false;
+    }
+    gRaceLine.line = line;
+    gRaceLine.fitted = true;
+    gRaceLine.generation = generation;
+    gRaceLine.lastFitFrame = frame;
+    return true;
+}
+
+// Remembers ONE car position for the fit.
+void rememberRaceLinePosition(int32_t carX, int32_t carY) {
+    const double x = static_cast<double>(carX);
+    const double y = static_cast<double>(carY);
+    if (gRaceLine.haveLast) {
+        const double dx = x - gRaceLine.lastX;
+        const double dy = y - gRaceLine.lastY;
+        // A metre, in port units.  A stationary car gives the fit nothing.
+        if (dx * dx + dy * dy < 65536.0) {
+            return;
+        }
+    }
+    gRaceLine.lastX = x;
+    gRaceLine.lastY = y;
+    gRaceLine.haveLast = true;
+    gRaceLine.x[gRaceLine.head] = x;
+    gRaceLine.y[gRaceLine.head] = y;
+    gRaceLine.head = (gRaceLine.head + 1) % kRaceLineSamples;
+    if (gRaceLine.count < kRaceLineSamples) {
+        ++gRaceLine.count;
+    }
+}
+
 // The reads are the port's own safe reads (plausibility gate, guest-image
 // check, svcQueryMemory, read) and nothing here writes anything.
 void fillCarState(RaceMetricsSample* out) {
@@ -953,6 +1061,42 @@ void fillCarState(RaceMetricsSample* out) {
         (out->carX > -400000 && out->carX < 400000) &&
         (out->carY > -400000 && out->carY < 400000) &&
         (out->carZ > -20000 && out->carZ < 20000);
+    // THE TARGET FROM THE TRACK'S RACING LINE.
+    //
+    // MEASURED 2026-11-01 (q81): the guest's own aim target is unreadable
+    // -- the offset holds 8992131 in its Y word, 35 km, while the car is at
+    // 207 m from the origin -- so the pursuit was refused and the car never
+    // steered, and the lap counter stayed at -1.
+    //
+    // The racing line is in the track's `.spline`, which the port now
+    // decodes (source/guest_spline.cpp), and the target comes from THERE.
+    // The line is FITTED AT RUN TIME, on the track that is actually loaded:
+    // the scale, the offset and the axis variant are all per track, and the
+    // only thing that can fix them is the car's own positions -- the car has
+    // to lie ON the line (source/race_line.cpp).
+    //
+    // THE GUARD: the line is used only when the car is on it.  A car far
+    // from the line is not on this track's line, and aiming at it would be
+    // aiming at noise -- the exact failure the guest's own target produced.
+    if (out->positionPlausible) {
+        rememberRaceLinePosition(out->carX, out->carY);
+        const rr3::SplineFile* spline = rr3::splineLastOpened();
+        if (spline != nullptr && refreshRaceLine(gRaceLineFrame)) {
+            double targetX = 0.0;
+            double targetY = 0.0;
+            if (rr3::raceLineTarget(gRaceLine.line, *spline,
+                                    static_cast<double>(out->carX),
+                                    static_cast<double>(out->carY),
+                                    kRaceLineLookAheadMetres, &targetX,
+                                    &targetY)) {
+                out->carTargetX = static_cast<int32_t>(targetX);
+                out->carTargetY = static_cast<int32_t>(targetY);
+                out->carTargetZ = out->carZ;
+                out->targetFromLine = true;
+                out->lineResidual = gRaceLine.line.residual;
+            }
+        }
+    }
     // THE TARGET'S OWN GATE.
     //
     // MEASURED 2026-11-01 (q81): the offset read for the aim target holds
@@ -1902,6 +2046,7 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             "rate=%.6f prog=%.3f from_total=%d sawprog=%d "
             "car=0x%llx cnum=%u cnode=%u cprev=%u cpos=%d,%d,%d ctgt=%d,%d,%d "
             "snode=%u sdist=%u tsok=%d posok=%d ctok=%d ctdist=%.2f "
+            "line=%d lres=%.2f "
             "perr=%.4f pur=%d ident=0x%llx "
             "drive=%d steer=%.3f mag=%.3f sign=%d best=%.6f flips=%d stalls=%d "
             "thr=%d brk=%d",
@@ -1937,6 +2082,7 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             m.positionPlausible ? 1 : 0,
             m.trackStateAddress != 0 ? 1 : 0,
             m.targetPlausible ? 1 : 0, m.targetDistance,
+            m.targetFromLine ? 1 : 0, m.lineResidual,
             static_cast<double>(g_drive.steerError), g_drive.pursuit ? 1 : 0,
             static_cast<unsigned long long>(m.membersIdentified),
             g_drive.enabled ? 1 : 0, static_cast<double>(g_drive.steer),
@@ -2046,6 +2192,9 @@ void pumpRaceStateProbe(unsigned long long frame) {
     if (g_metricsCount > 0) {
         RaceMetricsSample m{};
         fillMetrics(&m, g_metrics[0]);
+        // The racing line's fit is refreshed on the frame counter, so the
+        // "refit every N frames" rule has a frame to count.
+        gRaceLineFrame = frame;
         fillCarState(&m);
         updateProgress(frame, &m);
         g_sample.metrics[0] = m;

@@ -8808,7 +8808,17 @@ int guestOpen(const char* path, int flags, ...) {
         // now reporting "Failed opening file". Same run also proved the .z
         // retry itself works -- mtResourceCache failures went 71 -> 0 and the
         // pixel readback turned from 000000ff to 00ffffff.
-        const int rc = withReadFallback(resolution, path, [&fd, flags, mode](const char* candidate) {
+        const int rc = withReadFallback(resolution, path, [&fd, flags, mode, path](const char* candidate) {
+            // THE TRACK'S RACING LINE, on the POSIX open() path as well.
+            //
+            // MEASURED 2026-11-01 (q91): the guest reads the .spline with
+            // open(), NOT with fopen() -- the log shows the file being
+            // stat'ed (stat-layout, size 50664) and never opened through
+            // the fopen path, so a hook that only covered fopen never ran
+            // and the port never saw the racing line.
+            if (std::strstr(candidate, ".spline") != nullptr) {
+                rr3::splineObserveGuestOpen(path, candidate);
+            }
             fd = (flags & O_CREAT) != 0
                 ? ::open(candidate, flags, mode)
                 : ::open(candidate, flags);

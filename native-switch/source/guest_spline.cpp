@@ -38,16 +38,9 @@ int32_t readI32(const uint8_t* data, size_t size, size_t offset) {
 
 SplineFile g_lastOpened;
 bool g_hasLastOpened = false;
+uint32_t g_generation = 0;
 
 }  // namespace
-
-const SplineChunk* SplineFile::chunk(const char* chunkName) const {
-    if (chunkName == nullptr) return nullptr;
-    for (const SplineChunk& candidate : chunks) {
-        if (candidate.name == chunkName) return &candidate;
-    }
-    return nullptr;
-}
 
 bool splineParse(const uint8_t* data, size_t size, SplineFile* out) {
     if (data == nullptr || out == nullptr || size < 12) {
@@ -161,6 +154,13 @@ const SplineFile* splineLastOpened() {
     return g_hasLastOpened ? &g_lastOpened : nullptr;
 }
 
+// Bumped every time the guest opens a different spline, so a consumer can
+// tell "the line I fitted is still the current track's" from "the track
+// changed and my fit belongs to the last one".
+uint32_t splineGeneration() {
+    return g_generation;
+}
+
 void splineObserveGuestOpen(const char* guestPath, const char* hostPath) {
     if (hostPath == nullptr) {
         return;
@@ -176,6 +176,7 @@ void splineObserveGuestOpen(const char* guestPath, const char* hostPath) {
     }
     g_lastOpened = std::move(file);
     g_hasLastOpened = true;
+    ++g_generation;
     char details[512];
     int written = 0;
     written += std::snprintf(details + written, sizeof(details) - written,
