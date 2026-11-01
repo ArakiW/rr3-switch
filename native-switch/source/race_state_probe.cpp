@@ -78,6 +78,7 @@
 
 #include "rr3/elf_preflight.hpp"
 #include "rr3/guest_spline.hpp"
+#include "rr3/guest_rtti.hpp"
 #include "rr3/member_value_store.hpp"
 #include "rr3/race_line.hpp"
 #include "rr3/race_metrics_probe.hpp"
@@ -1325,6 +1326,17 @@ void fillMetrics(RaceMetricsSample* out, uintptr_t address) {
     } else {
         out->vptr = 0;
     }
+    // THE CLASS NAME, RESOLVED FROM THE GUEST'S OWN RTTI.
+    //
+    // The log used to print a CONSTANT here, so it said the class was right
+    // while the vptr check in the same line said it was wrong.  MEASURED
+    // 2026-11-01 (q92..q95): the object was not the RaceMetrics at all --
+    // what the port read there was ASCII text ("532#355#"), and the car's
+    // pointer came out as 0x3533352335333523.
+    out->className[0] = '\0';
+    if (out->vptr != 0) {
+        guestResolveClassName(out->vptr, out->className, sizeof(out->className));
+    }
     readDword(address + kOffLapDistance, &out->lapDistance);
     readDword(address + kOffTotalLaps, &out->totalLaps);
     readDword(address + kOffPreviousSpline, &out->previousSplineDistance);
@@ -1512,7 +1524,8 @@ bool followGameMode(uintptr_t bias, uintptr_t gameMode, uintptr_t* outRuleSet,
     }
     const uintptr_t root = static_cast<uintptr_t>(rootWord);
     const uintptr_t ruleSetVptr = bias + kRuleSetRaceMetricsVptrElfVa;
-    const uintptr_t metricsVptr = bias + kRaceMetricsVptrElfVa;
+    // The address point is no longer the test: the class NAME is (see
+    // isRaceMetricsVptr below), so this constant is no longer needed here.
 
     uintptr_t ruleSet = 0;
     int nodesVisited = 0;
@@ -1553,13 +1566,43 @@ bool followGameMode(uintptr_t bias, uintptr_t gameMode, uintptr_t* outRuleSet,
         return false;
     }
 
+    // IS THIS THE RACE METRICS OBJECT?
+    //
+    // A class is identified by its NAME -- the guest's own RTTI, read at
+    // runtime -- and not by ONE address point.
+    //
+    // MEASURED 2026-11-01 (q92..q95): the hard-coded address point stopped
+    // matching what the guest has in this configuration, so the port's
+    // discovery found a DIFFERENT object and read it as if it were the
+    // metrics: what it read there was ASCII text ("532#355#"), and the
+    // car's pointer came out as 0x3533352335333523.
+    //
+    // The RTTI read is three loads (the typeinfo slot, the __name slot, the
+    // name), it allocates nothing, takes no lock and makes no syscall, so it
+    // is safe on the guest's own thread.
+    auto isRaceMetricsVptr = [&](uintptr_t vptr) -> bool {
+        if (vptr == 0) {
+            return false;
+        }
+        if (vptr == bias + kRaceMetricsVptrElfVa) {
+            return true;
+        }
+        char name[96]{};
+        if (!guestResolveClassName(vptr, name, sizeof(name))) {
+            return false;
+        }
+        return guestClassNameContains(name, "RuleSetModifier_RaceMetrics") ||
+               (guestClassNameContains(name, "RaceMetrics") &&
+                !guestClassNameContains(name, "RuleSet_RaceMetrics"));
+    };
+
     // The metrics modifier is built IN PLACE inside the RuleSet_RaceMetrics
     // at +0x40 (the guest's constructor, ELF 0xb35938, constructs it at
     // this+0x40). It may also be reached through a pointer, and both are
-    // checked BY THE VPTR, so neither is a guess.
+    // checked BY THE CLASS NAME, so neither is a guess.
     uint64_t inlineHead = 0;
     if (readWord(ruleSet + kRuleSetMetricsInlineOff, &inlineHead) &&
-        inlineHead == metricsVptr) {
+        isRaceMetricsVptr(static_cast<uintptr_t>(inlineHead))) {
         *outRuleSet = ruleSet;
         *outMetrics = ruleSet + kRuleSetMetricsInlineOff;
         g_mapNodesVisited = nodesVisited;
@@ -1571,7 +1614,7 @@ bool followGameMode(uintptr_t bias, uintptr_t gameMode, uintptr_t* outRuleSet,
         if (!readWord(ruleSet + off, &word)) {
             continue;
         }
-        if (word == metricsVptr) {
+        if (isRaceMetricsVptr(static_cast<uintptr_t>(word))) {
             *outRuleSet = ruleSet;
             *outMetrics = ruleSet + off;
             g_mapNodesVisited = nodesVisited;
@@ -1585,7 +1628,7 @@ bool followGameMode(uintptr_t bias, uintptr_t gameMode, uintptr_t* outRuleSet,
         if (!readWord(static_cast<uintptr_t>(word), &head)) {
             continue;
         }
-        if (head == metricsVptr) {
+        if (isRaceMetricsVptr(static_cast<uintptr_t>(head))) {
             *outRuleSet = ruleSet;
             *outMetrics = static_cast<uintptr_t>(word);
             g_mapNodesVisited = nodesVisited;
@@ -2057,7 +2100,7 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             "f=%llu g=0x%llx gm=0x%llx gm_ok=%d gm_vptr=0x%llx gm_ap=0x%llx "
             "gm_base=%d gm_cand=%d cand=%s rs=0x%llx metrics=%d "
             "active=%d nodes=%d keyoff=%d heap=0x%llx+0x%llx "
-            "cls=27RuleSetModifier_RaceMetrics m=0x%llx vptr_ok=%d "
+            "cls=%s m=0x%llx vptr_ok=%d "
             "mres=0x%x "
             "laps=%u lapF=%.3f lapd=%u lapdF=%.3f prev=%u total=%u "
             "totalF=%.3f speed=%u speedF=%.3f time=%u timeF=%.3f "
@@ -2080,6 +2123,9 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             g_mapNodesVisited, g_mapKeyOffset,
             static_cast<unsigned long long>(g_heapBase),
             static_cast<unsigned long long>(g_heapSize),
+            // THE RESOLVED NAME, not a constant: the log must not be able to
+            // claim a class the object does not have.
+            m.className[0] != '\0' ? m.className : "unresolved",
             static_cast<unsigned long long>(m.address),
             (m.vptr == bias + kRaceMetricsVptrElfVa) ? 1 : 0,
             m.membersResolved,
@@ -2223,8 +2269,31 @@ void pumpRaceStateProbe(unsigned long long frame) {
         // so a STALE object -- the guest reallocated it -- was read as if it
         // were live.  A vptr that does not match is not a warning, it is the
         // end of that object: drop it and search again.
-        const uintptr_t bias = resolveMainImageLoadBias();
-        if (m.vptr != bias + kRaceMetricsVptrElfVa) {
+        // THE OBJECT MUST STILL BE THE RACE METRICS, AND THE CLASS NAME IS
+        // THE MEASUREMENT.
+        //
+        // MEASURED 2026-11-01 (q92..q95): the cached address stopped being
+        // the RaceMetrics -- the log says `vptr_ok=0` -- and the port kept
+        // reading it anyway.  What it read there was ASCII TEXT: the car's
+        // pointer came out as 0x3533352335333523, which is "532#355#", and
+        // the car's position came out as 0,0,0 for the whole round.
+        //
+        // EVERY DISCOVERY PATH CHECKS THE VPTR.  The per-frame read did not,
+        // so a STALE object -- the guest reallocated it -- was read as if it
+        // were live.  A vptr that does not match is not a warning, it is the
+        // end of that object: drop it and search again.
+        //
+        // AND THE CHECK IS BY NAME, not by address point: the address point
+        // the port hard-codes stopped matching in this configuration, and a
+        // class is identified by its NAME.  The name is also what the log
+        // prints now, so the log cannot claim a class the object does not
+        // have.
+        const bool isRaceMetrics =
+            guestClassNameContains(m.className, "RuleSetModifier_RaceMetrics") ||
+            (m.className[0] != '\0' &&
+             guestClassNameContains(m.className, "RaceMetrics") &&
+             !guestClassNameContains(m.className, "RuleSet_RaceMetrics"));
+        if (!isRaceMetrics) {
             g_metricsCount = 0;
             g_metrics[0] = 0;
             // THE GameMode GOES TOO.  discover() re-validates the GameMode

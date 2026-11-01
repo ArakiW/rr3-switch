@@ -11944,3 +11944,54 @@ directory on the host disk, and the port's `sdmc:/...` paths go through
 libnx's fsdev under the emulator -- and `fsFileGetSize` on it is exactly the
 call that would turn into a long wait if the emulator's fsdev handling is
 slow for a large file.
+
+### 2026-11-01 (21:20): A CLASS IS ITS NAME, NOT ONE ADDRESS POINT -- AND THE LOG WAS PRINTING A CONSTANT
+
+**The symptom.**  From q92 on, the port's race-state line said `vptr_ok=0`
+and the car's position read `0,0,0` for the whole round, while the race was
+obviously running (`msStartLights 7`, `msRaceScreen 10`).  The car's POINTER
+came out as `0x3533352335333523` -- which is ASCII: "532#355#".
+
+⇒ The port was reading a **stale object** as if it were live, and the stale
+object's memory held text.
+
+**The bisect.**  `git show` on the two commits between the last good round
+(q84) and the first bad one (q88) came back empty for the car's read path,
+so the break was not in the code that reads the car.  The candidates were the
+code and the configuration in the same time window, so the configuration was
+the prime suspect: `AA_LEVEL = 4` had just been switched on.
+
+**The bug, in three parts.**
+
+1. **The per-frame read never checked the vptr.**  Every DISCOVERY path
+   checks it; the read that happens every 30 frames did not.  A vptr that
+   does not match is not a warning, it is the end of that object: it is now
+   dropped, and the GameMode with it (the discovery skips the candidate list
+   when one is known, so a stale GameMode would have kept the probe from
+   ever finding the live one), and the next frame searches again.
+
+2. **The address point the port hard-codes is not the identity.**  It is the
+   address point of `27RuleSetModifier_RaceMetrics` in ONE configuration, and
+   the guest's object stopped matching it.  The identity of a C++ object is
+   its CLASS, and the guest carries its own RTTI: `[vptr-8]` -> typeinfo ->
+   `[typeinfo+8]` -> `__name`.  The port already has that resolver
+   (`source/guest_rtti.cpp`), so the check is now by NAME -- in the
+   discovery AND in the per-frame check.
+
+3. **⇒⇒ AND THE LOG WAS PRINTING A CONSTANT.**  The race-state line's
+   `cls=27RuleSetModifier_RaceMetrics` was PART OF THE FORMAT STRING.  So
+   the log said "the class is RuleSetModifier_RaceMetrics" -- the class the
+   port BELIEVED the object had -- while the vptr check in the very same line
+   said the object was something else, and the object's contents were ASCII.
+   **A field that is a constant cannot disagree with anything, which is
+   exactly why it agreed with the wrong thing for four rounds.**
+
+   ⇒ The name is now RESOLVED at runtime and printed, and the log cannot
+   claim a class the object does not have.
+
+⇒ **THIS IS THE FIFTH TIME IN THIS PROJECT THAT A LOG FIELD TURNED OUT TO
+BE SOMETHING ELSE.**  The list, so it is not rediscovered: a comparison that
+was always false; a "present" flag that was a constant; a name that was a
+constant; a `size` that was the primary's size and not the served one's; a
+"verdict" that was the port's belief.  ⇒ **EVERY FIELD THAT MAKES A CLAIM
+ABOUT THE GUEST HAS TO BE READ FROM THE GUEST.**

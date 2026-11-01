@@ -71,6 +71,17 @@ struct RaceMetricsSample {
     bool valid{};          // the object was found and reads cleanly
     uintptr_t address{};   // the RuleSetModifier_RaceMetrics object
     uintptr_t vptr{};      // its vptr, which must equal the expected vtable
+    // THE CLASS NAME, RESOLVED FROM THE GUEST'S OWN RTTI AT RUNTIME.
+    //
+    // The log used to print a CONSTANT here ("cls=27RuleSetModifier_RaceMetrics"
+    // was part of the format string), so it said the class was right while the
+    // vptr check in the same line said it was wrong.  MEASURED 2026-11-01
+    // (q92..q95): the object the port had was not the RaceMetrics at all --
+    // what it read there was ASCII text ("532#355#"), and the car's pointer
+    // came out as 0x3533352335333523.
+    //
+    // ⇒ The name is now a MEASUREMENT: the guest's own RTTI, read at runtime.
+    char className[96]{};
     // The guest's members are read as 32-bit words AND as floats, because the
     // guest's own member names ("m_n...") say "integer" while the values
     // themselves decide. Both readings are reported; nothing is assumed.
