@@ -11497,3 +11497,82 @@ of the 720p rate rather than 29%).
 ⇒ THE DEPLOY SWITCH CANNOT EXPRESS THAT YET: -ScreenView rewrites all
 THREE size lines (platform, ui, view) to one value.  It needs a way to set
 them independently.
+
+### 2026-11-01 (16:00): THE `ui=` CHANNEL DOES MOVE THE GUI ATLAS -- AND THE HD TREE HANGS THE BOOT
+
+The correction above leaves one thing open: `ui=` had never been measured.
+Round `q89` (archive `20261101-160153-eden-rr3-q89-ui2048`) measured it, with
+the card at `platform=2048x1152 / ui=2048x1152 / view=1280x720`.
+
+**WHAT THE PORT ANSWERED**
+
+    phase=screen-override platform=2048x1152 ui=2048x1152
+    phase=view-size view=1280x720 present=0,0 1280x720
+
+**WHAT THE GUEST DID WITH IT -- THE ATLAS TREE FLIPPED**
+
+| GUI tree requests | q88 (`ui=1280x720`) | q89 (`ui=2048x1152`) |
+|---|---|---|
+| `gui_assets/960x640`   | **4002** | 207 |
+| `gui_assets/2048x1536` | 280 | **267** |
+| `gui_assets/480x320`   | 74 | 20 |
+
+⇒ **`ui=` (what the port answers to `CCUserInterfaceManager.getScreenWidth`)
+IS THE ATLAS FILTER'S SCREEN SIZE.**  The guest's own `Res base` stayed
+`1280x720` in both rounds, so the atlas does NOT follow the view: it follows
+the UI screen size.  That is the lever the previous section said did not
+exist.
+
+⇒ AND IT IS THE LEVER THE USER ASKED FOR.  The split -- "HD material on the
+vehicles and the environment, the UI left alone" -- is now EXPRESSIBLE, and
+in the opposite direction from the one assumed before: `view=1280x720` keeps
+the LAYOUT and the scene at 720p, while `ui=2048x1152` makes the guest draw
+its 2D out of the **2048x1536** atlas.  The 3D assets are already the HD
+tree (`assets_2048x1536`, chosen by the device profile's quality tier, 352
+opens in every run).
+
+**BUT THE BOOT HANGS WITH THE HD TREE, AND THAT IS NOW THE BLOCKER**
+
+q89 ended at 153 s with the harness's own verdict -- "the guest has been
+blocked for 120 s" -- and only 3 frames:
+
+    gfxFrames              3
+    msLoadComplete         0
+    msAssetComplete        0
+    msMainMenuLayouts      0
+    msEventMapScreen       0
+    msMd5Mismatch          0      msStat22  0      msDownloadFailed  0
+
+The guest never finished loading: it froze at frame 2, with its own last log
+line being the cloudcell sync (`CC: [3] POST complete [Succeeded=True]`) and
+with 267 of the 750 HD GUI paths requested.  The port's own sampler caught it
+inside the HOST image:
+
+    phase=root-pc-sampler NOT-GUEST-IMAGE pc_img=host-nro pc=0x80fe7154
+                                    pc_off=0x5c6154
+
+**WHAT IS RULED OUT, WITH THE MEASUREMENT THAT RULES IT OUT**
+
+* *The 4.2 MB base asset list is NOT the stall.*  q89's log shows the list
+  served by the bulk path in **9 ms** (`bulk-read ... pieces=65 ms=9`) and
+  the PINNED slot hit twice.  The stall is downstream of it.
+* *The port's per-open full-file re-read for the "served-digest" line is NOT
+  the stall.*  MEASURED on the card: the whole HD GUI tree is **8 files,
+  3.0 MB**, and reading and MD5-ing all of it takes **0.01 s**.  The
+  hypothesis was wrong, and the measurement is what says so.
+* *The port's free-list probe is NOT an infinite loop.*  `guestViewTracedFree`
+  only counts a pointer sequence (`guest_view_trace.cpp:600-650`); it does
+  not walk the list.
+* *The guest's integrity checks are NOT rejecting anything*: md5 mismatch 0,
+  stat(22) 0, download failed 0.
+
+⇒ SO THE FROZEN THING IS: the guest is in a teardown (`guest-free-seq`
+reports 56909 frees at frame 2) inside a HOST call, and the port's whole
+process is frozen with it (the sampler stopped ticking at tick 24).  The
+next instrument has to name the host function at `pc_off=0x5c6154`; the
+offset is NOT yet resolved, because the NRO's own layout is not the host
+ELF's file layout and guessing that mapping is how the previous five rounds
+of the offscreen target went wrong.
+
+⇒ **THE CARD IS BACK AT `platform=ui=view=1280x720`**, the configuration
+that is measured to reach the race (q81) and to survive 300 s (q87).
