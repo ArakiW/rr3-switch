@@ -139,23 +139,34 @@ else {
     $sourceData = Join-Path $packageApp 'data'
     $targetData = Join-Path $appDir 'data'
     New-Item -ItemType Directory -Force -Path $targetData | Out-Null
-    foreach ($name in $volumeNames) {
-        $src = Join-Path $sourceData $name
-        $dst = Join-Path $targetData $name
-        $srcLen = (Get-Item $src).Length
+    # EVERY file in data\, not just the seven volumes: the directory also
+    # carries rr3-data-manifest.json, which says what is inside the volumes.
+    # Copying only the named volumes left the console without it -- caught by
+    # the installer's own positive control (2,594 bytes missing).
+    $dataFiles = @(Get-ChildItem -LiteralPath $sourceData -File | Sort-Object Name)
+    foreach ($file in $dataFiles) {
+        $dst = Join-Path $targetData $file.Name
+        $srcLen = $file.Length
         if ((Test-Path -LiteralPath $dst -PathType Leaf) -and
             (Get-Item $dst).Length -eq $srcLen) {
-            Write-Host ("present   : {0,-24} {1,14:N0} bytes (skipped)" -f $name, $srcLen)
+            Write-Host ("present   : {0,-24} {1,14:N0} bytes (skipped)" -f $file.Name, $srcLen)
             continue
         }
-        Write-Host ("copying   : {0,-24} {1,14:N0} bytes ..." -f $name, $srcLen)
-        Copy-Item -LiteralPath $src -Destination $dst -Force
+        Write-Host ("copying   : {0,-24} {1,14:N0} bytes ..." -f $file.Name, $srcLen)
+        Copy-Item -LiteralPath $file.FullName -Destination $dst -Force
         $dstLen = (Get-Item $dst).Length
         if ($dstLen -ne $srcLen) {
-            Write-Error "volume copy verification failed: $name ($srcLen -> $dstLen)"
+            Write-Error "data copy verification failed: $($file.Name) ($srcLen -> $dstLen)"
             exit 3
         }
-        Write-Host ("copied    : {0,-24} {1,14:N0} bytes" -f $name, $dstLen)
+        Write-Host ("copied    : {0,-24} {1,14:N0} bytes" -f $file.Name, $dstLen)
+    }
+    $missing = $volumeNames | Where-Object {
+        -not (Test-Path -LiteralPath (Join-Path $targetData $_) -PathType Leaf)
+    }
+    if ($missing) {
+        Write-Error ("volumes missing on the card: {0}" -f ($missing -join ', '))
+        exit 3
     }
 }
 

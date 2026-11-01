@@ -12358,3 +12358,37 @@ them would have cost the user an evening on a console.  A package that is
 about to be handed to somebody else is the right place to check the sentences
 against the code -- and, where possible, against a round that measured the
 thing being shipped.
+## THE INSTALLER'S OWN POSITIVE CONTROL FOUND THE FILE THE SCRIPT WAS NOT COPYING
+
+The release's installer had a verification step (it compares the file count
+after copying `.depot`), so it was run against an empty card directory before
+the package was handed over.  It failed on the **byte** comparison, not the
+file count:
+
+```
+  depot files        package=9872   card=9872   OK
+  data volumes       package=7      card=7      OK
+  control scripts    package=8      card=8      OK
+  data bytes         package=10156617382  card=10156614788   MISMATCH
+```
+
+**2,594 bytes**, and that is exactly the size of `data/rr3-data-manifest.json`.
+The script copied the seven volumes by name and never copied the manifest --
+the file that says what is inside the volumes.  The console would have had
+seven romfs images and no manifest.
+
+The fix is not "add the eighth name to the list": the script now copies
+**every file in `data\`** and then asserts that the seven volumes are there.
+A list of names is a list of things somebody can forget; a directory copy is
+a property.
+
+**And the control earned its keep by being a control.**  The copy ran against
+a directory that already held the volumes, so the volume lines reported
+"present (skipped)" and the missing file was invisible in every count that
+looked at names.  Only the byte total found it.  The rerun after the fix
+started from an empty directory, so the whole path -- seven volumes, the
+manifest, 9,872 depot files, eight control scripts, the NRO, the romfs and the
+conf -- was exercised once, end to end, the way the user will run it.
+
+A verification step that only checks what the script names is a restatement
+of the script.  It has to compare something the script did not choose.

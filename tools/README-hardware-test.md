@@ -12,7 +12,8 @@
 
 ### 方式 A：分卷 zip（推荐，脚本全自动）
 
-下载包里全部的 `*.zip.001` 分卷 + `Join-And-Extract.ps1`，放进**同一个文件夹**，然后：
+下载**全部 4 个分卷** `rr3-switch-fulltest-20261102.zip.001` … `.004`，加上
+`Join-And-Extract.ps1`，放进**同一个文件夹**，然后：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File Join-And-Extract.ps1 -Card F:
@@ -20,6 +21,8 @@ powershell -ExecutionPolicy Bypass -File Join-And-Extract.ps1 -Card F:
 
 它会：把分卷拼成一个 zip → 解包到 `.\rr3-package` → 调用包里的 `Copy-To-SwitchCard.ps1`
 把整棵树装到 SD 卡。`F:` 换成你的卡。
+
+> 分卷必须**一个不缺**。脚本会把找到的分卷按文件名排序拼接，少一个就会得到一个坏 zip。
 
 ### 方式 B：直接拷目录
 
