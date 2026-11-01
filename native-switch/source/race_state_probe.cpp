@@ -2330,9 +2330,18 @@ void pumpRaceStateProbe(unsigned long long frame) {
     // and THAT is what collapsed the frame rate from ~3 fps to ~0.5 fps when
     // it ran every frame.  So the cheap path gets its own, much shorter,
     // cadence, and the heap scan keeps the slow one.
+    //
+    // AND THE CHEAP PATH MUST NOT BE GATED ON THE GAMEMODE BEING KNOWN.
+    // MEASURED 2026-11-01 (q101): with the cheap path gated on
+    // `g_gameMode != 0`, the port found the metrics TWICE in 1080 frames --
+    // because the GameMode pointer was not known either, so the cheap path
+    // never ran and only the 300-frame heap scan did.  The cheap path IS the
+    // GameMode search, so gating it on the GameMode being already found
+    // meant it could only ever run after the expensive path had already
+    // succeeded.
     const unsigned long long cheapPeriod = 15ULL;
     const unsigned long long period = found ? 600ULL : 300ULL;
-    const bool needCheap = !found && g_gameMode != 0 &&
+    const bool needCheap = !found &&
                            (frame >= g_lastCheapSearchFrame + cheapPeriod);
     const bool needFull = g_forceSearch || (frame >= g_lastSearchFrame + period);
     if (needCheap || needFull) {
@@ -2397,17 +2406,21 @@ void pumpRaceStateProbe(unsigned long long frame) {
              guestClassNameContains(m.className, "RaceMetrics") &&
              !guestClassNameContains(m.className, "RuleSet_RaceMetrics"));
         // AND THE MEMBERS HAVE TO RESOLVE.  A class name says WHAT the
-        // object is; the members say whether it is the LIVE one.  The guest
-        // registers the six members in the modifier's constructor and reads
-        // their values through the value store, so a member that resolves is
-        // a member the guest has initialised.
+        // object is; the members say whether it is the LIVE one.
         //
-        // MEASURED 2026-11-01 (q98): the port found an object of the right
-        // CLASS whose position was frozen at (-247249,-153205,2563) for
-        // 200 frames and whose lap counter read 1971765338 -- an instance
-        // that exists but is not the race's.  The live one has `mres=0x3f`
-        // (all six members resolved), which is what the port now requires.
-        const bool membersLive = m.membersResolved == 0x3FULL;
+        // MEASURED 2026-11-01 (q98, q101, q102): the port found objects of
+        // the right CLASS whose position was frozen at
+        // (-247249,-153205,2563) for 200 frames and whose lap counter read
+        // 1971765338 -- instances that exist but are not the race's.
+        //
+        // ⇒ THE LAP DISTANCE IS THE DISCRIMINATOR.  In the good round
+        // (q84) the live instance read `lapd=1298432 lapdF=1298432.000`;
+        // the dead ones read `lapd=4294967295 lapdF=-1.000`, which is the
+        // guest's own "no lap yet" value.  So the instance is live when its
+        // lap distance resolves to a POSITIVE number, and the port waits
+        // for that instead of driving from a dead object.
+        const bool membersLive =
+            m.membersResolved == 0x3FULL && m.lapDistanceF > 0.0f;
         // AND THE RuleSet HAS TO BE KNOWN: the car's pointer lives in it.
         const bool ownerKnown = g_ruleSetRaceMetrics != 0;
         if (!isRaceMetrics || !membersLive || !ownerKnown) {

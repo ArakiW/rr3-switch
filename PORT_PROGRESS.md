@@ -12090,3 +12090,58 @@ CLASS NAME**, and drops the object otherwise.
 ruleSet -- the object came from the HEAP SCAN.  So the heap scan finds
 instances of the right class that are not the race's, and the member check
 is what tells them apart.
+
+### 2026-11-02 (01:40): THE PROBE WAS LOOKING ON THE WRONG CLOCK, AND FOR THE WRONG OBJECT
+
+Two separate reasons why the port could not drive, both found by counting
+instead of guessing.
+
+**① THE CHEAP PATH WAS GATED ON THE THING IT WAS SUPPOSED TO FIND.**
+
+The discovery has two paths: a cheap one (read the CGlobal's GameMode
+pointer, walk its map, look at what is inside the RuleSet) and an expensive
+one (scan the guest's writable segments for a vptr).  The cheap one got a
+15-frame cadence; the heap scan kept the 300-frame one, because the heap
+scan is what collapsed the frame rate from ~3 fps to ~0.5 fps when it ran
+every frame.
+
+**But the cheap path was gated on `g_gameMode != 0`** -- and the cheap path
+IS the GameMode search.  So it could only ever run *after* the expensive
+path had already succeeded.  MEASURED (q101): the metrics were found
+**TWICE in 1080 frames** (2 of 39 race-state samples), every one of them
+from the heap scan.  ⇒ After the gate was removed (q102): **3 of 25** in
+the first two minutes, i.e. the cheap path does find it.
+
+**⇒ A SEARCH PATH MUST NOT BE GATED ON THE RESULT OF ANOTHER SEARCH
+PATH.**
+
+**② "THE CLASS NAME IS RIGHT" IS NOT "THE OBJECT IS THE RIGHT ONE".**
+
+The port found objects of the right class -- `cls=27RuleSetModifier_RaceMetrics`,
+`vptr_ok=1`, `mres=0x3f` -- and read a FROZEN position out of them:
+
+    f=2040 cpos=-247249,-153205,2563 posok=0 line=0 lres=0.00 laps=1971765338
+    f=2250 cpos=-247249,-153205,2563 posok=0 line=0 lres=0.00 laps=1971765338
+
+same value for 200 frames.  And the car's pointer was 0, because the heap
+scan had found the modifier but not the RuleSet that OWNS it (the car
+pointer lives in the RuleSet at +0x40, and the modifier is built in place
+inside the same object at +0x40 -- so the owner is at modifier-0x40, and its
+vptr says whether that is true).  That is now verified, not assumed.
+
+**⇒ AND THE DISCRIMINATOR THAT ACTUALLY SEPARATES THEM IS THE LAP
+DISTANCE.**  In the good round (q84) the live instance read
+`lapd=1298432 lapdF=1298432.000`; the dead ones read
+`lapd=4294967295 lapdF=-1.000`, which is the guest's own "no lap yet"
+value.  ⇒ The port now accepts the metrics only when its lap distance
+resolves to a POSITIVE number, and waits for that instead of driving from
+a dead object.
+
+**⇒ THE GENERAL FORM, WHICH IS WORTH WRITING DOWN:**
+
+* a class name says WHAT an object is; **a VALUE that the game is actively
+  changing says WHETHER IT IS THE LIVE ONE**;
+* a search path must not be gated on the result of another search path;
+* and a port that reads the guest's state has to be able to say "not
+  found" honestly -- every one of these rounds was lost to a port that
+  reported a plausible-looking number read out of the wrong object.
