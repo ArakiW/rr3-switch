@@ -2375,7 +2375,19 @@ void pumpRaceStateProbe(unsigned long long frame) {
             (m.className[0] != '\0' &&
              guestClassNameContains(m.className, "RaceMetrics") &&
              !guestClassNameContains(m.className, "RuleSet_RaceMetrics"));
-        if (!isRaceMetrics) {
+        // AND THE MEMBERS HAVE TO RESOLVE.  A class name says WHAT the
+        // object is; the members say whether it is the LIVE one.  The guest
+        // registers the six members in the modifier's constructor and reads
+        // their values through the value store, so a member that resolves is
+        // a member the guest has initialised.
+        //
+        // MEASURED 2026-11-01 (q98): the port found an object of the right
+        // CLASS whose position was frozen at (-247249,-153205,2563) for
+        // 200 frames and whose lap counter read 1971765338 -- an instance
+        // that exists but is not the race's.  The live one has `mres=0x3f`
+        // (all six members resolved), which is what the port now requires.
+        const bool membersLive = m.membersResolved == 0x3FULL;
+        if (!isRaceMetrics || !membersLive) {
             g_metricsCount = 0;
             g_metrics[0] = 0;
             // THE GameMode GOES TOO.  discover() re-validates the GameMode

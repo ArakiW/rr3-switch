@@ -12059,3 +12059,34 @@ had closed.  q96 caught it once, by luck, at frame 600.
 process, and the thing it is looking for has a LIFETIME that is not the
 port's to choose.  ⇒ **A PROBE'S SEARCH CADENCE HAS TO MATCH THE THING IT
 IS LOOKING FOR, NOT THE PROBE'S OWN COMFORT.**
+
+#### MEASURED (q98): THE PORT FOUND THE RIGHT CLASS AND THE WRONG INSTANCE
+
+With the two-cadence discovery (the cheap path every 15 frames), q98 found a
+`RuleSetModifier_RaceMetrics` for the first time in a long while -- the
+class name resolved, the car's pointer was a real pointer again
+(`car=0x213218a9b0`, not ASCII), and 27 of 28 race-state samples had a
+non-zero position.
+
+**BUT IT WAS NOT THE RACE'S INSTANCE.**  The position was FROZEN:
+
+    f=2040 cpos=-247249,-153205,2563 posok=0 line=0 lres=0.00 laps=1971765338
+    f=2250 cpos=-247249,-153205,2563 posok=0 line=0 lres=0.00 laps=1971765338
+
+same value for 200 frames, the lap counter reading 1971765338, and
+`posok=0` although the three numbers are inside the gate's range -- because
+the object is not the race's, and the gate is doing its job.
+
+⇒ ⇒ **⇒ A CLASS NAME SAYS WHAT AN OBJECT IS; THE MEMBERS SAY WHETHER IT
+IS THE LIVE ONE.**  The guest registers the six members in the modifier's
+constructor and reads their values through its value store, so a member
+that RESOLVES is a member the guest has initialised -- and the live
+instance has `mres=0x3f` (all six), as every good round (q84, q96's one
+hit) has shown.  ⇒ **⇒ THE PORT NOW REQUIRES `mres == 0x3f` AS WELL AS THE
+CLASS NAME**, and drops the object otherwise.
+
+⇒ **⇒ AND THE PORT'S DISCOVERY HAD A THIRD SOURCE**: q98's log has ZERO
+`ruleset-contents` lines, which means the map walk never reached the
+ruleSet -- the object came from the HEAP SCAN.  So the heap scan finds
+instances of the right class that are not the race's, and the member check
+is what tells them apart.
