@@ -12597,3 +12597,90 @@ in which the dialog is up (frames 600..1400, which the measurements put
 inside the track loading and the dialog -- the screen changes 99.8 % of its
 pixels there, so there is no focused menu button for a held A to press by
 mistake).  It is a change to ONE card file, against the shipped script.
+## THE TUTORIAL DIALOG DOES NOT TAKE A TOUCH, AND IT DOES TAKE THE CONFIRM BUTTON
+
+The port finds the guest's own in-race tutorial dialog's orange 「继续」 button
+(x=848, y=480, area=14691, w=336, h=56 -- the label in the captured frame),
+presses it, the guest RECEIVES the touch at exactly that point
+(`guest{... gx=848 gy=480 down=1}`, with the matching `up` 40 frames later),
+and the dialog does not close.
+
+The same synthetic touch DOES work on the guest's other buttons -- the press
+on the car-select screen's 「比赛」 is what takes the guest into the race, and
+the race markers went from 7/10/22 to **13/19/44** once the press sequence
+was allowed to run.  So the layer that owns the coach mark is not the layer
+the port's touch reaches.
+
+⇒ **the console convention for "continue" is the CONFIRM button**, and this
+guest's own gamepad profile binds button 0 (BTN_A) to confirm.  The port's
+pad script already says so:
+
+> BUTTON 0 (the guest's BTN_A) is what actually accelerates the car ... BTN_A
+> is also "confirm" in a menu
+
+### MEASURED 2026-11-02, q109 (archive 20261102-054302-eden-rr3-q109-confirm-button)
+
+The experiment was ONE card file -- the pad script -- and NO rebuild: hold
+BTN_A over frames 600..1400, which the measurements put inside the track
+loading and the dialog (the screen changes 99.8 % of its pixels there, so
+there is no focused menu button for a held A to press by mistake).
+
+**The captured frame 1000 is the RACE GRID** -- the car on the grid, the
+driver list down the right, 「帕诺拉马山 杯赛」 -- and not the car-select
+screen that every earlier round ended on:
+
+```
+q105 (no press)     frame 1000 = car select        1.02 MB
+q107 (press allowed) frame 1000 = car select        1.02 MB
+q108 (press allowed) frame 1000 = car select        1.10 MB
+q109 (BTN_A held)   frame 1000 = THE RACE GRID     1.75 MB
+```
+
+⇒ **the first time the guest has reached a race in this port's history.**
+The lesson is the same one the touch path teaches, on another surface: a
+synthetic touch is not a synthetic *button*, and on a console the two are
+different devices.
+
+### AND TWO MORE THINGS THE RACE MEASURED
+
+**1. The member VALUE STORE WORKS.**  During the race the race-metrics
+probe reported the guest's own object:
+
+```
+f=570 rs=0x2138669020 ok=1 vptr=0x210b206378 vptrOk=1
+     lapsOk=1 lapsWhy=none topspeedOk=1
+```
+
+So the six-member read is not broken: the ids resolve, the chain walks, the
+cells decode, and the guest's own integrity check agrees.  Every earlier
+`mres=0x0` was a symptom of the race not running.
+
+**2. The chain below the metrics object was waiting on THE CAR MOVING.**
+
+The race-state probe still reported `metrics=0` during q109's race, and the
+reason is now visible in its own test: an instance counts as live when
+
+```cpp
+const bool membersLive = m.membersResolved == 0x3FULL && m.lapDistanceF > 0.0f;
+```
+
+and the car was **still on the grid**: its lap distance was 0.  A car that
+has not started has no lap distance, so `g_sawProgress` stayed 0, so
+`drive=0`, so `pur=0`, so no steering.  The chain was not broken; it was
+**waiting for the car to move**.
+
+**3. AND THE CAR NEVER MOVED, BECAUSE THE THROTTLE WAS NEVER REACHED.**
+
+The pad script's throttle starts at frame **6000** -- and the guest reaches
+about frame **1100** in a 300 s Eden round (it runs at roughly 4 fps on the
+emulator).  The throttle line was 5,000 frames out of reach.  A throttle
+window calibrated on a different machine's frame rate is a throttle that does
+not exist.
+
+⇒ the next experiment is the same file again: the throttle moves to where
+the race measurably is (frame 950, the race grid is up by 1000).
+
+⇒ **the lesson: every number in a control file is calibrated against SOME
+machine's clock, and the clock is not the machine.**  A frame-indexed
+timeline is only meaningful next to the frame rate it was measured at, and
+nothing in the file said what that was.
