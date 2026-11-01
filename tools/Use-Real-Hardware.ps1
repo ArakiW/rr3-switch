@@ -1,31 +1,38 @@
 <#
 .SYNOPSIS
-    Switch the deployed port between the Eden/null backend and real hardware.
+    Switch the port between the emulator configuration and the console one.
 
 .DESCRIPTION
-    gfx_backend.cpp picks its backend once per process, from this file:
+    sdmc:/switch/rr3-gfx.conf is read ONCE per process
+    (gfx_backend.cpp: resolveBackend/readConf) and it carries THREE kinds of
+    settings.  The old version of this script only knew about the first one:
 
-        sdmc:/switch/rr3-gfx.conf
+      1. WHICH BACKEND.  An absent file, an absent backend= key, or any
+         value other than null/0/on selects MESA (nouveau/DRM, NVN on
+         Maxwell) -- the path real hardware needs.  Only a literal
+         "backend=null" selects the stub backend that answers every GL call
+         from a table and never draws.
 
-    Absent file, absent `backend=` key, or any value other than null/0/on means
-    MESA -- which is the path real Switch hardware needs, because the NRO
-    ships devkitPro's Mesa (nouveau/DRM) and the console is NVIDIA Maxwell
-    driven through NVN.
+      2. HOW THE GUEST BEHAVES.  ccdisp / ccloginok / ccsocialok / objid.
+         These decide whether the guest gets past its cloud-sync spin and
+         reaches the race at all; with them off the guest loops on
+         "Sub Sync Queued: 10765" and the run dies at frame 4.
 
-    So the null backend is an EMULATOR opt-in, and only that. Leaving
-    `backend=null` on a real console is the single easiest way to make the
-    game come up on a black screen forever while the real path sits unused
-    in the binary: the null backend answers every GL call from a stub table,
-    so nothing is ever submitted.
+      3. WHERE THE PORT MAY TOUCH THE HARDWARE.  nofb / nogo / mkdiridem.
 
-    This script moves between the two modes and prints which one is live.
-    It is reversible and only ever touches that one conf file.
+    So DELETING the file is not "the hardware mode": it is Mesa PLUS four
+    guest-behaviour switches turned off, which is a boot that never reaches
+    the race.  This script therefore INSTALLS the right file for the target
+    instead of removing it.
 
 .PARAMETER Mode
-    hardware  - remove the override, so Mesa is selected. Use on a console.
-    eden      - write backend=null. Use under Eden, where there is no DRM
-                device and eglInitialize spins forever on the Mesa path.
-    status    - report the current setting without changing anything.
+    hardware  - install tools\rr3-gfx-hardware.conf (the console file).
+    eden      - install tools\rr3-gfx.conf (the emulator file).
+    status    - report what is live, without changing anything.
+
+.PARAMETER CardRoot
+    The card root -- the folder that CONTAINS `switch\`.  Defaults to Eden's
+    own SD card.
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File tools\Use-Real-Hardware.ps1 -Mode status
@@ -35,73 +42,98 @@
 param(
     [ValidateSet('hardware', 'eden', 'status')]
     [string]$Mode = 'status',
-    [string]$EdenRoot = 'E:\Eden'
+    [string]$CardRoot = ''
 )
 
 $ErrorActionPreference = 'Stop'
+$projectRoot = Split-Path -Parent $PSScriptRoot
 
-$confDir = Join-Path $EdenRoot 'user\sdmc\switch'
+if ($CardRoot -eq '') {
+    $CardRoot = Join-Path 'E:\Eden' 'user\sdmc'
+}
+$confDir = Join-Path $CardRoot 'switch'
 $conf = Join-Path $confDir 'rr3-gfx.conf'
 
-function Get-BackendSetting {
+function Get-ConfSettings {
+    $result = @{
+        present = $false
+        backend = '(unset)'
+        null    = $false
+        keys    = @{}
+        bytes   = 0
+    }
     if (-not (Test-Path -LiteralPath $conf -PathType Leaf)) {
-        return @{ present = $false; backend = $null; raw = $null }
+        return $result
     }
-    $raw = (Get-Content -LiteralPath $conf -Raw)
-    $line = ($raw -split "`n" |
-        Where-Object { $_ -notmatch '^\s*#' -and $_ -notmatch '^\s*$' } |
-        Select-Object -First 1)
-    $backend = $null
-    if ($line -match '^\s*backend\s*=\s*(\S+)\s*$') {
-        $backend = $Matches[1]
+    $result.present = $true
+    $result.bytes = (Get-Item $conf).Length
+    foreach ($line in (Get-Content -LiteralPath $conf)) {
+        $t = $line.Trim()
+        if ($t -eq '' -or $t.StartsWith('#')) { continue }
+        if ($t -match '^([A-Za-z0-9_-]+)\s*=\s*(.*)$') {
+            $result.keys[$Matches[1].ToLower()] = $Matches[2].Trim()
+        }
+        elseif ($t -notmatch '=') {
+            # the original one-word spelling: a bare line IS the backend name
+            $result.backend = $t
+        }
     }
-    elseif ($line) {
-        # the original one-word spelling: a bare line IS the backend name
-        $backend = $line.Trim()
+    if ($result.keys.ContainsKey('backend')) {
+        $result.backend = $result.keys['backend']
     }
-    return @{ present = $true; backend = $backend; raw = $raw }
+    $result.null = ($result.backend -in @('null', '0', 'on'))
+    return $result
 }
 
-$state = Get-BackendSetting
-$effective = if (-not $state.present) { 'mesa' }
-             elseif ($state.backend -in @('null', '0', 'on')) { 'null' }
-             else { 'mesa' }
+function Show-Status {
+    $s = Get-ConfSettings
+    Write-Host ("conf      : {0}" -f $(if ($s.present) { $conf } else { "$conf (absent)" }))
+    Write-Host ("bytes     : {0}" -f $s.bytes)
+    Write-Host ("backend   : {0}" -f $s.backend)
+    Write-Host ("effective : {0}" -f $(if ($s.null) { 'NULL (never draws)' } else { 'mesa (nouveau/DRM)' }))
+    foreach ($key in @('ccdisp', 'ccloginok', 'ccsocialok', 'objid', 'nofb', 'nogo', 'mkdiridem', 'ccmode')) {
+        $value = if ($s.keys.ContainsKey($key)) { $s.keys[$key] } else { '(unset)' }
+        Write-Host ("  {0,-11}: {1}" -f $key, $value)
+    }
+    if (-not $s.present -or -not $s.keys.ContainsKey('ccdisp')) {
+        Write-Warning ("ccdisp is unset: the managed (JNI) methods are NOT dispatched, so the guest" )
+        Write-Warning "cannot get past its cloud-sync spin and will never reach the race."
+        Write-Warning "Install the whole file instead of deleting it:"
+        Write-Warning "  powershell -ExecutionPolicy Bypass -File tools\Use-Real-Hardware.ps1 -Mode hardware"
+    }
+    if ($s.null) {
+        Write-Warning "the NULL backend is active: nothing is ever drawn. Never on a console."
+    }
+}
 
 switch ($Mode) {
-    'status' {
-        Write-Host ("conf    : {0}" -f $(if ($state.present) { $conf } else { "$conf (absent)" }))
-        Write-Host ("backend : {0}" -f $(if ($state.present -and $state.backend) { $state.backend } else { '(unset)' }))
-        Write-Host ("effective: {0}" -f $effective)
-        if ($effective -eq 'null') {
-            Write-Warning "null backend is active: this is correct under Eden, and wrong on a console."
-        }
-        else {
-            Write-Host "Mesa (nouveau/DRM) is active: this is correct on a console."
-        }
-    }
+    'status' { Show-Status }
     'hardware' {
-        if (Test-Path -LiteralPath $conf -PathType Leaf) {
-            Remove-Item -LiteralPath $conf -Force
-            Write-Host "removed  : $conf"
-        }
-        else {
-            Write-Host "already absent: $conf"
-        }
-        Write-Host "effective: mesa (nouveau/DRM) -- the real Switch path."
-        Write-Host "note     : re-deploy the NRO if it was built with a different conf default;"
-        Write-Host "           the backend is resolved once per process, so restart the port."
+        # There is no separate console configuration: the file the measured
+        # rounds ran IS the console configuration.  The two hardware-specific
+        # variations that were hypothesised (nogo=1, mkdiridem=1) were
+        # MEASURED and REJECTED -- q106 ran with them and the guest never
+        # reached "CC: AssetManager::StartDownloadService()" (q105: 301
+        # 'download' log lines, q106: 0), the scene framebuffer stayed 0x0
+        # and nothing was drawn.  So the shipped file is the measured one.
+        $source = Join-Path $projectRoot 'tools\rr3-gfx.conf'
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "missing: $source" }
+        New-Item -ItemType Directory -Force -Path $confDir | Out-Null
+        Copy-Item -LiteralPath $source -Destination $conf -Force
+        Write-Host ("installed : {0} ({1} bytes) -- the measured configuration" -f $conf, (Get-Item $conf).Length)
+        Show-Status
+        Write-Host "restart the port: the backend is resolved once per process."
+        Write-Host "note     : nogo=0 means the socket stack comes up. On a console with"
+        Write-Host "           Wi-Fi, turn the Wi-Fi OFF first: EA's service is gone, and a"
+        Write-Host "           connection that hangs is worse than one that fails fast."
     }
     'eden' {
-        if (-not (Test-Path -LiteralPath $confDir -PathType Container)) {
-            New-Item -ItemType Directory -Force -Path $confDir | Out-Null
-        }
-        # No trailing newline: the original parser stripped only leading
-        # whitespace, and a newline made every ordinary way of writing this
-        # file silently fall back to Mesa. gfx_backend.cpp now strips both
-        # ends, but keeping the file byte-minimal costs nothing.
-        Set-Content -LiteralPath $conf -Value 'backend=null' -Encoding ascii -NoNewline
-        Write-Host "wrote    : $conf"
-        Write-Host "effective: null -- required under Eden (no DRM device; Mesa's"
-        Write-Host "           eglInitialize spins forever there)."
+        $source = Join-Path $projectRoot 'tools\rr3-gfx.conf'
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "missing: $source" }
+        New-Item -ItemType Directory -Force -Path $confDir | Out-Null
+        Copy-Item -LiteralPath $source -Destination $conf -Force
+        Write-Host ("installed : {0} ({1} bytes) -- the measured configuration" -f $conf, (Get-Item $conf).Length)
+        Show-Status
+        Write-Host "restart the port: the backend is resolved once per process."
     }
 }

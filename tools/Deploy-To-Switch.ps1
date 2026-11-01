@@ -16,10 +16,16 @@
       1. the NRO straight out of native-switch\ (never dist\)
       2. the data volumes, ~9 GiB, which must already be on the card under
          sdmc:/switch/rr3-native-rehost/data/
-      3. NO rr3-gfx.conf -- its absence is what selects Mesa (nouveau/DRM,
-         NVN on Maxwell). A leftover backend=null forces the stub backend,
-         which answers every GL call from a table and never draws: the game
-         would sit on a black screen forever with the real path unused.
+      3. THE CONSOLE rr3-gfx.conf -- installed, not deleted.  Its absence
+         does select Mesa (nouveau/DRM, NVN on Maxwell), but it also switches
+         off the four guest-behaviour switches (ccdisp / ccloginok /
+         ccsocialok / objid), and with those off the guest spins on its
+         cloud-sync queue and never reaches the race.  A leftover
+         "backend=null" is the thing that really does force the stub
+         backend, which answers every GL call from a table and never draws:
+         the game would sit on a black screen forever with the real path
+         unused.  Installing the console file removes that leftover AND
+         keeps the switches on.
 
 .PARAMETER Card
     Path to the SD card's root -- the folder that CONTAINS `switch\`. The Switch
@@ -111,13 +117,26 @@ else {
 }
 
 # ------------------------------------------------------------------ 3. conf --
+# Install the port's configuration.  It is NOT deleted, and there is no
+# separate "console" version: the file the measured rounds ran IS the one a
+# console needs.  The two hardware-specific variations that were
+# hypothesised (nogo=1, mkdiridem=1) were MEASURED and REJECTED -- q106 ran
+# with them and the guest never reached
+# "CC: AssetManager::StartDownloadService()" (q105: 301 'download' log
+# lines, q106: 0), the scene framebuffer stayed 0x0 and nothing was drawn.
+$confSource = Join-Path $projectRoot 'tools\rr3-gfx.conf'
 $conf = Join-Path $switchDir 'rr3-gfx.conf'
-if (Test-Path -LiteralPath $conf -PathType Leaf) {
-    Remove-Item -LiteralPath $conf -Force
-    Write-Host "removed      : rr3-gfx.conf  (Mesa is now the active backend)"
+if (-not (Test-Path -LiteralPath $confSource -PathType Leaf)) {
+    throw "missing configuration: $confSource"
 }
-else {
-    Write-Host "confirmed    : no rr3-gfx.conf  -> Mesa (nouveau/DRM), the real path"
+$leftover = $null
+if (Test-Path -LiteralPath $conf -PathType Leaf) {
+    $leftover = Get-Content -LiteralPath $conf -Raw
+}
+Copy-Item -LiteralPath $confSource -Destination $conf -Force
+Write-Host ("installed  : rr3-gfx.conf ({0} bytes) -- the measured configuration" -f (Get-Item $conf).Length)
+if ($leftover -and ($leftover -match '(?im)^\s*backend\s*=\s*(null|0|on)\s*$')) {
+    Write-Host "note       : the previous rr3-gfx.conf selected the NULL backend; it is replaced."
 }
 
 Write-Host ""

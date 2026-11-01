@@ -12145,3 +12145,216 @@ a dead object.
 * and a port that reads the guest's state has to be able to say "not
   found" honestly -- every one of these rounds was lost to a port that
   reported a plausible-looking number read out of the wrong object.
+## THE RELEASE PACKAGE WAS SHIPPING A CARD THAT COULD NOT REACH THE RACE
+
+Two rounds, q105 and q106, 2026-11-02.  The question they answer is not "does
+the port work" -- that is settled -- it is **"is what we hand the user the same
+thing we measured"**.  They found three things, and the first one is a fact
+about the card that had been true for a month.
+
+### 1. THE CARD'S ROMFS WAS A MONTH OLD, AND EVERY ROUND SINCE RAN THE WRONG PAIR
+
+`tools/Deploy-RR3CardScripts.ps1` installs the eight control scripts and
+`rr3-gfx.conf`.  It does **not** install the NRO or the romfs: those were
+copied by hand, and the romfs was last copied on **2026-10-04**.
+
+| file | on the card | build output |
+|---|---|---|
+| `rr3.romfs` | 43,882,800 B / `8babe9bc473269a7` (2026-10-04) | 44,826,028 B / `790e6241be77b738` (2026-11-02) |
+| `rr3-native-rehost.nro` | 53,540,465 B / `6c64057fa7374371` | same |
+
+⇒ every Eden round since 2026-10-04 ran the **new NRO against the old romfs**.
+The romfs carries the guest image, the managed dependencies, the CJK bootstrap
+font and the fonts staged on 2026-10-24 -- so the typography work and the
+current romfs had never been in the same run as the current port.
+
+**q105 (300 s, archive `20261102-021750-eden-rr3-q105-shipped-romfs-nogo0`)**
+deployed the current romfs and the current NRO and re-measured:
+
+```
+frames 960   pixels lit 921600 of 921600   (the last 1280x720 back-buffer readback)
+EventMapScreen 262   start lights 7   race screen 10   race marker: HUD string 22
+TrackDesc::load failures 0   md5 mismatch 0   ASSET COMPLETE 8   stat(22) 0
+```
+
+⇒ the current romfs is fine; the stale one was not what the chain was standing
+on.  But the port was never measured **as a whole** until this round.
+
+The build is reproducible, and that is now a checkable property rather than a
+hope: the gate rebuilt both images and they came out **byte-identical**
+(`6c64057f…` / `790e6241…`).
+
+### 2. THE PACKAGE DELETED THE FILE THAT MAKES THE GAME REACH A RACE
+
+The release package's `Copy-To-SwitchCard.ps1` deleted `switch/rr3-gfx.conf`,
+and its README said why:
+
+> 千万不要放 `switch\rr3-gfx.conf` —— 它的**存在**会把后端强制成 `null`
+> （所有 GL 调用查表应答，**永远不画东西** ⇒ 黑屏）。
+
+**The code says the opposite.**  `gfx_backend.cpp:809-812`:
+
+```cpp
+const bool null = chosen[0] != '\0' &&
+                  (std::strcmp(chosen, "null") == 0 || std::strcmp(chosen, "0") == 0 ||
+                   std::strcmp(chosen, "on") == 0);
+s_backend = null ? GfxBackend::kNull : GfxBackend::kMesa;
+```
+
+⇒ an absent file, an absent `backend=` key, or **any** value other than
+`null`/`0`/`on` selects **Mesa**.  Only a literal `backend=null` selects the
+stub backend.  "The file exists" was never the rule.
+
+That is only the first half.  The file carries a second, much more expensive
+kind of setting -- **how the guest itself behaves**:
+
+| key | what it decides | what happens with it OFF |
+|---|---|---|
+| `ccdisp=2` | dispatch the managed (JNI) methods | the pre-2026-10-19 behaviour: the Cloudcell callback never fires |
+| `ccloginok=1` | answer the Cloudcell login with SUCCESS | the guest spins on `Sub Sync Queued: 10765` and **the run dies at frame 4** (measured 2026-10-19, archive `20261019-210729-exec1`) |
+| `ccsocialok=1` | report the social session as valid | `Unable to send Sync, Social Media not initialised.`, and the same spin |
+| `objid=1` | one real handle per `NewObjectV` | every instance shares one fake object, so instance methods write the wrong field |
+
+⇒ **deleting the file was not "the hardware mode".  It was Mesa plus four
+guest-behaviour switches turned off** -- a console that boots, reaches the
+cloud-sync queue and never comes out of it.  Three scripts in the repository
+said so: `tools/Use-Real-Hardware.ps1 -Mode hardware`,
+`tools/Deploy-To-Switch.ps1`, and the package's own copy script.
+
+**What changed:** the release now ships `tools/rr3-gfx-hardware.conf` and the
+installers **install** it.  Two of its keys are hardware-specific and are
+documented as such:
+
+- `nogo=1` -- never bring the socket stack up, so every outbound connection
+  fails *at once* instead of hanging.  On Eden there is no network, so
+  `nogo=0` was harmless; **on a console with Wi-Fi the guest would really try
+  to reach EA's servers** and could park in `send()`.
+- `mkdiridem=1` -- this card already carries the `.depot` tree, so the
+  guest's own `mkdir` of `.depot/CC_Data` would fail with `EEXIST`.
+
+`nofb=1` stays, and it is the reason the port's own Chinese loading screen is
+not drawn on a console: creating and then closing a framebuffer on the default
+NWindow poisons it, and Mesa's `eglInitialize` never returns (measured
+2026-10-11).  The price of that is one progress bar.
+
+### 3. THE COPY SCRIPT COPIED THE TOP LEVEL OF .depot AND NOTHING ELSE
+
+```powershell
+robocopy $sourceDepot $targetDepot /NFL /NDL /NJH /NJS /NP /R:1 /W:1
+```
+
+**No `/E`.**  robocopy without `/E` (or `/S`) copies only the files directly in
+the source directory.  The tree's **9,872** files live in subdirectories --
+`Tracks\`, `vehicles\`, `gui_assets\`, `audio\`, `hud\`, ... -- so a console
+would have received a `.depot` with the root files and **none of the assets**.
+The repository's own `tools/Setup-IsolatedEden.ps1` gets this right (`/E` on
+every copy); the release script was the odd one out.
+
+⇒ `/E` added, and the copy is now **verified**: the file count on the card is
+compared with the file count in the package and the script fails if they
+differ.  A silent partial copy is the one outcome that must not be possible.
+
+### 4. THE CONFIGURATION FOR A CONSOLE WAS A HYPOTHESIS, AND IT WAS WRONG
+
+The release was going to ship its own `rr3-gfx.conf`, with two keys changed
+for the console's sake:
+
+- `nogo=1` -- never bring the socket stack up, so every outbound connection
+  fails *at once* instead of hanging.  The reason was sound: EA's service is
+  gone, and on a console with Wi-Fi the guest would really try to reach it.
+- `mkdiridem=1` -- this card already carries the `.depot` tree, so the guest's
+  own `mkdir` of `.depot/CC_Data` would fail with `EEXIST`.
+
+**q106 (300 s, archive `20261102-022318-eden-rr3-q106-shipped-hardware-conf`)
+ran that hypothesis, and it failed:**
+
+| | q105 (`nogo=0`) | q106 (`nogo=1`) |
+|---|---|---|
+| frames | 960 | 13680 (spinning) |
+| pixels lit | **921600 / 921600** | **0 / 921600** |
+| draw calls | 38390 | **0** |
+| `ASSET COMPLETE` | 8 | **0** |
+| `asset lists added` | 1674 | **0** |
+| `EventMapScreen` | 262 | **0** |
+| start lights / race screen | 7 / 10 | **0 / 0** |
+| scene FBO size | 1280x720 | **0x0** |
+| guest-log lines containing "download" | **301** | **0** |
+
+The guest's own log says exactly where it stopped:
+
+```
+q105:  CC: AssetManager::StartDownloadService()
+       CC: AssetManager::StartListDownload() : Downloading asset_list_updates.txt
+q106:  (neither line ever appears) ... last line: "startMusic disabled during download"
+```
+
+⇒ **the guest's asset pipeline needs the socket layer to EXIST**, even if every
+connection fails fast.  With the stack never initialised, the whole
+Cloudcell/asset machine is dead: the scene framebuffer stays 0x0 and nothing
+is ever drawn.  So `nogo=1` is not "safer on a console", it is "the game never
+starts".
+
+⇒ **the shipped configuration is the measured one, byte for byte**
+(`tools/rr3-gfx.conf`, sha256 `65643a55…`, 3975 B -- identical to the file
+q105 ran, and identical to the file on the card).  There is no separate
+"console" configuration.  The file is NOT annotated with comments: the port
+reads it into a 4096-byte buffer and drops the tail silently, and this copy is
+already 3975 bytes.
+
+⇒ and the residual hardware risk is answered by the USER, not by a key:
+**turn the console's Wi-Fi off before the first launch.**  `nogo=0` means the
+socket stack comes up; with no network the guest's outbound calls fail
+immediately (exactly as on Eden) and it takes its offline path.  With Wi-Fi on
+it could park in `send()` waiting for a server that has been gone for years.
+
+`mkdiridem=0` stays as well.  It only ever produced four benign
+`[FileManager::CreateDir] Error creating directory: .../.depot/CC_Data` lines
+(q105) and the guest went on to race; q106 produced **zero** of them (the key
+did what it says) but the run was dead for the other reason, so `mkdiridem=1`
+was never measured in a passing run either.  ⇒ ship what was measured.
+
+### 5. A GUARD WHOSE REASON HAD BEEN MEASURED AGAINST
+
+`tools/Test-OnEden.ps1` warned on **every single round**:
+
+> rr3-gfx.conf does not select the null backend ('backend=mesa'). On Eden any
+> other backend has no DRM device and eglInitialize will hang.
+
+That warning had been refuted on 2026-10-11: the culprit was never the
+backend, it was `nativeUiInit()`'s `framebufferCreate` on the default NWindow
+closed again by `nativeUiExit()`, which poisons that NWindow for the rest of
+the process.  With `nofb=1` the Mesa path is indistinguishable from the old
+null baseline (threads=6, moving=3, total_imports=28551, mutexes_known=75).
+
+⇒ the guard now checks **`nofb`**, which is the variable that actually decides
+it.  A guard whose reason has been measured against is a guard that protects
+the wrong thing, and it fires on every run.
+
+### 6. WHAT THE PACKAGE IS NOW
+
+- a copy of the **measured card tree** (not a re-derivation), minus the runtime
+  log -- so the console gets the tree that was measured;
+- `switch/rr3-gfx.conf` = the **measured** configuration, installed, not deleted;
+- `checksums.sha256` over **every file** in the package, so "the package is
+  complete" is a claim the user can check instead of one they have to trust;
+- shipped as a **split archive** (2 GiB parts): a 12 GiB attachment is not
+  something anybody can click, and a directory is not a file at all;
+- `tools/Join-And-Extract.ps1` joins the parts and installs; the package's
+  `Copy-To-SwitchCard.ps1` installs from the unpacked tree, and it **verifies
+  the .depot file count after the copy** so a partial copy cannot pass.
+
+**Still open, unchanged by any of this:** the car does not move in the first
+lap (the guest's in-race tutorial dialog, which the port's glove clicker
+deliberately does not click while it believes it is in a race), the steering
+handedness (`steersign`) has never been measured, and the lap counter is still
+0 because the chain above it is not closed.
+
+**The lesson worth keeping:** the three defects in the release package were
+all *statements about the port that no one had checked against the code* --
+"the conf file's presence forces the null backend", "robocopy copies the
+tree", "this NRO's hash is 3934...".  Every one of them was a sentence in a
+script or a README that the port's own source contradicts, and every one of
+them would have cost the user an evening on a console.  A package that is
+about to be handed to somebody else is the right place to check the sentences
+against the code -- and, where possible, against a round that measured the
+thing being shipped.

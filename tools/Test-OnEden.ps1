@@ -240,25 +240,36 @@ $built = Get-Item -LiteralPath $deployedNro
 Write-Host ("deploy : {0}  {1} bytes  sha256={2}" -f $built.LastWriteTime, $built.Length, (Get-FileHash -LiteralPath $deployedNro -Algorithm SHA256).Hash.Substring(0, 16))
 
 # The emulator opt-in files live on the SD card, NOT in the repository, so nothing
-# restores them after a cleanup, a fresh card, or a stray deletion. Without
-# rr3-gfx.conf, gfx_backend.cpp silently falls back to its default backend --
-# Mesa, the one the real console uses. On Eden that is the wrong default: there
-# is no DRM device, so Mesa's eglInitialize never returns and the run wedges at
-# "view-egl-init-begin" with zero gfx-proc calls. That failure is indistinguishable
-# from a code regression by symptom alone, and it cost a full misdiagnosis once.
-# The harness guarantees the file instead of relying on someone remembering it.
+# restores them after a cleanup, a fresh card, or a stray deletion.  The harness
+# guarantees the file instead of relying on someone remembering it.
+#
+# WHAT ACTUALLY MATTERS ON EDEN, measured 2026-10-11 (gfx_backend.cpp:794-805):
+# the culprit was never the backend.  It was nativeUiInit()'s
+# framebufferCreate on the default NWindow, closed again by nativeUiExit(),
+# which poisons that NWindow for the rest of the process -- so Mesa's
+# eglInitialize never returned and the run wedged at "view-egl-init-begin"
+# with zero gfx-proc calls.  With "nofb=1" the Mesa path is
+# indistinguishable from the old null baseline (threads=6, moving=3,
+# total_imports=28551), and every round since has run backend=mesa + nofb=1.
+#
+# So the guard is on nofb, not on the backend name.  The old check ("the conf
+# must select the null backend") was a belief that had been measured against
+# and refuted, and it warned on every single round.
 $gfxConf = Join-Path $sdmcSwitch 'rr3-gfx.conf'
 if (-not (Test-Path $gfxConf -PathType Leaf)) {
     New-Item -ItemType Directory -Force -Path $sdmcSwitch | Out-Null
-    Set-Content -LiteralPath $gfxConf -Value 'backend=null' -Encoding ascii -NoNewline
-    Write-Host "gfxconf : recreated $gfxConf (backend=null) -- it was missing, so the run would have used Mesa and hung in eglInitialize"
+    Set-Content -LiteralPath $gfxConf -Value 'backend=mesa' -Encoding ascii -NoNewline
+    Add-Content -LiteralPath $gfxConf -Value "`nnofb=1" -Encoding ascii -NoNewline
+    Write-Host "gfxconf : recreated $gfxConf (backend=mesa, nofb=1) -- without nofb=1 the Mesa path wedges in eglInitialize on Eden"
 }
 else {
-    $backendLine = (Select-String -LiteralPath $gfxConf -Pattern '^\s*backend\s*=' -ErrorAction SilentlyContinue | Select-Object -First 1).Line
-    if (-not $backendLine) { $backendLine = (Get-Content -LiteralPath $gfxConf -Raw).Trim() }
-    Write-Host ("gfxconf : {0}   -> {1}" -f $gfxConf, $backendLine)
-    if ($backendLine -notmatch 'null') {
-        Write-Warning "rr3-gfx.conf does not select the null backend ('$backendLine'). On Eden any other backend has no DRM device and eglInitialize will hang. Expect a run that stops at view-egl-init-begin."
+    $confLines = @(Get-Content -LiteralPath $gfxConf)
+    $backendLine = ($confLines | Where-Object { $_ -match '^\s*backend\s*=' } | Select-Object -First 1)
+    $nofbLine = ($confLines | Where-Object { $_ -match '^\s*nofb\s*=' } | Select-Object -First 1)
+    if (-not $backendLine) { $backendLine = ($confLines | Where-Object { $_.Trim() -ne '' -and -not $_.Trim().StartsWith('#') } | Select-Object -First 1) }
+    Write-Host ("gfxconf : {0}   -> {1}" -f $gfxConf, ($backendLine -replace '^\s*backend\s*=\s*', ''))
+    if (-not $nofbLine -or $nofbLine -notmatch '=\s*1\s*$') {
+        Write-Warning "rr3-gfx.conf does not set nofb=1. On Eden the Mesa path then creates and closes a framebuffer on the default NWindow, which poisons it: eglInitialize never returns and the run stops at view-egl-init-begin."
     }
 }
 
