@@ -11772,3 +11772,32 @@ so a run can never claim the line is in use when the line was refused.
 centre line, completes a lap (the lap counter has been -1 since the start
 of this work).  The next round answers that, and the numbers to read are
 `line=`, `lres=`, `pur=`, `perr=` and `laps=`.
+
+#### AND ONE STALE CLAIM IN THE SURVEY IS CORRECTED HERE
+
+The drive-path survey (`.build/drive_path_survey.md`, §8.2-8.3) says the
+`.spline` chunk bodies are "compressed with something UNKNOWN" and that
+"reading them means reversing the guest's loader".  **That is superseded:**
+the bodies are NOT compressed.  They are 26-byte records -- 3 x int32
+(x, y, z), 5 x uint16 and 1 x uint32 -- and the decode is confirmed three
+ways (the parsed length lands inside the file for every `.spline` on the
+card; the three chunks agree on the loop length to within 1.5 % and the
+aspect to within 1 %; and the tangent at +0x0c turns exactly once around
+the loop).
+
+The survey's own byte dump was read **by hand** ("decoded by hand from the
+bytes", §8.2), and it is offset by two bytes from the parser's: it reads
+`00 64` where the parser reads the node count, and its first node's X is
+-2700 where the parser reads -2716.  ⇒ **A hand-read byte dump is not a
+measurement**; the parser is.
+
+⇒ **AN OPEN QUESTION THIS RAISES, NOT AN ANSWER**: the survey read the
+volume's copy (`tracks.romfs`) and the parser read the card's loose copy
+(`.depot/Tracks/...`), and their first node's X differs (-2700 vs -2716).
+So the card's track tree is a REBUILD of the volume's, and the guest asks
+for `bathurst_noon.spline` four times before it asks for `bathurst.spline`
+-- the time-of-day suffix is dropped somewhere in that rebuild.  The port
+takes the bytes from the very candidate the guest is about to read, so the
+port's line and the guest's line are the same bytes whatever that rebuild
+did; but the four misses per track are the guest paying for a name the
+rebuild does not carry, and that is worth chasing on its own.
