@@ -1635,6 +1635,58 @@ bool followGameMode(uintptr_t bias, uintptr_t gameMode, uintptr_t* outRuleSet,
             g_mapKeyOffset = keyOffset;
             return true;
         }
+        // WHAT IS IN THERE, BY NAME.
+        //
+        // MEASURED 2026-11-01 (q92..q96): the object the port had stopped
+        // matching the address point it hard-codes, and reading it gave ASCII
+        // text.  A name-based check needs the names, so they are printed:
+        // the ruleSet's own name, and the names of the words inside it that
+        // LOOK like vptrs.  Without this, "the metrics were not found" is a
+        // black box -- and a black box is how four rounds were lost.
+        {
+            char names[512]{};
+            int written = 0;
+            char own[96]{};
+            if (guestResolveClassName(static_cast<uintptr_t>(head), own,
+                                      sizeof(own))) {
+                written += __builtin_snprintf(names + written,
+                                             sizeof(names) - written,
+                                             "ruleSet_own=%s", own);
+            }
+            for (size_t probe = 0;
+                 probe + 8 <= kRuleSetRaceMetricsBytes && written < 400;
+                 ++probe) {
+                uint64_t candidate = 0;
+                if (!readWord(ruleSet + probe, &candidate) ||
+                    !looksLikePointer(bias, candidate)) {
+                    continue;
+                }
+                uint64_t candidateHead = 0;
+                if (!readWord(static_cast<uintptr_t>(candidate),
+                              &candidateHead)) {
+                    continue;
+                }
+                char candidateName[96]{};
+                if (!guestResolveClassName(
+                        static_cast<uintptr_t>(candidateHead), candidateName,
+                        sizeof(candidateName))) {
+                    continue;
+                }
+                written += __builtin_snprintf(
+                    names + written, sizeof(names) - written, " +0x%zx=%s",
+                    probe, candidateName);
+            }
+            char detail[700];
+            __builtin_snprintf(detail, sizeof(detail),
+                               "ruleSet=0x%llx bytes=0x%llx nodes=%d "
+                               "found_no_RaceMetrics names=%s",
+                               static_cast<unsigned long long>(ruleSet),
+                               static_cast<unsigned long long>(
+                                   kRuleSetRaceMetricsBytes),
+                               nodesVisited, names);
+            appendGuestBootLine(kGuestViewLogPath, "ruleset-contents", 0, 0,
+                                detail);
+        }
     }
     return false;
 }

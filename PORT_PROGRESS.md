@@ -11995,3 +11995,36 @@ was always false; a "present" flag that was a constant; a name that was a
 constant; a `size` that was the primary's size and not the served one's; a
 "verdict" that was the port's belief.  ⇒ **EVERY FIELD THAT MAKES A CLAIM
 ABOUT THE GUEST HAS TO BE READ FROM THE GUEST.**
+
+#### MEASURED (q96): THE RTTI IDENTITY WORKS, AND THE METRICS ARE FOUND ONLY ONCE
+
+    phase=race-state ... rs=0x2138306280 metrics=1 active=0
+      cls=27RuleSetModifier_RaceMetrics m=0x21383062c0 vptr_ok=1 mres=0x3f
+
+⇒ The class name in the log is now a MEASUREMENT (the guest's own RTTI, read
+at runtime) and it says `27RuleSetModifier_RaceMetrics`, the vptr matches,
+and all six members resolve (`mres=0x3f`).  **The identity check is right.**
+
+⇒ **BUT THE METRICS ARE FOUND ONCE AND THEN GONE.**  q96 has 41 race-state
+lines: 40 with `active=-1` (not found) and ONE with `active=0` -- at frame
+600, after which the object is dropped again.  The port's re-discovery runs
+every 300 frames while the objects are missing, and it is failing.
+
+⇒ ⇒ **AND THE QUESTION THE NEXT ROUND ANSWERS IS EXACTLY THE ONE THAT WAS
+MISSING**: when the ruleSet is found but no RaceMetrics is inside it, the
+port now prints what IS inside it, by name (`phase=ruleset-contents`): the
+ruleSet's own class name and the names of the words inside it that look like
+vptrs.  Without that, "the metrics were not found" is a black box -- and a
+black box is how four rounds were lost.
+
+⇒ **WHAT IS KNOWN AND WHAT IS NOT, STATED PLAINLY:**
+
+* KNOWN: the racing line is decoded and captured (q92/q94/q96: Bathurst,
+  `centre_spline` 389 nodes, loop 98941 stored units, three chunks in
+  agreement); the pursuit and its gate are already in the port and need no
+  change; the fit module recovers a known answer exactly (scale 16.0000,
+  residual 0.0757 m); the freeze is a race in the port's file I/O, not the
+  guest's code; the guest's own `strtoul` was an unbounded host scan.
+* NOT KNOWN: why the guest's RaceMetrics modifier is not stably at
+  ruleSet+0x40 in this configuration.  That is the next measurement, and it
+  is one line of log away.
