@@ -136,14 +136,30 @@ inline int FormatOutOfRange(char* out, size_t cap, uint64_t pcOff) {
 // is PROVABLY not in [kFdeLo, kFdeHi] are exactly the periods the census is
 // silent, and a negative control built on the census gate could not produce a
 // single line. This variant makes that period loud.
+//
+// THE LINK REGISTER IS ON THE LINE TOO, and it is what names the CALLER.
+// MEASURED 2026-11-01 (q89, q93): the root thread was sampled inside the HOST
+// image at the link-time vaddr of newlib's `_svfprintf_r` / `_svfiprintf_r` --
+// the guest is inside a printf -- and with only the pc there is no way to say
+// WHICH guest code asked for it.  The lr is the guest's return address, and the
+// repository's own tools can name the guest function from it.
+//
+// The census already knows how to classify a register (censusClassifyRegister
+// with the lr), so the same attribution is used here: the lr's ELF vaddr is
+// printed when it lands in a guest image, and "host+0x..." when it does not.
 inline int FormatNotGuest(char* out, size_t cap, const char* pcImg, uint64_t pc,
-                          uint64_t pcOff) {
+                          uint64_t pcOff, const char* lrImg, uint64_t lr,
+                          uint64_t lrOff) {
     return std::snprintf(out, cap,
                          "NOT-GUEST-IMAGE pc_img=%s pc=0x%llx pc_off=0x%llx "
+                         "lr_img=%s lr=0x%llx lr_off=0x%llx "
                          "(B/E not read)",
                          pcImg != nullptr ? pcImg : "unknown",
                          static_cast<unsigned long long>(pc),
-                         static_cast<unsigned long long>(pcOff));
+                         static_cast<unsigned long long>(pcOff),
+                         lrImg != nullptr ? lrImg : "unknown",
+                         static_cast<unsigned long long>(lr),
+                         static_cast<unsigned long long>(lrOff));
 }
 
 // Census copy: pthread_bridge.cpp:2698.

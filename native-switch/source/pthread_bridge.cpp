@@ -4033,6 +4033,9 @@ void* rootPcSamplerWorker(void*) {
         uint64_t pc = 0;
         uint64_t sp = 0;
         uint64_t fp = 0;
+        // The guest's LINK REGISTER: the return address, which names the
+        // guest code that called into the host when the pc cannot.
+        uint64_t lr = 0;
         bool ctxOk = false;
         // Published BEFORE the pause. If it were published after, the one pause
         // that matters most -- the one whose own svc does not return -- would be
@@ -4103,6 +4106,13 @@ void* rootPcSamplerWorker(void*) {
             pc = static_cast<uint64_t>(context.pc.x);
             sp = static_cast<uint64_t>(context.sp);
             fp = static_cast<uint64_t>(context.fp);
+            // THE LINK REGISTER.  When the pc is in the HOST image it cannot
+            // say which guest code is stuck there, and the lr can: it is the
+            // guest's return address.  MEASURED 2026-11-01 (q89, q93): the pc
+            // was inside newlib's `_svfprintf_r`, i.e. the guest was inside a
+            // printf, and there was no way to name the guest function that
+            // asked for it.
+            lr = static_cast<uint64_t>(context.lr);
         }
 
         // ---- everything below runs with the root thread RUNNING. ---------
@@ -4122,8 +4132,18 @@ void* rootPcSamplerWorker(void*) {
             const bool pcGuest = pc >= kCensusPcSentinel
                 && censusIsGuestImage(pcRc);
             if (!pcGuest) {
+                // THE CALLER.  The pc is in the host, so it cannot say WHICH
+                // guest code is stuck; the lr is the guest's return address
+                // and it can.  MEASURED 2026-11-01 (q89, q93): the pc was
+                // inside newlib's `_svfprintf_r`, i.e. the guest was inside a
+                // printf, and with only the pc there was no way to name the
+                // guest function that asked for it.
+                const uint64_t lrValue = lr;
+                const RegisterClass lrRc = censusClassifyRegister(
+                    plan, nroBase, static_cast<uintptr_t>(sp), lrValue, false);
                 rr3::rootpc::FormatNotGuest(body, sizeof(body), pcRc.kind, pc,
-                                            pcRc.off);
+                                            pcRc.off, lrRc.kind, lrValue,
+                                            lrRc.off);
             } else if (!rr3::rootpc::InFdeRange(pcRc.off)) {
                 rr3::rootpc::FormatOutOfRange(body, sizeof(body), pcRc.off);
             } else {
