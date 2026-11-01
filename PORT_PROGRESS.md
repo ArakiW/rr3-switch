@@ -12684,3 +12684,76 @@ the race measurably is (frame 950, the race grid is up by 1000).
 machine's clock, and the clock is not the machine.**  A frame-indexed
 timeline is only meaningful next to the frame rate it was measured at, and
 nothing in the file said what that was.
+## THE CAR MOVED: ALL SIX MEMBERS RESOLVED, THE LAP DISTANCE WENT POSITIVE
+
+MEASURED 2026-11-02, q111 (archive `20261102-055238-eden-rr3-q111-throttle-rerun`),
+420 s, the pad script's throttle at frame 950:
+
+```
+phase=race-state ... metrics=1 active=0 mres=0x3f mfail=none
+                      posok=1 lapd=1593344
+```
+
+* `mres=0x3f` -- **all six members resolved, for the first time in this
+  port's history** (and `mfail=none`, so the value store answered every one
+  of them);
+* `posok=1` -- the car's world position is plausible;
+* `lapd=1593344` -- **the lap distance is POSITIVE**, i.e. the car moved.
+
+And the captured frames are a race, not a menu:
+
+```
+frame 1200 : the race grid
+frame 1400 : the in-race coach mark, over a BLURRED TRACK
+frame 1800 : the race start cinematic (the GT3 car on the grid, the driver
+              list scrolling off, 帕诺拉马山杯赛)
+```
+
+The race markers went with it: start lights 19, race screen 28, HUD string 66
+(q105, before any of this: 7 / 10 / 22).
+
+### THE TWO THINGS THAT HAD TO CHANGE, AND NEITHER WAS IN THE PORT
+
+**1. THE TUTORIAL DIALOG DOES NOT TAKE A TOUCH.**  The port found the
+dialog's orange 「继续」 button (x=848, y=480, area=14691, w=336, h=56), the
+guest received the touch at exactly that point (`guest{... gx=848 gy=480
+down=1}`, with the matching up 40 frames later), and the dialog stayed.  The
+same synthetic touch DOES work on the guest's other buttons -- the press on
+the car-select screen's 「比赛」 is what takes the guest into the race.  So the
+layer that owns the coach mark is not the layer the port's touch reaches.
+
+Holding the guest's CONFIRM button (BTN_A, which the guest's own gamepad
+profile binds to confirm) over that window DOES dismiss it (q109: the captured
+frame 1000 became the race grid).
+
+**2. THE THROTTLE WAS FIVE THOUSAND FRAMES OUT OF REACH.**  The shipped pad
+script held the throttle from frame **6000**; the guest reaches about frame
+**1100** in a 300 s Eden round (it runs at roughly 4 fps on the emulator), so
+the throttle was never applied and the car never moved.
+
+⇒ **every number in a control file is calibrated against SOME machine's
+clock, and the clock is not the machine.**  A frame-indexed timeline is only
+meaningful next to the frame rate it was measured at, and nothing in the file
+said what that was.  The fix was to move the throttle to where the race
+measurably is (frame 950), and to record WHY in the file.
+
+### AND ONE THING WAS THE PORT'S FAULT
+
+q110, the same configuration, **froze**: "guest log stable for 121 s and no
+frame was captured: the guest is blocked, not slow", 3 frames rendered, and
+the port had not pressed anything.  That is this project's known RANDOM BOOT
+FREEZE, not the pad script -- and the way to tell the two apart is to run
+the same configuration again, because one round cannot distinguish "the known
+race" from "the change I just made".  q111, the same configuration, ran.
+
+⇒ **a stall and a regression look identical from the inside; only a repeat
+tells them apart.**
+
+### WHAT IS STILL OPEN
+
+The steering has not taken over: `sawprog=0` keeps `drive=0` and `pur=0`, so
+the car is driving itself (throttle + confirm held) with nobody steering it.
+The progress test needs the distance to advance by more than one metre
+between two samples, and the pure pursuit waits for that.  The steering
+handedness (`steersign`) is still unmeasured, and the lap counter still
+reads -1.

@@ -1,4 +1,6 @@
-# The throttle, for the moment the guest is in a race.
+# The confirm-then-throttle script: the guest's BTN_A is BOTH.
+#
+# BTN_A (button 0) IS THE CONFIRM BUTTON, AND IT IS ALSO THE ACCELERATOR.
 #
 # The port's own measurement (archive 20261024-134104-eden-thr-btnA) is that
 # BUTTON 0 (the guest's BTN_A) is what actually accelerates the car: with
@@ -10,15 +12,60 @@
 # The guest's own Android Gamepad Extended profile binds the accelerator to
 # "button 0 (A) | axis 5 (RT) | button 7 (R2)", so RT is sent as well.
 #
-# WHY IT STARTS LATE.  BTN_A is also "confirm" in a menu, and the f1a run
-# held it from frame 3000 while the front end was still up -- so a run that
-# starts the throttle before the race has begun presses whatever the menu
-# has focused. Here the throttle starts at frame 6000, which is AFTER the
-# start-race click at 5500 and after the track has had time to load, and
-# the touch script has already walked the whole path by then.
+# WHY THE CONFIRM IS HELD FROM 600.
+#
+# MEASURED 2026-11-02 (q108, archive
+# 20261102-053630-eden-rr3-q108-resolver-metrics): the guest's own in-race
+# tutorial dialog -- a full-screen panel with an ORANGE "continue" button at
+# x 688..1023, y 450..515 and the guest's red glove pointing at it -- does
+# NOT react to the port's synthetic touch.  The port found the button
+# (x=848 y=480 area=14691 w=336 h=56), the guest RECEIVED the touch at
+# exactly that point (guest{... gx=848 gy=480 down=1}, with the matching up
+# 40 frames later), and the dialog stayed.
+#
+# The same synthetic touch DOES work on the guest's other buttons -- the press
+# on the car-select screen's "race" button is what takes the guest into the
+# race -- so the layer that owns the coach mark is not the layer the port's
+# touch reaches.
+#
+# MEASURED 2026-11-02 (q109, archive
+# 20261102-054302-eden-rr3-q109-confirm-button): holding BTN_A over that
+# window DOES dismiss it.  The captured frame 1000 is the RACE GRID -- the
+# car on the grid with the driver list down the right -- instead of the
+# car-select screen every earlier round ended on.  The first time this guest
+# has reached a race.
+#
+# The window: the "race" button is pressed at frame 540 and the dialog's
+# button is detected at frame 690 (q107/q109) and again at 1320 (q108).  The
+# hold covers 600 onwards, which is inside the track LOADING and the dialog
+# -- the screen changes 99.8 % of its pixels there, so there is no focused
+# menu button for a held A to press by mistake.
+#
+# WHY THE THROTTLE IS AT 950 AND NOT 6000.
+#
+# The old script held the throttle from frame 6000, which is AFTER the
+# start-race click at 5500 -- a window measured on a machine whose frame rate
+# this port has never seen.  MEASURED 2026-11-02 (q109): the guest reaches
+# about frame 1100 in a 300 s Eden round (it runs at roughly 4 fps on the
+# emulator), so the throttle at 6000 was 5,000 frames out of reach and the car
+# NEVER MOVED.
+#
+# And the car not moving is not a small thing: the guest's lap distance only
+# advances while the car moves, and the port's steering controller waits for
+# that progress before it takes over.  MEASURED 2026-11-02 (q111, archive
+# 20261102-055238-eden-rr3-q111-throttle-rerun) with the throttle at 950:
+#
+#     phase=race-state ... metrics=1 active=0 mres=0x3f mfail=none
+#                           posok=1 lapd=1593344
+#
+# -- all six members resolved for the first time, the position plausible,
+# and a POSITIVE lap distance, i.e. the car moved.  And the captured frames
+# are the race: frame 1200 the grid, frame 1400 the in-race coach mark over
+# a blurred track, frame 1800 the race start cinematic.
 #
 # The pad script is a STATE TIMELINE: the last line whose "at" frame is at or
-# before the current frame applies.  So the two lines below are HOLDS that
-# start at those frames and never end.
+# before the current frame applies.  So the lines below are HOLDS that start
+# at those frames and never end.
 [at 0] lx=0 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x000
-[at 6000] lx=0 ly=0 rx=0 ry=0 lt=0 rt=1.0 b=0x001
+[at 600] lx=0 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 950] lx=0 ly=0 rx=0 ry=0 lt=0 rt=1.0 b=0x001
