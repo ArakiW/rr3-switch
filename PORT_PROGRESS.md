@@ -12028,3 +12028,34 @@ black box is how four rounds were lost.
 * NOT KNOWN: why the guest's RaceMetrics modifier is not stably at
   ruleSet+0x40 in this configuration.  That is the next measurement, and it
   is one line of log away.
+
+#### MEASURED (q96, q97): THE PORT WAS LOOKING FOR THE METRICS ON THE WRONG CLOCK
+
+Both rounds REACHED the race -- q96: `msStartLights 13`, `msRaceScreen 19`;
+q97: `msStartLights 7`, `msRaceScreen 10` -- and both were stuck at
+`active=-1`, i.e. "the race metrics were not found":
+
+| | race-state lines | with a car position |
+|---|---|---|
+| q96 | 41 (40 with `active=-1`, ONE at frame 600) | 1 |
+| q97 | 33, all `active=-1` | 0 |
+
+⇒ **⇒ THE PORT WAS LOOKING FOR THE METRICS ON THE WRONG CLOCK.**  The guest
+creates the RaceMetrics modifier while the race is being SET UP and
+replaces it afterwards, so the object exists in a WINDOW -- and the port's
+discovery ran every **300** frames, so it usually looked after the window
+had closed.  q96 caught it once, by luck, at frame 600.
+
+⇒ **⇒ SO THE DISCOVERY NOW HAS TWO CADENCES** (`race_state_probe.cpp`):
+
+* the **cheap path** -- three pointer reads and a short map walk -- runs every
+  **15 frames** while the metrics are missing;
+* the **heap scan** -- the expensive one, which walks the guest's writable
+  segments -- keeps its own slow cadence (300/600 frames).  **It is the heap
+  scan that collapsed the frame rate from ~3 fps to ~0.5 fps when it ran
+  every frame**, so it is the one that must not run often.
+
+⇒ **WHY THIS IS THE RIGHT SHAPE**: the port is a probe on someone else's
+process, and the thing it is looking for has a LIFETIME that is not the
+port's to choose.  ⇒ **A PROBE'S SEARCH CADENCE HAS TO MATCH THE THING IT
+IS LOOKING FOR, NOT THE PROBE'S OWN COMFORT.**

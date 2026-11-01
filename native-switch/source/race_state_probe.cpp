@@ -801,6 +801,11 @@ void readDriveConfig() {
 RaceStateSample g_sample;
 RaceDriveState g_drive;
 unsigned long long g_lastSearchFrame = 0;
+// The cheap path's own cadence.  The guest creates the RaceMetrics modifier
+// while the race is being set up and replaces it afterwards, so the port has
+// to LOOK while it is there: MEASURED 2026-11-01 (q96, q97), a 300-frame
+// cadence found the metrics once in 41 samples.
+unsigned long long g_lastCheapSearchFrame = 0;
 unsigned long long g_lastLogFrame = 0;
 double g_lastTotalValue = 0.0;
 double g_lastLapValue = 0.0;
@@ -1691,7 +1696,7 @@ bool followGameMode(uintptr_t bias, uintptr_t gameMode, uintptr_t* outRuleSet,
     return false;
 }
 
-void discover() {
+void discover(bool withHeapScan) {
     const uintptr_t bias = resolveMainImageLoadBias();
     if (bias == 0) {
         return;
@@ -1779,7 +1784,12 @@ void discover() {
     if (g_gameMode == 0) {
         g_ruleSetRaceMetrics = 0;
         g_metricsCount = 0;
-        findMetricsInHeap(bias, g);
+        // THE HEAP SCAN IS THE EXPENSIVE ONE: it walks the guest's writable
+        // segments.  It is what collapsed the frame rate when it ran every
+        // frame, so it keeps its own cadence.
+        if (withHeapScan) {
+            findMetricsInHeap(bias, g);
+        }
         return;
     }
 }
@@ -2287,12 +2297,32 @@ void pumpRaceStateProbe(unsigned long long frame) {
     // frame while the objects were missing, and the guest's own frame rate
     // collapsed from about 3 frames a second to about 0.5.
     const bool found = (g_gameMode != 0) && (g_metricsCount > 0);
+    // THE CHEAP PATH RUNS OFTEN; THE HEAP SCAN DOES NOT.
+    //
+    // MEASURED 2026-11-01 (q96, q97): the metrics were found ONCE in 41
+    // race-state samples in one round and not at all in another -- the
+    // port's 300-frame cadence races the GAME's own timing, and the
+    // RaceMetrics modifier only exists while the race is being set up.
+    //
+    // The cheap path is three pointer reads and a short map walk.  The heap
+    // scan is the expensive one (it walks the guest's writable segments),
+    // and THAT is what collapsed the frame rate from ~3 fps to ~0.5 fps when
+    // it ran every frame.  So the cheap path gets its own, much shorter,
+    // cadence, and the heap scan keeps the slow one.
+    const unsigned long long cheapPeriod = 15ULL;
     const unsigned long long period = found ? 600ULL : 300ULL;
-    const bool needSearch = g_forceSearch || (frame >= g_lastSearchFrame + period);
-    if (needSearch) {
-        g_lastSearchFrame = frame;
-        g_forceSearch = false;
-        discover();
+    const bool needCheap = !found && g_gameMode != 0 &&
+                           (frame >= g_lastCheapSearchFrame + cheapPeriod);
+    const bool needFull = g_forceSearch || (frame >= g_lastSearchFrame + period);
+    if (needCheap || needFull) {
+        if (needCheap) {
+            g_lastCheapSearchFrame = frame;
+        }
+        if (needFull) {
+            g_lastSearchFrame = frame;
+            g_forceSearch = false;
+        }
+        discover(needFull);
     }
 
     g_sample.gameMode = g_gameMode;
