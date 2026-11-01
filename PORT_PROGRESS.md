@@ -11904,3 +11904,43 @@ guest's base asset list (the `baselist-rewrite` line: 8649 overrides).  A
 number the port writes there becomes, in the guest, a width or a precision.
 ⇒ The next thing to check is the rewrite's output, against the guest's own
 parser.
+
+#### AND THE STACK IS IN THE PORT'S OWN FILE I/O, NOT IN THE GUEST'S CODE
+
+q94 ran the sampler with the link register on the line.  The guest's root
+thread was sampled like this:
+
+    tick=3 NOT-GUEST-IMAGE pc_img=host-nro pc_off=0x5a373c
+                        lr_img=host-nro lr_off=0x594b84
+    tick=4 NOT-GUEST-IMAGE pc_img=host-nro pc_off=0x5a373c
+                        lr_img=host-nro lr_off=0x593934
+
+and resolving those offsets against the host ELF's symbol table gives:
+
+| offset | host symbol | what it is |
+|---|---|---|
+| `0x5a373c` | (static, unnamed) | a static function inside newlib's stdio |
+| `0x594b84` | `fsFileGetSize` | libnx's file-size query |
+| `0x593934` | `_fsObjectClose` | libnx's file close |
+| `0x5cc86c` | `__locale_mb_cur_max` | newlib's locale state |
+| `0x5ee64c` | `__getreent` | newlib's per-thread reentrancy state |
+
+⇒ **The pc, the lr AND the call below it are all in the HOST, and the host
+functions involved are the FILE ones.**  So the thread is not "the guest
+inside a printf" -- it is the PORT's own file handling, entered from the
+guest's stdio, sitting in newlib's stdio around a libnx `fsFileGetSize` /
+`_fsObjectClose`.
+
+⇒ **AND THAT IS A MUCH NARROWER QUESTION THAN "WHERE IS THE GUEST STUCK":**
+it is the port's own file path, on the emulated SD card, in the stdio layer
+that a guest `fopen`/`fseek`/`fclose` goes through.  The next instrument is
+the PORT's stack at that moment -- the census already has a frame walk
+(`censusFrameDump`, `censusFpWalk`) that reads the frame chain, and the
+frame's own return addresses are the port's callers.
+
+⇒ **WHAT IS NOT CLAIMED**: which call it is, and whether the wait is on the
+kernel or in the emulator's own file layer.  Eden's emulated SD card is a
+directory on the host disk, and the port's `sdmc:/...` paths go through
+libnx's fsdev under the emulator -- and `fsFileGetSize` on it is exactly the
+call that would turn into a long wait if the emulator's fsdev handling is
+slow for a large file.
