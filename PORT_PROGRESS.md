@@ -12431,3 +12431,169 @@ quantity-based check ("is it exactly as big as the thing it came from?")
 confirms the thing itself.  The missing `rr3-data-manifest.json` was found
 by bytes, the duplicated package was found by bytes, and the copied `.depot`
 tree would have been found by bytes too.
+## THE GUARD WAS RIGHT ABOUT THE GLOVE AND WRONG ABOUT THE BUTTON
+
+The port's UI driver refuses to click while the guest is racing, and the
+reason is sound: **a click in a race IS a steer**, and the guest's cars are
+red, so the glove detector false-positives on them and a false press throws
+the car off the track.
+
+But the guard was not about the glove alone, and the part it was not about
+cost the whole race.
+
+### WHAT THE ARCHIVE SHOWS
+
+MEASURED 2026-11-02, archive `20261102-010143-eden-rr3-q98-dual-cadence`.  The
+captured frames are the evidence, and the last one is the decisive one:
+
+```
+frame 1000 : a full-screen panel, an ORANGE "continue" button at
+              x 688..1023, y 450..515, and the guest's own RED GLOVE
+              pointing straight at it
+frame 3000 : THE SAME PANEL
+```
+
+The guest sat on its own in-race tutorial dialog for the whole round.  (The
+guest's log mentions `cs_results_bathurst.banim`, which looks like a
+finished race; it is not -- that is the results ANIMATION being LOADED as an
+asset.  Reading a race out of a log line that names a resource is how a
+finished race gets invented; the frame is the thing that happened.)
+
+And the port's own log says why it did nothing: every press before the race,
+and **not one press after it**.
+
+### WHY THAT ONE GUARD WAS THE WHOLE CHAIN
+
+The same round's `phase=race-state` line, read in full:
+
+```
+metrics=1 active=0 cls=27RuleSetModifier_RaceMetrics m=0x212e850e00 vptr_ok=1
+mres=0x0  car=0x213218a9b0  cnum=0  cnode=696696
+cpos=-247249,-153205,2563  posok=0  ctok=0
+line=0 lres=0.00 perr=0.0000 pur=0  drive=0  sawprog=0
+```
+
+Read it as a chain rather than as a list of failures:
+
+* the metrics object **is** found and **is** identified by the guest's own
+  RTTI (`vptr_ok=1`, `cls=27RuleSetModifier_RaceMetrics`) -- so the probe's
+  identity work is fine;
+* `mres=0x0`: none of the six members resolved, so the lap counter and the
+  speed are the raw descriptors (garbage);
+* `cpos` is garbage (`posok=0`), so the car's world position is unusable;
+* `g_sawProgress` is 0, and `updateDrive()` enables the controller only when
+  `metricsFound && g_sawProgress` -- so `drive=0`, so `pur=0`, so no steering.
+
+**Every one of those is downstream of the race never starting.**  A car that
+has not started has no position, no lap count and no progress; the members
+are only written while the race runs.  `mres=0x0` was not a second bug, it
+was the same bug wearing a different hat.
+
+⇒ **one press was missing, and everything below it was waiting on that
+press.**
+
+### THE GUARD IS NARROWED, NOT LIFTED
+
+A press in a race is allowed when BOTH of these hold:
+
+* **the screen is QUIET.**  A live race changes 57..100 % of its pixels
+  between two readbacks (measured 2026-10-30), so a quiet screen during a
+  race is a MODAL DIALOGUE covering the scene.  The tutorial panel is a
+  static overlay: only the glove's animation and a small spinner move.
+* **the target is an ACCENT-COLOURED control.**  Orange and yellow are the
+  guest's own convention for a PRIMARY ACTION, and the thing that
+  false-positives in a race -- a RED car -- cannot be in either band.
+
+A live race satisfies neither condition, so the car still cannot be thrown
+off the track by this.  The named-control path (`rr3-ui.txt`) stays blocked
+in a race, because that press is a steer too.
+
+### AND "mres=0x0" IS NO LONGER A DEAD END
+
+The guest's value store already knows why a member lookup failed
+("the-chain-ended", "the-node-is-in-another-bucket", "the-table-has-no-
+buckets", ...) and `readMemberValue()` threw that away: it returned a bool and
+the reason was dropped on the floor.  So a round that resolved none of the six
+members said only `mres=0x0` -- which says that all six failed and nothing
+about any of them.
+
+The probe now reports the FIRST failure in full: the reason, the member id
+the slot held, the four keys the lookup derived from it, the four table
+counts it read, the four chain nodes it found and the four value cells.  A
+count of zero in a table says "the registry has no buckets there", which is a
+different thing from "the chain did not contain the key", and the difference
+is the difference between a stale member id and an empty registry.
+
+⇒ **a diagnostic that says "it failed" is a dead end; a diagnostic that says
+"it failed BECAUSE ..." is a lead.**  The value store had the reason the whole
+time.
+
+### TWO PROBES, ONE OF THEM WORKS, AND THE WRONG ONE WAS WIRED TO THE DECISION
+
+The next round (q107) turned the guard's question into a second discovery.
+The port has TWO probes for the same guest object:
+
+* the race-state probe finds the RuleSet_RaceMetrics by WALKING the guest's
+  writable segments (the heap scan) and by trying candidate offsets off the
+  GameMode;
+* the race-metrics probe finds the SAME object by RESOLVING it through the
+  guest's own ruleset map (`raceStateResolveRuleSetRaceMetrics()`) and then
+  checks its vptr against the class.
+
+In the same round, at the same moment, with the guest IN a race:
+
+```
+phase=race-state  ... metrics=0 active=-1
+phase=race-metrics ... ok=1 vptrOk=1 lapsOk=1 lapsWhy=none
+```
+
+⇒ the resolver found the object and the heap scan did not -- and the heap
+scan's answer is the one that fed "is the guest racing?", which is what
+decides whether a click is a steer.  So the port believed it was in the front
+end while the guest was racing, and clicked the race HUD.
+
+Both fixed, both small:
+
+1. the race-state probe takes the resolver's object as its FALLBACK when its
+   own walk found nothing -- reusing the race-metrics probe's CACHED sample
+   (pumped by the input pump, on this same thread, once per frame, so it is at
+   most one frame old and touches no guest memory);
+2. the click guard asks the same question of the same probe.
+
+⇒ **a port can have two instruments for the same question, and the one that
+is wired to the decision can be the one that does not work.**  The diagnosis
+that took the longest was not "the object is hard to find" but "we are asking
+the wrong instrument".
+
+### THE TOUCH IS CORRECT, AND THE DIALOG STILL DOES NOT CLOSE
+
+Two more rounds (q107, q108) measured the press itself:
+
+* the port DOES find the tutorial's orange button -- `x=848 y=480 area=14691
+  w=336 h=56`, which is the 「继续」 label in the captured frame;
+* the guest RECEIVES it: the injection log reads
+  `x=848 y=480 action=down ... guest{... gx=848 gy=480 down=1}`, and the
+  matching `up` lands on the same point 40 frames later;
+* and the dialog does not close.  The harness captured it again at frame 1320
+  (it even named the frame `frame-hud-001320-76552.png`, because the
+  tutorial's blue coach bar looks like a HUD to the frame picker).
+
+⇒ **the synthetic touch is correct and the tutorial's layer does not take
+it.**  The same synthetic touch DOES work on the guest's other buttons: the
+press on the car-select screen's 「比赛」 is what takes the guest into the
+race, and the race markers went from 7/10/22 to **13/19/44** once the press
+sequence was allowed to run.
+
+So the layer that owns the coach mark is not the layer the port's touch
+reaches.  The console convention for "continue" is the CONFIRM button, and
+this guest's own gamepad profile binds button 0 (BTN_A) to confirm -- the
+port's pad script already says so:
+
+> BUTTON 0 (the guest's BTN_A) is what actually accelerates the car ... BTN_A
+> is also "confirm" in a menu
+
+⇒ **the next experiment needs no rebuild at all**: hold BTN_A over the window
+in which the dialog is up (frames 600..1400, which the measurements put
+inside the track loading and the dialog -- the screen changes 99.8 % of its
+pixels there, so there is no focused menu button for a held A to press by
+mistake).  It is a change to ONE card file, against the shipped script.
