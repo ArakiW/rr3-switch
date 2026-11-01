@@ -11576,3 +11576,111 @@ of the offscreen target went wrong.
 
 ⇒ **THE CARD IS BACK AT `platform=ui=view=1280x720`**, the configuration
 that is measured to reach the race (q81) and to survive 300 s (q87).
+
+### 2026-11-01 (16:30): THE GUEST'S `strtoul()` WAS AN UNBOUNDED SCAN ON THE HOST -- AND THE HD CONFIGURATION RUNS
+
+#### THE FREEZE WAS THE GUEST'S OWN `strtoul`, CALLING INTO THE HOST
+
+q89 froze for 120 s at boot.  The port's root-pc sampler had already caught
+it inside the HOST image:
+
+    phase=root-pc-sampler NOT-GUEST-IMAGE pc_img=host-nro pc=0x80fe7154
+                                    pc_off=0x5c6154
+
+`pc_off` is a LINK-TIME vaddr -- `censusNroBase()` is `&_start`
+(`pthread_bridge.cpp`), and `_start` is at vaddr 0 in the link -- so
+0x5c6154 resolves in the host ELF's own symbol table to
+`_strtoul_l.isra.0`, which is newlib's `strtoul`, running ON THE GUEST'S
+THREAD.
+
+And the port BOUND that symbol to the host's own implementation
+(`RR3_BIND(strtoul)` in `source/symbol_resolver.cpp`).  The host's
+`strtoul` scans forward until it meets a byte that is not a digit; on the
+guest's thread that scan has NO bound, so a guest pointer to a string that
+is not terminated makes the port walk the guest's address space, burn a
+CPU, and log nothing.  **That is the shape of every "random stall" this
+project has chased**, including the 4.2 MB manifest hangs: a quiet log, a
+climbing CPU, and no frame.
+
+⇒ **THE NINE `strto*`/`ato*` IMPORTS NOW GO THROUGH A BOUNDED SHIM**
+(`source/guest_strto.cpp`): the guest's string is copied out of its memory
+under a plausibility gate and a `svcQueryMemory` readability check, with a
+hard limit of 128 bytes; the host's parser only ever sees that copy; a
+string that is not terminated inside the window is REFUSED with a log line
+that names the function, the pointer, the reason and the bytes that were
+read.  The refusal answers 0 and leaves the end pointer at the start,
+which is what the C standard asks for when no conversion was performed, so
+the guest's behaviour is unchanged and only the infinite scan is gone.
+
+#### MEASURED (q90, archive 20261101-161433-eden-rr3-q90-strto-bounded)
+
+**The same configuration that froze now runs the full round:**
+
+| | q89 (`ui=2048x1152`, before the shim) | q90 (same config, after the shim) |
+|---|---|---|
+| frames | **3** | **3360** |
+| wall | 153 s (killed, "blocked for 120 s") | 306 s (the whole round) |
+| guest log | 1.6 MB, frozen | 40.5 MB, growing |
+| `msLoadComplete` | 0 | **1** |
+| `msMainMenuLayouts` | 0 | **20** |
+| `msEventMapScreen` | 0 | **217** |
+| `msStartLights` | 0 | **7** |
+| `msRaceScreen` | 0 | **10** |
+| `pixelsLit` | 0 | **921600 / 921600** |
+
+⇒ **THE FREEZE IS GONE, AND THE HD CONFIGURATION REACHES A RACE.**
+The event card in q90's `frames/frame-000340.png` is drawn from the
+**2048x1536** atlas at a 1280x720 layout: the card images are sharp and
+the Chinese labels are crisp.  So the split the user asked for -- HD
+material, 720p layout -- is not only expressible, it RUNS.
+
+#### THE `.spline` CONTAINER IS DECODED
+
+The racing line is in the guest's `.spline` file, and the format is plain
+little-endian, not compressed and not obfuscated:
+
+    u16 magic 0xFFFF | u16 version 10 | u32 guidLen | GUID ascii
+    u16 chunkCount
+    per chunk: u32 nameLen | name | u16 nodeCount | nodes
+    per node, 26 bytes:
+      +0x00 i32 x | +0x04 i32 y | +0x08 i32 z
+      +0x0c u16 tangent (65536 units per turn) | +0x0e u16 heading
+      +0x16 u32 arc (cumulative arc length)
+
+* MEASURED: the container decodes inside itself for **every** `.spline` on
+  the card.  The card's copies are PADDED to a power of two (16384, 32768,
+  65536 or 131072 bytes) and the remainder is stale data from the previous
+  occupant of the slot, so it must not be parsed.
+* MEASURED, and this is what makes the decode credible: the three chunks
+  were decoded independently and they AGREE.  Catalunya: `centre_spline`
+  194 nodes, loop **49392** stored units, aspect **2.641**;
+  `start_spline` 388 nodes, loop **49255**, aspect **2.639**;
+  `ai_spline` 388 nodes, loop **48656**, aspect **2.620**.  Three chunks
+  that agree on the loop length to within 1.5 % and the aspect to within
+  1 % are not three coincidences.
+* MEASURED: the tangent at +0x0c turns exactly once around the loop, which
+  is what a heading does.
+
+⇒ **THE PORT NOW DECODES IT ITSELF** (`source/guest_spline.cpp`), and it
+takes the bytes from the very candidate the guest is about to read, in the
+filesystem layer, so the port and the guest always see the same file
+(`source/guest_filesystem.cpp`, the `.spline` hook in `guestFopen`).
+
+**WHAT IS NOT YET FIXED: THE UNIT.**  The coordinates are in some stored
+unit U, and the guest multiplies them by 16 when it uses them (the node
+accessor at ELF 0x1425d54), which puts the port's 1/256 m car position at
+**16 stored units per metre** -- but that is a GEOMETRIC ESTIMATE, not a
+measurement, and the port does NOT steer from it yet.  The calibration is
+the next step, and it needs one round in which the port logs BOTH the
+captured spline and the car's own positions: the car has to lie ON the
+line, and that fixes the scale, the origin and the axis mapping in one go.
+
+#### THE NEXT INSERTION POINT IS ONE BLOCK
+
+The port's controller ALREADY has the pure pursuit, and it is gated on the
+target being plausible; only WHERE the target comes from has to change
+(`native-switch/source/race_state_probe.cpp`, `fillCarState`, between the
+guest's target read at :935 and the plausibility gate at :967).  With the
+target taken from the captured racing line, the existing gate and the
+existing pursuit code apply unchanged, and `updateDrive` needs NO change
+at all.  The survey that establishes this is in `.build/drive_path_survey.md`.

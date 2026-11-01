@@ -3,6 +3,7 @@
 #include "rr3/bionic_misc_shims.hpp"
 #include "rr3/gfx_backend.hpp"
 #include "rr3/guest_settings.hpp"
+#include "rr3/guest_spline.hpp"
 #include "rr3/recovery_guard.hpp"
 #include "rr3/rr3_md5.hpp"
 #include "bionic_errno.hpp"
@@ -8599,6 +8600,19 @@ std::FILE* guestFopen(const char* path, const char* mode) {
         // freads cost nothing.
         const char* servedPointer = nullptr;
         withReadFallback(resolution, path, [&file, mode, path](const char* candidate) {
+            // THE TRACK'S RACING LINE.  The guest opens the .spline when it
+            // loads a track, and the port needs those bytes: the guest's own
+            // aim target is unreadable (q81: ctgt=312,8992131,-19347, a
+            // target 35 km away), so the racing line is where the port's
+            // pure pursuit has to get its target from.
+            //
+            // It is taken HERE, from the very candidate the guest is about
+            // to read, so the port and the guest always see the same bytes.
+            // The guest's own stream is not disturbed: the file is opened a
+            // second time for the port's read.
+            if (std::strstr(candidate, ".spline") != nullptr) {
+                rr3::splineObserveGuestOpen(path, candidate);
+            }
             // THE PROBE COMES FIRST. For a ".ast" stream -- and for the two
             // known-good control streams -- the port serves the guest from a
             // buffer whose digest it has computed, so the port knows what
