@@ -419,6 +419,12 @@ uintptr_t g_candidateVptrs[4] = {0, 0, 0, 0};
 int g_mapNodesVisited = 0;
 int g_mapKeyOffset = -1;
 uintptr_t g_cglobal = 0;
+// Set when the cached metrics object stopped being the RaceMetrics (its vptr
+// no longer matches), so the next frame searches again instead of waiting out
+// the 600-frame cadence.  MEASURED 2026-11-01 (q92..q94): a stale object read
+// as if it were live is what made the car's position read as 0,0,0 for a
+// whole round.
+bool g_forceSearch = false;
 
 // Forward declaration: the heap scan below uses the pointer filter, which is
 // defined after it.
@@ -2184,9 +2190,10 @@ void pumpRaceStateProbe(unsigned long long frame) {
     // collapsed from about 3 frames a second to about 0.5.
     const bool found = (g_gameMode != 0) && (g_metricsCount > 0);
     const unsigned long long period = found ? 600ULL : 300ULL;
-    const bool needSearch = (frame >= g_lastSearchFrame + period);
+    const bool needSearch = g_forceSearch || (frame >= g_lastSearchFrame + period);
     if (needSearch) {
         g_lastSearchFrame = frame;
+        g_forceSearch = false;
         discover();
     }
 
@@ -2204,14 +2211,41 @@ void pumpRaceStateProbe(unsigned long long frame) {
     if (g_metricsCount > 0) {
         RaceMetricsSample m{};
         fillMetrics(&m, g_metrics[0]);
-        // The racing line's fit is refreshed on the frame counter, so the
-        // "refit every N frames" rule has a frame to count.
-        gRaceLineFrame = frame;
-        fillCarState(&m);
-        updateProgress(frame, &m);
-        g_sample.metrics[0] = m;
-        g_sample.metricsCount = 1;
-        g_sample.activeIndex = 0;
+        // THE OBJECT MUST STILL BE THE RACE METRICS.
+        //
+        // MEASURED 2026-11-01 (q92, q93, q94): the cached address stopped
+        // being the RaceMetrics -- the log says `vptr_ok=0` -- and the port
+        // kept reading it anyway.  What it read there was ASCII TEXT: the
+        // car's pointer came out as 0x3533352335333523, which is "532#355#",
+        // and the car's position came out as 0,0,0 for the whole round.
+        //
+        // EVERY DISCOVERY PATH CHECKS THE VPTR.  The per-frame read did not,
+        // so a STALE object -- the guest reallocated it -- was read as if it
+        // were live.  A vptr that does not match is not a warning, it is the
+        // end of that object: drop it and search again.
+        const uintptr_t bias = resolveMainImageLoadBias();
+        if (m.vptr != bias + kRaceMetricsVptrElfVa) {
+            g_metricsCount = 0;
+            g_metrics[0] = 0;
+            // THE GameMode GOES TOO.  discover() re-validates the GameMode
+            // only by following it to a RuleSetRaceMetrics, and it SKIPS the
+            // candidate list when one is already known -- so a stale GameMode
+            // would keep the probe from ever finding the live one.  Clearing
+            // it makes the next search try the candidates again, and fall
+            // back to the heap scan if they all fail.
+            g_gameMode = 0;
+            g_ruleSetRaceMetrics = 0;
+            g_forceSearch = true;
+        } else {
+            // The racing line's fit is refreshed on the frame counter, so the
+            // "refit every N frames" rule has a frame to count.
+            gRaceLineFrame = frame;
+            fillCarState(&m);
+            updateProgress(frame, &m);
+            g_sample.metrics[0] = m;
+            g_sample.metricsCount = 1;
+            g_sample.activeIndex = 0;
+        }
     }
     g_sample.metricsFound = g_sample.metricsCount > 0;
 
