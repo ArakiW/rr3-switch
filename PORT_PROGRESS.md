@@ -12757,3 +12757,61 @@ The progress test needs the distance to advance by more than one metre
 between two samples, and the pure pursuit waits for that.  The steering
 handedness (`steersign`) is still unmeasured, and the lap counter still
 reads -1.
+## THE FALLBACK WAS ONE SAMPLE BEHIND, AND THE OBJECT IS ONLY THERE IN BURSTS
+
+The q111 round produced the first live metrics sample of the port's history
+(`mres=0x3f`, `posok=1`, `lapd=1593344`), and the steering still did not take
+over (`sawprog=0` ⇒ `drive=0` ⇒ `pur=0`).  The reason is in the same archive.
+
+### THE OBJECT COMES AND GOES, AND IT COMES BACK DURING THE RACE
+
+The value-store probe samples every 30 frames.  Over the whole round it
+found the guest's RuleSet_RaceMetrics at:
+
+```
+570, 600, 630,  1170, 1200,  1800, 1830
+```
+
+and NOT at the 58 samples in between.  1170/1200 is the race grid (the
+captured frame 1200 IS the grid) and 1800/1830 is the race start (the
+captured frame 1800 IS the start cinematic).  ⇒ **the object exists during
+the race**, and the guest replaces it (or replaces the whole rule set) as
+the race is set up.
+
+### AND THE RACE-STATE PROBE MISSED EVERY ONE OF THOSE WINDOWS
+
+At frames 1170 and 1200 the value-store probe said `ok=1 vptrOk=1` and the
+race-state probe said `metrics=0`.  Two probes, same frame, same object, one
+answer and one not.
+
+The reason is the ORDER.  The race-state probe takes the value-store
+probe's object as its fallback, and it read the value-store probe's CACHED
+sample -- which was pumped at the END of the previous pass.  So the fallback
+was always one sample old, and the object is only there in bursts of two or
+three samples.
+
+⇒ **the fallback was a fallback for an object that was not there any more.**
+A one-sample-old answer is not a small error here: the object appears and
+disappears inside the sampling window.
+
+⇒ the value-store probe is now pumped at the TOP of the race-state probe's
+pass, so the fallback sees THIS frame's answer.  The pump itself is on the
+same thread and on the same 30-frame cadence as everything else, so nothing
+about its safety changes.
+
+### AND WHY THE OBJECT WAS REFUSED IS NOW IN WORDS
+
+"metrics=0" is a dead end: it says the port did not USE the object, not why.
+There are three ways to refuse one and they are three different problems:
+
+| 拒绝原因 | 含义 |
+|---|---|
+| `the-object-is-not-the-race-metrics` | 读到了别的类（同类的过期实例） |
+| `the-members-are-not-live` | 类对，但成员没解析或圈距还是 −1（客机自己的「还没开始」） |
+| `the-owner-is-not-known` | 对象的属主（RuleSet）不知道 ⇒ 车指针读不出来 |
+
+The log now carries `rej=<reason>` next to `metrics=0`.
+
+⇒ **a counter says how often; a reason says what to do.**  The three reasons
+above have three completely different fixes, and the port could not tell
+them apart before.

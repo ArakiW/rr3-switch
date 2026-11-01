@@ -847,6 +847,9 @@ void readDriveConfig() {
 RaceStateSample g_sample;
 RaceDriveState g_drive;
 unsigned long long g_lastSearchFrame = 0;
+// WHY THE LAST METRICS OBJECT WAS REFUSED, IN WORDS.  "metrics=0" alone is
+// a dead end; this is what turns it into a lead.
+const char* g_metricsRejection = "not-looked-for";
 // The cheap path's own cadence.  The guest creates the RaceMetrics modifier
 // while the race is being set up and replaces it afterwards, so the port has
 // to LOOK while it is there: MEASURED 2026-11-01 (q96, q97), a 300-frame
@@ -2220,7 +2223,7 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             "f=%llu g=0x%llx gm=0x%llx gm_ok=%d gm_vptr=0x%llx gm_ap=0x%llx "
             "gm_base=%d gm_cand=%d cand=%s metrics=%d "
             "active=-1 nodes=%d keyoff=%d heap=0x%llx+0x%llx "
-            "drive=%d cfg=%d",
+            "rej=%s drive=%d cfg=%d",
             frame, static_cast<unsigned long long>(g_cglobal),
             static_cast<unsigned long long>(sample.gameMode),
             sample.gameModeFound ? 1 : 0,
@@ -2232,6 +2235,7 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             g_mapNodesVisited, g_mapKeyOffset,
             static_cast<unsigned long long>(g_heapBase),
             static_cast<unsigned long long>(g_heapSize),
+            g_metricsRejection,
             g_drive.enabled ? 1 : 0,
             g_driveConfig.present ? 1 : 0);
     } else {
@@ -2390,6 +2394,24 @@ void pumpRaceStateProbe(unsigned long long frame) {
         return;
     }
 
+    // THE VALUE STORE PROBE GOES FIRST, NOT LAST.
+    //
+    // The race-state probe takes the value-store probe's object as its
+    // FALLBACK (see "THE OTHER PROBE'S OBJECT" below), and a fallback that
+    // reads a sample one pump old is a fallback that misses.
+    //
+    // MEASURED 2026-11-02 (q111, archive
+    // 20261102-055238-eden-rr3-q111-throttle-rerun): the value-store probe
+    // found the guest's RuleSet_RaceMetrics at frames 570, 600, 630, 1170,
+    // 1200, 1800 and 1830 -- 1170/1200 is the race grid and 1800/1830 is the
+    // race start -- while the race-state probe reported `metrics=0` at 1170
+    // and 1200.  The object is there; the fallback was one sample behind.
+    //
+    // It is pumped here rather than at the end of this function so that it is
+    // this frame's answer, not the previous one's.  The pump itself is on the
+    // same thread and on the same 30-frame cadence as everything else here.
+    pumpRaceMetricsProbe(frame);
+
     // (Re)discover. The search is expensive -- it walks the guest's object
     // graph -- so it runs on a CADENCE, not every frame. While the objects
     // are still missing it looks every 120 frames; once they are found it
@@ -2477,6 +2499,9 @@ void pumpRaceStateProbe(unsigned long long frame) {
             g_ruleSetRaceMetrics = mv.ruleSet;
         }
     }
+    // THE REASON IS RESET HERE, so a stale reason from an earlier rejection
+    // can never be read as the current one.
+    g_metricsRejection = "not-found";
     if (g_metricsCount > 0) {
         RaceMetricsSample m{};
         fillMetrics(&m, g_metrics[0]);
@@ -2535,6 +2560,17 @@ void pumpRaceStateProbe(unsigned long long frame) {
         // AND THE RuleSet HAS TO BE KNOWN: the car's pointer lives in it.
         const bool ownerKnown = g_ruleSetRaceMetrics != 0;
         if (!isRaceMetrics || !membersLive || !ownerKnown) {
+            // WHY THE OBJECT WAS REJECTED, IN WORDS.
+            //
+            // "metrics=0" on its own is a dead end: it says the port did not
+            // use the object, not why.  The three ways it can be refused are
+            // very different problems -- a wrong object, a dead one (the
+            // guest's own "no lap yet" value) and a missing owner -- and the
+            // reader cannot tell them apart from the counter.
+            g_metricsRejection =
+                !isRaceMetrics
+                    ? "the-object-is-not-the-race-metrics"
+                    : (!membersLive ? "the-members-are-not-live" : "the-owner-is-not-known");
             g_metricsCount = 0;
             g_metrics[0] = 0;
             // THE GameMode GOES TOO.  discover() re-validates the GameMode
@@ -2665,9 +2701,8 @@ void pumpRaceStateProbe(unsigned long long frame) {
     // member's id lives there and the number lives in the guest's global
     // member value store. The value-store probe reads it out with a pure
     // read (no guest call, so nothing in the guest is mutated) and logs it
-    // as "race-metrics". It is pumped here, next to the rest of the race
-    // state, so it sees the same object the rest of this file sees.
-    pumpRaceMetricsProbe(frame);
+    // as "race-metrics". It is pumped at the TOP of this function, so that
+    // the fallback below sees this frame's answer.
 
     updateDrive(frame, g_sample);
 
