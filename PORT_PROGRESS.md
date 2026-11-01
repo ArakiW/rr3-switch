@@ -11389,22 +11389,63 @@ then dead.  `AA_LEVEL` alone leaves the shader set alone.
     the LAYOUT, the viewport, the touch coordinate space, and (measured,
     q77/q79) the size of the framebuffer the guest renders its 3D scene into.
   * `ui=WxH`    -- what the port answers to
-    `CCUserInterfaceManager.getScreenWidth/getScreenHeight`: the GUI atlas
-    filter (a tree survives only when it is not bigger in BOTH dimensions)
-    and the UI's own screen size.
-  * `platform=WxH` -- the platform's screen size.
+    `CCUserInterfaceManager.getScreenWidth/getScreenHeight`.
+    **WHAT IT DOES TO THE ATLAS IS NOT MEASURED.  The previous version of
+    this section claimed it drives the GUI atlas filter; that was a GUESS
+    dressed as a conclusion, and the measurement that would have caught it
+    was never run.**  q1 (2026-10-28) overrode `platform=` only -- its log
+    line reads `platform=2048x1152 ui=0x0`, because the `ui=` key did not
+    exist yet -- and the guest's atlas did not move.  So `platform=` is
+    MEASURED INERT, and `ui=` has never been tested at all.
+  * `platform=WxH` -- the platform's screen size.  MEASURED INERT (q1):
+    reporting a 2048x1152 platform screen changed nothing the guest does.
 
-⇒ **`view=2048x1152` with `ui=1280x720` is "the vehicles and the
-environment at 2048x1152, the UI at 1280x720"** -- which is what the user
-asked for in the first place.  And because the guest renders its scene into
-a 2048x1152 framebuffer and composites it into the 1280x720 window, that
-composite IS a downscale: **supersampling, which is anti-aliasing for free**
--- the same thing AA_LEVEL buys, but for the 3D as a whole and without the
-guest having to multisample anything.
+⇒ **AND THE BIGGEST CORRECTION OF THIS SECTION: WITH THE PORT'S OFFSCREEN
+TARGET OFF, `view=` ABOVE 1280x720 IS INERT.**
 
-⇒ THE PORT'S OFFSCREEN TARGET IS NOT NEEDED FOR THAT.  It was an attempt to
-build the same thing from the outside, and it is what broke the picture
-(q76..q80).
+The port tells the guest the view in `onViewChangedJNI`, and what it tells
+it is `gfxViewWidth()` -- the view AFTER the clamp
+(`source/guest_view_probe.cpp:2887-2888`), not the raw override.  With no
+offscreen target the clamp pins it to the real 1280x720 surface
+(`gfx_backend.cpp:1165-1187`), so:
+
+    q88 (archive 20261101-153533-eden-rr3-q88-hd3d-ui720p), whose
+    rr3-screen.txt said view=2048x1152 / ui=1280x720:
+
+      phase=screen-override platform=1280x720 ui=1280x720
+      phase=view-clamped view 2048x1152 clamped to 1280x720: the port owns
+                       no offscreen target of the view size ...
+      phase=view-size view=1280x720 present=0,0 1280x720
+      phase=guest-log-any Res base: 1280x720
+
+⇒ **q88 WAS A 720p ROUND.  It was not an HD round.**  The guest's Res base,
+its atlas filter, its layout and its scene framebuffer were all 1280x720.
+The previous version of this section called it "the vehicles and the
+environment at 2048x1152, the UI at 1280x720"; that was read off the
+CONFIGURATION FILE, not off the guest's own answer, and the guest's own
+answer is in the log line above.
+
+⇒ SO "HD 3D + 720p UI" IS **NOT** ESTABLISHED, and the two things that
+would have to be true for it are not both true:
+
+  * the guest lays its 2D UI out in the VIEW's coordinate space -- MEASURED
+    (q77/q78): its scissor rectangles are in 2048x1152 coordinates while the
+    viewport was 1280x720, which is exactly the "flat sky blue" symptom;
+  * the scene framebuffer's size is the view's size -- MEASURED (q77/q79).
+
+  ⇒ one number drives the UI layout AND the scene size, so "HD scene, 720p
+  UI" is NOT expressible through the view.  It would need a second surface
+  of the view's size -- which is the port's offscreen target, and that is
+  what broke the picture (q76..q80).
+
+⇒ THE OPEN QUESTION, WHICH IS CHEAP TO ANSWER: does `ui=` move the atlas
+filter and/or the scene size?  It has never been tested.  If `ui=2048x1152`
+with `view=1280x720` flips the guest to the 2048x1536 GUI tree while the
+scene stays at 1280x720, then the user's split -- "HD material on the
+vehicles and the environment, the UI left alone" -- is reachable with a
+720p layout and a 720p scene, and no offscreen target at all.  If it does
+not, then the view is the only lever there is, and the HD path needs the
+offscreen target to be rebuilt.
 
 ### The 4.2 MB stall, finally fixed
 
@@ -11442,11 +11483,16 @@ ring, checked before the ring and never evicted.  The log line says
     binary, same settings) both died at the same line.  The pinned slot is
     what changed.
 
-⇒ THE CHEAPER HALF OF THE SAME MEDICINE: iew=2048x1152 with
-ui=1280x720 makes the guest render the scene at 2048x1152 and composite it
-into the 1280x720 window -- a 2x downscale, which is supersampling, which is
-anti-aliasing for the 3D WITHOUT multisampling (measured in q73: 2040 frames
-in 305 s, i.e. about 55% of the 720p rate rather than 29%).
+⇒ THE CHEAPER HALF OF THE SAME MEDICINE -- AS A PLAN, NOT AS A
+MEASUREMENT.  IF the guest rendered its scene at 2048x1152 and composited
+it into the 1280x720 window, that composite would be a 2x downscale, i.e.
+supersampling, i.e. anti-aliasing for the 3D WITHOUT multisampling (the
+cost of the same idea is measured in q73: 2040 frames in 305 s, about 55%
+of the 720p rate rather than 29%).
+
+  **BUT THE GUEST NEVER GETS THAT VIEW**: the port tells it the clamped one
+  (see the correction above), so this is currently a PLAN, and q88 is not its
+  measurement.
 
 ⇒ THE DEPLOY SWITCH CANNOT EXPRESS THAT YET: -ScreenView rewrites all
 THREE size lines (platform, ui, view) to one value.  It needs a way to set

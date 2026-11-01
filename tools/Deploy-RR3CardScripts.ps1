@@ -177,6 +177,10 @@ if ($ScreenView -ne '' -or $ScreenUi -ne '') {
             $key = $Matches[1]
             if ($key -eq 'ui' -and $ScreenUi -ne '') {
                 "{0}={1}" -f $key, $ScreenUi
+            } elseif ($key -eq 'platform' -and $ScreenUi -ne '') {
+                # The platform line describes the SCREEN the guest believes
+                # it has, so it follows the UI size, not the view size.
+                "{0}={1}" -f $key, $ScreenUi
             } elseif ($ScreenView -ne '') {
                 "{0}={1}" -f $key, $ScreenView
             } else {
