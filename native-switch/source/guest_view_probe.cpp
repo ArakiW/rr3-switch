@@ -28,6 +28,7 @@
 #include "rr3/glove_detector.hpp"
 #include "rr3/guest_touch.hpp"
 #include "rr3/race_state_probe.hpp"
+#include "rr3/race_metrics_probe.hpp"
 #include "rr3/ui_tap.hpp"
 #include "rr3/ui_target.hpp"
 #include "rr3/ui_control_probe.hpp"
@@ -9480,8 +9481,36 @@ void* frameLoopDriver(void* opaque) {
                         // and then pressed NOTHING for the next 4300, because
                         // a turning car looks exactly like a race.
                         const rr3::RaceStateSample& race = rr3::raceStateSample();
+                        //
+                        // WHICH PROBE ANSWERS "IS THE GUEST RACING?".
+                        //
+                        // The race-state probe finds the guest's
+                        // RuleSet_RaceMetrics by WALKING the guest's
+                        // writable segments; the race-metrics probe
+                        // finds the SAME object by RESOLVING it through
+                        // the guest's own ruleset map and checks its
+                        // vptr against the class.
+                        //
+                        // MEASURED 2026-11-02 (q107): in the same
+                        // round the race-state probe said
+                        // `metrics=0` while the race-metrics probe
+                        // said `ok=1 vptrOk=1` for the very same
+                        // object -- and the guest was IN a race then
+                        // (`start lights 13`, `race screen 19`).
+                        //
+                        // So the guard was asking the probe that could
+                        // not answer, and it answered "not racing",
+                        // and the port clicked the race HUD.
+                        //
+                        // The race-metrics probe is pumped by the input
+                        // pump on this same thread, once per frame, so
+                        // its sample is at most one frame old and
+                        // reading it here touches no guest memory.
+                        const rr3::RaceMetricsValueSample& metrics =
+                            rr3::raceMetricsValueSample();
                         const bool guestRacing =
-                            race.metricsCount > 0 || race.activeIndex >= 0;
+                            race.metricsCount > 0 || race.activeIndex >= 0 ||
+                            (metrics.ok && metrics.vptrOk);
                         // The change rate is still REPORTED, because it says
                         // whether the screen is in motion, but it no longer
                         // decides anything: a turning car on the car-select

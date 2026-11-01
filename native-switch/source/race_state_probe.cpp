@@ -2447,6 +2447,36 @@ void pumpRaceStateProbe(unsigned long long frame) {
 
     // Read the metrics object.
     g_sample.metricsCount = 0;
+    //
+    // THE OTHER PROBE'S OBJECT, USED AS THE FALLBACK.
+    //
+    // This probe finds the guest's RuleSet_RaceMetrics by WALKING the guest's
+    // writable segments (the heap scan) and by trying a list of candidate
+    // offsets off the GameMode.  The race-metrics probe (source/
+    // race_metrics_probe.cpp) finds the SAME object by RESOLVING it through
+    // the guest's own ruleset map
+    // (raceStateResolveRuleSetRaceMetrics()), and then checks its vptr.
+    //
+    // MEASURED 2026-11-02 (q107, archive
+    // 20261102-052853-eden-rr3-q107-accent-click-guard): in the SAME round,
+    // this probe reported `metrics=0` while the race-metrics probe reported
+    // `ok=1 vptrOk=1` for the very same object, and the guest was IN a race
+    // at that moment (`start lights 13`, `race screen 19`).  Two probes, one
+    // of them works, and the one that fed "am I racing?" and the steering
+    // controller was the one that did not.
+    //
+    // The fallback is the RESOLVER's answer, not a second walk: the
+    // race-metrics probe is pumped by the input pump on this same thread,
+    // once per frame, so its sample is at most one frame old and reading it
+    // here touches no guest memory at all.
+    if (g_metricsCount == 0) {
+        const RaceMetricsValueSample& mv = raceMetricsValueSample();
+        if (mv.ok && mv.vptrOk && mv.ruleSet != 0) {
+            g_metrics[0] = mv.ruleSet;
+            g_metricsCount = 1;
+            g_ruleSetRaceMetrics = mv.ruleSet;
+        }
+    }
     if (g_metricsCount > 0) {
         RaceMetricsSample m{};
         fillMetrics(&m, g_metrics[0]);
