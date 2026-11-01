@@ -11857,3 +11857,50 @@ notice, because the symptom (the car's position reads zero) does not look
 like the cause (a bounded libc call answering 0).  ⇒ **A FIX TO THE GUEST'S
 PLUMBING HAS TO BE MEASURED ON THE GUEST'S BEHAVIOUR, NOT ONLY ON THE
 THING THAT WAS BROKEN.**
+
+### 2026-11-01 (21:05): THE FREEZE IS THE GUEST INSIDE A `printf` -- AND IT HAPPENS IN THE FIRST SECOND
+
+**The freeze is still there.**  q93 (the faithful shim) froze exactly like q89
+did, at the same line -- `fopen-other ordinal=11 ... size=4212795` -- and the
+harness's verdict was the same: "the guest has been blocked for 120 s".
+
+**And the PC says what it is.**  The root-pc sampler had already answered, and
+resolving the offset against the host ELF's own symbol table says:
+
+| round | sampled host offset | host symbol |
+|---|---|---|
+| q89 | `0x5c6154` | `_svfiprintf_r` (newlib, integer printf) |
+| q93 | `0x5d7474` | `_svfprintf_r` (newlib, float printf) |
+| q93 | `0x5ee5cc` | `__getreent` (newlib's per-thread reentrancy struct) |
+
+⇒ **The guest is inside a `printf`, on the HOST's newlib** (the guest's
+printf import is bound to the host's).  A printf that takes forever is a
+printf with an ENORMOUS width or precision -- and the number that width comes
+from is, in this port, the GUEST'S OWN REWRITTEN ASSET LIST.
+
+⇒ **AND THE FREEZE IS EARLY, NOT AT THE 4.2 MB LIST.**  The q93 sampler's
+lines are ticks 1, 3 and 4 -- the guest was already inside the printf within
+the first second.  The `fopen-other ... size=4212795` line is simply the last
+thing the guest logged before it got stuck, and the log kept growing after
+that because the PORT's other threads keep logging.  ⇒ **"the last log line
+before the freeze" is not "where the freeze is"**, and the sampler is the
+instrument that says the difference.
+
+⇒ **THE NEXT INSTRUMENT IS THE CALLER.**  The pc is in the host, so it cannot
+say WHICH guest code is stuck; the guest's LINK REGISTER can, and the census
+already knows how to classify a register (`censusClassifyRegister` with the
+lr -- 74.7 % of the lr ring tokens resolve inside libRealRacing3 while the pc
+for the same threads reads as the sentinel).  So the root-pc sampler's line
+now carries the lr and its ELF vaddr:
+
+    NOT-GUEST-IMAGE pc_img=host-nro pc=0x... pc_off=0x... \
+        lr_img=libRealRacing3.so lr=0x... lr_off=0x... (B/E not read)
+
+⇒ and `.build/guest_addr.py <guest elf> <lr_off>` names the guest function
+the repository's own tools can see.
+
+**WHY THE PORT'S OWN CODE IS THE PRIME SUSPECT.**  The port REWRITES the
+guest's base asset list (the `baselist-rewrite` line: 8649 overrides).  A
+number the port writes there becomes, in the guest, a width or a precision.
+⇒ The next thing to check is the rewrite's output, against the guest's own
+parser.
