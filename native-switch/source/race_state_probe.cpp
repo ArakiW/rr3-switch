@@ -534,6 +534,27 @@ bool findMetricsInHeap(uintptr_t bias, uintptr_t g) {
         const uintptr_t hit = scanRegionForVptr(base, size,
                                                 bias + kRaceMetricsVptrElfVa);
         if (hit != 0) {
+            // AND THE RuleSet THAT OWNS IT.  The car's pointer lives in the
+            // RuleSet_RaceMetrics at +0x20, and the modifier is built IN
+            // PLACE inside the same object at +0x40 -- so the owner is at
+            // hit-0x40, and its vptr says whether that is true.
+            //
+            // MEASURED 2026-11-01 (q100): this path set g_metrics[0] and
+            // NOT g_ruleSetRaceMetrics, so fillCarState read the car from a
+            // ruleSet that was never identified (0) and every sample came
+            // out as cpos=0,0,0 -- with the class name and all six members
+            // resolved, so the log looked healthy.
+            //
+            // ⇒ The owner is verified by its vptr, not assumed.
+            g_ruleSetRaceMetrics = 0;
+            if (hit >= kRuleSetMetricsInlineOff) {
+                const uintptr_t owner = hit - kRuleSetMetricsInlineOff;
+                uint64_t ownerHead = 0;
+                if (readWord(owner, &ownerHead) &&
+                    ownerHead == bias + kRuleSetRaceMetricsVptrElfVa) {
+                    g_ruleSetRaceMetrics = owner;
+                }
+            }
             g_metrics[0] = hit;
             g_metricsCount = 1;
             return true;
@@ -2387,7 +2408,9 @@ void pumpRaceStateProbe(unsigned long long frame) {
         // that exists but is not the race's.  The live one has `mres=0x3f`
         // (all six members resolved), which is what the port now requires.
         const bool membersLive = m.membersResolved == 0x3FULL;
-        if (!isRaceMetrics || !membersLive) {
+        // AND THE RuleSet HAS TO BE KNOWN: the car's pointer lives in it.
+        const bool ownerKnown = g_ruleSetRaceMetrics != 0;
+        if (!isRaceMetrics || !membersLive || !ownerKnown) {
             g_metricsCount = 0;
             g_metrics[0] = 0;
             // THE GameMode GOES TOO.  discover() re-validates the GameMode
