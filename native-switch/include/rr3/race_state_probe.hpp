@@ -105,6 +105,27 @@ struct RaceMetricsSample {
     // Which of the six members the port proved BY NAME at runtime, from the
     // guest's own descriptor (the name hash and len^hash it wrote there).
     uint32_t membersIdentified{};
+    // WHY the members did not resolve.
+    //
+    // "mres=0x0" on its own is a dead end: it says that all six lookups
+    // failed but not what any of them hit.  The guest's value store knows
+    // exactly why ("the-chain-ended", "the-node-is-in-another-bucket",
+    // "the-table-has-no-buckets", ...), and the port threw that away.
+    //
+    // So the FIRST failure is reported in full: the reason, the member id the
+    // slot held, the four keys the lookup derived from it, the four table
+    // counts it read, the four chain nodes it found and the four value cells.
+    // Every one of those is a measured value, and together they say whether
+    // the slot's id was stale, the registry was empty, or the chain was
+    // walked wrongly.
+    //
+    // The strings are static literals, so the sample stays a plain value type.
+    const char* memberFailure{nullptr};
+    uint64_t memberId{};
+    uint64_t memberKeys[4]{};
+    uint64_t memberCounts[4]{};
+    uint64_t memberNodes[4]{};
+    uint64_t memberCells[4]{};
     // THE GUEST'S OWN PER-CAR STATE.
     //
     // The chain, each step proved by the guest's own code:

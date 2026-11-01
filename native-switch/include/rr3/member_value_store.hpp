@@ -246,6 +246,11 @@ struct Lookup {
     uint64_t cell2{0};  // the 8-byte cell in table 2
     uint64_t cell3{0};  // the 8-byte cell in table 3
     uint64_t cell4{0};  // the 8-byte cell in table 4
+    // The four table counts, as the registry holds them.  A count of zero is
+    // "this table has no buckets at all", which is a different failure from
+    // "the chain did not contain the key" -- and it is the difference between
+    // a stale member id and an empty registry.
+    uint64_t counts[4]{};
     int32_t value{0};
     // The guest's own integrity check: fnv1a64(cell1^cell2^cell3) == cell4.
     // The guest re-keys the member when it fails; the port cannot (that would
@@ -451,6 +456,7 @@ const char* lookup(Read& read, uintptr_t registry, uint64_t id, Lookup* out) {
         if (!read(registry + countOffsets[i], &counts[i])) {
             return "a-table-count-is-unreadable";
         }
+        out->counts[i] = counts[i];
     }
 
     // THE VALUE IS MADE OF CELLS 1 AND 2 (tables 1 and 2); the INTEGRITY

@@ -689,27 +689,52 @@ struct ValueReader {
     }
 };
 
-bool readMemberValue(uintptr_t slotAddress, int32_t* value, uint64_t* idOut) {
+bool readMemberValue(uintptr_t slotAddress, int32_t* value, uint64_t* idOut,
+                     member_value_store::Lookup* lookupOut,
+                     const char** whyOut) {
     const uintptr_t bias = resolveMainImageLoadBias();
     if (bias == 0 || value == nullptr) {
+        if (whyOut != nullptr) {
+            *whyOut = "the-guest-image-has-no-bias";
+        }
         return false;
     }
     const uintptr_t registry = bias + member_value_store::kRegistryBssVa;
     ValueReader reader;
+    const char* why = "the-lookup-was-never-reached";
     for (int attempt = 0; attempt < 2; ++attempt) {
         uint64_t id = 0;
         if (!readWord(slotAddress, &id) || id == 0) {
+            why = "the-slot-holds-no-id";
+            if (lookupOut != nullptr) {
+                lookupOut->id = id;
+            }
+            if (whyOut != nullptr) {
+                *whyOut = why;
+            }
             return false;
         }
         member_value_store::Lookup lookup{};
-        const char* why = member_value_store::lookup(reader, registry, id, &lookup);
+        why = member_value_store::lookup(reader, registry, id, &lookup);
         if (why == nullptr) {
             *value = lookup.value;
             if (idOut != nullptr) {
                 *idOut = id;
             }
+            if (lookupOut != nullptr) {
+                *lookupOut = lookup;
+            }
+            if (whyOut != nullptr) {
+                *whyOut = nullptr;
+            }
             return true;
         }
+        if (lookupOut != nullptr) {
+            *lookupOut = lookup;
+        }
+    }
+    if (whyOut != nullptr) {
+        *whyOut = why;
     }
     return false;
 }
@@ -1426,9 +1451,42 @@ void fillMetrics(RaceMetricsSample* out, uintptr_t address) {
     };
     out->membersResolved = 0;
     out->membersIdentified = 0;
+    out->memberFailure = nullptr;
     for (size_t i = 0; i < sizeof(slots) / sizeof(slots[0]); ++i) {
         int32_t value = 0;
-        if (!readMemberValue(address + slots[i].offset, &value, nullptr)) {
+        member_value_store::Lookup lookup{};
+        const char* why = nullptr;
+        if (!readMemberValue(address + slots[i].offset, &value, nullptr, &lookup,
+                             &why)) {
+            // THE FIRST FAILURE IS THE ONE THAT IS REPORTED, IN FULL.
+            //
+            // The port used to drop the reason on the floor and print only
+            // "mres=0x0", which says that all six lookups failed and nothing
+            // about any of them.  The guest's value store already knows why
+            // ("the-chain-ended", "the-node-is-in-another-bucket", "the-table-
+            // has-no-buckets", ...), and the lookup's own bookkeeping -- the
+            // id the slot held, the four keys derived from it, the four table
+            // counts, the four nodes and the four cells -- says whether the
+            // id was stale, the registry was empty, or the walk was wrong.
+            if (out->memberFailure == nullptr && why != nullptr) {
+                out->memberFailure = why;
+                out->memberId = lookup.id;
+                out->memberKeys[0] = lookup.key0;
+                out->memberKeys[1] = lookup.key1;
+                out->memberKeys[2] = lookup.key2;
+                out->memberKeys[3] = lookup.key3;
+                out->memberNodes[0] = lookup.node1;
+                out->memberNodes[1] = lookup.node2;
+                out->memberNodes[2] = lookup.node3;
+                out->memberNodes[3] = lookup.node4;
+                out->memberCells[0] = lookup.cell1;
+                out->memberCells[1] = lookup.cell2;
+                out->memberCells[2] = lookup.cell3;
+                out->memberCells[3] = lookup.cell4;
+                for (int t = 0; t < 4; ++t) {
+                    out->memberCounts[t] = lookup.counts[t];
+                }
+            }
             continue;
         }
         *slots[i].raw = static_cast<uint32_t>(value);
@@ -2131,7 +2189,7 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
 }
 
 void logSample(unsigned long long frame, const RaceStateSample& sample) {
-    char detail[768];
+    char detail[1536];
     const int active = sample.activeIndex;
     const uintptr_t bias = resolveMainImageLoadBias();
     // The GameMode's vptr, and the ELF ADDRESS POINT it corresponds to. The
@@ -2185,6 +2243,9 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             "active=%d nodes=%d keyoff=%d heap=0x%llx+0x%llx "
             "cls=%s m=0x%llx vptr_ok=%d "
             "mres=0x%x "
+            "mfail=%s mid=0x%llx mkeys=%llx/%llx/%llx/%llx "
+            "mcounts=%llu/%llu/%llu/%llu "
+            "mnodes=%llx/%llx/%llx/%llx mcells=%llx/%llx/%llx/%llx "
             "laps=%u lapF=%.3f lapd=%u lapdF=%.3f prev=%u total=%u "
             "totalF=%.3f speed=%u speedF=%.3f time=%u timeF=%.3f "
             "rate=%.6f prog=%.3f from_total=%d sawprog=%d "
@@ -2212,6 +2273,26 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             static_cast<unsigned long long>(m.address),
             (m.vptr == bias + kRaceMetricsVptrElfVa) ? 1 : 0,
             m.membersResolved,
+            // WHY the members did not resolve.  "mres=0x0" alone was a dead
+            // end; the value store knows the reason and the port now says it.
+            m.memberFailure != nullptr ? m.memberFailure : "none",
+            static_cast<unsigned long long>(m.memberId),
+            static_cast<unsigned long long>(m.memberKeys[0]),
+            static_cast<unsigned long long>(m.memberKeys[1]),
+            static_cast<unsigned long long>(m.memberKeys[2]),
+            static_cast<unsigned long long>(m.memberKeys[3]),
+            static_cast<unsigned long long>(m.memberCounts[0]),
+            static_cast<unsigned long long>(m.memberCounts[1]),
+            static_cast<unsigned long long>(m.memberCounts[2]),
+            static_cast<unsigned long long>(m.memberCounts[3]),
+            static_cast<unsigned long long>(m.memberNodes[0]),
+            static_cast<unsigned long long>(m.memberNodes[1]),
+            static_cast<unsigned long long>(m.memberNodes[2]),
+            static_cast<unsigned long long>(m.memberNodes[3]),
+            static_cast<unsigned long long>(m.memberCells[0]),
+            static_cast<unsigned long long>(m.memberCells[1]),
+            static_cast<unsigned long long>(m.memberCells[2]),
+            static_cast<unsigned long long>(m.memberCells[3]),
             m.totalLaps, static_cast<double>(m.totalLapsF),
             m.lapDistance, static_cast<double>(m.lapDistanceF),
             m.previousSplineDistance, m.totalSplineDistance,

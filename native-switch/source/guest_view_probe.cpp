@@ -9490,6 +9490,34 @@ void* frameLoopDriver(void* opaque) {
                             static_cast<size_t>(changed) >
                                 (static_cast<size_t>(viewW) * viewH) / 5;
 
+                        // A QUIET SCREEN.  A live race changes 57..100 %
+                        // of its pixels between two readbacks (measured
+                        // 2026-10-30), so a quiet screen during a race is
+                        // a MODAL DIALOGUE covering the scene -- the
+                        // guest's own tutorial panel is a static overlay
+                        // whose only moving parts are the glove's
+                        // animation and a small spinner.
+                        const size_t gloveScreenPixels =
+                            static_cast<size_t>(viewW) * viewH;
+                        const bool screenQuiet =
+                            gloveScreenPixels != 0 &&
+                            static_cast<size_t>(changed) * 20 < gloveScreenPixels;
+
+                        // AND AN ACCENT-COLOURED CONTROL ON IT.  Orange
+                        // and yellow are the guest's own convention for
+                        // a PRIMARY ACTION; the thing that
+                        // false-positives in a race is a RED car, and a
+                        // red car is in neither band.
+                        bool screenAccent = false;
+                        for (int i = 0; i < targets.count; ++i) {
+                            const rr3::ui::TargetKind k = targets.items[i].kind;
+                            if (k == rr3::ui::TargetKind::OrangeButton ||
+                                k == rr3::ui::TargetKind::YellowButton) {
+                                screenAccent = true;
+                                break;
+                            }
+                        }
+
                         // THE FEEDBACK LOOP.
                         //
                         // A press that changes nothing leaves its own control
@@ -9543,7 +9571,41 @@ void* frameLoopDriver(void* opaque) {
                             }
                         }
 
-                        if (!s_waitingFeedback && !guestRacing &&
+                        // THE GUARD IS NARROWED, NOT LIFTED.
+                        //
+                        // In a race a click IS a steer, and the guest's
+                        // cars are red, so the GLOVE detector
+                        // false-positives on them.  That part of the
+                        // old guard stands.
+                        //
+                        // What stood in the way of the one press that
+                        // mattered is the OTHER part: the port found
+                        // the guest's OWN in-race tutorial dialog's
+                        // orange "continue" button and refused to
+                        // touch it, so the guest sat on that dialog for
+                        // a whole round (MEASURED 2026-11-02, archive
+                        // 20261102-010143-eden-rr3-q98-dual-cadence: the
+                        // last frame, 3000, still shows the dialog with
+                        // the glove on the button).
+                        //
+                        // So the press is allowed when BOTH hold:
+                        //
+                        //   * the screen is QUIET.  A live race changes
+                        //     57..100 % of its pixels between two
+                        //     readbacks (measured 2026-10-30), so a
+                        //     quiet screen during a race is a MODAL
+                        //     DIALOGUE covering the scene.
+                        //   * the target is an ACCENT-COLOURED control.
+                        //     Orange and yellow are the guest's own
+                        //     convention for a PRIMARY ACTION, and a red
+                        //     car cannot be in either band.  The glove
+                        //     stays forbidden in a race.
+                        //
+                        // A live race satisfies neither, so the car
+                        // cannot be thrown off the track by this.
+                        const bool raceClickAllowed =
+                            !guestRacing || (screenQuiet && screenAccent);
+                        if (!s_waitingFeedback && raceClickAllowed &&
                             !tapper.pending()) {
                             // THE SEMANTIC REQUEST.
                             //
@@ -9561,7 +9623,11 @@ void* frameLoopDriver(void* opaque) {
                             // better eyesight, so it does not: it only ever
                             // presses what a human wrote down.
                             rr3::UiControl request{};
-                            if (rr3::uiControlNextRequest(&request)) {
+                            // A NAMED control is the front end's job.  In
+                            // a race it is a steer, exactly like a
+                            // glove press, so it stays blocked there.
+                            if (!guestRacing &&
+                                rr3::uiControlNextRequest(&request)) {
                                 const int cx = request.x + request.w / 2;
                                 const int cy = request.y + request.h / 2;
                                 const bool inside =
@@ -9614,6 +9680,21 @@ void* frameLoopDriver(void* opaque) {
                             }
                             for (int i = 0; i < targets.count; ++i) {
                                 const rr3::ui::Target& t = targets.items[i];
+                                // IN A RACE, ONLY THE ACCENT COLOURS.
+                                //
+                                // The glove is the guest's own red hint
+                                // hand, and in a race the guest's red
+                                // CARS look exactly like it -- that is
+                                // what the old guard was for, and it
+                                // stays.  Orange and yellow are a
+                                // different matter: they are the
+                                // guest's own primary-action convention,
+                                // and no car is painted in them.
+                                if (guestRacing &&
+                                    t.kind != rr3::ui::TargetKind::OrangeButton &&
+                                    t.kind != rr3::ui::TargetKind::YellowButton) {
+                                    continue;
+                                }
                                 int tries = 0;
                                 int slot = -1;
                                 for (int k = 0; k < s_triedCount; ++k) {
@@ -9661,11 +9742,12 @@ void* frameLoopDriver(void* opaque) {
                                         diag, sizeof(diag),
                                         "frame=%llu kind=%s x=%d y=%d area=%d "
                                         "w=%d h=%d screenChanged=%d moving=%d "
-                                        "racing=%d tried=%d",
+                                        "racing=%d quiet=%d tried=%d",
                                         static_cast<unsigned long long>(frames),
                                         kind, t.x, t.y, t.area, t.width, t.height,
                                         changed, screenMoving ? 1 : 0,
-                                        guestRacing ? 1 : 0, s_triedCount);
+                                        guestRacing ? 1 : 0,
+                                        screenQuiet ? 1 : 0, s_triedCount);
                                     appendGuestBootLine(
                                         "sdmc:/switch/rr3-native-rehost.guest-view.log",
                                         "ui-press", 250, 0, diag);
