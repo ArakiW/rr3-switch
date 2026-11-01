@@ -46,8 +46,30 @@ def main() -> None:
         assert "std::%s(text" % parser not in shim, parser
 
     # 3. The bound is a constant, and it is small.
-    assert "constexpr size_t kMaxScan = 128;" in shim
+    assert "constexpr size_t kMaxScan = 512;" in shim
     assert "for (size_t i = 0; i < kMaxScan; ++i)" in shim
+
+    # 3b. THE REGRESSION GUARD: A BOUND ON THE SCAN MUST NOT CHANGE THE
+    #     ANSWER.  The first version refused every string that was longer
+    #     than the window and answered 0; the guest parses long dotted
+    #     lists, so the guest got 0 where it expected a number and the
+    #     race's metrics came back empty (the car's pointer 0, the lap
+    #     distance -1).  A truncated string is LEGAL: the copy parses to
+    #     the same value the host's parser would have returned, and THAT
+    #     value is returned.
+    assert "TextState::Truncated" in shim
+    assert "TextState::Unreadable" in shim
+    for name in ("strtol", "strtoll", "strtoul", "strtoull", "strtod", "strtof"):
+        block = shim[shim.index("guest%s(" % name.capitalize()):]
+        block = block[:block.index("\n}\n")]
+        # the truncation branch must NOT return: it falls through to the parse
+        truncated = block[block.index("TextState::Truncated"):]
+        truncated = truncated.split("char* stop")[0]
+        # the comments may talk about "returned"; the CODE may not return.
+        code = "\n".join(line.split("//")[0] for line in truncated.split("\n"))
+        assert "return" not in code, name
+        # and the parse must run on the COPY
+        assert ".buffer" in block, name
 
     # 4. The guest's memory is read through a readability check.
     assert "svcQueryMemory" in shim
@@ -63,7 +85,8 @@ def main() -> None:
                "guestAtof"):
         assert fn in header, fn
 
-    print("guest_strto contract: 9 imports shimmed, copy bounded to 128 bytes")
+    print("guest_strto contract: 9 imports shimmed, copy bounded to 512 bytes, "
+          "a truncated string still answers with the copy's value")
 
 
 if __name__ == "__main__":

@@ -174,10 +174,21 @@ bool raceLineFit(const SplineFile& spline, const char* chunkName,
         return false;
     }
 
-    // REFINE the scale around the winner, in 1/64 steps, because the powers
-    // of two are a grid and the truth need not be on it.
-    for (int step = -32; step <= 32; ++step) {
-        const double scale = bestScale + static_cast<double>(step) / 64.0;
+    // REFINE the scale around the winner, MULTIPLICATIVELY.
+    //
+    // The powers of two are a grid, and the truth need not be on it: the
+    // guest multiplies the stored coordinates by 16 when it uses them, but
+    // the line the port can see is the CENTRE line, which is not the same
+    // length as the track the guest drives.  A refinement of +/-0.5 around
+    // the winning power of two cannot reach a scale that is a factor of 1.5
+    // away from it, and the fit would then report a large residual and
+    // REFUSE a line that is perfectly good.
+    //
+    // ⇒ The sweep covers 0.5x .. 2x of the winner, in 1/32 steps of the
+    // factor, which is 49 fits.
+    for (int step = 0; step <= 48; ++step) {
+        const double factor = 0.5 + static_cast<double>(step) / 32.0;
+        const double scale = bestScale * factor;
         if (scale <= 0.0) continue;
         transform(*chunk, bestVariant, scale, &poly);
         const Alignment alignment = alignOntoCar(poly, carX, carY, count);

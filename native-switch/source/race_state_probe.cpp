@@ -1976,7 +1976,19 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
     if (g_drive.brake) {
         g_drive.steer = -static_cast<float>(g_drive.sign) * kDriveRecoveryMagnitude;
     } else if (pursuit) {
-        g_drive.steer = static_cast<float>(steerError / g_driveConfig.steerGain);
+        // THE AXIS SIGN.  `steersign` is the pursuit's axis sign -- "a
+        // POSITIVE axis steers RIGHT" (MEASURED: lx=+0.6 at the launch
+        // ended up on the right runoff, .build/rr3-pad-mirror.txt) -- and
+        // the port's world frame has its Y NEGATED (the guest's converter at
+        // 0xf05600), so the handedness of the pursuit's error is NOT the
+        // handedness of the guest's steering axis.  The key existed and was
+        // never applied, because the pursuit had never run: the guest's own
+        // aim target was garbage, so the pursuit was always OFF.
+        //
+        // `sign` is a DIFFERENT key: it is the SWEEP's starting direction,
+        // not the pursuit's axis sign.
+        g_drive.steer = static_cast<float>(g_driveConfig.steerSign) *
+                        static_cast<float>(steerError / g_driveConfig.steerGain);
     }
     if (g_drive.steer > 1.0f) {
         g_drive.steer = 1.0f;

@@ -27,10 +27,18 @@ namespace {
 
 // HOW FAR THE HOST MAY LOOK.
 //
-// A number is short.  128 bytes is enough for any legitimate conversion
+// A number is short.  512 bytes is enough for any legitimate conversion
 // (including a long run of leading spaces) and short enough that a
 // pathological input cannot cost more than one bounded copy.
-constexpr size_t kMaxScan = 128;
+//
+// MEASURED 2026-11-01 (q90..q92): the guest parses DOTTED LISTS that are
+// longer than 128 bytes ("50.12.3c9.7.0.19.3.3.7.26.7.11.1..."), 150 of
+// them per round.  With a 128-byte window every one of them was TRUNCATED --
+// which is legal, and the copy still parses to the same value -- but the
+// first version of the shim answered 0 for a truncated string and the
+// guest's race metrics came back empty.  The window is 512 so that the
+// guest's own strings fit entirely and the truncation path is the rare one.
+constexpr size_t kMaxScan = 512;
 
 constexpr const char* kGuestViewLog = "sdmc:/switch/rr3-native-rehost.guest-view.log";
 
@@ -59,8 +67,9 @@ bool pageReadable(uintptr_t address) {
 
 enum class TextState {
     Ok,          // copied, and the NUL was found inside the window
-    Unreadable,  // a page of the string is not mapped and readable
-    Unterminated // the window ran out before the NUL
+    Truncated,   // the window ran out before the NUL: the string is LONGER
+                 // than the window, which is legal
+    Unreadable   // a page of the string is not mapped and readable
 };
 
 struct GuestText {
@@ -107,15 +116,34 @@ GuestText takeGuestText(const char* text) {
     }
     out.buffer[kMaxScan] = '\0';
     out.length = kMaxScan;
-    out.state = TextState::Unterminated;
+    out.state = TextState::Truncated;
     return out;
 }
 
 // The refusal is a NAMED EVENT, not a silent zero.
 //
-// The bytes that WERE read are printed, because "the guest called strtoul
-// on an unterminated string" is a fact and "the guest called strtoul on a
-// string that starts with 7f 31 2e 30" is a fact that points at the asset.
+// THE BYTES THAT WERE READ ARE PRINTED, because "the guest called strtod
+// on an unterminated string" is a fact and "the guest called strtod on a
+// string that starts with 37 30 2e 31 32 2e 33" is a fact that points at
+// the asset.
+//
+// AND THE TWO CASES ARE NOT THE SAME THING, WHICH IS WHY THEY ARE NOT
+// TREATED THE SAME WAY:
+//
+//   * TRUNCATED: the string is LEGAL and longer than the window.  The
+//     host's parser would have read the same leading bytes and stopped at
+//     the same place, so the copy parses to the SAME VALUE and the answer
+//     is returned.  Only the scan is bounded.
+//   * UNREADABLE: the pointer is not mapped.  The host's parser would have
+//     faulted, so there is no value to be faithful to; the answer is 0 and
+//     the refusal is logged.
+//
+// MEASURED 2026-11-01 (q90..q92): the first version treated BOTH as a
+// refusal and answered 0, and the guest then got 0 where it expected a
+// number -- the guest parses long dotted strings ("50.12.3c9.7.0.19...",
+// 150 of them per round), and the race's metrics came back EMPTY: the car's
+// pointer was 0 and the lap distance was -1.  **A BOUND ON THE SCAN MUST
+// NOT CHANGE THE ANSWER.**
 void logRefusal(const char* function, const char* text, const GuestText& copy) {
     char head[96]{};
     const size_t shown = copy.length < 32 ? copy.length : 32;
@@ -123,15 +151,21 @@ void logRefusal(const char* function, const char* text, const GuestText& copy) {
         std::snprintf(head + i * 2, 3, "%02x",
                       static_cast<unsigned>(static_cast<unsigned char>(copy.buffer[i])));
     }
+    const bool unreadable = copy.state == TextState::Unreadable;
     char details[320];
     std::snprintf(details, sizeof(details),
                   "fn=%s ptr=0x%llx state=%s bytes_read=%zu head=%s "
-                  "note=bounded_scan_refused_the_host_parser_never_saw_the_guest_string",
+                  "note=%s",
                   function, static_cast<unsigned long long>(
                                reinterpret_cast<uintptr_t>(text)),
-                  copy.state == TextState::Unterminated ? "unterminated" : "unreadable",
-                  copy.length, head);
-    rr3::appendGuestBootLine(kGuestViewLog, "guest-strto-refused", 0, 0, details);
+                  unreadable ? "unreadable" : "truncated",
+                  copy.length, head,
+                  unreadable
+                      ? "the_pointer_is_not_readable_the_host_parser_would_have_faulted"
+                      : "the_string_is_longer_than_the_window_the_value_is_the_copy_s_value");
+    rr3::appendGuestBootLine(kGuestViewLog, unreadable ? "guest-strto-refused"
+                                                       : "guest-strto-truncated",
+                              0, 0, details);
 }
 
 }  // namespace
@@ -145,10 +179,19 @@ void logRefusal(const char* function, const char* text, const GuestText& copy) {
 
 long guestStrtol(const char* text, char** end, int base) {
     const GuestText copy = takeGuestText(text);
-    if (copy.state != TextState::Ok) {
+    if (copy.state == TextState::Unreadable) {
+        // There is no value to be faithful to: the host's parser would
+        // have faulted on this pointer.
         logRefusal("strtol", text, copy);
         if (end != nullptr) *end = const_cast<char*>(text);
         return 0;
+    }
+    if (copy.state == TextState::Truncated) {
+        // The string is LEGAL and just longer than the window.  The
+        // host's parser would have read the same leading bytes and
+        // stopped in the same place, so the COPY parses to the same
+        // value and it is returned.  Only the scan is bounded.
+        logRefusal("strtol", text, copy);
     }
     char* stop = nullptr;
     const long value = std::strtol(copy.buffer, &stop, base);
@@ -161,10 +204,19 @@ long guestStrtol(const char* text, char** end, int base) {
 
 long long guestStrtoll(const char* text, char** end, int base) {
     const GuestText copy = takeGuestText(text);
-    if (copy.state != TextState::Ok) {
+    if (copy.state == TextState::Unreadable) {
+        // There is no value to be faithful to: the host's parser would
+        // have faulted on this pointer.
         logRefusal("strtoll", text, copy);
         if (end != nullptr) *end = const_cast<char*>(text);
         return 0;
+    }
+    if (copy.state == TextState::Truncated) {
+        // The string is LEGAL and just longer than the window.  The
+        // host's parser would have read the same leading bytes and
+        // stopped in the same place, so the COPY parses to the same
+        // value and it is returned.  Only the scan is bounded.
+        logRefusal("strtoll", text, copy);
     }
     char* stop = nullptr;
     const long long value = std::strtoll(copy.buffer, &stop, base);
@@ -177,10 +229,19 @@ long long guestStrtoll(const char* text, char** end, int base) {
 
 unsigned long guestStrtoul(const char* text, char** end, int base) {
     const GuestText copy = takeGuestText(text);
-    if (copy.state != TextState::Ok) {
+    if (copy.state == TextState::Unreadable) {
+        // There is no value to be faithful to: the host's parser would
+        // have faulted on this pointer.
         logRefusal("strtoul", text, copy);
         if (end != nullptr) *end = const_cast<char*>(text);
         return 0;
+    }
+    if (copy.state == TextState::Truncated) {
+        // The string is LEGAL and just longer than the window.  The
+        // host's parser would have read the same leading bytes and
+        // stopped in the same place, so the COPY parses to the same
+        // value and it is returned.  Only the scan is bounded.
+        logRefusal("strtoul", text, copy);
     }
     char* stop = nullptr;
     const unsigned long value = std::strtoul(copy.buffer, &stop, base);
@@ -193,10 +254,19 @@ unsigned long guestStrtoul(const char* text, char** end, int base) {
 
 unsigned long long guestStrtoull(const char* text, char** end, int base) {
     const GuestText copy = takeGuestText(text);
-    if (copy.state != TextState::Ok) {
+    if (copy.state == TextState::Unreadable) {
+        // There is no value to be faithful to: the host's parser would
+        // have faulted on this pointer.
         logRefusal("strtoull", text, copy);
         if (end != nullptr) *end = const_cast<char*>(text);
         return 0;
+    }
+    if (copy.state == TextState::Truncated) {
+        // The string is LEGAL and just longer than the window.  The
+        // host's parser would have read the same leading bytes and
+        // stopped in the same place, so the COPY parses to the same
+        // value and it is returned.  Only the scan is bounded.
+        logRefusal("strtoull", text, copy);
     }
     char* stop = nullptr;
     const unsigned long long value = std::strtoull(copy.buffer, &stop, base);
@@ -209,10 +279,19 @@ unsigned long long guestStrtoull(const char* text, char** end, int base) {
 
 double guestStrtod(const char* text, char** end) {
     const GuestText copy = takeGuestText(text);
-    if (copy.state != TextState::Ok) {
+    if (copy.state == TextState::Unreadable) {
+        // There is no value to be faithful to: the host's parser would
+        // have faulted on this pointer.
         logRefusal("strtod", text, copy);
         if (end != nullptr) *end = const_cast<char*>(text);
         return 0.0;
+    }
+    if (copy.state == TextState::Truncated) {
+        // The string is LEGAL and just longer than the window.  The
+        // host's parser would have read the same leading bytes and
+        // stopped in the same place, so the COPY parses to the same
+        // value and it is returned.  Only the scan is bounded.
+        logRefusal("strtod", text, copy);
     }
     char* stop = nullptr;
     const double value = std::strtod(copy.buffer, &stop);
@@ -225,10 +304,19 @@ double guestStrtod(const char* text, char** end) {
 
 float guestStrtof(const char* text, char** end) {
     const GuestText copy = takeGuestText(text);
-    if (copy.state != TextState::Ok) {
+    if (copy.state == TextState::Unreadable) {
+        // There is no value to be faithful to: the host's parser would
+        // have faulted on this pointer.
         logRefusal("strtof", text, copy);
         if (end != nullptr) *end = const_cast<char*>(text);
         return 0.0f;
+    }
+    if (copy.state == TextState::Truncated) {
+        // The string is LEGAL and just longer than the window.  The
+        // host's parser would have read the same leading bytes and
+        // stopped in the same place, so the COPY parses to the same
+        // value and it is returned.  Only the scan is bounded.
+        logRefusal("strtof", text, copy);
     }
     char* stop = nullptr;
     const float value = std::strtof(copy.buffer, &stop);

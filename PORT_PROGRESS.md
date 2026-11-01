@@ -11801,3 +11801,59 @@ takes the bytes from the very candidate the guest is about to read, so the
 port's line and the guest's line are the same bytes whatever that rebuild
 did; but the four misses per track are the guest paying for a name the
 rebuild does not carry, and that is worth chasing on its own.
+
+### 2026-11-01 (20:50): A BOUND ON THE SCAN MUST NOT CHANGE THE ANSWER
+
+**The regression, and how it was found.**  The bounded `strto*` shim (the
+entry above) was supposed to stop the host's unbounded scan.  It did -- and it
+BROKE THE RACE, in a way that looked like a different problem entirely.
+
+**The symptom.**  q88, q90, q91 and q92 all read the car's world position as
+`cpos=0,0,0` with `car=0x0`, while q84 (and everything before it) read
+`cpos=150307,53299,119` with `car=0x21347fdab0`.  The race metrics were
+found and their members resolved (`mres=0x3f`), but the CAR POINTER was zero
+and the lap distance was -1: the port was looking at a RaceMetrics object
+that had no car in it yet.
+
+**The bisect.**  Neither `c906f421` nor `8be2f439` touched the car's read
+path -- `git show` on both, filtered for the read lines, comes back empty.
+So the break was not in the code that reads the car.
+
+**The actual cause, and it was in the log all along.**  The shim logs every
+refusal, and there are 150 of them per round -- all of them `strtod`, all of
+them `state=unterminated`, and the bytes it printed are the answer:
+
+```
+head=35302c31322e3363392e372c302c31392e332c332e372c32362e372c31312e31
+     = "50.12.3c9.7.0.19.3.3.7.26.7.11.1"
+```
+
+⇒ The guest parses long DOTTED LISTS, and they are longer than the
+128-byte window.  The first version of the shim treated "longer than the
+window" as "refuse", and answered **0** -- so the guest got 0 where it
+expected a number, 150 times a round, and its race metrics came back empty.
+**A fix that changes the value is not a fix.**
+
+⇒ **THE RULE, AND IT IS GENERAL:** *bounding a scan must not change the
+answer.*  The host's parser would have read the same leading bytes and
+stopped in the same place, so the bounded copy parses to the SAME value and
+THAT value is returned.  Only a pointer that is not mapped has no value to
+be faithful to (the host's parser would have faulted), and only that case is
+refused with 0.
+
+⇒ The window is now 512 bytes, so the guest's own strings fit entirely and
+the truncation path is the rare one; and the two cases are separate states
+(`Truncated` vs `Unreadable`) with separate log lines
+(`guest-strto-truncated` vs `guest-strto-refused`).
+
+⇒ **AND THE CONTRACT TEST NOW HOLDS THE REGRESSION GUARD**: for each of the
+six conversions, the truncated branch must NOT return -- it has to fall
+through to the parse of the copy (`test_guest_strto_contract.py`).
+
+**WHAT THIS ALSO SAYS ABOUT THE EARLIER ENTRY.**  The freeze was real and
+the shim fixed it (q89: 3 frames; q90: 3360 frames, the whole round).  But
+the shim's refusal path quietly broke the race, and it took four rounds to
+notice, because the symptom (the car's position reads zero) does not look
+like the cause (a bounded libc call answering 0).  ⇒ **A FIX TO THE GUEST'S
+PLUMBING HAS TO BE MEASURED ON THE GUEST'S BEHAVIOUR, NOT ONLY ON THE
+THING THAT WAS BROKEN.**

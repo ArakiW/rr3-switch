@@ -54,10 +54,12 @@ def main() -> None:
     assert "alignOntoCar" in source
     assert "nearestOnPolyline(poly, carX[i], carY[i], &qx, &qy)" in source
 
-    # 2. The scale search covers the powers of two and then refines, so a
-    #    wrong guess does not decide the fit.
+    # 2. The scale search covers the powers of two and then sweeps
+    #    MULTIPLICATIVELY around the winner, because the truth need not be on
+    #    the power-of-two grid.
     assert "kScales[] = {1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0}" in source
-    assert "for (int step = -32; step <= 32; ++step)" in source
+    assert "for (int step = 0; step <= 48; ++step)" in source
+    assert "const double factor = 0.5 + static_cast<double>(step) / 32.0;" in source
 
     # 3. All eight axis variants are tried, because the guest's axes and the
     #    spline's axes are not documented to agree.
