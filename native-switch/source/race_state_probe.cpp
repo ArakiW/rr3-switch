@@ -2238,7 +2238,27 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
             // is a steering command derived from noise.  With the gate the
             // pursuit stays OFF (pur=0) instead of turning the car at
             // random.
-            if (hLen > 0.05) {
+            if (hLen > 0.05 && !g_drive.brake) {
+                // THE HEADING IS NOT UPDATED WHILE THE CAR IS REVERSING.
+                //
+                // The heading is the direction of TRAVEL, and the recovery
+                // deliberately drives the car BACKWARDS -- so a heading taken
+                // from a reversing car points behind the car, the target is
+                // ahead of it, and the pursuit's error becomes about 180
+                // degrees.  The port then steers at FULL LOCK in the wrong
+                // direction and the car reverses further, and the loop never
+                // ends.
+                //
+                // MEASURED 2026-11-02 (q116): the pursuit was ON in 93 of 164
+                // samples for the first time, and the error it computed was
+                // 2.2562 rad -- 129 degrees -- while the car was 1.38 m from
+                // the fitted line and the look-ahead point was 4.4 m ahead of
+                // it.  A car 1.38 m off the line does not need 129 degrees of
+                // correction; it needs a heading that is not pointing
+                // backwards.
+                //
+                // So the last FORWARD heading is kept while the recovery
+                // reverses the car, and the pursuit can steer it back.
                 s_headingX = hx / hLen;
                 s_headingY = hy / hLen;
                 s_haveHeading = true;

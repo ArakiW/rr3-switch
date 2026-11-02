@@ -13045,3 +13045,55 @@ right for a car nose-into-a-wall and wrong for a car that is simply stopped.
 ⇒ **⇒ and the sign has to be measured AGAIN, with the pursuit actually
 running.**  The value in the shipped rr3-drive.txt (-1) is not a measurement of
 the pursuit's handedness; it is a measurement of the recovery's.
+## THE PURSUIT IS ON, AND IT IS AIMING 129 DEGREES AWAY FROM A CAR THAT IS 1.38 METRES OFF THE LINE
+
+q116 (archive `20261102-135331-eden-rr3-q116-pursuit-on`) is the round where
+the pure pursuit ran at all:
+
+```
+q114:  pur=1 in 0 of 228 samples
+q115:  pur=1 in 4 of 233 samples
+q116:  pur=1 in 93 of 164 samples
+```
+
+⇒ the heading is kept while the car is standing still, and the pursuit
+finally has something to steer with.
+
+And it produced the most telling measurement of the whole series:
+
+```
+f=6720  snode=238  sdist=8015
+        cpos=144927,-54056,172      ctgt=140544,-53848,172   ctok=1
+        line=1  lres=1.38  pur=1  perr=2.2562  steer=-1.000
+        thr=0 brk=1  stalls=22  rate=-0.516667
+```
+
+Read it: the car is **1.38 metres** from the fitted racing line, the
+look-ahead point is **4.4 metres ahead of it** and in the right direction
+(`ctok=1`), and the pursuit is asking for **2.2562 radians -- 129 degrees --
+of correction**, and is at **full lock**.
+
+**A car 1.38 m off the line does not need 129 degrees of correction.**  It
+needs a heading that is not pointing backwards.
+
+### WHY THE HEADING POINTS BACKWARDS
+
+The heading is the direction of TRAVEL, and the recovery deliberately drives
+the car BACKWARDS.  So:
+
+```
+no progress -> the recovery brakes -> the car reverses
+            -> the heading (taken from the motion) now points BEHIND the car
+            -> the target is AHEAD of it -> the error is about 180 degrees
+            -> the port steers at full lock in the wrong direction
+            -> the car reverses further -> the loop never ends
+```
+
+⇒ the last FORWARD heading is now kept while the recovery reverses the car,
+so the pursuit can steer it back onto the line instead of fighting itself.
+
+⇒ **and the sign is STILL not measured.**  The pursuit's own axis sign has
+never been exercised with the pursuit actually running; the earlier
+comparison settled the RECOVERY's direction.  The value in rr3-drive.txt is a
+reasoned default (the port's world frame has its Y negated), and the round
+that measures it is the one after this.
