@@ -190,7 +190,16 @@ else {
     # the installer's own positive control (2,594 bytes missing).
     $dataFiles = @(Get-ChildItem -LiteralPath $sourceData -File | Sort-Object Name)
     foreach ($file in $dataFiles) {
-        if ($wantedVolumes -notcontains $file.Name) {
+        # THE MANIFEST IS NOT A VOLUME AND IS NEVER OMITTED.
+        #
+        # rr3-data-manifest.json says what is inside each volume (the file
+        # counts, the byte totals and the sha256 of each one), and the port
+        # reads it to know what it is looking at.  A filter that says "omit
+        # everything that is not in the wanted-volume list" omits the
+        # manifest too -- and the game then has no idea what its data
+        # volumes contain.  So the omission list is EXACTLY the two named
+        # volumes and nothing else.
+        if ($miniOmits -contains $file.Name) {
             Write-Host ("omitted   : {0,-24} {1,14:N0} bytes (the mini profile)" -f `
                 $file.Name, $file.Length)
             continue
@@ -216,6 +225,13 @@ else {
     }
     if ($missing) {
         Write-Error ("volumes missing on the card: {0}" -f ($missing -join ', '))
+        exit 3
+    }
+    # THE MANIFEST HAS TO BE THERE.  It is what says what is inside the
+    # volumes, and the port reads it.
+    $manifest = Join-Path $targetData 'rr3-data-manifest.json'
+    if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
+        Write-Error 'rr3-data-manifest.json is missing from the card'
         exit 3
     }
 }
@@ -300,3 +316,12 @@ Write-Host "Expect: the port's loading screen (skipped by design), then the gues
 Write-Host "front end, then a race.  Then send back:"
 Write-Host ("  {0}" -f (Join-Path $appDir 'rr3-native-rehost.guest-view.log'))
 Write-Host "the phase=race-state lines are the ones that matter."
+
+# EXIT 0, EXPLICITLY.
+#
+# The last native command in this script is robocopy, and robocopy returns 1
+# when it SUCCEEDS.  Without this line the script's exit code is that 1, and
+# a caller that checks the exit code concludes the install failed when it
+# worked.  (Measured: the install was complete and verified, and the
+# installer still exited 1.)
+exit 0
