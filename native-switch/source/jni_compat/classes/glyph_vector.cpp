@@ -152,6 +152,29 @@ constexpr FaceChoice kGameFaces[] = {
     {"LCD.ttf", "romfs:/ui/LCD.ttf"},
     {"minion_pro_italic.otf", "romfs:/ui/minion_pro_italic.otf"},
     {"myriadp0.otf", "romfs:/ui/myriadp0.otf"},
+    // THE SYMBOL FONT, USED AS ITSELF.
+    //
+    // r3_symbols.ttf used to be substituted with the text face, and the
+    // frame shows what that cost: the three currency readouts in the top
+    // bar came out as the LETTERS "MS", "RS" and "C", because the symbol
+    // font's codepoints were being looked up in ConduitITCPro-Regular (653
+    // glyphs, no symbols).  The game's own icons were simply not there.
+    //
+    // And the size was wrong with them: r3_symbols.ttf has upem 2048 and
+    // Conduit has upem 1000, so the SAME requested size drew the icon at
+    // half the intended scale.
+    //
+    // The reason it was substituted is still true for PARAGRAPHS -- the
+    // symbol font's "digits" are 2.3 x 2.3 em boxes, so a paragraph drawn
+    // with it is solid boxes.  But the game does not draw paragraphs with
+    // it: it draws single icons, one glyph at a time.  So the font is used
+    // as itself now, and the frame is the judge.
+    //
+    // It lives on the CARD, not in the NRO's romfs: the NRO carries the
+    // Latin and CJK UI faces, and the game's symbol face is 72,468 bytes
+    // that the guest asks for by name (the log says
+    // "req=sdmc:/switch/rr3-native-rehost/.depot/r3_symbols.ttf").
+    {"r3_symbols.ttf", "sdmc:/switch/rr3-native-rehost/.depot/r3_symbols.ttf"},
 };
 
 // THE FACES THAT ARE NOT TEXT.
@@ -162,15 +185,19 @@ constexpr FaceChoice kGameFaces[] = {
 // placeholder boxes the game draws its currency and badge art into, not
 // letters, and drawing a paragraph with them produces solid boxes.
 //
-// So the port deliberately draws those with the text face instead. It is a
-// DECISION in the source, not an accident of a missing needle, and the log
-// says when it happened.
+// r3_symbols.ttf IS NOT IN THIS LIST ANY MORE.  It was, and that made the
+// port draw the game's ICONS with the Latin text face: the frame showed the
+// currency readouts as the letters "MS", "RS" and "C" instead of icons, and
+// at half the size, because the symbol font's upem is 2048 and the text
+// face's is 1000.
 //
-// LCD.ttf is NOT in this list, even though its upem is 2048 too: it is the
-// game's display face for the HUD's digits, and its digit advances 0.71 em
-// with an ink box 0.62 x 1.00 em. It is used as it is.
+// The substitution is right for a PARAGRAPH and wrong for a single glyph,
+// and the game draws icons with this font one glyph at a time.  So the font
+// is used as itself (see kGameFaces) and the frame is the judge.
+//
+// r3_decals.ttf IS STILL HERE: it is not staged anywhere the port can open,
+// so it still falls back to the text face, and the log still says so.
 constexpr const char* kNonTextFaces[] = {
-    "r3_symbols.ttf",
     "r3_decals.ttf",
 };
 

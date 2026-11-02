@@ -13308,3 +13308,139 @@ Both found by RUNNING it on a blank card directory:
 
 ⇒ **the manifest bug is the same shape as the one in the ports before it: a
 filter that is slightly too wide eats a file it was not thinking about.**
+
+## THE CONSOLE DIED AT THE FIRST EGL CALL, AND THE ICONS WERE NEVER DRAWN
+
+Two defects, both found by reading the console's own log against the
+emulator's, and both fixed with the measurement written into the source.
+
+### THE CONSOLE'S LOG IS 292 KB. THE EMULATOR'S IS 39 MB.
+
+The user reported: black screen, then about ten seconds later "the software
+was closed because of an error".  The console's guest-view log is **292,710
+bytes / 1,175 lines**.  The emulator's is 39,180,669 bytes / 190,447 lines,
+and it was **295,222 bytes at t=10s**.
+
+⇒ **⇒ THE CONSOLE DIED AT THE SAME PLACE THE EMULATOR WAS AT AFTER TEN
+SECONDS.**  That is a measurement, not a guess: the log's byte count is the
+same to within 0.8%.
+
+Line by line, the two logs agree up to `phase=guest-frame-selftest
+verdict=SELFTEST_PASS` -- the last line the console has.  The emulator's
+next lines are:
+
+```
+phase=census-arm
+phase=census-deinfo-frame-selftest ... verdict=SELFTEST_PASS
+phase=census-bind
+phase=gl-ctx-early ... surfaceless ok, glGetString=OpenGL ES 3.2 Mesa 20.1.0-rc3
+phase=census-pc
+phase=rebase: img=0 ... ctors=181 ctor0ok=1
+```
+
+⇒ **THE CONSOLE NEVER REACHED `gl-ctx-early`.**  It never made an EGL call
+at all.  And the console's `teardown-repair.log` ends with
+`verdict=TEARDOWN_REPAIR_PASS`, so the startup self-tests themselves passed.
+
+### WHAT `gl-ctx-early` IS, AND WHY IT IS FATAL ON A CONSOLE
+
+`ensureEarlyGuestGlContext()` (source/guest_view_probe.cpp) creates an EGL
+context and makes it current **SURFACELESS**:
+
+```c
+eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, context)
+```
+
+It exists for a measured reason: the guest samples `glGetString(GL_VERSION)`
+exactly once, in its early initialisation (0x128a17c: `glGetString` ->
+`strstr("OpenGL ES")` -> `sscanf("%d.%d")`), and without a current context
+Mesa returns NULL, the version stays 0, and the GL assert guard at
+0x14851e8 (whose silent-return branch is "major < 3") is on the wrong side
+for the rest of the process.
+
+⇒ **A surfaceless `eglMakeCurrent` is legal on the emulator's software Mesa
+and is NOT legal on the real NVN driver.**  The console faults inside the
+kernel and comes back as "the software was closed because of an error".
+
+⇒ **⇒ THE FIX IS TO STOP NEEDING IT.**  The port already intercepts the
+guest's `glGetString` (source/gfx/gfx_gles.cpp, the `--wrap` list and the
+generated proc table).  It only FORWARDED `GL_VERSION` to the driver.  Now,
+**when there is no current context, the host answers**:
+
+| query | answer with no context |
+|---|---|
+| `GL_VERSION` | `OpenGL ES 3.2 Mesa 20.1.0-rc3` |
+| `GL_RENDERER` | the substituted identity (`PowerVR Rogue GE8320 (Mesa 20.1.0-rc3)`) |
+| `GL_VENDOR` | `Imagination Technologies` |
+| `GL_SHADING_LANGUAGE_VERSION` | `OpenGL ES GLSL ES 3.20` |
+
+⇒ that is the **same string Mesa reports**, so the guest parses the same
+version numbers it always did, and the port makes **no EGL call at all**
+before the guest's own WINDOWED context.
+
+⇒ **`glctxearly` now defaults to 0** (`glctxearly=1` brings the old
+behaviour back for an A/B).  MEASURED in the emulator, archive
+`20261102-172518-eden-rr3-q121-no-early-gl`:
+
+```
+phase=gl-ctx-early   ... disabled by conf
+phase=view-egl-init-begin -> view-egl-init-ok -> view-egl-surface-ok
+   -> view-egl-context-ok -> view-egl-current-ok
+```
+
+⇒ the first EGL call is now the guest's own windowed surface on the NWindow,
+which is what the NVN driver supports.
+
+⇒ It also fixes a latent bug: when the early context was current on the
+HOST's thread but the guest sampled from another one, the guest's answer was
+NULL, the version stayed 0, and the assert guard silently returned for the
+whole run.
+
+### THE ICONS WERE NEVER DRAWN
+
+The frame (archive 20261102-154600-eden-rr3-q120-physical-pad-path,
+frames/frame-000300.png) shows the guest's own front end at 1280x720, and
+three readouts in the top bar say:
+
+```
+MS 500,000      RS 22,141,500      C 20,354
+```
+
+⇒ **those are LETTERS where the game's CURRENCY ICONS should be.**  The
+guest draws them with `r3_symbols.ttf`, and the port was substituting the
+text face for it (`kNonTextFaces`), so the symbol font's codepoints were
+looked up in `ConduitITCPro-Regular` -- 653 glyphs, no symbols -- and the
+codes that happened to exist came out as letters.
+
+⇒ and the SIZE was wrong too: `r3_symbols.ttf` has **upem 2048** and
+Conduit has **upem 1000**, so the same requested size drew every icon at
+**half** the intended scale.
+
+⇒ the reason for the substitution is still true for PARAGRAPHS: the symbol
+font's "digits" are 2.29 x 2.28 em boxes, and a paragraph drawn with it is
+solid boxes.  But the game draws ICONS with that font, one glyph at a time.
+⇒ **⇒ `r3_symbols.ttf` is now opened AS ITSELF**, from the card
+(`sdmc:/switch/rr3-native-rehost/.depot/r3_symbols.ttf`), and it is out of
+the not-text list.  `r3_decals.ttf` stays in it: the port cannot open that
+one anywhere, so it still falls back, and the log still says so.
+
+⇒ **⇒ AND THE PACKAGING HAD DROPPED IT.**  The prune list that trims the
+card tree collected the paths the port SERVED from the card -- and a file
+the guest asks for but the port substitutes is never served, so it was cut.
+The shipped package had **no symbol font in it at all**: a missing-character
+bug caused by the packaging, not by the port.
+
+⇒ **⇒ THE PRUNE LIST IS NOW "EVERY CARD PATH THE LOG MENTIONS"**, not
+"every card path that was served".  The instrument was measuring the wrong
+thing.
+
+### THE TWO THINGS THAT ARE STILL TRUE
+
+* the sign font is still wrong for a PARAGRAPH, so the port's own native UI
+  (Chinese) must not use it;
+* the console's ten seconds of BLACK before anything appears are the port's
+  own startup work (the asset-invariant check alone is 7,519 ms), and the
+  native loading screen is off because `nofb=1` is what keeps the guest's
+  EGL surface clean.  Turning it on needs the framebuffer and the guest's
+  surface to stop fighting over the NWindow, which is a separate piece of
+  work.

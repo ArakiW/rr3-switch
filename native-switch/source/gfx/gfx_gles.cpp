@@ -83,6 +83,26 @@ constexpr const char* kGlRenderer = "Adreno (TM) 420";
 constexpr const char* kGlVersion = "OpenGL ES 2.0 (GIT_20260802)";
 constexpr const char* kGlslVersion = "OpenGL ES GLSL ES 1.00";
 
+// THE VERSION ANSWERED WHEN THERE IS NO CONTEXT.
+//
+// It has to say major 3 or higher, and it has to be the SAME string the
+// driver reports, because the guest does two things with it:
+//
+//   * it parses it ("OpenGL ES" + sscanf "%d.%d") into the version numbers
+//     it keeps for the rest of the process;
+//   * and the GL assert guard at 0x14851e8 silently returns when major < 3.
+//
+// The null backend's kGlVersion says "OpenGL ES 2.0", so it CANNOT be used
+// here: the guest would parse major 2 and every GL assert would fail
+// silently for the whole run.
+//
+// Mesa 20.1.0-rc3 on this console answers "OpenGL ES 3.2 Mesa 20.1.0-rc3"
+// (measured, archive 20261102-153631-eden-rr3-q119-gamepad-layer, phase
+// gl-ctx-early), and that is the string the guest has always seen on the
+// working path. So the host answers exactly that.
+constexpr const char* kGlVersionNoContext = "OpenGL ES 3.2 Mesa 20.1.0-rc3";
+constexpr const char* kGlslVersionNoContext = "OpenGL ES GLSL ES 3.20";
+
 // Only extensions whose entry points are actually answered above. Advertising
 // one we cannot answer is how an engine ends up dereferencing a generic stub
 // that has to write an array.
@@ -278,6 +298,45 @@ extern "C" const GLubyte* __wrap_glGetString(GLenum name) {
         case GL_EXTENSIONS:
             return reinterpret_cast<const GLubyte*>(kGlExtensions);
         default: return reinterpret_cast<const GLubyte*>("");
+        }
+    }
+    // NO CONTEXT YET?  THEN THE HOST ANSWERS, NOT THE DRIVER.
+    //
+    // THE CONSOLE DIED HERE.  The guest samples GL_VERSION exactly once, in
+    // its early initialisation (0x128a17c), and the port used to make a
+    // SURFACELESS EGL context exist just so that this call had a driver to
+    // ask.  A surfaceless eglMakeCurrent is legal on the emulator's
+    // software Mesa and is NOT legal on the real NVN driver: the console
+    // faults inside the kernel and comes back as "the software was closed
+    // because of an error" (measured: archive
+    // 20261102-154600-eden-rr3-q120-physical-pad-path stops before
+    // phase=gl-ctx-early, and no EGL call is logged at all).
+    //
+    // So the answer is produced HERE.  The guest gets the same string it
+    // got from Mesa, so nothing about the guest's behaviour changes -- and
+    // the port does not have to touch EGL before the guest's own WINDOWED
+    // context, which the real driver does support.
+    //
+    // It also fixes a latent bug: when the context was current on the
+    // HOST's thread but the guest sampled from another one, the guest's
+    // answer was NULL, the version stayed 0, and the assert guard at
+    // 0x14851e8 silently returned for the rest of the run.
+    if (eglGetCurrentContext() == EGL_NO_CONTEXT) {
+        switch (name) {
+        case GL_VENDOR: {
+            const char* v = glVendorString();
+            return reinterpret_cast<const GLubyte*>(v != nullptr ? v : kGlVendor);
+        }
+        case GL_RENDERER: {
+            const char* r = glRendererString();
+            return reinterpret_cast<const GLubyte*>(r != nullptr ? r : kGlRenderer);
+        }
+        case GL_VERSION:
+            return reinterpret_cast<const GLubyte*>(kGlVersionNoContext);
+        case GL_SHADING_LANGUAGE_VERSION:
+            return reinterpret_cast<const GLubyte*>(kGlslVersionNoContext);
+        default:
+            return reinterpret_cast<const GLubyte*>("");
         }
     }
     // The guest's GPU tier comes from GL_RENDERER, so the identity has to be

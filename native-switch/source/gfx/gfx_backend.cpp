@@ -319,12 +319,21 @@ struct ConfState {
     // late. With no context Mesa returns NULL, sscanf never runs, and the
     // guest's GLES major version stays 0 for the rest of the process.
     //
-    // The early context is surfaceless (EGL_NO_SURFACE), which the guest's own
-    // EGL_KHR_surfaceless_context extension list says is supported. That is the
-    // point of doing it this way: no surface is taken on the NWindow, so the
-    // view probe's own ladder is untouched and cannot end up with two surfaces
-    // on one window.
-    bool earlyGlContext = true;
+    // THE EARLY CONTEXT IS OFF BY DEFAULT NOW, because it is what killed the
+    // console.  It was surfaceless (EGL_NO_SURFACE), which the guest's own
+    // EGL_KHR_surfaceless_context extension list says is supported -- and it
+    // is, on the emulator's software Mesa.  On the real NVN driver it is
+    // NOT: the console faults inside the kernel and comes back as "the
+    // software was closed because of an error" (measured: archive
+    // 20261102-154600-eden-rr3-q120-physical-pad-path stops before
+    // phase=gl-ctx-early, with no EGL call logged at all).
+    //
+    // It is not needed any more either: the host's glGetString shim answers
+    // GL_VERSION from the host when there is no context (see gfx_gles.cpp),
+    // with the SAME string Mesa reports, so the guest parses the same
+    // version numbers it always did.  "glctxearly=1" brings the old
+    // behaviour back for whoever wants to A/B it.
+    bool earlyGlContext = false;
     // "gpuid=powervr|adreno|native" -- which GL identity the guest is told it
     // is running on. Default powervr because that is the one whose guest-side id
     // is 4, and the render loop at 0x12af190 does `cmp #4 / b.ne` and will not
