@@ -12992,3 +12992,56 @@ the garbage rates that were braking the car are gone.
 
 ⇒ the next work is the pursuit's aim point and its magnitude, and the
 recovery needs an exit instead of a reset.
+## THE PURSUIT WAS NEVER ON: A CAR THAT IS STANDING STILL HAS NO HEADING
+
+q115's log, read for the pursuit instead of for the steering value:
+
+```
+q114:  pur=1 in 0 of 228 samples
+q115:  pur=1 in 4 of 233 samples
+```
+
+**The pure pursuit was essentially never running.**  Every steering value in
+those rounds -- the +-0.600 that looked like the pursuit tracking the line --
+was the RECOVERY's full lock.
+
+### WHY
+
+The heading is the difference of two position samples (the car object carries
+no heading of its own), and the pursuit used to switch itself off when that
+difference was too small to be a direction:
+
+```cpp
+if (hLen > 0.05 && dLen > 0.05 && m.targetPlausible) { ... pursuit = true; }
+```
+
+⇒ **a car that is not moving has no heading, and the pursuit turns itself off
+exactly when it is needed.**  And the deadlock closes:
+
+```
+no progress -> the recovery brakes -> the car does not move -> no heading
+            -> the pursuit is off -> the recovery steers the other way
+            -> still no progress
+```
+
+### AND THE CORRECTION
+
+q114 and q115 compared `steersign=+1` with `steersign=-1` and the car ended
+up in the sand and then on the apron respectively, so it LOOKED like the sign
+had been settled.  It had not: **the pursuit was off in both rounds**, so what
+changed was the RECOVERY's direction (the recovery steers `-sign`, i.e. the
+opposite of `sign`), and the pursuit's own handedness is still UNMEASURED.
+
+⇒ the last known heading is now KEPT while the car is standing still: a
+stopped car has not changed its heading, and the pursuit can steer it off the
+spot.
+
+⇒ and the pursuit now WINS over the recovery.  The recovery keeps the BRAKE
+(the guest's own "hold the brake to reverse" message) and the pursuit keeps
+the WHEEL, because the pursuit's target is on the racing line and its
+direction is the right one; the recovery's "point the wheel the other way" was
+right for a car nose-into-a-wall and wrong for a car that is simply stopped.
+
+⇒ **⇒ and the sign has to be measured AGAIN, with the pursuit actually
+running.**  The value in the shipped rr3-drive.txt (-1) is not a measurement of
+the pursuit's handedness; it is a measurement of the recovery's.

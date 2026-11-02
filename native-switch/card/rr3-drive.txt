@@ -25,27 +25,24 @@
 #                   aiming that means FULL LOCK.  0.50 rad = 28.6 degrees.
 # steersign=1|-1    the sign of the axis.  A POSITIVE axis 0 steers RIGHT
 #                   (MEASURED: lx=+0.6 at the launch ended up on the right
-#                   runoff, .build/rr3-pad-mirror.txt); the world frame's
-#                   handedness is the one thing here that is not measured,
-#                   so this is a knob and one round settles it.
+#                   runoff, .build/rr3-pad-mirror.txt); the port's world frame
+#                   has its Y NEGATED (the guest's converter at 0xf05600), so
+#                   the handedness of the pursuit's error is NOT the
+#                   handedness of the guest's steering axis.
 #
-# THE SIGN IS NOW -1, AND IT IS NOT A GUESS: IT IS MEASURED.
+# THE SIGN IS -1, AND IT IS A REASONED DEFAULT, NOT A MEASUREMENT -- YET.
 #
-# THE ROUND THAT SETTLED IT: 2026-11-02 (q114, archive
-# 20261102-133201-eden-rr3-q114-car-progress).  This is the first round in
-# which the pursuit actually RAN -- the car reached the race, the port
-# adopted the racing line (line=1, lres=0.20 m) and drove -- and the
-# captured frame 4000 shows where the car ended up: ON THE TRACK'S EDGE, IN
-# THE GRAVEL, with the HUD up and the position reading 7.
+# MEASURED 2026-11-02 (q114, q115): the car drove, and with steersign=+1 it
+# ended up in the SAND off the circuit, with steersign=-1 on the track apron
+# against the tyre wall.  BUT the same two rounds' logs say `pur=1` in 0 of
+# 228 and 4 of 233 samples: the PURSUIT WAS NEVER ON.  What those rounds
+# compared was the RECOVERY's direction (the recovery steers `-sign`), so the
+# pursuit's own handedness is still unmeasured.
 #
-# With steersign=+1 the pursuit steers the wrong way, so the car leaves the
-# circuit at the first corner.  With the sign flipped the pursuit's error
-# and the guest's steering axis have the same handedness.
-#
-# The other sign, `sign`, is a DIFFERENT key: it is the SWEEP's starting
-# direction, not the pursuit's axis sign, and it is -1 for the reason
-# measured on 2026-10-24 (a positive axis steers right, and the straight
-# bends left).
+# -1 is kept because the port's world frame has its Y negated, so the
+# pursuit's error and the guest's steering axis have opposite handedness.
+# The round that settles it is the one in which the pursuit actually runs
+# (the heading is now kept while the car is standing still, so it does).
 #
 # The loop flips the sign itself when the guest's progress rate goes NEGATIVE
 # (the car is travelling against the spline's direction, i.e. round the track

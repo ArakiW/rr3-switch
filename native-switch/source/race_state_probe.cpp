@@ -2196,6 +2196,28 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
         static double s_lastX = 0.0;
         static double s_lastY = 0.0;
         static bool s_haveLast = false;
+        // THE LAST KNOWN HEADING, KEPT WHILE THE CAR IS STANDING STILL.
+        //
+        // The heading is the difference of two position samples, and the
+        // car object carries no heading of its own.  So a car that is NOT
+        // MOVING has no heading -- and the pursuit used to switch itself off
+        // exactly then, which is the one moment it is needed.
+        //
+        // MEASURED 2026-11-02 (q114): the pursuit was ON in 0 of 228
+        // samples.  (q115: 4 of 233.)  Every steering value in those rounds
+        // was the RECOVERY's full lock, not the pursuit's -- so the
+        // "steersign" that q114 and q115 compared was the recovery's
+        // direction, and the pursuit's own handedness is still UNMEASURED.
+        //
+        // And the deadlock is visible: no progress -> the recovery brakes ->
+        // the car does not move -> no heading -> the pursuit is off -> the
+        // recovery steers the wrong way -> still no progress.
+        //
+        // So the last heading is KEPT: a car that is stopped has not changed
+        // its heading, and the pursuit can steer it off the spot.
+        static double s_headingX = 0.0;
+        static double s_headingY = 0.0;
+        static bool s_haveHeading = false;
         const double px = static_cast<double>(m.carX) / 256.0;
         const double py = static_cast<double>(m.carY) / 256.0;
         const double tx = static_cast<double>(m.carTargetX) / 256.0;
@@ -2216,9 +2238,14 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
             // is a steering command derived from noise.  With the gate the
             // pursuit stays OFF (pur=0) instead of turning the car at
             // random.
-            if (hLen > 0.05 && dLen > 0.05 && m.targetPlausible) {
-                const double ax = hx / hLen;
-                const double ay = hy / hLen;
+            if (hLen > 0.05) {
+                s_headingX = hx / hLen;
+                s_headingY = hy / hLen;
+                s_haveHeading = true;
+            }
+            if (s_haveHeading && dLen > 0.05 && m.targetPlausible) {
+                const double ax = s_headingX;
+                const double ay = s_headingY;
                 const double bx = dx / dLen;
                 const double by = dy / dLen;
                 const double cross = ax * by - ay * bx;
@@ -2238,9 +2265,15 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
     // WHILE REVERSING, HOLD A DECISIVE ANGLE THE OTHER WAY.  The car has
     // to come off the barrier pointing back down the track, and the swept
     // magnitude the servo is still hunting for is not a recovery angle.
-    if (g_drive.brake) {
-        g_drive.steer = -static_cast<float>(g_drive.sign) * kDriveRecoveryMagnitude;
-    } else if (pursuit) {
+    //
+    // BUT THE PURSUIT WINS.  MEASURED 2026-11-02 (q114): the pursuit was ON
+    // in 0 of 228 samples, so every steering value in that round was this
+    // recovery's full lock -- the pursuit never got a say.  Now that the
+    // heading is kept while the car is standing still, the pursuit CAN steer
+    // a stuck car, and its target is on the racing line, so its direction is
+    // the right one.  The recovery keeps the BRAKE (the guest reverses) and
+    // the pursuit keeps the WHEEL.
+    if (pursuit) {
         // THE AXIS SIGN.  `steersign` is the pursuit's axis sign -- "a
         // POSITIVE axis steers RIGHT" (MEASURED: lx=+0.6 at the launch
         // ended up on the right runoff, .build/rr3-pad-mirror.txt) -- and
@@ -2254,6 +2287,8 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
         // not the pursuit's axis sign.
         g_drive.steer = static_cast<float>(g_driveConfig.steerSign) *
                         static_cast<float>(steerError / g_driveConfig.steerGain);
+    } else if (g_drive.brake) {
+        g_drive.steer = -static_cast<float>(g_drive.sign) * kDriveRecoveryMagnitude;
     }
     if (g_drive.steer > 1.0f) {
         g_drive.steer = 1.0f;
