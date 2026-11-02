@@ -1,18 +1,26 @@
-# RR3 Native Rehost 0.22.4 — 实机（Nintendo Switch）完整测试包
+# RR3 Native Rehost — 实机（Nintendo Switch）测试包
 
 《真实赛车 3》安卓客机 → Nintendo Switch 原生移植（libnx + Mesa / nouveau / NVN）。
-对应仓库提交 **850a46d5**（`origin/master` 已同步）。
 
-**这个包是自包含的**：应用、控制脚本、7 个数据卷、散落素材树 `.depot`、端口的实机配置
+**这个包是自包含的**：应用、控制脚本、7 个数据卷、端口的实机配置
 `sdmc:/switch/rr3-gfx.conf`，全都在里面，不需要再去别的卡上找。
+
+> **这一版的关键变化：卡上从 10 546 个文件 / 11.21 GiB 变成 ~500 个文件 / 9.56 GiB。**
+>
+> 上一版把整棵散落素材树 `.depot`（9 873 个文件）原样拷上卡。实测证明那是**死重量**：
+> 七个数据卷先被查（46 574 个文件），卡上那份松散副本只是兜底，整轮跑完（归档
+> `20261102-141035-eden-rr3-q118`）**卡上真正被读到的只有 133 个文件**。
+>
+> 这一版只装那 133 个（外加目录结构），并且给一个 `-Profile mini` 档：
+> 再省 2.92 GiB。详见 §1.3。
 
 ---
 
 ## 1. 装到卡上
 
-### 方式 A：分卷 zip（推荐，脚本全自动）
+### 1.1 方式 A：分卷 zip（推荐，脚本全自动）
 
-下载**全部 4 个分卷** `rr3-switch-fulltest-20261102.zip.001` … `.004`，加上
+下载**全部 4 个分卷** `rr3-switch-20261102.zip.001` … `.004`，加上
 `Join-And-Extract.ps1`，放进**同一个文件夹**，然后：
 
 ```powershell
@@ -20,13 +28,34 @@ powershell -ExecutionPolicy Bypass -File Join-And-Extract.ps1 -Card F:
 ```
 
 它会：把分卷拼成一个 zip → 解包到 `.\rr3-package` → 调用包里的 `Copy-To-SwitchCard.ps1`
-把整棵树装到 SD 卡。`F:` 换成你的卡。
+→ 把整棵树装到 SD 卡。`F:` 换成你的卡。
 
 > 分卷必须**一个不缺**。脚本会把找到的分卷按文件名排序拼接，少一个就会得到一个坏 zip。
 
-### 方式 B：直接拷目录
+### 1.2 方式 B：只更新应用（**45 MB，一个文件**）
 
-把 `switch\` 整个目录复制到 SD 卡根目录：
+如果卡上已经有数据卷，只想换应用和脚本（比如升到带手柄映射的这一版），
+用 `rr3-switch-app-20261102.zip`：解包，把 `switch\` 里的东西覆盖到卡根即可。
+**不要删 `switch/rr3-gfx.conf`**（见 §4）。
+
+### 1.3 方式 C：小卡（空间不够）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File Copy-To-SwitchCard.ps1 -Card F: -Profile mini
+```
+
+`mini` 档少装两个数据卷，**省 2.92 GiB**（9.56 → 6.64 GiB）：
+
+| 不装的卷 | 大小 | 实测依据 | 代价 |
+|---|---|---|---|
+| `gui-hd.romfs` | 1.55 GiB | 被查 272 次（gui-sd 是 2 321 次），且**全部**是 2048×1536 那套 | 载入画面回退到 960×640 |
+| `vehicles-modern.romfs` | 1.37 GiB | 被查 **0 次**（跑的是 2015 前的车） | 2021 年后的新车不可用 |
+
+> **4 GB 的卡装不下全部游戏数据。** 最小的一组（core + gui-sd + tracks +
+> vehicles-classic）已经是 4.87 GiB。要真正塞进 4 GB，得按「一条赛道 + 一辆车」
+> 裁数据卷 —— 那是下一个工程，不是打包能解决的。
+
+### 1.4 卡上会长什么样
 
 ```
 <SD卡>/switch/
@@ -40,12 +69,17 @@ powershell -ExecutionPolicy Bypass -File Join-And-Extract.ps1 -Card F:
     ├── rr3-screen.txt                      屏幕尺寸（默认 1280×720）
     ├── rr3-settings.txt                    含 AA_LEVEL = 4（抗锯齿开）
     ├── rr3-ui.txt / rr3-open.txt
-    ├── data/                               7 个 *.romfs 数据卷
-    ├── .depot/                             散落素材树
-    └── cache/ apk/ doc/ proc/ save/
+    ├── rr3-gamepad.txt                     **手柄映射 + 谁在开车（见 §10）**
+    ├── data/                               7 个 *.romfs 数据卷 + manifest
+    ├── .depot/  cache/  doc/              只放实测被读到的那些文件
+    └── proc/ save/
 ```
 
 启动器标题栏显示的就是 `switch\rr3-native-rehost` 这个路径。
+
+> **包里还附了一个 `optional/card-depot-full.zip`**：完整的散落素材树（10 413 个文件）。
+> 默认**不装**——那正是低容量卡不想要的东西。如果游戏报缺素材，再解到卡上：
+> `Copy-To-SwitchCard.ps1 -Card F: -OptionalTree`。
 
 ---
 
@@ -248,3 +282,113 @@ NRO 与 RomFS 的哈希可以和构建产物对照（构建是可复现的：门
 rr3-native-rehost.nro  sha256 = 6c64057fa737437195d42ac73d861535fb6eaaa5a60489cddc38cce91888d769
 rr3.romfs              sha256 = 790e6241be77b7380e018f90522725ec8ae3d497ab52250f744b92da71e32dde
 ```
+
+---
+
+## 10. 手柄：PS4 / PS5 / Xbox 360 / Xbox Elite，以及「谁来开车」
+
+### 10.1 支持哪些手柄，怎么接
+
+| 手柄 | 怎么接 | 说明 |
+|---|---|---|
+| Switch Pro / Joy-Con | **原生**，直接插 | 机器自己就把它当 Npad，端口直接读 |
+| Sony DS4 / DualSense (PS4/PS5) | CFW 的 **hidretro** 或 **dinput_redux** | 它们不是 Npad 设备，靠驱动翻译成 Npad |
+| Xbox 360 / One / Series | 同上 | 同一个 0x20 报告 |
+| Xbox 精英一代 / 二代 | 同上 | 手柄型号不影响（精英的拨杆在单独的 0x21 报告里，客机没有拨杆概念，映射也不需要） |
+
+**为什么不是「直接读原始 HID 报告」**：这个主机的 HID 服务只暴露 Npad 状态。
+本 SDK 的 `services/hid.h` 里全是 Npad 和 Palma 的调用，**没有原始报告读取器**；
+`hidbus.h` 只覆盖 Joy-Con 导轨（`HidbusBusType_LeftJoyRail` / `RightJoyRail`）。
+所以「读原始报告」这件事得由驱动做，端口这一层只管映射。
+
+> 报告布局以 Linux 内核 `drivers/hid/hid-playstation.c` 为准（它每天对着真机校验），
+> DS4 与 DualSense 的按钮位置**不一样**（DS4 是 `x,y,rx,ry,buttons[3],z,rz`，
+> DualSense 是 `x,y,rx,ry,z,rz,seq,buttons[4]`），方向键是 HAT 而不是四个键。
+> 客机侧 Xbox 的 Y 轴要取反、X 不取反。这些解码器在宿主自测里逐字节验过（189 项）。
+
+**面键位置**（驱动按位置翻译，所以最下面的那颗永远是 A）：
+
+```
+DS4 / DualSense    × → A    ○ → B    □ → X    △ → Y
+Xbox               A → A    B → B    X → X    Y → Y
+```
+
+### 10.2 映射文件在哪，怎么改
+
+`sdmc:/switch/rr3-native-rehost/rr3-gamepad.txt`。**没有这个文件也能玩**——
+端口会用内置默认，而内置默认就是实测能跑的行为。文件在的时候，
+**文件对它提到的那些输入是权威的**；没提到的输入保留默认。
+
+文件格式（`|` 分隔多个目标，和客机自己 profile 的写法一样）：
+
+```
+autopilot = 1
+deadzone = 0.12
+
+A = BTN_A
+R2 = BTN_A | BTN_R2          ← 右扳机同时是油门键（实测）
+LSTICK_X = AXIS_LX
+RTRIGGER = AXIS_RT
+```
+
+可用的输入名：`A B X Y L1 R1 L2 R2 SELECT START HOME DPAD_UP DPAD_DOWN
+DPAD_LEFT DPAD_RIGHT L3 R3` 和 `LSTICK_X LSTICK_Y RSTICK_X RSTICK_Y LTRIGGER RTRIGGER`。
+
+可用的客机控件：`BTN_A BTN_B BTN_X BTN_Y BTN_L1 BTN_R1 BTN_L2 BTN_R2
+BTN_DPAD_LEFT BTN_DPAD_RIGHT BTN_DPAD_UP BTN_DPAD_DOWN BTN_SELECT BTN_START
+BTN_DPAD_CENTER` 和 `AXIS_LX AXIS_LY AXIS_RX AXIS_RY AXIS_LT AXIS_RT`。
+
+选项：`scale=<f>`、`invert=<0|1>`、`thresh=<f>`（轴当按钮用时，多大算按下）。
+`<输入> = none` 把这个输入整个去掉。名字**大小写不敏感**。
+
+### 10.3 「谁来开车」——这是最要紧的一条
+
+```
+autopilot = 1        端口自己开（实测能让车跑起来的模式）
+autopilot = 0        你开。端口完全不碰油门、刹车、转向
+autopilot = assist   你开，端口只在你没碰的那个控制上补位
+```
+
+> **要自己跑完整一圈 ⇒ `autopilot = 0`。**
+> 这是「端口闭环会和你抢方向盘」的开关。
+
+### 10.4 常用配方
+
+```ini
+# 右扳机当油门（任何手柄）
+R2 = none
+RTRIGGER = BTN_A | AXIS_RT thresh=0.2
+
+# 方向盘反了
+LSTICK_X = AXIS_LX scale=-1
+
+# 方向盘挪到右摇杆
+LSTICK_X = none
+RSTICK_X = AXIS_LX
+```
+
+### 10.5 怎么确认手柄被认出来了
+
+端口每 300 帧往 `sdmc:/switch/rr3-native-rehost.guest-view.log` 写两行：
+
+* `gamepad-map` —— 它在这个文件里找到了什么（或者根本没找到这个文件）；
+* `gamepad-state` —— 这一帧的标准输入状态和推给客机的状态。
+
+在 PC 上读（**不要用 `Get-Content`**，UTF-8 中文会乱码）：
+
+```powershell
+$p = 'F:\switch\rr3-native-rehost.guest-view.log'
+[System.IO.File]::ReadAllLines($p,[System.Text.Encoding]::UTF8) |
+    Select-String 'gamepad-map|gamepad-state'
+```
+
+* `gamepad-map ... file=absent` ⇒ 端口**看不到**这个文件，跑的是内置默认。
+  多半是路径不对：必须是 `switch\rr3-native-rehost\rr3-gamepad.txt`。
+* `gamepad-map ... parsed=0 error_line=N` ⇒ 这个文件第 N 行有问题，端口**拒绝**了它
+  并继续用默认。这是故意的：半张映射表比没有映射表更糟。
+* `gamepad-map ... TRUNCATED` ⇒ 文件太大，缓冲区装不下（正常不会发生）。
+* `gamepad-state ... buttons=0x... guest_buttons=0x...` ⇒ 端口看到的状态和你推的一致。
+  `guest_buttons` 的 bit 0 就是客机的 `BTN_A`，也就是油门。
+
+> **注意**：`rr3-pad.txt`（脚本手柄）在的时候，物理手柄这条路**完全不会被走到**，
+> 所以 `gamepad-state` 不会有输出。调试手柄时先把 `rr3-pad.txt` 挪走。

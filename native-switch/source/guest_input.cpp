@@ -68,6 +68,7 @@
 #include "rr3/guest_input.hpp"
 
 #include "rr3/elf_preflight.hpp"
+#include "rr3/gamepad.hpp"
 #include "rr3/guest_action.hpp"
 #include "rr3/guest_input_doors.hpp"
 #include "rr3/guest_touch.hpp"
@@ -143,9 +144,6 @@ bool g_connectedIssued = false;
 const char* g_progressPath = nullptr;
 float g_lastLx = 0, g_lastLy = 0, g_lastRx = 0, g_lastRy = 0;
 float g_lastLt = 0, g_lastRt = 0;
-bool g_lastFace[8] = {};
-bool g_lastDpad[4] = {};
-bool g_lastMeta[3] = {};
 
 // What the port last handed to the guest, in the guest's own numbering.
 //
@@ -158,37 +156,151 @@ GuestPushedInput g_pushed = {};
 // iteration, just before the guest's render call, so this tracks the guest's
 // frame number to within one.
 unsigned long long g_frameCounter = 0;
-// The last button state pushed per guest ordinal, for the scripted pad. The
-// physical path keeps its own per-button state in g_lastFace/g_lastDpad/
-// g_lastMeta, which are libnx masks; this one is a guest ordinal.
+// The last button state pushed per guest ordinal.
+//
+// BOTH the scripted pad and the physical path speak the guest's own
+// numbering, so there is ONE array of last-states for all fifteen
+// ordinals: the physical path used to keep its own per-button state in
+// libnx masks, and that is gone now that the mapping layer produces guest
+// ordinals.
 bool g_lastOrdinal[15] = {};
+
+// THE GAMEPAD MAPPING.
+//
+// The card may carry a mapping file at
+//   sdmc:/switch/rr3-native-rehost/rr3-gamepad.txt
+// that says which canonical input drives which guest control, and WHO owns
+// the car: the port's own closed loop, the human, or the human with the
+// loop filling in the gaps.
+//
+// WITHOUT THE FILE THE BUILT-IN DEFAULTS APPLY, and those defaults are the
+// port's MEASURED behaviour, exactly: ZR drove BTN_A and BTN_R2 and the
+// right trigger axis, ZL drove BTN_L2 and the left trigger axis, the left
+// stick click drove BTN_START, the right stick click drove BTN_DPAD_CENTER,
+// and the sticks went across as (x, -y).  So a user with no file gets the
+// behaviour that was measured to work, and a user with a file gets to say
+// otherwise.
+//
+// A FILE WITH A BAD LINE LEAVES THE DEFAULTS IN PLACE.  The port must not
+// drive the car with half a mapping: a throttle that lost its binding is
+// worse than the throttle the user had.
+//
+// THE BUFFER IS 32 KiB, NOT 8 KiB.  An 8 KiB buffer silently truncated the
+// shipped 9,021-byte mapping file to 8,191 bytes -- and because the tail
+// happened to be comments the file still parsed, so the truncation was
+// invisible.  A truncated mapping file is a file that does not say what it
+// says, and the only defence is a buffer that cannot truncate it.
+constexpr const char* kGamepadMappingPath =
+    "sdmc:/switch/rr3-native-rehost/rr3-gamepad.txt";
+constexpr size_t kGamepadMappingTextSize = 32768;
+
+rr3::gamepad::Mapping g_gamepadMapping;
+bool g_gamepadMappingLoaded = false;
+char g_gamepadMappingText[kGamepadMappingTextSize] = {};
+
+// Reads the mapping file and reports what it found.
+//
+// The report is an INSTRUMENT: "the file was not read" and "the file was
+// read and it says nothing" have to be different observations, or a dead
+// controller and a mis-mapped one look the same.
+void loadGamepadMapping() {
+    rr3::gamepad::mappingSetDefaults(&g_gamepadMapping);
+    g_gamepadMappingLoaded = false;
+
+    std::FILE* file = std::fopen(kGamepadMappingPath, "rb");
+    if (file == nullptr) {
+        char detail[192];
+        std::snprintf(detail, sizeof(detail),
+                       "file=absent path=%s fallback=defaults mode=%d "
+                       "deadzone=%.3f bindings=%d",
+                       kGamepadMappingPath, g_gamepadMapping.autopilot,
+                       static_cast<double>(g_gamepadMapping.deadzone),
+                       g_gamepadMapping.bindingCount);
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "gamepad-map", 0, 0, detail);
+        return;
+    }
+    const size_t read =
+        std::fread(g_gamepadMappingText, 1, kGamepadMappingTextSize - 1, file);
+    std::fclose(file);
+    g_gamepadMappingText[read] = '\0';
+
+    rr3::gamepad::Mapping parsed;
+    int errorLine = 0;
+    const bool ok =
+        rr3::gamepad::parseMappingText(g_gamepadMappingText, &parsed, &errorLine);
+    if (!ok) {
+        char detail[192];
+        std::snprintf(detail, sizeof(detail),
+                       "file=present path=%s parsed=0 error_line=%d "
+                       "fallback=defaults bytes=%zu",
+                       kGamepadMappingPath, errorLine, read);
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "gamepad-map", 0, 0, detail);
+        return;
+    }
+    g_gamepadMapping = parsed;
+    g_gamepadMappingLoaded = true;
+    int explicitCount = 0;
+    for (int i = 0; i < g_gamepadMapping.bindingCount; ++i) {
+        if (!g_gamepadMapping.bindings[i].fromDefault) {
+            ++explicitCount;
+        }
+    }
+    char detail[224];
+    std::snprintf(detail, sizeof(detail),
+                   "file=present path=%s parsed=1 error_line=0 mode=%d "
+                   "deadzone=%.3f bindings=%d from_file=%d bytes=%zu%s",
+                   kGamepadMappingPath, g_gamepadMapping.autopilot,
+                   static_cast<double>(g_gamepadMapping.deadzone),
+                   g_gamepadMapping.bindingCount, explicitCount, read,
+                   (read >= kGamepadMappingTextSize - 1) ? " TRUNCATED" : "");
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "gamepad-map", 0, 0, detail);
+}
+
+// The state of the controller this frame, and the state that went to the
+// guest.  Logged every 300 frames so the log can answer "did the port see
+// my controller?" and "what did the guest get?".
+void logGamepadState(unsigned long long frame, const rr3::gamepad::State& canonical,
+                     const rr3::gamepad::GuestState& guest, bool driving,
+                     int mode) {
+    static unsigned long long s_lastLogged = 0;
+    if (frame < s_lastLogged + 300ULL) {
+        return;
+    }
+    s_lastLogged = frame;
+    char detail[288];
+    std::snprintf(
+        detail, sizeof(detail),
+        "f=%llu mode=%d driving=%d mapped=%d buttons=0x%08x lx=%.3f ly=%.3f "
+        "rx=%.3f ry=%.3f lt=%.3f rt=%.3f guest_buttons=0x%04x "
+        "guest_lx=%.3f guest_lt=%.3f guest_rt=%.3f",
+        frame, mode, driving ? 1 : 0, g_gamepadMappingLoaded ? 1 : 0,
+        canonical.buttons, static_cast<double>(canonical.sticks[0]),
+        static_cast<double>(canonical.sticks[1]),
+        static_cast<double>(canonical.sticks[2]),
+        static_cast<double>(canonical.sticks[3]),
+        static_cast<double>(canonical.triggers[0]),
+        static_cast<double>(canonical.triggers[1]), guest.buttons,
+        static_cast<double>(guest.axes[0]), static_cast<double>(guest.axes[4]),
+        static_cast<double>(guest.axes[5]));
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "gamepad-state", 0, 0, detail);
+}
 
 void** jniTable(void* env) {
     return static_cast<void**>(*static_cast<void**>(env));
 }
 
-void emitButton(void* env, void* self, int id, uint64_t held, uint64_t mask,
-                int ordinal, bool* last) {
-    const bool now = (held & mask) != 0;
-    if (now == *last) {
-        return;
-    }
-    *last = now;
-    if (g_setButton != nullptr) {
-        g_setButton(env, self, id, now ? 1 : 0, ordinal);
-        if (now) {
-            g_pushed.buttons |= 1u << ordinal;
-        } else {
-            g_pushed.buttons &= ~(1u << ordinal);
-        }
-        ++g_pushed.pushes;
-    }
-}
-
-// One button, named by the guest's ControllerButtons ordinal. The scripted
-// pad speaks ordinals (that is the guest's own numbering and the bit index
-// in the script's mask), while the physical path speaks libnx masks, so the
-// two meet here.
+// One button, named by the guest's ControllerButtons ordinal.
+//
+// BOTH PATHS SPEAK THE GUEST'S OWN NUMBERING: the scripted pad because that
+// is the guest's numbering and the bit index in the script's mask, and the
+// physical path because the mapping layer outputs guest ordinals.  They
+// meet here, and they share one "last state" array, so switching between
+// them pushes exactly the difference and the guest never sees a stale
+// button.
 void emitOrdinalButton(void* env, void* self, int id, int ordinal, bool pressed,
                        bool* last) {
     if (pressed == *last) {
@@ -291,6 +403,12 @@ bool prepareGuestControllerInput() {
     // actually reports, so "the analogue trigger is zero" and "the analogue
     // trigger is not being delivered" stop being the same observation.
     padConfigureInput(1, kNpadStyleSet);
+    // THE MAPPING FILE, read once, before the first padUpdate.
+    //
+    // It decides both what the controller does to the guest and whether the
+    // port's own closed loop is allowed to drive the car, so it has to be
+    // in hand before the first frame that pushes anything.
+    loadGamepadMapping();
     g_setButton = reinterpret_cast<SetButtonFn>(resolveMainImageExport(
         "Java_com_firemint_realracing_ControllerManager_SetButtonValueJNI"));
     g_setJoystick = reinterpret_cast<SetJoystickFn>(resolveMainImageExport(
@@ -506,94 +624,135 @@ void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
         emitAxis(jniEnvironment, activityObject, deviceId, scripted.rightTrigger,
                  kAxisRTrigger, &g_lastRt);
     } else {
-    // ZR IS THE RIGHT TRIGGER, AND IT IS ALSO THE THROTTLE.
+    // THE PHYSICAL CONTROLLER, THROUGH THE MAPPING.
     //
-    // The guest's own profile binds the accelerator to "button 0 (A) |
-    // axis 5 (RT) | button 7 (R2)", and the port maps the Switch's ZR onto
-    // button 7 -- which is what the profile's name says. But MEASURED, it
-    // does not accelerate: with only button 7 held the guest draws its own
-    // "hold the brake to reverse" message, which is the guest saying the
-    // car is NOT moving. (Archive 20261024-135257-eden-thr-btnR2: the
-    // port injected 0x80, the guest's own controller held button 7, and
-    // the guest's own message said the car was standing still. The same
-    // run with button 0 injected has no such message.)
+    //   libnx  ->  canonical inputs  ->  the mapping on the card  ->  the guest
     //
-    // So on a real Switch the right trigger would be DEAD, which is no
-    // good for a racing game: the trigger is where the throttle belongs.
-    // ZR therefore also drives the guest's button 0, the accelerator that
-    // is measured to work. The button 7 press is left alone: the profile
-    // calls it the accelerator too, and it does no harm.
-    static constexpr uint64_t kFaceMasks[] = {
-        HidNpadButton_A | HidNpadButton_ZR, HidNpadButton_B, HidNpadButton_X,
-        HidNpadButton_Y, HidNpadButton_L, HidNpadButton_R, HidNpadButton_ZL,
-        HidNpadButton_ZR,
-    };
-    static constexpr int kFaceOrdinals[] = {
-        kBtnA, kBtnB, kBtnX, kBtnY, kBtnL1, kBtnR1, kBtnL2, kBtnR2,
-    };
-    // The closed loop's overrides are folded into the held mask BEFORE any
-    // button is pushed, so the guest sees exactly one state per frame.
-    uint64_t effective = held;
-    if (driving) {
-        effective |= HidNpadButton_A;
-        effective &= ~static_cast<uint64_t>(HidNpadButton_X);
-        if (drive.brake) {
-            effective |= HidNpadButton_X;
-        }
-    }
-    for (int i = 0; i < 8; ++i) {
-        emitButton(jniEnvironment, activityObject, deviceId, effective,
-                   kFaceMasks[i], kFaceOrdinals[i], &g_lastFace[i]);
-    }
-
-    static constexpr uint64_t kDpadMasks[] = {
-        HidNpadButton_Left,
-        HidNpadButton_Right,
-        HidNpadButton_Up,
-        HidNpadButton_Down,
-    };
-    static constexpr int kDpadOrdinals[] = {
-        kBtnDpadLeft,
-        kBtnDpadRight,
-        kBtnDpadUp,
-        kBtnDpadDown,
-    };
-    for (int i = 0; i < 4; ++i) {
-        emitButton(jniEnvironment, activityObject, deviceId, held,
-                   kDpadMasks[i], kDpadOrdinals[i], &g_lastDpad[i]);
-    }
-
-    emitButton(jniEnvironment, activityObject, deviceId, held,
-               HidNpadButton_Minus, kBtnSelect, &g_lastMeta[0]);
-    // Stick clicks are common "start / menu" on Android pads. PLUS stays with
-    // the frame-loop exit chord.
-    emitButton(jniEnvironment, activityObject, deviceId, held,
-               HidNpadButton_StickL, kBtnStart, &g_lastMeta[1]);
-    emitButton(jniEnvironment, activityObject, deviceId, held,
-               HidNpadButton_StickR, kBtnDpadCenter, &g_lastMeta[2]);
-
+    // The canonical layer exists so the rest of the port never asks "which
+    // controller is this?".  A Pro Controller, a DualShock 4 that the
+    // console presents as a Pro Controller, and (on a CFW console, through
+    // hidretro / dinput_redux) a DualSense or an Xbox pad all arrive as
+    // the same canonical inputs, and the mapping file says what each of
+    // them does to the guest.
+    //
+    // The mapping's DEFAULTS are the port's measured behaviour, so with no
+    // file on the card this path reproduces what it always did: ZR drove
+    // BTN_A and BTN_R2 and the right trigger axis, ZL drove BTN_L2 and the
+    // left trigger axis, the left stick click drove BTN_START, the right
+    // stick click drove BTN_DPAD_CENTER, and the sticks went across as
+    // (x, -y).
     const HidAnalogStickState left = padGetStickPos(pad, 0);
     const HidAnalogStickState right = padGetStickPos(pad, 1);
     auto norm = [](int raw) {
         const float v = static_cast<float>(raw) / 32767.0f;
         return v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
     };
-    // The closed loop owns the steering axis when it is on.
-    emitAxis(jniEnvironment, activityObject, deviceId,
-             driving ? drive.steer : norm(left.x),
+
+    rr3::gamepad::NpadState physical;
+    physical.a = (held & HidNpadButton_A) != 0;
+    physical.b = (held & HidNpadButton_B) != 0;
+    physical.x = (held & HidNpadButton_X) != 0;
+    physical.y = (held & HidNpadButton_Y) != 0;
+    physical.l = (held & HidNpadButton_L) != 0;
+    physical.r = (held & HidNpadButton_R) != 0;
+    physical.zl = (held & HidNpadButton_ZL) != 0;
+    physical.zr = (held & HidNpadButton_ZR) != 0;
+    physical.minus = (held & HidNpadButton_Minus) != 0;
+    physical.plus = (held & HidNpadButton_Plus) != 0;
+    physical.left = (held & HidNpadButton_Left) != 0;
+    physical.right = (held & HidNpadButton_Right) != 0;
+    physical.up = (held & HidNpadButton_Up) != 0;
+    physical.down = (held & HidNpadButton_Down) != 0;
+    physical.stickL = (held & HidNpadButton_StickL) != 0;
+    physical.stickR = (held & HidNpadButton_StickR) != 0;
+    physical.lx = norm(left.x);
+    physical.ly = norm(left.y);
+    physical.rx = norm(right.x);
+    physical.ry = norm(right.y);
+    // THE TRIGGER VALUE IS THE CALLER'S JOB: the analogue one when the
+    // controller has it, the digital one otherwise.
+    physical.lt = triggerValue(pad, held, HidNpadButton_ZL, 0);
+    physical.rt = triggerValue(pad, held, HidNpadButton_ZR, 1);
+
+    const rr3::gamepad::State canonical =
+        rr3::gamepad::canonicalFromNpad(physical);
+    rr3::gamepad::GuestState guest;
+    rr3::gamepad::applyMapping(g_gamepadMapping, canonical, &guest);
+
+    // THE CLOSED LOOP'S OVERRIDES, IN GUEST SPACE.
+    //
+    // WHO OWNS THE CAR IS THE MAPPING FILE'S DECISION:
+    //
+    //   auto   the port's own loop owns the throttle, the brake and the
+    //          steering axis -- the behaviour that was measured to make the
+    //          car drive;
+    //   assist the HUMAN owns every control they are touching, and the loop
+    //          fills in only the ones they are leaving alone;
+    //   manual the port does not touch the car at all.
+    //
+    // In "auto" the loop's throttle is forced ON while it is driving, which
+    // is what the port has always done on this path; the scripted path
+    // above is the one that can release it.
+    const int mode = g_gamepadMapping.autopilot;
+    bool loopOwnsSteer = false;
+    bool loopOwnsThrottle = false;
+    bool loopOwnsBrake = false;
+    if (driving && mode != rr3::gamepad::kAutopilotManual) {
+        if (mode == rr3::gamepad::kAutopilotAssist) {
+            // The human wins on every control they are actively using.
+            loopOwnsSteer =
+                rr3::gamepad::mappingGuestAxisMagnitude(
+                    g_gamepadMapping, canonical, kAxisLThumbX) <= 0.0f;
+            loopOwnsThrottle =
+                !rr3::gamepad::mappingGuestButtonActive(g_gamepadMapping,
+                                                        canonical, kBtnA);
+            loopOwnsBrake =
+                !rr3::gamepad::mappingGuestButtonActive(g_gamepadMapping,
+                                                        canonical, kBtnX);
+        } else {
+            // kAutopilotAuto: the loop owns the car.
+            loopOwnsSteer = true;
+            loopOwnsThrottle = true;
+            loopOwnsBrake = true;
+        }
+    }
+    if (loopOwnsSteer) {
+        guest.axes[kAxisLThumbX] = drive.steer;
+    }
+    if (loopOwnsThrottle) {
+        if (drive.throttle) {
+            guest.buttons |= (1u << kBtnA);
+        } else {
+            guest.buttons &= ~(1u << kBtnA);
+        }
+    }
+    if (loopOwnsBrake) {
+        if (drive.brake) {
+            guest.buttons |= (1u << kBtnX);
+        } else {
+            guest.buttons &= ~(1u << kBtnX);
+        }
+    }
+
+    // THE GUEST SEES ONE STATE PER FRAME.
+    for (int i = 0; i < 15; ++i) {
+        const bool pressed = ((guest.buttons >> i) & 1u) != 0;
+        emitOrdinalButton(jniEnvironment, activityObject, deviceId, i, pressed,
+                          &g_lastOrdinal[i]);
+    }
+    emitAxis(jniEnvironment, activityObject, deviceId, guest.axes[kAxisLThumbX],
              kAxisLThumbX, &g_lastLx);
-    emitAxis(jniEnvironment, activityObject, deviceId, -norm(left.y),
+    emitAxis(jniEnvironment, activityObject, deviceId, guest.axes[kAxisLThumbY],
              kAxisLThumbY, &g_lastLy);
-    emitAxis(jniEnvironment, activityObject, deviceId, norm(right.x),
+    emitAxis(jniEnvironment, activityObject, deviceId, guest.axes[kAxisRThumbX],
              kAxisRThumbX, &g_lastRx);
-    emitAxis(jniEnvironment, activityObject, deviceId, -norm(right.y),
+    emitAxis(jniEnvironment, activityObject, deviceId, guest.axes[kAxisRThumbY],
              kAxisRThumbY, &g_lastRy);
-    emitAxis(jniEnvironment, activityObject, deviceId,
-             triggerValue(pad, held, HidNpadButton_ZL, 0), kAxisLTrigger,
-             &g_lastLt);
-    emitAxis(jniEnvironment, activityObject, deviceId,
-             triggerValue(pad, held, HidNpadButton_ZR, 1), kAxisRTrigger,
-             &g_lastRt);
+    emitAxis(jniEnvironment, activityObject, deviceId, guest.axes[kAxisLTrigger],
+             kAxisLTrigger, &g_lastLt);
+    emitAxis(jniEnvironment, activityObject, deviceId, guest.axes[kAxisRTrigger],
+             kAxisRTrigger, &g_lastRt);
+    logGamepadState(g_frameCounter, canonical, guest, driving, mode);
     logTriggerState(g_frameCounter, pad, held);
     }
 

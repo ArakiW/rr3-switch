@@ -42,8 +42,35 @@
 .PARAMETER SkipDepot
     Do not copy the loose .depot tree (the game will have no assets).
 
+.PARAMETER Profile
+    full (default) installs everything in the package.
+
+    mini installs everything EXCEPT two of the data volumes, for a card that
+    is too small for the lot:
+
+      * gui-hd.romfs (1.55 GiB) -- the 2048x1536 GUI assets.  In the
+        measured run it was consulted 272 times against gui-sd's 2,321, and
+        every one of those was the 2048x1536 set: the loading splash.  The
+        game runs without it; the splash falls back to the 960x640 set.
+      * vehicles-modern.romfs (1.37 GiB) -- the 2021-and-later cars.  It was
+        consulted ZERO times in the measured run, because the car being
+        driven was not one of them.
+
+    That is 2.92 GiB saved and the card goes from 9.56 GiB to 6.64 GiB.
+    What you lose: the 2048x1536 splash art, and the modern cars.
+
+.PARAMETER OptionalTree
+    Also unpack optional\card-depot-full.zip onto the card.  It is the
+    COMPLETE loose tree -- the 10,413 files the measured run did not read.
+    Off by default: it is 1.6 GiB and 10,413 files, which is the opposite of
+    what a small card wants.  Turn it on only if the game reports a missing
+    asset.
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File Copy-To-SwitchCard.ps1 -Card F:\
+
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File Copy-To-SwitchCard.ps1 -Card F:\ -Profile mini
 #>
 [CmdletBinding()]
 param(
@@ -51,7 +78,10 @@ param(
     [string]$Card,
     [string]$PackageRoot = '',
     [switch]$SkipVolumes,
-    [switch]$SkipDepot
+    [switch]$SkipDepot,
+    [ValidateSet('full', 'mini')]
+    [string]$Profile = 'full',
+    [switch]$OptionalTree
 )
 
 $ErrorActionPreference = 'Stop'
@@ -75,9 +105,20 @@ $appDir = Join-Path (Join-Path $Card 'switch') 'rr3-native-rehost'
 New-Item -ItemType Directory -Force -Path $appDir | Out-Null
 
 $scriptNames = @('rr3-touch.txt', 'rr3-drive.txt', 'rr3-pad.txt', 'rr3-action.txt',
-    'rr3-screen.txt', 'rr3-settings.txt', 'rr3-ui.txt', 'rr3-open.txt')
+    'rr3-screen.txt', 'rr3-settings.txt', 'rr3-ui.txt', 'rr3-open.txt',
+    'rr3-gamepad.txt')
 $volumeNames = @('core.romfs', 'gui-hd.romfs', 'gui-sd.romfs', 'tracks.romfs',
     'vehicles-classic.romfs', 'vehicles-mid.romfs', 'vehicles-modern.romfs')
+
+# THE VOLUMES THE "mini" PROFILE LEAVES BEHIND, and why.  Both numbers are
+# from the measured run (archive 20261102-141035-eden-rr3-q118), not from a
+# guess: the log records every volume the port consulted.
+$miniOmits = @('gui-hd.romfs', 'vehicles-modern.romfs')
+$wantedVolumes = if ($Profile -eq 'mini') {
+    @($volumeNames | Where-Object { $miniOmits -notcontains $_ })
+} else {
+    $volumeNames
+}
 
 # ---- 0. preflight ------------------------------------------------------------
 $fail = @()
@@ -92,7 +133,7 @@ foreach ($name in $scriptNames) {
     }
 }
 if (-not $SkipVolumes) {
-    foreach ($name in $volumeNames) {
+    foreach ($name in $wantedVolumes) {
         if (-not (Test-Path -LiteralPath (Join-Path $packageApp "data\$name") -PathType Leaf)) {
             $fail += "package volume missing: switch\rr3-native-rehost\data\$name"
         }
@@ -106,7 +147,11 @@ if ($fail.Count -gt 0) {
     exit 1
 }
 Write-Host ("preflight : {0} app files, {1} scripts, {2} volumes, 1 conf -- all present" -f `
-    2, $scriptNames.Count, $(if ($SkipVolumes) { 0 } else { $volumeNames.Count }))
+    2, $scriptNames.Count, $(if ($SkipVolumes) { 0 } else { $wantedVolumes.Count }))
+if ($Profile -eq 'mini') {
+    Write-Host ("profile   : mini -- {0} left off ({1:N2} GiB saved)" -f `
+        ($miniOmits -join ', '), 2.92)
+}
 
 # ---- 1. the app --------------------------------------------------------------
 foreach ($name in @('rr3-native-rehost.nro', 'rr3.romfs')) {
@@ -145,6 +190,11 @@ else {
     # the installer's own positive control (2,594 bytes missing).
     $dataFiles = @(Get-ChildItem -LiteralPath $sourceData -File | Sort-Object Name)
     foreach ($file in $dataFiles) {
+        if ($wantedVolumes -notcontains $file.Name) {
+            Write-Host ("omitted   : {0,-24} {1,14:N0} bytes (the mini profile)" -f `
+                $file.Name, $file.Length)
+            continue
+        }
         $dst = Join-Path $targetData $file.Name
         $srcLen = $file.Length
         if ((Test-Path -LiteralPath $dst -PathType Leaf) -and
@@ -161,7 +211,7 @@ else {
         }
         Write-Host ("copied    : {0,-24} {1,14:N0} bytes" -f $file.Name, $dstLen)
     }
-    $missing = $volumeNames | Where-Object {
+    $missing = $wantedVolumes | Where-Object {
         -not (Test-Path -LiteralPath (Join-Path $targetData $_) -PathType Leaf)
     }
     if ($missing) {
@@ -170,36 +220,61 @@ else {
     }
 }
 
-# ---- 4. the loose .depot -----------------------------------------------------
+# ---- 4. the loose trees -------------------------------------------------------
+#
+# .depot, cache and doc.
 #
 # /E IS LOAD-BEARING.  robocopy without /E copies only the TOP LEVEL: the
-# tree's 9,872 files live in subdirectories (Tracks\, vehicles\, gui_assets\,
+# tree's files live in subdirectories (Tracks\, vehicles\, gui_assets\,
 # audio\, ...), so a non-recursive copy leaves the console with a .depot that
 # has the root files and none of the assets.  The file count is verified
 # afterwards, so this cannot fail silently.
+#
+# THE PACKAGE CARRIES THE SUBSET THE PORT ACTUALLY READS (measured: 133
+# distinct card files in a full run), not the whole 10,546-file tree, so
+# this is a small copy on purpose.
 if ($SkipDepot) {
     Write-Host "depot     : SKIPPED by request (the game will have no assets)"
 }
 else {
-    $sourceDepot = Join-Path $packageApp '.depot'
-    $targetDepot = Join-Path $appDir '.depot'
-    if (-not (Test-Path -LiteralPath $sourceDepot -PathType Container)) {
-        Write-Error "the package has no .depot"
+    foreach ($dir in @('.depot', 'cache', 'doc')) {
+        $sourceTree = Join-Path $packageApp $dir
+        if (-not (Test-Path -LiteralPath $sourceTree -PathType Container)) {
+            continue
+        }
+        $targetTree = Join-Path $appDir $dir
+        $srcCount = @(Get-ChildItem $sourceTree -Recurse -File -Force).Count
+        if ($srcCount -eq 0) { continue }
+        Write-Host ("copying   : {0} ({1} files) ..." -f $dir, $srcCount)
+        & robocopy.exe $sourceTree $targetTree /E /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null
+        if ($LASTEXITCODE -ge 8) {
+            Write-Error "robocopy failed for $dir (code $LASTEXITCODE)"
+            exit 4
+        }
+        $dstCount = @(Get-ChildItem $targetTree -Recurse -File -Force).Count
+        if ($dstCount -lt $srcCount) {
+            Write-Error ("{0} copy incomplete: {1} files in the package, {2} on the card" -f $dir, $srcCount, $dstCount)
+            exit 3
+        }
+        Write-Host ("copied    : {0,-10} -- {1} files, verified" -f $dir, $dstCount)
+    }
+}
+
+# ---- 4b. the optional complete tree -------------------------------------------
+if ($OptionalTree) {
+    $archive = Join-Path $PackageRoot 'optional\card-depot-full.zip'
+    if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
+        Write-Error "optional\card-depot-full.zip is missing from the package"
         exit 1
     }
-    $srcCount = @(Get-ChildItem $sourceDepot -Recurse -File -Force).Count
-    Write-Host ("copying   : .depot ({0} files) ..." -f $srcCount)
-    & robocopy.exe $sourceDepot $targetDepot /E /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null
-    if ($LASTEXITCODE -ge 8) {
-        Write-Error "robocopy failed for .depot (code $LASTEXITCODE)"
+    Write-Host ("unpacking  : {0} (this is 10,413 files -- it takes a while)" -f $archive)
+    & tar.exe -xf $archive -C $appDir
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "tar failed (code $LASTEXITCODE)"
         exit 4
     }
-    $dstCount = @(Get-ChildItem $targetDepot -Recurse -File -Force).Count
-    if ($dstCount -ne $srcCount) {
-        Write-Error ("depot copy incomplete: {0} files in the package, {1} on the card" -f $srcCount, $dstCount)
-        exit 3
-    }
-    Write-Host ("copied    : .depot -- {0} files, verified" -f $dstCount)
+    Write-Host ("unpacked  : the complete loose tree, {0} files" -f `
+        @(Get-ChildItem $appDir -Recurse -File -Force).Count)
 }
 
 # ---- 5. the port's conf ------------------------------------------------------

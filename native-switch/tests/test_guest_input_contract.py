@@ -35,7 +35,25 @@ def main() -> None:
     # same run with button 0 injected has no such message). So on a real
     # Switch the right trigger would be dead, and it is the accelerator's
     # natural home. ZR therefore also drives the guest's button 0.
-    assert "HidNpadButton_A | HidNpadButton_ZR" in source
+    #
+    # WHERE THAT BINDING LIVES CHANGED.  It used to be a libnx mask in this
+    # file ("HidNpadButton_A | HidNpadButton_ZR"); now the controller is
+    # normalised into the canonical inputs and the MAPPING decides, and the
+    # mapping's default binds R2 to BTN_A.  So the contract is no longer
+    # "this literal is in the source" but "the binding is still there, and
+    # the source goes through the mapping" -- which is what
+    # test_gamepad_contract.py EXECUTES on the host.
+    assert "HidNpadButton_A | HidNpadButton_ZR" not in source, (
+        "the source still hard-codes the ZR mask; the mapping layer owns that "
+        "binding now and the two would fight")
+    assert "canonicalFromNpad" in source, (
+        "the physical path does not go through the canonical input layer")
+    assert "applyMapping" in source, (
+        "the physical path does not go through the mapping")
+    card = (root / "card" / "rr3-gamepad.txt").read_text(encoding="utf-8")
+    assert "R2 = BTN_A | BTN_R2" in card, (
+        "the card's mapping file no longer binds the right trigger to the "
+        "guest's accelerator, which is the measured behaviour")
     # Frame loop must pump input and keep EGL when workers live.
     assert "pumpGuestControllerInput" in probe
     assert "connectGuestController" in probe

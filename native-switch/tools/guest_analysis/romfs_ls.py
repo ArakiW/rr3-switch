@@ -53,9 +53,19 @@ class RomFS:
         return sibling, size, name
 
     def walk(self, node: int = 0, prefix: str = ""):
-        """Yield (path, size) for every file under the directory node."""
-        _, child_dir, child_file, name = self.directory(node)
-        path = prefix + name + "/" if node != 0 else ""
+        """Yield (path, size) for every file under the directory node.
+
+        THE PATH IS BUILT ONCE PER LEVEL.  An earlier version of this
+        function added the directory's OWN name to the prefix and then
+        passed the name in again when it recursed, so every level came out
+        twice: "files/files/.depot/.depot/Tracks/Tracks/...".  The volumes
+        were never like that; the lister was.  It mattered because a
+        duplicate check against the card's loose tree compares paths, and
+        doubled paths match NOTHING -- which is how a tool can report "0
+        overlap" for two trees that are in fact the same tree.
+        """
+        _, child_dir, child_file, _name = self.directory(node)
+        path = prefix
         while child_file != INVALID:
             _, size, file_name = self.file(child_file)
             yield path + file_name, size

@@ -13,6 +13,10 @@
         rr3-screen.txt  the screen size the port reports to the guest
         rr3-settings.txt the launcher-side settings, translated into the
                         guest's own encrypted device profile (eds/*.plist)
+        rr3-gamepad.txt the controller mapping, and WHO owns the car: the
+                        port's own closed loop (autopilot=1), the human
+                        (autopilot=0), or the human with the loop filling in
+                        the gaps (autopilot=assist)
 
     They are EXPERIMENT INPUTS, not environment: a run is only reproducible
     if the inputs are on record with the result.  They live in the repository
@@ -132,7 +136,8 @@ $sourceRoot = Join-Path $projectRoot 'native-switch\card'
 $appDir = Join-Path (Join-Path (Join-Path $EmulatorRoot 'user\sdmc') 'switch') 'rr3-native-rehost'
 
 $scripts = @('rr3-touch.txt', 'rr3-drive.txt', 'rr3-pad.txt', 'rr3-action.txt',
-    'rr3-screen.txt', 'rr3-settings.txt', 'rr3-ui.txt', 'rr3-open.txt')
+    'rr3-screen.txt', 'rr3-settings.txt', 'rr3-ui.txt', 'rr3-open.txt',
+    'rr3-gamepad.txt')
 
 # --- the screen override ------------------------------------------------------
 #

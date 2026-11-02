@@ -1,0 +1,206 @@
+# THE GAMEPAD MAPPING, AND WHO IS DRIVING.
+#
+# Read by the port from
+#   sdmc:/switch/rr3-native-rehost/rr3-gamepad.txt
+#
+# It is OPTIONAL: with no file the port uses the built-in defaults, which
+# are exactly the behaviour that was measured to work.  With a file, the
+# file is authoritative for the inputs it mentions.
+#
+# ---------------------------------------------------------------------------
+# WHICH CONTROLLERS THIS WORKS WITH
+# ---------------------------------------------------------------------------
+# The port reads ONE canonical set of inputs (17 buttons and 6 axes) and
+# this file says what each of them does to the guest.  So the port never
+# asks "which controller is this?":
+#
+#   * Nintendo Switch Pro Controller / Joy-Con
+#     Arrives natively as an Npad.  The port reads it directly.  Nothing to
+#     install, nothing to configure.
+#
+#   * Sony DualShock 4 / DualSense (PS4 / PS5)
+#   * Xbox 360 pad / Xbox One / Series pad / Xbox Elite (1st and 2nd gen)
+#     These are NOT Npad devices.  On a hacked console a HID driver
+#     (hidretro / dinput_redux) translates them into Npad, and after that
+#     they travel exactly the same path as the Pro Controller, so this file
+#     applies to them unchanged.
+#
+#     Why there is no "read the raw report" option: this console's HID
+#     service only exposes Npad state -- there is no raw HID report reader
+#     in the SDK (services/hid.h has Npad and Palma calls and nothing else,
+#     and hidbus.h covers only the Joy-Con rails).  So the translation is
+#     the driver's job, and the mapping is this file's job.
+#
+#   Face buttons, by position:
+#     DS4 / DualSense   cross -> A   circle -> B   square -> X   triangle -> Y
+#     Xbox              A      -> A   B      -> B   X     -> X   Y     -> Y
+#     (the driver maps by position, so the bottom face button is always A)
+#
+# ---------------------------------------------------------------------------
+# THE FORMAT
+# ---------------------------------------------------------------------------
+#   # a comment
+#   autopilot = 0 | 1 | assist
+#   deadzone = <0..1>
+#   <input> = <guest control> [| <guest control> ...] [scale=<f>] [invert=<0|1>] [thresh=<f>]
+#   <input> = none
+#
+# THE INPUTS (the same names for every controller):
+#
+#   buttons   A B X Y L1 R1 L2 R2 SELECT START HOME
+#             DPAD_UP DPAD_DOWN DPAD_LEFT DPAD_RIGHT L3 R3
+#   axes      LSTICK_X LSTICK_Y RSTICK_X RSTICK_Y LTRIGGER RTRIGGER
+#
+# THE GUEST CONTROLS (the guest's own ordinals):
+#
+#   buttons   BTN_A BTN_B BTN_X BTN_Y BTN_L1 BTN_R1 BTN_L2 BTN_R2
+#             BTN_DPAD_LEFT BTN_DPAD_RIGHT BTN_DPAD_UP BTN_DPAD_DOWN
+#             BTN_SELECT BTN_START BTN_DPAD_CENTER
+#   axes      AXIS_LX AXIS_LY AXIS_RX AXIS_RY AXIS_LT AXIS_RT
+#
+# Names are case-insensitive.  "|" separates several targets, the way the
+# guest's own profile writes "button 0 (A) | axis 5 (RT) | button 7 (R2)".
+#
+# "scale=" and "invert=" apply to an AXIS target.  "thresh=" is the value
+# at which an AXIS input counts as pressing a guest BUTTON -- an analogue
+# throttle wants a low one, or it does not bite until it is half way down.
+#
+# "none" removes an input completely.
+#
+# A LINE REPLACES the built-in bindings for the input it names.  The inputs
+# it does not name keep the defaults.  That is why every default is spelled
+# out below: so you can see it, and so you can change exactly one line.
+#
+# ---------------------------------------------------------------------------
+# WHO IS DRIVING -- autopilot
+# ---------------------------------------------------------------------------
+#   autopilot = 1        THE PORT DRIVES.
+#                       The port reads the guest's own race state and
+#                       computes the throttle, the brake and the steering,
+#                       and the controller is ignored.  This is the mode
+#                       that was measured to make the car drive.
+#
+#   autopilot = 0        YOU DRIVE.
+#                       The port does not touch the throttle, the brake or
+#                       the steering at all.  Your controller has the car.
+#                       <<< THIS IS THE MODE FOR DRIVING A FULL LAP YOURSELF.
+#
+#   autopilot = assist   YOU DRIVE, THE PORT FILLS IN THE GAPS.
+#                       For every control you are actively using, your
+#                       input wins.  For the ones you are leaving alone,
+#                       the port's own computation takes over.  Useful when
+#                       you want help on the straights but want to take the
+#                       corners yourself.
+#
+# ---------------------------------------------------------------------------
+# THE THROTTLE, AND WHY R2 IS BOUND TO BTN_A
+# ---------------------------------------------------------------------------
+# MEASURED 2026-10-24 (archive 20261024-134104-eden-thr-btnA): the guest's
+# accelerator is BTN_A.  With only BTN_R2 held the guest draws its own
+# "hold the brake to reverse" message -- the car is NOT moving.  With BTN_A
+# held it does.  The guest's own gamepad profile also binds the accelerator
+# to "button 0 (A) | axis 5 (RT) | button 7 (R2)".
+#
+# So the right trigger has to reach BTN_A, which is why R2 is bound to both
+# BTN_A and BTN_R2 below, and why RTRIGGER also drives BTN_A.
+#
+# On a controller with an ANALOGUE trigger, the trigger is the throttle you
+# want.  That is what the RTRIGGER line does, with a low threshold so the
+# throttle engages as soon as you touch it:
+#
+#     RTRIGGER = BTN_A | AXIS_RT thresh=0.2
+#
+# The line below binds RTRIGGER to AXIS_RT only, because on this console
+# the Npad layer has no analogue trigger at all (a Pro Controller's ZL and
+# ZR are plain buttons), so the digital R2 line above is the one that fires.
+# Uncomment the RTRIGGER line and comment out the R2 line if your driver
+# does deliver an analogue trigger.
+#
+# ---------------------------------------------------------------------------
+# THE DEFAULTS, SPELLED OUT
+# ---------------------------------------------------------------------------
+# These are the port's measured behaviour, one line per binding, so that you
+# can change exactly one thing and leave the rest alone.
+
+autopilot = 1
+deadzone = 0.12
+
+# --- the face buttons -------------------------------------------------------
+A = BTN_A
+B = BTN_B
+X = BTN_X
+Y = BTN_Y
+
+# --- the shoulders ----------------------------------------------------------
+L1 = BTN_L1
+R1 = BTN_R1
+L2 = BTN_L2
+
+# --- THE THROTTLE ------------------------------------------------------------
+# R2 is the right shoulder button, which is where the throttle lives on a
+# controller that has no analogue trigger.  It drives BTN_A (the guest's
+# accelerator, MEASURED) and BTN_R2 (which the guest's own profile also
+# binds to the accelerator).
+R2 = BTN_A | BTN_R2
+
+# --- the menus --------------------------------------------------------------
+SELECT = BTN_SELECT
+
+# The stick clicks.  The left one is the common "start / menu" on an
+# Android pad, and it is what the port has always used for BTN_START.
+L3 = BTN_START
+R3 = BTN_DPAD_CENTER
+
+# --- the d-pad --------------------------------------------------------------
+DPAD_UP = BTN_DPAD_UP
+DPAD_DOWN = BTN_DPAD_DOWN
+DPAD_LEFT = BTN_DPAD_LEFT
+DPAD_RIGHT = BTN_DPAD_RIGHT
+
+# --- the sticks -------------------------------------------------------------
+LSTICK_X = AXIS_LX
+LSTICK_Y = AXIS_LY
+RSTICK_X = AXIS_RX
+RSTICK_Y = AXIS_RY
+
+# --- the triggers -----------------------------------------------------------
+LTRIGGER = AXIS_LT
+RTRIGGER = AXIS_RT
+
+# ---------------------------------------------------------------------------
+# RECIPES
+# ---------------------------------------------------------------------------
+# RIGHT TRIGGER AS THE THROTTLE (every controller):
+#     R2 = none
+#     RTRIGGER = BTN_A | AXIS_RT thresh=0.2
+#
+# INVERTED STEERING (if the car turns the wrong way):
+#     LSTICK_X = AXIS_LX scale=-1
+#
+# STEERING ON THE RIGHT STICK:
+#     LSTICK_X = none
+#     RSTICK_X = AXIS_LX
+#
+# ONLY THE STEERING, everything else on the keyboard or another device:
+#     A = none
+#     R2 = none
+#
+# ---------------------------------------------------------------------------
+# WHEN SOMETHING DOES NOT WORK, LOOK AT THE LOG
+# ---------------------------------------------------------------------------
+# The port writes two lines to
+#   sdmc:/switch/rr3-native-rehost.guest-view.log
+#
+#   gamepad-map    what it found in THIS file (or that there is no file)
+#   gamepad-state  the controller state and what went to the guest
+#
+# To read them on a PC, with the card as, say, F::
+#
+#   $p = 'F:\switch\rr3-native-rehost.guest-view.log'
+#   [System.IO.File]::ReadAllLines($p,[System.Text.Encoding]::UTF8) |
+#       Select-String 'gamepad-map|gamepad-state'
+#
+# "gamepad-map ... file=absent" means the port cannot see this file, so it
+# is running the built-in defaults.  "gamepad-map ... parsed=0 error_line=N"
+# means this file has a mistake on line N and the port refused it and kept
+# the defaults -- which is deliberate: half a mapping is worse than none.
