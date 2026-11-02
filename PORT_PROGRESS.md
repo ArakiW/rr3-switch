@@ -13139,3 +13139,172 @@ line -- the one thing that is certainly wrong.
 time**: the pursuit is running, the error is sane, the car is 0.19 m from the
 line, and the steering it asks for is the one that decides whether the car
 holds the line or leaves it.
+
+## THE CONTROLLER IS A VOCABULARY, AND THE CARD SAYS WHO DRIVES
+
+Two rounds (q119, q120) and one change to what the port writes to the card.
+
+### THE GAMEPAD LAYER
+
+One canonical set of inputs -- seventeen buttons and six axes -- and a mapping
+onto the guest's own controls.  Every controller is normalised into it, so
+the port never asks "which controller is this?".
+
+```
+libnx Npad  ->  canonical inputs  ->  rr3-gamepad.txt  ->  the guest
+```
+
+The built-in defaults ARE the port's measured behaviour, exactly: ZR drove
+BTN_A and BTN_R2 and the right trigger axis, ZL drove BTN_L2 and the left
+trigger axis, the left stick click drove BTN_START, the right stick click
+drove BTN_DPAD_CENTER, and the sticks went across as (x, -y).  A user with no
+mapping file gets the behaviour that was measured to work.
+
+`rr3-gamepad.txt` is authoritative for the inputs it names and the defaults
+survive for the ones it does not, so a user can change one line.  A file with
+a bad line is REFUSED and the defaults stay: half a mapping is worse than no
+mapping.
+
+### WHAT THE CONTROLLERS ARE
+
+The Pro Controller and the Joy-Con arrive as NPAD and the port already read
+them.  A DualShock 4, a DualSense, an Xbox 360 pad, an Xbox One/Series pad
+and both Elite pads do **not** arrive as NPAD.
+
+⇒ **this SDK has no raw HID report reader.**  Checked, not assumed:
+`libnx/include/switch/services/hid.h` exports only Npad and Palma calls, and
+`hidbus.h` covers only the Joy-Con rails (`HidbusBusType_LeftJoyRail` /
+`RightJoyRail`).  So "decode the raw report" has no transport here.
+
+⇒ on a hacked console a HID driver -- **hidretro** or **dinput_redux** --
+translates them into NPAD, and after that they travel exactly the same path
+as the Pro Controller, and the mapping file applies to them unchanged.
+
+The report decoders for the DS4, the DualSense and the Xbox 0x20 report are
+in the header and are pinned against the layouts in the Linux kernel's
+`drivers/hid/hid-playstation.c` (94,073 B, kept at `.build/ref/`):
+
+* the DS4 and the DualSense **disagree** about where the buttons sit --
+  `x,y,rx,ry,buttons[3],z,rz` against `x,y,rx,ry,z,rz,seq,buttons[4]`;
+* the d-pad is a **HAT**, not four buttons: 0 N, 1 NE, 2 E, 3 SE, 4 S, 5 SW,
+  6 W, 7 NW, 8 centre, and a diagonal is two directions;
+* the button bits are the kernel's: buttons[0] 4 square/5 cross/6 circle/
+  7 triangle, buttons[1] 0 L1/1 R1/2 L2/3 R2/4 create/5 options/6 L3/7 R3,
+  buttons[2] 0 PS/1 touchpad/2 mic;
+* the Sony and the Xbox Y axes have to be **negated**; the X axes do not.
+
+189 host checks execute all of it (`tests/host/gamepad_selftest.cpp`).
+
+### THE AXIS CONVENTION IS NOT THE ONE YOU WOULD GUESS
+
+Y is **UP-positive**, because that is what the port has always handed the
+guest (`-norm(left.y)`), and a normalisation layer that changed the sign
+would change what the guest receives.
+
+It is NOT Android's convention: the guest passes Android's `AXIS_Y` straight
+through (`ControllerManager.java:488`) and Android's `AXIS_Y` is
+down-positive.  So this axis has always been inverted relative to the
+guest's own Android source.  Nothing in the driving uses it (the steering is
+X) and libnx does not document the sign either way
+(`HidAnalogStickState` says only "X" and "Y"), so the port keeps the
+convention it has been running rather than the one it would have to guess.
+The mapping file can flip it: `LSTICK_Y = AXIS_LY scale=-1`.
+
+### MEASURED
+
+**q119** (`20261102-153631`) -- the new layer in place, the scripted pad
+driving:
+
+| | q118 | q119 |
+|---|---|---|
+| race-state samples | 251 | 263 |
+| live samples (on the line) | 167 | **210** |
+| pure pursuit on | 167/167 | **210/210** |
+| metres off the fitted line | 1.58 | **1.09** |
+| stalls | 7 | **1** |
+| heading flips | 6 | **2** |
+| last frame | 7530 | **7890** |
+
+**q120** (`20261102-154600`) -- the scripted pad **removed**, so the physical
+path was the one that ran:
+
+```
+gamepad-map    file=present parsed=1 error_line=0 mode=1 deadzone=0.120
+               bindings=22 from_file=22 bytes=9021
+gamepad-state  f=1200 mode=1 driving=1 mapped=1 buttons=0x00000000
+               guest_buttons=0x0001 guest_lx=-0.110
+gamepad-state  f=3900 mode=1 driving=1 mapped=1 guest_buttons=0x0001
+               guest_lx=-1.000
+```
+
+`guest_buttons=0x0001` is bit 0, the guest's **BTN_A**, the accelerator that
+was MEASURED to work (archive 20261024-134104-eden-thr-btnA).  The car
+reached a race with **no scripted pad at all**: the closed loop, going
+through the canonical layer and the mapping, drove it.
+
+### TWO BUGS, AND ONE OF THEM WAS THE INSTRUMENT
+
+**The buffer was too small.**  The first cut read the mapping file into an
+8 KiB buffer.  The shipped file is 9,021 bytes, so it was silently truncated
+to 8,191 -- and because the tail happened to be comments it still parsed, so
+nothing said so.  The buffer is 32 KiB now, and the log says `TRUNCATED` if
+it ever fills.  **A truncated mapping file is a file that does not say what
+it says.**
+
+**The instrument was lying.**  `tools/guest_analysis/romfs_ls.py` added every
+directory's name **twice**, so its paths read
+`files/files/.depot/.depot/Tracks/Tracks/...`.  The volumes were never like
+that; the lister was.  It matters because a duplicate check compares paths,
+and doubled paths match **nothing** -- which is how a tool can report "0
+overlap" for two trees that are in fact the same tree.  The "0 overlap"
+answer was the bug, and the honest answer is 897 identical copies, 1,391
+same-path-different-size and 7,584 card-only.
+
+### AND THE CARD IS TOO BIG
+
+The user reported that the package would not open on the console, and that
+the file layout was unfriendly to a small card.  Measured, not guessed:
+
+* the card carried **10,546 files / 11.21 GiB**;
+* the port's own log records every read it serves from the card as
+  `served=sdmc:/switch/rr3-native-rehost/<path>`, and in a full run there
+  were **133 distinct card files** served (92 under `.depot`, 30 under
+  `cache`, 10 under `doc`, plus `.nomedia`);
+* the seven data volumes carry **46,574 files** and are consulted FIRST --
+  the read chain is volume, then the volume's alias, then the card -- so the
+  loose copies on the card are a fallback that almost never fires;
+* the card's `apk/` (244 files) is dead: the guest's `apk/res` tree is served
+  from `rr3core:/files/apk/res`, 10,812 hits against 0 from the card.
+
+⇒ **the package now ships the tree the port actually reads**:
+
+```
+full profile : 112 files,  9.57 GiB
+mini profile : 108 files,  6.65 GiB   (gui-hd.romfs + vehicles-modern.romfs off)
+```
+
+⇒ `mini` leaves off `gui-hd.romfs` (1.55 GiB; consulted 272 times against
+gui-sd's 2,321, and every one of those was the 2048x1536 set -- the loading
+splash) and `vehicles-modern.romfs` (1.37 GiB; consulted **zero** times,
+because the car being driven was not one of them).
+
+⇒ **4 GB is still not enough for the game's data.**  The smallest useful set
+(core + gui-sd + tracks + vehicles-classic) is 4.87 GiB.  Getting under 4 GB
+means trimming the volumes to one track and one car, which is the next
+project, not a packaging problem.
+
+### AND THE INSTALLER LIED TWICE
+
+Both found by RUNNING it on a blank card directory:
+
+* the last native command is robocopy, and **robocopy returns 1 when it
+  succeeds** -- so the script exited 1 on a complete, verified install.  It
+  ends with an explicit `exit 0` now;
+* the mini profile's filter said "omit every file in `data\` that is not a
+  wanted volume", and `rr3-data-manifest.json` is not a volume -- so the
+  manifest was omitted, and the manifest is what says what is inside each
+  volume.  The omission list is now exactly the two named volumes, and the
+  installer checks that the manifest is on the card afterwards.
+
+⇒ **the manifest bug is the same shape as the one in the ports before it: a
+filter that is slightly too wide eats a file it was not thinking about.**
