@@ -13097,3 +13097,45 @@ never been exercised with the pursuit actually running; the earlier
 comparison settled the RECOVERY's direction.  The value in rr3-drive.txt is a
 reasoned default (the port's world frame has its Y negated), and the round
 that measures it is the one after this.
+## THE RECOVERY WAS KEEPING ITS OWN STALL ALIVE
+
+q117 (archive `20261102-140129-eden-rr3-q117-heading-kept`) is the round where
+the pursuit started to behave:
+
+* the error it computes fell from **2.2562 rad (129 degrees)** in q116 to
+  **0.69 rad (40 degrees)** -- because the heading is no longer taken from a
+  reversing car;
+* the car was **0.19-0.40 m from the fitted racing line** -- that is good
+  tracking, the pursuit is doing its job;
+* and the car still did not advance.
+
+The last one is the interesting one, because the log says exactly why:
+
+```
+f=3000  sdist=15001  thr=0 brk=1  steer=-1.000  pur=1  perr=0.6866  lres=0.40
+f=3900  sdist=1751   thr=0 brk=1  steer=-1.000  pur=1  perr=0.6952  lres=0.19
+```
+
+**The wheel is turned the right way, the car is on the line, and the BRAKE IS
+ON.**  The recovery is the reason:
+
+```
+no progress for 240 frames -> the recovery fires -> it brakes and the guest
+reverses -> the car still does not advance -> 240 frames later the recovery
+fires AGAIN
+```
+
+⇒ **the recovery was keeping its own stall alive**, and the car sat at the
+grid with the wheel turned the right way and the brake on.
+
+⇒ a car that is ON the racing line and not advancing is not stuck: it is being
+HELD (the guest's start sequence holds the car at the grid until the lights go
+out) or it is crawling.  Recovering from that means reversing away from the
+line -- the one thing that is certainly wrong.
+
+⇒ so the stall test now also requires that the car is **OFF the line**.
+
+⇒ **⇒ and with that, the pursuit's sign becomes measurable for the first
+time**: the pursuit is running, the error is sane, the car is 0.19 m from the
+line, and the steering it asks for is the one that decides whether the car
+holds the line or leaves it.

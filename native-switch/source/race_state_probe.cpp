@@ -2081,7 +2081,25 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
     // it; updateProgress() keeps the reference in step with the car while
     // the brake is held, so the stall does not fire again every 240 frames
     // and reverse the car down the circuit for the rest of the race.
-    if (g_lastProgressFrame != 0 &&
+    // A STALL IS A CAR THAT IS NEITHER ADVANCING NOR ON THE LINE.
+    //
+    // MEASURED 2026-11-02 (q117): the pursuit was tracking the car to
+    // 0.19-0.40 m from the fitted line -- that is GOOD tracking -- and the
+    // car still did not advance, because the recovery was braking it.  The
+    // recovery fires (no progress for 240 frames), the brake holds the car,
+    // the car does not advance, the recovery fires again: **the recovery was
+    // keeping its own stall alive**, and the car sat there with the wheel
+    // turned the right way and the brake on.
+    //
+    // A car that is ON the racing line and not advancing is not stuck: it is
+    // being HELD (the guest's start sequence holds the car at the grid) or
+    // it is crawling.  Recovering from that means reversing away from the
+    // line -- the one thing that is certainly wrong.
+    //
+    // So the stall test also requires that the car is OFF the line.
+    const bool onLine = m.targetFromLine && m.lineResidual > 0.0f &&
+                        m.lineResidual < 3.0f;
+    if (g_lastProgressFrame != 0 && !onLine &&
         frame - g_lastProgressFrame > 240ULL) {
         ++g_drive.stalls;
         g_drive.bestRate = 0.0f;
