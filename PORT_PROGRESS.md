@@ -12873,3 +12873,68 @@ port had two independent views of the same car (six members, and the car's
 own state) and chose the one that was frozen.  When two instruments measure
 the same thing and they disagree, the one that MOVES when the thing moves is
 the one that is wired to the decision.
+## THE CAR WAS ON THE TRACK, AND THE PORT STEERED IT OFF
+
+q114 is the round that finished the story, and it ends with a picture.
+
+The chain was complete for the first time:
+
+```
+phase=race-state ... metrics=1 active=0 mres=0x3f mfail=none posok=1
+                      line=1 lres=0.20
+                      drive=1 steer=... sawprog=1
+                      cpos=...
+```
+
+* the racing line was **ADOPTED** (`line=1`) and the car was **20 cm** from
+  the fitted line (`lres=0.20`);
+* the steering controller was **ENABLED** (`drive=1`) and steering;
+* the progress was **OBSERVED** (`sawprog=1`).
+
+And the captured frames are 57 of them, with frames 1400 to 7400 all being a
+moving 3D scene -- the race ran for thousands of frames.
+
+### THE PORT WAS WATCHING A FROZEN MEMBER, AND THEN A WRAPPING COUNTER
+
+The progress metric was the guest's lap-distance MEMBER, and in q113 that
+member read **1171456 at every single sample from frame 900 to frame 5400**
+while the car's own travelled distance went 3910 -> 164090 -> 76740 and its
+world position moved 300 metres.  The port concluded the car had stalled,
+braked it to a standstill (`thr=0 brk=1 steer=-0.600`, the position motionless
+afterwards) and then waited for a progress the frozen member could never
+report.
+
+⇒ the progress metric is now the car's OWN travelled distance.
+
+⇒ and THAT one is a 32-bit counter that WRAPS.  MEASURED 2026-11-02 (q114):
+it read 27922, then 4294961179 (-6117 signed), then 10668 again.  The raw
+difference is 4.29 billion, so the rate came out as 35,791,050 units per
+frame, which the stall detector read as "the car teleported" -- so it braked
+the car again, and the stall counter ran 0, 1, 2, 3, 5, 6, 7, 8, 10, 11, 12,
+13.  Every difference of the metric is now taken as a SIGNED 32-bit value.
+
+### AND THE CAR ENDED UP IN THE GRAVEL, BECAUSE THE SIGN WAS WRONG
+
+The captured frame 4000 of q114: Suzuka, the HUD up, the position reading 7,
+the green racing line on the asphalt -- **and the player's black GT3 sitting in
+the gravel beside the track.**
+
+⇒ **the pursuit was steering the wrong way.**  And the port's own comment
+had said so all along:
+
+> the world frame's handedness is the one thing here that is not measured, so
+> this is a knob and one round settles it ... THE KEY EXISTED AND WAS NEVER
+> APPLIED, because the pursuit had never run
+
+⇒ the round has now run, and it settles it: **`steersign=-1`**.
+
+⇒ **a knob that was never exercised is not a setting, it is a guess.**  It
+took the first round in which the thing it controls actually ran to turn the
+guess into a measurement.
+
+### WHAT IS STILL OPEN
+
+The lap counter still reads -1 (the guest's own "no lap yet" value), so the
+port has no lap number yet; and the q114 run ended with the car in the gravel,
+so the line tracking has to be shown to hold the car ON the asphalt before
+the port can be called a driver rather than a steering suggestion.

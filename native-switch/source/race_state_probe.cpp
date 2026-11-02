@@ -1891,6 +1891,24 @@ void discover(bool withHeapScan) {
 // average progress over the last couple of seconds.
 constexpr unsigned long long kRateWindowFrames = 120ULL;
 
+// THE DIFFERENCE OF A 32-BIT COUNTER, TAKEN AS A SIGNED VALUE.
+//
+// The guest's own travelled distance is a uint32 and it WRAPS.  MEASURED
+// 2026-11-02 (q114): it read 27922, then 4294961179 (-6117 signed), then
+// 10668 again.  The raw difference is 4.29 billion, and every consumer of a
+// rate or of a threshold has to see the small signed difference instead --
+// otherwise the port reads "the car teleported" where the guest means "the
+// counter rolled over".
+inline double wrapDelta32(double now, double before) {
+    double delta = now - before;
+    if (delta > 2147483648.0) {
+        delta -= 4294967296.0;
+    } else if (delta < -2147483648.0) {
+        delta += 4294967296.0;
+    }
+    return delta;
+}
+
 void updateProgress(unsigned long long frame, RaceMetricsSample* sample) {
     // The progress metric is the guest's own distance along the track's
     // spline. Two members carry it and the guest's names do not say which is
@@ -1973,16 +1991,30 @@ void updateProgress(unsigned long long frame, RaceMetricsSample* sample) {
     // and the car would reverse its way down the circuit for the rest of
     // the race.  Measured 2026-10-28: the distance fell from 125,357 to
     // 103,119 and the stall counter ran to 8.
+    //
+    // AND THE DISTANCE IS A 32-BIT COUNTER THAT WRAPS.
+    //
+    // MEASURED 2026-11-02 (q114): the car's own travelled distance read
+    // 27922, then 4294961179 (which is -6117 as a signed value), then
+    // 10668 again.  The raw difference is 4.29 BILLION, and the rate the
+    // port computed from it was 35,791,050 units per frame -- which the
+    // stall detector read as "the car teleported", so it braked the car to
+    // a standstill and then waited for progress that the wrapped counter
+    // could not report (the stall counter ran 0, 1, 2, 3, 5, 6, 7, 8, 10,
+    // 11, 12, 13).
+    //
+    // So every difference of the progress metric is taken as a SIGNED 32-bit
+    // value, which is what the counter actually is.
     if (g_drive.brake) {
         g_lastProgressValue = value;
-    } else if (value >= g_lastProgressValue + kProgressEpsilon) {
+    } else if (wrapDelta32(value, g_lastProgressValue) >= kProgressEpsilon) {
         g_lastProgressValue = value;
         g_lastProgressFrame = frame;
         g_sawProgress = true;
     }
     if (frame >= g_windowFrame + kRateWindowFrames) {
         const double frames = static_cast<double>(frame - g_windowFrame);
-        g_smoothedRate = (value - g_windowValue) / frames;
+        g_smoothedRate = wrapDelta32(value, g_windowValue) / frames;
         g_windowValue = value;
         g_windowFrame = frame;
     }

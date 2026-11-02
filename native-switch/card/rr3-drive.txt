@@ -31,6 +31,22 @@
 #
 # THE SIGN IS NOW -1, AND IT IS NOT A GUESS: IT IS MEASURED.
 #
+# THE ROUND THAT SETTLED IT: 2026-11-02 (q114, archive
+# 20261102-133201-eden-rr3-q114-car-progress).  This is the first round in
+# which the pursuit actually RAN -- the car reached the race, the port
+# adopted the racing line (line=1, lres=0.20 m) and drove -- and the
+# captured frame 4000 shows where the car ended up: ON THE TRACK'S EDGE, IN
+# THE GRAVEL, with the HUD up and the position reading 7.
+#
+# With steersign=+1 the pursuit steers the wrong way, so the car leaves the
+# circuit at the first corner.  With the sign flipped the pursuit's error
+# and the guest's steering axis have the same handedness.
+#
+# The other sign, `sign`, is a DIFFERENT key: it is the SWEEP's starting
+# direction, not the pursuit's axis sign, and it is -1 for the reason
+# measured on 2026-10-24 (a positive axis steers right, and the straight
+# bends left).
+#
 # The loop flips the sign itself when the guest's progress rate goes NEGATIVE
 # (the car is travelling against the spline's direction, i.e. round the track
 # the wrong way), so sign is only the starting guess.  The starting guess
@@ -70,4 +86,4 @@ probe=0
 base=0.05
 sign=-1
 steergain=0.50
-steersign=1
+steersign=-1
