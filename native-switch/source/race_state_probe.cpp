@@ -850,6 +850,11 @@ unsigned long long g_lastSearchFrame = 0;
 // WHY THE LAST METRICS OBJECT WAS REFUSED, IN WORDS.  "metrics=0" alone is
 // a dead end; this is what turns it into a lead.
 const char* g_metricsRejection = "not-looked-for";
+// WHAT THE REJECTED OBJECT LOOKED LIKE: the member mask it managed to
+// resolve, and the lap distance it read.  Without them, "the members are
+// not live" is still a dead end.
+uint32_t g_metricsRejectionMask = 0;
+uint32_t g_metricsRejectionLapd = 0;
 // The cheap path's own cadence.  The guest creates the RaceMetrics modifier
 // while the race is being set up and replaces it afterwards, so the port has
 // to LOOK while it is there: MEASURED 2026-11-01 (q96, q97), a 300-frame
@@ -2223,7 +2228,8 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             "f=%llu g=0x%llx gm=0x%llx gm_ok=%d gm_vptr=0x%llx gm_ap=0x%llx "
             "gm_base=%d gm_cand=%d cand=%s metrics=%d "
             "active=-1 nodes=%d keyoff=%d heap=0x%llx+0x%llx "
-            "rej=%s drive=%d cfg=%d",
+            "rej=%s rejm=0x%x rejlapd=%u "
+            "drive=%d cfg=%d",
             frame, static_cast<unsigned long long>(g_cglobal),
             static_cast<unsigned long long>(sample.gameMode),
             sample.gameModeFound ? 1 : 0,
@@ -2236,6 +2242,8 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             static_cast<unsigned long long>(g_heapBase),
             static_cast<unsigned long long>(g_heapSize),
             g_metricsRejection,
+            g_metricsRejectionMask,
+            g_metricsRejectionLapd,
             g_drive.enabled ? 1 : 0,
             g_driveConfig.present ? 1 : 0);
     } else {
@@ -2555,8 +2563,27 @@ void pumpRaceStateProbe(unsigned long long frame) {
         // guest's own "no lap yet" value.  So the instance is live when its
         // lap distance resolves to a POSITIVE number, and the port waits
         // for that instead of driving from a dead object.
-        const bool membersLive =
-            m.membersResolved == 0x3FULL && m.lapDistanceF > 0.0f;
+        // THE LIVE TEST IS THE GUEST'S OWN "THE RACE IS RUNNING" VALUE.
+        //
+        // It used to require ALL SIX members to resolve AND the lap distance
+        // to be positive.
+        //
+        // MEASURED 2026-11-02 (q112): the value-store probe found the
+        // guest's object and read TWO of its members successfully (lapsOk=1
+        // lapsWhy=none), while the race-state probe's SIX-member read left
+        // one of them unresolved and therefore REFUSED the object outright --
+        // six samples in a row, and the reason was
+        // "the-members-are-not-live".
+        //
+        // The steering does not need six members.  It needs the car's
+        // POSITION -- which comes from the CAR pointer inside the RuleSet,
+        // not from a member -- and the LAP DISTANCE, which is the progress
+        // signal.  So the test is now: the lap distance member RESOLVED, and
+        // its value is positive.  The guest's own "no lap yet" value is -1.0
+        // (measured 2026-10-28: the dead instances read lapd=4294967295
+        // lapdF=-1.000, the live one lapd=1298432 lapdF=1298432.000).
+        const bool lapResolved = (m.membersResolved & 1u) != 0;
+        const bool membersLive = lapResolved && m.lapDistanceF > 0.0f;
         // AND THE RuleSet HAS TO BE KNOWN: the car's pointer lives in it.
         const bool ownerKnown = g_ruleSetRaceMetrics != 0;
         if (!isRaceMetrics || !membersLive || !ownerKnown) {
@@ -2571,6 +2598,8 @@ void pumpRaceStateProbe(unsigned long long frame) {
                 !isRaceMetrics
                     ? "the-object-is-not-the-race-metrics"
                     : (!membersLive ? "the-members-are-not-live" : "the-owner-is-not-known");
+            g_metricsRejectionMask = m.membersResolved;
+            g_metricsRejectionLapd = m.lapDistance;
             g_metricsCount = 0;
             g_metrics[0] = 0;
             // THE GameMode GOES TOO.  discover() re-validates the GameMode
