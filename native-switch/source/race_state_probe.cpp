@@ -886,6 +886,10 @@ unsigned long long g_lastProgressFrame = 0;
 constexpr double kProgressEpsilon = 256.0;
 double g_lastProgressValue = 0.0;
 bool g_progressMetricIsTotal = true;
+// Whether the progress metric is the CAR'S OWN travelled distance rather
+// than one of the guest's members.  MEASURED 2026-11-02 (q113): the member
+// is frozen while the car moves, so the car is the metric.
+bool g_progressMetricIsCar = false;
 // THE STEERING FLOOR AND THE RECOVERY ANGLE.
 //
 // The floor used to be 0.05, i.e. 5 % of the steering axis: measured on the
@@ -1901,12 +1905,18 @@ void updateProgress(unsigned long long frame, RaceMetricsSample* sample) {
         g_haveProgressValue = true;
         g_progressFromTotal = true;
         g_lastProgressFrame = frame;
-        g_lastProgressValue = total;
-        g_progressMetricIsTotal = true;
-        g_windowValue = total;
+        // THE FIRST REFERENCE IS THE CAR'S OWN DISTANCE WHEN THERE IS ONE.
+        // See the comment further down: the member can be frozen while the
+        // car moves, and a reference taken from a frozen member can never be
+        // passed.
+        const double car = static_cast<double>(sample->splineDistance);
+        g_progressMetricIsCar = (car != 0.0);
+        g_lastProgressValue = g_progressMetricIsCar ? car : total;
+        g_progressMetricIsTotal = !g_progressMetricIsCar;
+        g_windowValue = g_lastProgressValue;
         g_windowFrame = frame;
         g_smoothedRate = 0.0;
-        sample->progress = total;
+        sample->progress = g_lastProgressValue;
         sample->progressRate = 0.0;
         sample->progressFromTotal = true;
         return;
@@ -1921,10 +1931,35 @@ void updateProgress(unsigned long long frame, RaceMetricsSample* sample) {
     } else if (deltaLap != 0.0) {
         g_progressFromTotal = false;
     }
-    const double value = g_progressFromTotal ? total : lap;
+    // THE CAR'S OWN TRAVELLED DISTANCE, AND WHY IT IS THE METRIC NOW.
+    //
+    // MEASURED 2026-11-02 (q113, archive
+    // 20261102-061012... and the round after it): the guest's lap-distance
+    // MEMBER read 1171456 at EVERY sample from frame 900 to frame 5400,
+    // while the car's own spline distance went 3910 -> 164090 -> 76740 and
+    // its world position moved 300 metres.
+    //
+    // So the port was watching a FROZEN member and the car was NOT frozen.
+    // It concluded the car had stalled, braked it to a standstill
+    // (thr=0 brk=1 steer=-0.600 from frame 1500 on, with the position
+    // motionless afterwards) and then waited for a progress that the frozen
+    // member could never report.  A recovery that waits for a signal the
+    // guest does not send is a deadlock, not a recovery.
+    //
+    // The car's own travelled distance is the guest's own progress, it moves
+    // when the car moves, and it is what the steering needs.  The members
+    // stay as the fallback for the case where the car state is not readable
+    // yet.
+    const double car = static_cast<double>(sample->splineDistance);
+    const bool useCar = (car != 0.0);
+    if (useCar != g_progressMetricIsCar) {
+        g_progressMetricIsCar = useCar;
+        g_lastProgressValue = useCar ? car : (g_progressFromTotal ? total : lap);
+    }
+    const double value = useCar ? car : (g_progressFromTotal ? total : lap);
     // The live metric can switch, and the two members are not on the same
     // scale, so the threshold's reference has to start again when it does.
-    if (g_progressFromTotal != g_progressMetricIsTotal) {
+    if (!useCar && g_progressFromTotal != g_progressMetricIsTotal) {
         g_progressMetricIsTotal = g_progressFromTotal;
         g_lastProgressValue = value;
     }

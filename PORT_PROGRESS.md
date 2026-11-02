@@ -12815,3 +12815,61 @@ The log now carries `rej=<reason>` next to `metrics=0`.
 ⇒ **a counter says how often; a reason says what to do.**  The three reasons
 above have three completely different fixes, and the port could not tell
 them apart before.
+THE PORT WAS WATCHING A FROZEN MEMBER WHILE THE CAR MOVED
+
+q113 is the round where the whole chain came up at once.  The race-state
+probe, for the first time, held a LIVE metrics object through the race:
+
+    phase=race-state ... metrics=1 active=0 cls=27RuleSetModifier_RaceMetrics
+                          vptr_ok=1 mres=0x3f mfail=none posok=1
+                          line=1 lres=0.20
+                          drive=1 steer=-0.600 sawprog=1
+                          cpos=198775,-89323,724
+
+and it held it for 96 consecutive samples (frame 630 to 3480).  Two things
+that had been believed to be properties of the guest turned out to be
+properties of the PORT:
+
+* "the metrics object only exists in bursts" -- no.  The bursts were the port
+  REFUSING the object: the live test wanted all six members resolved, and
+  one unresolved member was enough to throw it away.  The live test is now
+  the guest's own "the race is running" value -- the lap distance member
+  RESOLVED and positive -- because that is all the steering needs (the car's
+  position comes from the CAR pointer in the RuleSet, not from a member).
+
+* "the racing line is fitted but the car is not on it" -- no.  lres=0.20
+  metres: the car is TWENTY CENTIMETRES from the fitted line.
+
+### AND THEN THE CAR STOPPED, AND THE PORT WAS THE REASON
+
+The same log, read as a time series:
+
+    frame   lapd      sdist    cpos                     thr brk steer
+     900   1171456   3910     136227,-63131,-3         1   0   0.000
+    1200   1171456   12769    191188,-85309,616        1   0  -0.110
+    1500   1171456   164090   208174,-92294,693        0   1  -0.600
+    1800   1171456   134950   204715,-91032,670        0   1  -0.600
+    ...
+    4800   1171456   76736    198782,-89335,726        0   1  -0.600
+
+**The guest's lap-distance MEMBER read 1171456 at every single sample from
+frame 900 to frame 5400**, while the car's own travelled distance (sdist)
+went 3910 -> 164090 -> 76740 and its world position moved 300 metres.
+
+So the port, watching the frozen member, concluded the car had stalled.  It
+braked it to a standstill (thr=0 brk=1 steer=-0.600 from frame 1500 on, with
+the position motionless afterwards) and then waited for a progress that the
+frozen member could never report.
+
+=> **A recovery that waits for a signal the guest does not send is a
+deadlock, not a recovery.**
+
+=> the progress metric is now the car's OWN travelled distance -- the guest's
+own progress, it moves when the car moves -- and the members are only the
+fallback for the case where the car state is not readable yet.
+
+=> **a member that is supposed to be the progress was not the progress.**  The
+port had two independent views of the same car (six members, and the car's
+own state) and chose the one that was frozen.  When two instruments measure
+the same thing and they disagree, the one that MOVES when the thing moves is
+the one that is wired to the decision.
