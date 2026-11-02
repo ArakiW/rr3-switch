@@ -13444,3 +13444,46 @@ thing.
   EGL surface clean.  Turning it on needs the framebuffer and the guest's
   surface to stop fighting over the NWindow, which is a separate piece of
   work.
+
+## THE SYMBOL FONT IS SUBSTITUTED, AND THE REASON IS NOW MEASURED
+
+The user caught a regression: the tips screen's dialog body came out EMPTY,
+with a single "V" and a caret in it.
+
+MEASURED (archive 20261102-173359-eden-rr3-q122-real-symbol-font): the guest
+uses r3_symbols.ttf for a whole ENGLISH PARAGRAPH --
+
+    phase=glyph-para ... size=140.0 textLen=143
+      text="If you want to race in the real world, try your local track."
+
+-- and with the symbol font opened as itself, that paragraph is looked up in a
+font with 236 SYMBOL glyphs and almost no letters:
+
+    phase=glyph-face ... face=sdmc:/.../r3_symbols.ttf substituted=0
+      upem=2048 glyphs=236
+
+=> one "V" and nothing else.  One build earlier (q120, with the
+substitution) the same line says
+
+    phase=glyph-face ... face=romfs:/ui/ConduitITCPro-Regular.otf
+      substituted=1 upem=1000 glyphs=653
+
+=> **THE SUBSTITUTION IS WHAT MAKES THAT TEXT READABLE, so it stays.**
+
+WHAT THE SUBSTITUTION COSTS, MEASURED
+--------------------------------------
+1. The currency readouts come out as the LETTERS "MS", "RS" and "C"
+   instead of icons.
+2. **THE SIZE IS OFF BY THE EM RATIO.**  The guest lays the paragraph out
+   with the SYMBOL font's em (2048) and asks for size 140; the port draws it
+   with the TEXT face's em (1000) => the port's text is **2.048x** the size
+   the guest asked for.  The paragraph size is 140.0 in BOTH builds, so this
+   is long-standing, not new.
+
+=> THE FIX IS PER CODEPOINT, NOT PER FILE: open the requested face for its
+METRICS and for the icons it owns, and draw the codepoints it lacks with the
+text face, scaled by upem_text/upem_symbol.  That touches the MEASUREMENT
+path as well as the drawing path, so it has to be measured, not guessed.
+
+=> the symbol font change is REVERTED; the console crash fix, the prune-list
+fix, the gamepad layer and the consolidated package all stay.
