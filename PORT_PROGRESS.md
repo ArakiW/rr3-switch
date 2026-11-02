@@ -12938,3 +12938,57 @@ The lap counter still reads -1 (the guest's own "no lap yet" value), so the
 port has no lap number yet; and the q114 run ended with the car in the gravel,
 so the line tracking has to be shown to hold the car ON the asphalt before
 the port can be called a driver rather than a steering suggestion.
+## THE SIGN WAS RIGHT, AND THE CAR STILL LEAVES THE TRACK
+
+q115 (archive `20261102-134135-eden-rr3-q115-steersign-minus1`) ran with
+`steersign=-1`, and the captured frame 7600 is the answer: the car is on the
+**track apron**, against the tyre wall -- where in q114 (steersign=+1) it was
+in the **sand**, off the circuit entirely.
+
+⇒ the sign flip moved the car from the sand onto the paved runoff, i.e. the
+handedness was wrong and is now right.  The car still leaves the racing
+surface, so the pursuit is not tracking the line well enough -- and once the
+car is off, the recovery loop keeps it there.
+
+### THE RECOVERY IS A TRAP, AND IT IS EASY TO SEE WHY
+
+```cpp
+if (g_lastProgressFrame != 0 && frame - g_lastProgressFrame > 240ULL) {
+    ++g_drive.stalls;
+    g_drive.bestRate = 0.0f;
+    g_lastProgressFrame = frame;              // <- the reference is RESET
+    g_brakeUntilFrame = frame + kDriveRecoveryFrames;
+}
+```
+
+⇒ every 240 frames without progress the port brakes, AND IT RESETS THE
+REFERENCE, so the stall fires again 240 frames later.  If the car does not get
+free in one recovery window, the loop repeats for the rest of the race.  The
+measured stall counters say exactly that: q114 ran 0, 1, 2, 3, 5, 6, 7, 8, 10,
+11, 12, 13 and q115 ran 0, 1, 2, 3, 4, 6, 7, 8, 9, 11, 12, 13.
+
+And in q115 the recovery's own work is visible: the car's own travelled
+distance went 3910 -> 19,189 -> **166,210** and then back down to 76,799 --
+it advanced and then gave 350 metres back while reversing.
+
+### THE WRAP FIX IS CONFIRMED
+
+q115's rates read 32.58, 40.49, 0.26, -50.59, -56.38, -56.47, -55.74,
+-38.75, 0.31, 0.11, -0.08, 0.28 -- all sane.  q114's read 32.58, 79.23,
+**-35,789,676**, 43.91, 56.79, **35,791,050**, -35,791,354, 0.26, 0.16, 0.20,
+0.33.  ⇒ the signed 32-bit difference is what the counter actually is, and
+the garbage rates that were braking the car are gone.
+
+### WHERE THE PORT STANDS
+
+* the guest reaches the race (BTN_A dismisses the tutorial dialog);
+* the port reads the guest's own metrics (all six members, mres=0x3f);
+* the port adopts the guest's own racing line (line=1, 0.18-0.20 m);
+* the port drives (drive=1, it steers and it accelerates, the race ran for
+  thousands of frames and the HUD was up with the position reading 7);
+* the port's sign is now measured rather than guessed (steersign=-1);
+* **and the car does not yet stay on the racing surface**, and the recovery
+  loop traps it once it is off.
+
+⇒ the next work is the pursuit's aim point and its magnitude, and the
+recovery needs an exit instead of a reset.
