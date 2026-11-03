@@ -26,9 +26,10 @@ length bound**. With that bounded the game runs clean:
 
 1. **Install the newest NRO on the console and boot** (§4.1) — the crash
    fixes are only proven on the emulator so far.
-2. **Rebuild the deliverables and commit** (this round is uncommitted; `dist/`
-   still carries the old NRO).
-3. **Characterise the "Version 1" stretch** (see §4.2).
+2. **Characterise the splash overflow** (see §4.2) — the chain is measured
+   down to the engine's own matrix; what is left is which matrix it sets up
+   for the 2D pass.
+3. **Pure pursuit cannot hold the line** (§4.4).
 
 ---
 
@@ -44,10 +45,12 @@ length bound**. With that bounded the game runs clean:
 | 6 | 10,546 loose files on the card; slow to copy / slow to scan | **Fixed** | 10,546 → 186 files, 9.58 GiB |
 | 7 | Installer exit code reported failure; mini profile deleted the manifest | **Fixed** | previous round |
 | 8 | Mapping file truncated at 8 KiB (9,021 B → 8,191 B) | **Fixed** | previous round |
-| 9 | Splash "Version 1" stretched 2.47×, right half clipped | **Needs characterisation** | §4.2 |
-| 10 | First 10 s of black screen before the guest appears | **Not started** (separate work) | §4.3 |
-| 11 | Pure pursuit cannot hold the line (lap count −1) | **Not started** | §4.4 |
-| 12 | Deliverables (app zip / full package / 4 volumes) + commit | **Not started** | §4.5 |
+| 9 | The release archive was stale (1480 B off the package) | **Fixed, measured** | §2.8; fingerprint + rebuild + byte-for-byte join check |
+| 10 | `renderToTexture` did not scale the glyphs (and had no log line) | **Fixed, measured** | §2.7; q133: 0 calls, so no pixel changed — a latent fix |
+| 11 | Splash title overflows the screen (1398 px of the line off-screen) | **Characterised, not fixed** | §2.7 / §4.2; the engine's own matrix overshoots by 1.525× |
+| 12 | First 10 s of black screen before the guest appears | **Largely fixed** | §4.3; q134: 6,628 ms → 2,843 ms, 2.6 MB no longer written |
+| 13 | Pure pursuit cannot hold the line (lap count −1) | **Not started** | §4.4 |
+| 14 | Deliverables (app zip / full package / 4 volumes) + commit | **Rebuilt** | §4.5; the NRO in the package, the app zip and on the card are the same file |
 
 ---
 
@@ -324,13 +327,165 @@ Gate: BUILD 0, INPUTS 0, SYMBOLS 0, tests **39/39**.
 
 ---
 
-### 3. Conclusions that were falsified (recorded so they are not re-derived)
+### 2.7 The splash title overflows the screen — and the port's `renderToTexture` never scaled the glyphs
+
+**This is the "Version 1" / "font size is wrong" family. It reproduces on the
+emulator, so it needs no console to investigate.**
+
+#### What is on the screen
+
+The splash's big line is **guest text**, not artwork:
+
+```
+jni-utf163  … text=Player ID: CCDI123456789 / CCRR123456789      (40 characters)
+glyph-face  req=…/ConduitITCPro-Bold.otf  size=140.0  substituted=0
+glyph-vector method=init textLen=40 size=140.0 boundsW=2421.0 boundsH=125.0
+glyph-vector method=createTexture boundsW=2421.0 texId=260 texW=4096 texH=128
+```
+
+The port measures the string at **2421 px**, and the font's ground truth agrees
+with it (`tools/conduit_width_truth.py`: 17,383 font units at upem 1000 ⇒
+**2433.6 px** at size 140; the 0.5 % difference is the ink box vs the advance).
+**⇒ the port measures correctly.**
+
+Pixel measurement of the rendered frame (`tools/splash_measure.py`, q132
+`frame-000120.png`, 1280×720):
+
+```
+band y 271..391 (h=121)  x 257..1279  ->  TOUCHES THE RIGHT EDGE (column 1279)
+```
+
+The title's ink starts at x=257 and is cut off at the screen edge. 1023 px of
+the 2421 px string are visible ⇒ **~1398 px of the line are off-screen.**
+
+#### Where the engine's idea and the port's idea disagree
+
+The engine put the line's left edge at 257. A string of width *w* centred on a
+1280-px screen starts at `(1280 − w)/2`, so the engine believes the line is
+**~766 px** wide. The same string measured at **size 42 is 719 px** — and the
+guest *also* asks for that size (`glyph-vector … size=42.0 boundsW=719.0`).
+The 2421/766 ratio is **3.16**, and 140/42 is **3.33**.
+
+So the engine laid the line out for the *small* variant and the port drew the
+*large* one, or something scaled by ~1/3.2 was expected and did not happen.
+
+#### The port's bug
+
+`native-switch/source/jni_compat/classes/glyph_vector.cpp`, `gv_renderToTexture()`.
+
+The guest's own Java is the contract (`reverse/java/sources/com/firemint/
+realracing/GlyphVector.java`):
+
+```java
+public boolean renderToTexture(int i, int i2, int i3, float f) {
+    …
+    float fWidth = (i2 - (this.m_bounds.width() * f)) * 0.5f;
+    canvas.translate(fWidth - (rect.left * f),
+                     ((f2 - (rect.height() * f)) * 0.5f) - (this.m_bounds.top * f));
+    canvas.scale(f, f);                 // <-- the glyphs are scaled by f
+    canvas.drawText(this.m_text, 0.0f, 0.0f, this.m_paint);
+}
+```
+
+The port used `scale` **only** to compute the origin and then rasterised the
+glyphs at their full size:
+
+```cpp
+const float originX = (w - facade->boundsW * scale) * 0.5f;   // origin used scale
+rasterizeLine(face, …, state->widthScale, originX, originY, …); // glyphs did NOT
+```
+
+⇒ **text drawn through that path came out 1/f too big** — exactly the 3.2×
+disagreement above. Two further divergences from the Java were in the same
+function: the port centred by the **ascent** instead of the **ink box**, and it
+put the **ink-left** where the Java puts the **pen**.
+
+Worse, **that path had no log line at all** (`renderToTexture` never reached
+`guestViewWideLog`), so a wrong answer there was invisible — which is why the
+icon-font investigation had to walk the whole chain before landing here.
+
+**Fixed 2026-11-03** (`gv_renderToTexture`): the glyphs are rendered at
+`textSize * f`, the ink box is centred horizontally and vertically, and the pen
+is placed at `inkLeft + offsetX * f`. A `glyph-rtt` log line now records every
+call (`texId, w, h, scale, size, boundsW/H, inkW/H, penX, baselineY, text`), so
+the path is observable for the first time.
+
+**MEASURED (q133): the guest NEVER CALLS `renderToTexture`** — 0 `glyph-rtt`
+lines in a 23.5 MB log, and the same 218/214 `text-quad` lines with the same
+33/35 over-wide quads in q132 and q133. **⇒ this fix is a latent contract
+correction, NOT the cause of the splash overflow, and it did not change a
+single pixel on screen.** It is recorded here because it was a real divergence
+from the guest's Java, and because the reason it took so long to find is the
+one worth keeping: *the path had no log line, so it was invisible.*
+
+**⇒ The remaining lead (measured, not guessed)**: the overflow is in the
+engine's own matrix, not in the text. The `text-quad` probe records the
+vertex data and the resulting NDC:
+
+```
+a_Position: v0=(0,1022) … v2=(0,0)                 <- the full-screen quad
+a_Position: v0=(1021,472) … v2=(0,0)
+  ndc= v0=(1.2168,-1.0000) … v2=(-1.2168,-1.0000)  rect=-138,0,1557,720
+```
+
+⇒ a quad whose vertices are 0..1021 px wide comes out **1557 px** wide and
+**starts 138 px off the left edge** — the guest's own matrix overshoots the
+1280-px viewport by 1.525x, symmetrically. Other quads in the same frame map
+1:1 (`a_Position 257..731` → `ndc -0.5984..0.1422`), so the engine uses two
+different matrices. The next reading is which matrix the guest sets up for the
+2D UI pass, and what it derives it from.
+
+#### Ruled out with measurements (so they are not re-derived)
+
+| Candidate | Measurement | Verdict |
+|---|---|---|
+| The icon font | q123b (`iconfont=0`) and q132 (`iconfont=1`) produce the **identical** `size=140 … boundsW=2421.0` | not the cause |
+| A wrong font FILE | the romfs copy and the guest's own APK copy of `ConduitITCPro-Bold.otf` are the **same 130,400 bytes, same sha256** (`CABB8BE8…`) | not the cause |
+| The screen size | the guest prints `Res base: 1280x720` and `nScreenSize = 1280x720` — the same as the framebuffer | not the cause |
+| The device profile | **q61 already measured this**: writing `EXPECTED_SCREEN_*` changed the profile (`changed=2 written=1`) and the font sizes **did not move**; the sizes come from a fixed table (14/28/42/56/70/84/98/140) | not the cause |
+| Another face | `tools/face_width_scan.py` measured the string in all 18 staged faces at size 140: the narrowest is 2367 px, none is ~766 | not the cause |
+
+**⇒ The device profile's `EXPECTED_SCREEN_WIDTH = 480` / `HEIGHT = 320` are a
+red herring for the font size** (q61), even though they are what the game's
+`AndroidHigh.plist` really contains. The profile is built by the port's own
+settings layer (`settings-profile … base=rr3core:/files/.depot/eds/
+AndroidHigh.plist … bytes=6808/6808 changed=1`), and the guest's own dump
+confirms it reads `EXPECTED_SCREEN_WIDTH = 480`.
+
+### 2.8 The release archive was stale: `pack-zip.ps1` reused an existing zip
+
+`tools/…/.build/pack-zip.ps1` had `if (Test-Path $outZip) { … } else { zip }`:
+**an existing archive was reused without checking it against the package.** The
+2026-11-03 repack shipped an archive that was **1480 bytes** off the package:
+
+```
+README-hardware-test.md   zip=27,062   pkg=29,969   (+2,907)
+switch/rr3-gfx.conf       zip=3,975    pkg=2,548    (−1,427)
+```
+
+The size gate caught it (`the archive holds 11459500064 bytes but the package
+holds 11459501544`), which is how it was found — but the failure came **after**
+a whole repack cycle.
+
+**Fixed 2026-11-03**: the archive is now fingerprinted against the package it
+was built from (file list + sizes + timestamps, hashed) and a mismatching
+archive is **rebuilt** rather than reused; the fingerprint is written only after
+a successful build, so an interrupted run leaves none and the next run rebuilds.
+`pack-zip.ps1` also takes a `-Stamp` now (its paths were hard-wired to
+20261102, which is how a repack could write next to the previous day's
+deliverables), and `.build/run-repack.ps1` chains the whole deliverable set in
+one go: archive → parts → app zip → join check.
+
+
 
 | Old conclusion | Measurement | Why it was wrong |
 |---|---|---|
 | "The guest lays out a whole English paragraph with the symbol font, so the port draws it 2.048× too big" | The paragraph uses Conduit 1:1; 2,812 text draws per run, zero substitutions | a log window that crossed a request boundary ⇒ misattribution |
 | "q122's blank dialog was caused by the symbol font" | q122 opened the card's **72,468-byte** file, which is a **different font** | same name, different content |
 | "The icons are half the size because upem 2048 vs 1000" | A ratio does not describe a size error; the real cause was the **face being swapped** (different glyphs entirely) | a ratio mistaken for a size error |
+| "The splash title is 1455 px wide because the symbol font's advance is 10.4 em at size 140" | The string is drawn with **ConduitITCPro-Bold**; the font's real advance for it is 2433.6 px at size 140 (`conduit_width_truth.py`). 1455 px is the width of a *different* element | a number from another measurement |
+| "The splash line is drawn too big because the device profile says EXPECTED_SCREEN 480×320" | **q61 already measured this**: the profile was rewritten (`changed=2 written=1`) and the font sizes did not move. The sizes come from a fixed table | a plausible cause that was already falsified |
+| "The splash artwork is scaled too wide" | The overflowing line is **guest text** (`Player ID: CCDI123456789 / CCRR123456789`), measured with a texture id, a bounds width and a pixel band | the artwork was blamed for a text bug |
 
 ---
 
@@ -382,41 +537,80 @@ $B/aarch64-none-elf-addr2line -f -C -i -e native-switch/rr3-native-rehost.elf 0x
 
 ### 4.2 P1 — The splash's "Version 1" is clipped off the right edge
 
-**Re-characterised on 2026-11-03 — it is NOT a font problem.**
-
-What was measured first (q123b, the `iconfont=0` control run):
+**Re-characterised on 2026-11-03 — the full chain is in §2.7.** The line that
+overflows is **guest text**, not artwork:
 
 ```
-glyph-face   req=ConduitITCPro-Bold.otf  size=140.0     <- the guest names Conduit Bold
-glyph-tex    texture=1024x128  inked=20618 of 131072 (15.7%) texId=254
-glyph-vector createTexture  boundsW=588.0  boundsH=93.0
-text-quad    a_Position: v0=(2048,430) v2=(593,430)      <- actually drawn 1455 px wide
+"Player ID: CCDI123456789 / CCRR123456789"   (40 characters, Conduit Bold, size 140)
 ```
 
-⇒ the port measures **588 px**; the guest draws it **1455 px** wide (ratio
-**2.474**) on a 1280-px screen ⇒ the right half is clipped, which is exactly
-what the frame shows.
+⇒ the port measures it at 2421 px (ground truth 2433.6 px — the port is right),
+the engine puts its left edge at 257, and the 1280-px screen cuts it at the
+right edge with ~1398 px of the line off-screen.
 
-**But it is not the guest's text.** In the q124/q132 logs the string
-`Version 1` never appears in a `jni-utf163 … text=` line, and it is not in the
-port's source either — so it comes out of the **game's splash artwork**, and
-the artwork is being drawn too wide. The splash cycles several lines: the
-"Version 1" wordmark comes from the art, and the neighbouring
-`Player ID: CCDI123456789 / CCRR123456789` **is** a guest text (measured in
-both q123b and q132, 40 characters) and it is drawn at a plausible width.
+The **"Version 1" wordmark itself** is still not in any `text=` line and not in
+the port's source, so *that* string does come out of the splash artwork — but
+the artwork is not the cause of the overflow: the neighbouring guest text
+overflows in exactly the same way, and it is the guest text that was measured.
 
-⇒ **Open question for the next round**: why is the splash art scaled so that
-it overflows the screen by ~400 px? The candidate is the same class of bug as
-the icon font: the guest's layout and the port's rendering disagree about the
-size of one element. Nothing has been changed here — a wrong guess in the
-splash scaling would move the whole splash, and there is still no console
-feedback on how the splash looks on the device.
+**What was fixed**: the port's `renderToTexture()` did not scale the glyphs by
+the guest's scale factor, so text drawn through that path came out 1/f too big
+(§2.7). That path had **no log line at all**, which is why this took a whole
+chain of measurements to find.
+
+**What is still open**: whether the splash line's *size request* (140, the
+largest entry of the guest's fixed table 14/28/42/56/70/84/98/140) is what the
+game intends on a 1280-px screen. The guest asks for the same string at
+**size 42** as well (719 px — that one fits), and the engine's own layout put
+the large one where a ~766-px line would go. The next reading is the
+`glyph-rtt` log line and the `text-quad` geometry of the two variants; if the
+engine still draws the large one after the `renderToTexture` fix, the
+remaining lever is the **view size** (`view=WxH` in `rr3-screen.txt`), which
+also moves the guest's layout and therefore the touch script's pixel
+coordinates.
 
 ### 4.3 P2 — The first 10 seconds are black
 
-The port's own Chinese loading screen is off (`nofb=1`) because it fights the
-guest's EGL surface for the same NWindow. Enabling it requires the framebuffer
-and the guest's surface to stop fighting — **separate piece of work**.
+**Largely fixed on 2026-11-03 (q134) — see the numbers below.** What was left is
+the port's own Chinese loading screen, which is off (`nofb=1`) because it fights
+the guest's EGL surface for the same NWindow. Enabling it requires the
+framebuffer and the guest's surface to stop fighting — **separate piece of
+work**.
+
+**The guest's own asset-list rewrite was the black screen's real cost.**
+MEASURED on Eden (q132):
+
+```
+assetlist-rewrite-all-begin  lists=1235 overrides=8649
+assetlist-rewrite-all        lists_touched=386 lists_written=386
+  entries_rewritten=2992 bytes=2610656 ms=6628
+```
+
+386 of 1235 lists are rewritten, 2.6 MB is written, and the write is **a
+temporary file, a remove and a rename per list** — three filesystem metadata
+operations on a slow card. On the console that is 33..41 s of black screen.
+
+**Fixed (q134): the pass now compares the content it would write with the
+content the card already has, and writes nothing when they are the same.** The
+content is deterministic, so after the first boot it always is. Measured on
+Eden, same card, same build otherwise:
+
+```
+assetlist-rewrite-all  lists_touched=386 lists_written=0 lists_unchanged=386
+  bytes=0 bytes_skipped=2610656 ms=2843
+  read_ms=564 rewrite_ms=5 write_ms=0
+```
+
+⇒ **6,628 ms → 2,843 ms on Eden (2.33x), and 2,610,656 bytes are no longer
+written.** The three costs are now separated in the log for the first time:
+**reading the 1235 source lists is 564 ms, rewriting them is 5 ms, and the
+writing was the other ~6,000 ms.** On the console, where the write is 5..6x
+slower than Eden's, that is the bulk of the 33..41 s.
+
+**What is left**: the pass still reads 1235 lists and 386 cached files on every
+boot (~2.8 s on Eden). The GUI base list already has a cache key for exactly
+this (`assetlist-rewrite-gui … cached=1 key=…`); the same key could cover the
+whole pass and skip it entirely on an unchanged card.
 
 ### 4.4 P3 — Pure pursuit cannot hold the line (lap count −1)
 
@@ -427,7 +621,7 @@ Known directions (**none done yet**):
 * **the recovery logic needs an EXIT, not a reference-point reset** — resetting
   makes the car spin on the spot.
 
-### 4.5 P4 — Deliverables and commit (**done on 2026-11-03**)
+### 4.5 P4 — Deliverables and commit (**rebuilt on 2026-11-03, late**)
 
 | Artefact | Size | Notes |
 |---|---|---|
@@ -436,12 +630,21 @@ Known directions (**none done yet**):
 | `dist/rr3-switch-20261103.zip` | 7.89 GiB | 237 entries = 190 files + 46 directories |
 | `dist/parts-20261103/*.001…004` | 2 + 2 + 2 + 1.89 GiB | concatenated = the archive **byte for byte** |
 
-* The NRO in the package, the build output and the emulator card are all the
-  same file: `249c9f02…`.
+* **The NRO in the package, in the app zip and on the emulator card are all
+  the same file**, and `.build/rebuild-deliverables.ps1` now PROVES it (it
+  hashes all three and refuses to finish if they differ). The build this round
+  is `b71fbc5a…`.
+* **The package used to carry the NRO of an OLDER build** — the one that
+  crashed the console five times. That is the same class of bug as the stale
+  archive (§2.8), one level up, and it is why the rebuild script exists and
+  why the deliverable packagers are now versioned (`.gitignore` explains it).
+* The parts join to the archive byte for byte (sha256
+  `6001e60e…` for the archive of the earlier build; the rebuild prints its
+  own).
 * The 20261102 deliverables were removed (they carried the NRO that crashed
   five times on the console).
-* Committed as `b2e15180` and pushed to `origin/master`. **`git commit` must
-  use `-F <file>`** — `-m` and `-F` are mutually exclusive.
+* **`git commit` must use `-F <file>`** — `-m` and `-F` are mutually
+  exclusive.
 
 ---
 
@@ -461,6 +664,16 @@ Known directions (**none done yet**):
 | Files on the card | **186** (was 10,546) | `make-package-v2.ps1` |
 | Size on the card | **9.58 GiB** (was 11.21 GiB) | same |
 | Files actually read in a full run | 133 (.depot 92 + cache 30 + doc 10 + .nomedia 1) | read-chain measurement |
+| Splash line: guest text | `"Player ID: CCDI123456789 / CCRR123456789"`, 40 chars | q133 log |
+| … its size request | 140 (the largest entry of the fixed table 14/28/42/56/70/84/98/140) | q133 log |
+| … the port's measurement | 2421 px | q133 log |
+| … the font's ground truth | 2433.6 px (17,383 units at upem 1000) | `tools/conduit_width_truth.py` |
+| … on screen | ink x 257..1279, right edge touched ⇒ ~1398 px off-screen | `tools/splash_measure.py` |
+| … what the engine thought | ~766 px (it centred that width) | from the ink's left edge |
+| The engine's own matrix | 0..1021 px of vertices → 1557 px on screen (−138..1419) | `text-quad` probe |
+| Asset-list rewrite, before | 386 of 1235 lists, 2,610,656 B written, 6,628 ms | q132 log |
+| Asset-list rewrite, after | **0 written, 386 unchanged, 2,843 ms** (read 564 / rewrite 5 / write 0) | q134 log |
+| `renderToTexture` calls by the guest | **0** (in a 23.5 MB log) | q133 log |
 
 ---
 

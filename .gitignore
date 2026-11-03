@@ -37,6 +37,23 @@ reference/
 # --- build products ---------------------------------------------------------
 # .build/ holds intermediate objects AND the eden-runs archives (~8.4 GB).
 .build/
+# BUT the DELIVERABLE PACKAGERS are hand-written, and this file's own rule of
+# thumb says "keep anything a person wrote; ignore anything a tool produced".
+# So a few of them are force-tracked (git add -f) and the rest of .build/
+# stays ignored:
+#
+#   .build/gate.ps1                 the gate (39 tests + symbol resolution)
+#   .build/pack-zip.ps1              the full archive + its parts
+#   .build/pack-app-v2.ps1           the application-only zip
+#   .build/make-package-v2.ps1       the release tree
+#   .build/join_check.py             the parts-to-archive comparison
+#   .build/run-repack.ps1            the chain: archive -> parts -> app -> join
+#   .build/rebuild-deliverables.ps1  refresh the tree, then PROVE the NRO in it
+#   .build/run-round.ps1             build -> gate -> deploy -> Eden, in one go
+#
+# WHY THEY HAVE TO BE TRACKED: the archive packer silently reused a STALE
+# archive on 2026-11-03 and shipped one 1480 bytes off the package.  A fix to
+# a script that nobody can recover from a commit is a fix that does not exist.
 native-switch/build/
 native-switch/*.nro
 native-switch/*.elf

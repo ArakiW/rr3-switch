@@ -5385,9 +5385,20 @@ void buildRewrittenAssetLists() {
     unsigned touched = 0;
     unsigned visited = 0;
     unsigned written = 0;
+    unsigned unchanged = 0;
     unsigned entries = 0;
     unsigned atlasEntries = 0;
     unsigned long long bytes = 0;
+    unsigned long long bytesSkipped = 0;
+    // THE THREE COSTS, SEPARATED.
+    //
+    // MEASURED 2026-11-03: this pass touches 386 of 1235 lists and writes
+    // 2.6 MB.  That is 6.6 s on Eden and 33..41 s on the console, where the
+    // first ten seconds are a black screen.  The only number in the log was
+    // the total, so nobody could say WHICH part it was.
+    uint64_t readMs = 0;
+    uint64_t rewriteMs = 0;
+    uint64_t writeMs = 0;
     for (const std::string& guestPath : lists) {
         // A PROGRESS LINE EVERY 64 LISTS, so a log that stops inside this
         // pass says how far it got and how fast it was going.
@@ -5403,9 +5414,12 @@ void buildRewrittenAssetLists() {
                                 "assetlist-rewrite-all-progress", visited, 0, diag);
         }
         ++visited;
+        const uint64_t readStart = armGetSystemTick();
         std::string text;
         std::vector<std::string> paths;
         collectPathsFromList(guestPath.c_str(), paths, false, &text);
+        readMs += (armGetSystemTick() - readStart) * 1000ULL /
+                  (tickFreq != 0 ? tickFreq : 1);
         if (text.empty()) {
             continue;
         }
@@ -5428,6 +5442,7 @@ void buildRewrittenAssetLists() {
 
         // REWRITE THE MD5 COLUMN, AND ONLY THAT COLUMN. The path text, the
         // order, the count and the field layout are preserved exactly.
+        const uint64_t rewriteStart = armGetSystemTick();
         std::string out;
         out.reserve(text.size() + 64u);
         size_t position = 0;
@@ -5467,8 +5482,12 @@ void buildRewrittenAssetLists() {
             position = end + 1;
         }
         if (changed == 0) {
+            rewriteMs += (armGetSystemTick() - rewriteStart) * 1000ULL /
+                         (tickFreq != 0 ? tickFreq : 1);
             continue;
         }
+        rewriteMs += (armGetSystemTick() - rewriteStart) * 1000ULL /
+                     (tickFreq != 0 ? tickFreq : 1);
 
         const char* leaf = guestPath.c_str();
         const size_t slash = guestPath.find_last_of('/');
@@ -5480,8 +5499,49 @@ void buildRewrittenAssetLists() {
                       kRewrittenListDir, leaf);
         std::snprintf(finalPath, sizeof(finalPath), "%srr3-%s",
                       kRewrittenListDir, leaf);
+
+        // SKIP THE WRITE WHEN THE CARD ALREADY HAS EXACTLY THIS CONTENT.
+        //
+        // WHY: the write is not one write.  It is a temporary file, a remove
+        // and a rename -- three filesystem metadata operations per list, on a
+        // card that is 5..6x slower than Eden's -- and the content is
+        // DETERMINISTIC, so after the first boot it is almost always already
+        // there.  MEASURED 2026-11-03: 386 lists, 2.6 MB, 6.6 s on Eden and
+        // 33..41 s on the console, where those seconds are a black screen.
+        //
+        // A read is much cheaper than a write plus two metadata operations,
+        // so the comparison pays for itself as soon as one list in three is
+        // unchanged.
+        bool identical = false;
+        {
+            std::FILE* existing = std::fopen(finalPath, "rb");
+            if (existing != nullptr) {
+                std::string current;
+                char chunk[8192];
+                size_t got = 0;
+                bool same = true;
+                while ((got = std::fread(chunk, 1, sizeof(chunk), existing)) > 0) {
+                    current.append(chunk, got);
+                    if (current.size() > out.size()) {
+                        same = false;
+                        break;
+                    }
+                }
+                std::fclose(existing);
+                identical = same && current.size() == out.size() &&
+                            std::memcmp(current.data(), out.data(), out.size()) == 0;
+            }
+        }
+        if (identical) {
+            ++unchanged;
+            bytesSkipped += out.size();
+            gRewrittenLists.emplace_back(leaf, finalPath);
+            continue;
+        }
+
         // THROUGH A TEMPORARY FILE, so a card that is pulled mid-write never
         // shows the guest a half list.
+        const uint64_t writeStart = armGetSystemTick();
         std::FILE* file = std::fopen(tempPath, "wb");
         if (file == nullptr) {
             continue;
@@ -5497,6 +5557,8 @@ void buildRewrittenAssetLists() {
             std::remove(tempPath);
             continue;
         }
+        writeMs += (armGetSystemTick() - writeStart) * 1000ULL /
+                   (tickFreq != 0 ? tickFreq : 1);
         ++written;
         bytes += out.size();
         gRewrittenLists.emplace_back(leaf, finalPath);
@@ -5506,10 +5568,12 @@ void buildRewrittenAssetLists() {
                                (tickFreq != 0 ? tickFreq : 1);
     char diag[768];
     std::snprintf(diag, sizeof(diag),
-                  "lists_touched=%u lists_written=%u entries_rewritten=%u "
-                  "atlas_entries=%u bytes=%llu ms=%llu overrides=%zu",
-                  touched, written, entries, atlasEntries,
-                  (unsigned long long)bytes, (unsigned long long)elapsedMs,
+                  "lists_touched=%u lists_written=%u lists_unchanged=%u "
+                  "entries_rewritten=%u atlas_entries=%u bytes=%llu bytes_skipped=%llu "
+                  "ms=%llu read_ms=%llu rewrite_ms=%llu write_ms=%llu overrides=%zu",
+                  touched, written, unchanged, entries, atlasEntries, bytes, bytesSkipped,
+                  (unsigned long long)elapsedMs, (unsigned long long)readMs,
+                  (unsigned long long)rewriteMs, (unsigned long long)writeMs,
                   overrides.size());
     appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                         "assetlist-rewrite-all", 0, 0, diag);

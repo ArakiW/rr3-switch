@@ -1686,11 +1686,40 @@ jboolean gv_renderToTexture(JNIEnv*, jobject self, jint texId, jint width,
         return 0;
     }
     FT_Face face = nullptr;
+    // The guest's scale factor.  A scale outside this range is a bug in the
+    // caller, not something to honour: the Java would produce a texture with
+    // no visible text, and so would the port.
+    const float f = (scale > 0.f && scale < 64.f) ? scale : 1.f;
     if (g_library != nullptr) {
         face = openFaceFor(state->fontPath, state->bold);
         if (face != nullptr) {
-            const FT_Error sizeError = sizeFace(face, state->sizePx);
-            noteFace(state->fontPath, face, 0, state->sizePx, sizeError);
+            // THE GUEST'S OWN CONTRACT, VERBATIM.
+            //
+            // GlyphVector.renderToTexture(int texId, int w, int h, float f):
+            //
+            //     float fWidth = (i2 - (this.m_bounds.width() * f)) * 0.5f;
+            //     canvas.translate(fWidth - (rect.left * f),
+            //                      ((f2 - (rect.height() * f)) * 0.5f) - (this.m_bounds.top * f));
+            //     canvas.scale(f, f);
+            //     canvas.drawText(this.m_text, 0.0f, 0.0f, this.m_paint);
+            //
+            // THREE THINGS THAT MATTER, AND THE PORT HAD NONE OF THEM RIGHT:
+            //
+            //  1. THE GLYPHS ARE SCALED BY f.  The canvas is scaled before
+            //     drawText, so the text is rendered at textSize*f.  The port
+            //     used `scale` ONLY to compute the origin and then rasterised
+            //     the glyphs at their FULL size, so the text came out 1/f too
+            //     big.  (Rendering at textSize*f is geometrically the same as
+            //     scaling the canvas; only the hinting differs.)
+            //  2. THE TEXT IS CENTRED BY ITS INK BOX, not by the ascent.
+            //  3. THE PEN IS AT fWidth - rect.left*f, i.e. the INK-left
+            //     minus the left bearing -- not the ink-left itself.
+            //
+            // This path had NO LOG LINE at all, so a wrong answer here was
+            // invisible; the log line below is what makes it checkable.
+            const float scaledSize = state->sizePx * f;
+            const FT_Error sizeError = sizeFace(face, scaledSize);
+            noteFace(state->fontPath, face, 0, scaledSize, sizeError);
         }
     }
     const int w = static_cast<int>(width);
@@ -1702,18 +1731,42 @@ jboolean gv_renderToTexture(JNIEnv*, jobject self, jint texId, jint width,
         mutexUnlock(&g_glyphMutex);
         return 0;
     }
-    // The Java centres the text and scales it; the canvas is flipped, so the
-    // baseline of the single line sits at the vertical centre.
-    const Metrics metrics = metricsOf(face);
-    const float originX = (static_cast<float>(w) - facade->boundsW * scale) * 0.5f;
-    const float originY =
-        (static_cast<float>(h) + static_cast<float>(metrics.ascent) * scale) * 0.5f;
+    // The Java centres the text by its INK BOX and draws it at textSize*f.
+    // The ink box is boundsW x boundsH; the left bearing is -offsetX and the
+    // ink top (relative to the baseline) is -offsetY - boundsH.
+    const float inkW = facade->boundsW * f;
+    const float inkH = facade->boundsH * f;
+    const float inkLeft = (static_cast<float>(w) - inkW) * 0.5f;
+    const float penX = inkLeft + facade->offsetX * f;
+    const float inkTop = -facade->offsetY - facade->boundsH;
+    const float baselineY = static_cast<float>(h) * 0.5f + inkH * 0.5f + inkTop * f;
     rasterizeLine(face, nullptr, state->text, state->textLen, state->widthScale,
-                  originX, originY, w, h, coverage, true);
+                  penX, baselineY, w, h, coverage, true);
+    {
+        char details[256];
+        char preview[48];
+        size_t n = 0;
+        for (size_t i = 0; i < state->textLen && n + 1 < sizeof(preview); ++i) {
+            const unsigned char c = static_cast<unsigned char>(state->text[i]);
+            preview[n++] = (c >= 0x20 && c < 0x7f) ? static_cast<char>(c) : '?';
+        }
+        preview[n] = '\0';
+        snprintf(details, sizeof(details),
+                 "texId=%d w=%d h=%d scale=%.4f size=%.1f scaledSize=%.1f "
+                 "boundsW=%.1f boundsH=%.1f inkW=%.1f inkH=%.1f penX=%.1f "
+                 "baselineY=%.1f textLen=%u text=\"%s\"",
+                 static_cast<int>(texId), w, h, f, state->sizePx,
+                 state->sizePx * f, facade->boundsW, facade->boundsH, inkW, inkH,
+                 penX, baselineY, static_cast<unsigned>(state->textLen), preview);
+        rr3::guestViewWideLog("glyph-rtt", 0, 0, details);
+    }
     ::glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(texId));
     ::glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     ::glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_ALPHA, GL_UNSIGNED_BYTE,
                       coverage);
+    // The face is cached and shared, so it must not be left at the scaled
+    // size for the next caller.
+    sizeFace(face, state->sizePx);
     mutexUnlock(&g_glyphMutex);
     return 1;
 }

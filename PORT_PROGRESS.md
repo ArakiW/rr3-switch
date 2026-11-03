@@ -13670,3 +13670,83 @@ Gate: BUILD 0, INPUTS 0, SYMBOLS 0, tests 39/39.
 => the icon font exposed the crash; the worker gate and the asymmetric
 readability window fixed it.  The shipping configuration (icon font ON) is
 the measured-clean one.
+
+---
+
+## 2026-11-03, LATE: THE STALE ARCHIVE, THE UNSCALED GLYPHS, AND THE 2.6 MB
+
+### THE DELIVERABLE ARCHIVE WAS STALE (and the fix is a fingerprint)
+
+`.build/pack-zip.ps1` reused an existing archive instead of checking it
+against the package.  The 2026-11-03 repack therefore shipped an archive that
+was **1480 bytes** off the package:
+
+    README-hardware-test.md   zip=27,062  pkg=29,969  (+2,907)
+    switch/rr3-gfx.conf       zip=3,975   pkg=2,548   (-1,427)
+
+The archive is now fingerprinted against the package it was built from and a
+mismatching archive is rebuilt.  `pack-zip.ps1` takes a `-Stamp` now (its
+paths were hard-wired to 20261102), and `.build/run-repack.ps1` chains the
+whole set: archive -> parts -> app zip -> join check.  The rebuild verified
+byte for byte: parts joined sha256
+`6001e60e321c37a740e82f3df10ba7d07f9a6f4e99528df32753f18f317b6852` == the
+archive.
+
+### renderToTexture DID NOT SCALE THE GLYPHS (latent, and now visible)
+
+The guest's Java scales the canvas by `f` BEFORE `drawText`.  The port used
+`scale` only for the origin and rasterised the glyphs at full size, so text
+through that path came out 1/f too big; it also centred by the ascent rather
+than the ink box, and put the ink-left where the Java puts the pen.
+
+**MEASURED (q133): the guest never calls it** -- 0 `glyph-rtt` lines in a
+23.5 MB log, and the same text-quad set in q132 and q133.  So it changed no
+pixel.  It is recorded because it was real, and because the reason it took so
+long to find is worth keeping: *the path had no log line at all*.
+
+### THE SPLASH TITLE, MEASURED
+
+The overflowing line is GUEST TEXT, not artwork:
+
+    "Player ID: CCDI123456789 / CCRR123456789"   40 chars, Conduit Bold, size 140
+
+The port measures it at **2421 px** and the font's ground truth agrees
+(2433.6 px, `tools/conduit_width_truth.py`), so **the port measures
+correctly**.  The rendered frame: ink band y 271..391, x 257..1279, touching
+the right edge -- about **1398 px of the line are off-screen**.
+
+Ruled out with measurements: the icon font (q123b `iconfont=0` is
+identical), the font FILE (romfs == the guest's own copy, same sha256), the
+screen size (`Res base: 1280x720` == the framebuffer), the device profile
+(q61 already measured that `EXPECTED_SCREEN_*` does not move the sizes), and
+another face (all 18 faces measured; the narrowest is 2367 px).
+
+**The remaining lead**: the `text-quad` probe shows the guest's OWN matrix
+overshooting the viewport:
+
+    a_Position v0=(1021,472) … v2=(0,0)
+    ndc        v0=(1.2168,-1.0) … v2=(-1.2168,-1.0)   rect=-138,0,1557,720
+
+i.e. a quad with 1021 px of vertices comes out 1557 px wide and starts 138 px
+off the left edge -- 1.525x the viewport, symmetrically.  Other quads in the
+same frame map 1:1, so the engine uses two matrices.  `glOrtho` is not in the
+port's symbol table at all (the guest reaches it through
+`eglGetProcAddress`), so the matrix is the guest's own.  Next reading: which
+matrix the guest sets up for the 2D pass and what it derives it from.
+
+### THE FIRST TEN BLACK SECONDS (q134)
+
+MEASURED (q132): the asset-list rewrite touches 386 of 1235 lists and writes
+2,610,656 bytes, each write being a temp file + remove + rename -- three
+metadata operations on a slow card.  6,628 ms on Eden, 33..41 s on the
+console.
+
+The content is deterministic, so the card already has it after the first
+boot.  The pass now compares and writes nothing when they match:
+
+    lists_touched=386 lists_written=0 lists_unchanged=386
+    bytes=0 bytes_skipped=2610656 ms=2843
+    read_ms=564 rewrite_ms=5 write_ms=0
+
+**6,628 ms -> 2,843 ms on Eden (2.33x), and the three costs are separated for
+the first time: the write was the other ~6,000 ms.**
