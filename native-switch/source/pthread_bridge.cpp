@@ -5629,6 +5629,21 @@ void* reapDetachedThreadWorker(void*) {
                 const uintptr_t biasNow = resolveMainImageLoadBias();
                 const uintptr_t slot =
                     static_cast<uintptr_t>(biasNow + kAssetSingletonElfVa);
+                // 2026-11-03 console crash: the reaper starts during boot and
+                // its first 1 s tick can land before libRealRacing3.so is
+                // loaded (the console's dry load of the 32 MiB image is slow).
+                // Then biasNow is 0 and slot is the raw ELF VA 0x1f6d5d0,
+                // which is unmapped on hardware: data abort, far=0x1f6d5d0,
+                // pc in this function. Eden happened to map it. Read nothing
+                // until the loader says the slot is inside the image.
+                if (biasNow == 0 || !guestImageContains(slot, sizeof(uintptr_t))) {
+                    guestViewWideLog("reaper-asset-singleton", waitedNanos,
+                                     kReaperWaitSliceNanos,
+                                     "asset-probe: SKIPPED main image not loaded yet");
+                    // Still inside the wait loop with gRegistryLock held: go
+                    // back to the pending/quiesce check and the next wait.
+                    continue;
+                }
                 const uintptr_t obj =
                     *reinterpret_cast<const volatile uintptr_t*>(slot);
                 const bool biasAgrees = (biasNow + kAssetSlotAddend) == obj;
@@ -5648,7 +5663,9 @@ void* reapDetachedThreadWorker(void*) {
                         (unsigned long long)(obj - (biasNow + kAssetSlotAddend)));
                     guestViewWideLog("reaper-asset-singleton", waitedNanos,
                                      kReaperWaitSliceNanos, bdiag);
-                    mutexUnlock(&gRegistryLock);
+                    // No unlock here: this continue stays in the wait loop,
+                    // which must hold gRegistryLock for condvarWaitTimeout.
+                    // The old mutexUnlock made the next wait run unlocked.
                     continue;
                 }
                 if (biasNow != 0) {

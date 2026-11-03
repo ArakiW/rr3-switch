@@ -1471,7 +1471,7 @@ const HostSymbol kHostSymbols[] = {
     RR3_BIND(snprintf),
     RR3_BIND(sprintf),
     RR3_BIND(srand),
-    RR3_BIND(sscanf),
+    RR3_SHIM("sscanf", guestSscanf),
     RR3_SHIM("stat", guestStat),
     RR3_BIND(strcasecmp),
     RR3_BIND(strcat),

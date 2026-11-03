@@ -1620,6 +1620,11 @@ static const char kAuthUrlMarker[] = "CC_Sync.php";
  * Returns false when the response could not be built or delivered, in which
  * case the caller falls back to the honest failure.
  */
+/* The worker check lives in ccprobe, next to readU64(), and the delivery
+ * functions are outside that namespace, so it is declared here and called
+ * qualified.  See the note on the definition. */
+namespace ccprobe { static bool guestWorkerAlive(const CCHttpRequest *req); }
+
 static bool deliverAuthSuccess(JNIEnv *env, CCHttpRequest *req,
                                 const cccloud::AuthRequest &info)
 {
@@ -1666,6 +1671,9 @@ static bool deliverAuthSuccess(JNIEnv *env, CCHttpRequest *req,
     env->SetByteArrayRegion(array, 0, (jsize)body.size(),
                              (const jbyte *)body.data());
 
+    if (!ccprobe::guestWorkerAlive(req)) {
+        return false;
+    }
     data_callback(env, (jobject)req, req->callback, array, (jint)body.size());
     complete_callback(env, (jobject)req, req->callback, 200);
 
@@ -1734,6 +1742,9 @@ static bool deliverSyncResponse(JNIEnv *env, CCHttpRequest *req,
     env->SetByteArrayRegion(array, 0, (jsize)body.size(),
                              (const jbyte *)body.data());
 
+    if (!ccprobe::guestWorkerAlive(req)) {
+        return false;
+    }
     data_callback(env, (jobject)req, req->callback, array, (jint)body.size());
     complete_callback(env, (jobject)req, req->callback, 200);
 
@@ -1829,6 +1840,9 @@ static bool deliverAssetResponse(JNIEnv *env, CCHttpRequest *req)
                                "request had no local file); status=200");
     }
 
+    if (!ccprobe::guestWorkerAlive(req)) {
+        return false;
+    }
     data_callback(env, (jobject)req, req->callback, array, (jint)body.size());
     complete_callback(env, (jobject)req, req->callback, 200);
 
@@ -1960,8 +1974,25 @@ static bool guestReadable(uintptr_t addr)
     if (bias == 0) {
         return false;
     }
+    /* THE WINDOW IS ASYMMETRIC, AND IT HAS TO BE.
+     *
+     * MEASURED 2026-11-03 on the console: the guest's worker object was at
+     * 0x562EA7C4C0 and the guest's image bias was 0x18361F3000, so the
+     * worker sits 0x4E2CC44C0 = 259 GiB ABOVE the image.  The old window
+     * was [bias - 4 GiB, bias + 4 GiB), so the port called a perfectly
+     * good guest object "unreadable" -- and then handed it to the guest
+     * anyway (see workerAlive() below).
+     *
+     * The host's own addresses are BELOW the image on both machines (host
+     * objects 0x87e1147b0 and 0x80e209c0, host stack 0x6d20958940), and the
+     * guest's heap is ABOVE it, so a symmetric window cannot tell them
+     * apart.  The lower bound stays where it was (it is what keeps the
+     * probe out of the host's address space, which is what the Eden
+     * archive 20261021-072048-eden-srvtime4 needed) and the upper bound
+     * covers the guest's heap.
+     */
     const uintptr_t lo = bias - 0x1000000000ull;
-    const uintptr_t hi = bias + 0x1000000000ull;
+    const uintptr_t hi = bias + 0x8000000000ull;
     if (addr < lo || addr >= hi) {
         return false;
     }
@@ -1988,6 +2019,51 @@ static bool readU64(uintptr_t addr, uint64_t *out)
     memcpy(out, reinterpret_cast<const void *>(addr), sizeof(uint64_t));
     return true;
 }
+
+/*
+ * IS THE GUEST'S WORKER STILL THERE?
+ *
+ * MEASURED 2026-11-03 on the CONSOLE (NRO dc27a427): the port answered the
+ * guest's /time request, and the probe one line before the hand-off said
+ *
+ *     phase=cc-probe ordinal=370149934272 ... worker unreadable
+ *
+ * The port handed that pointer to the guest's native headerCallback anyway,
+ * and the guest faulted: esr=0x92000005 (data abort, translation fault,
+ * level 1), far=0x28 (NULL + 0x28), pc inside the guest image, lr the
+ * host's deliverServerTime.
+ *
+ * On Eden the same probe prints the worker's vtable and the delivery
+ * succeeds ("headerCallback returned", "body delivered 24 bytes",
+ * "CC: Server time returned").  The code path is the same; the difference
+ * is whether the guest still OWNS the worker.
+ *
+ * => Every hand-off of req->callback to the guest goes through this check.
+ * A worker the guest has already released must not be handed back: the
+ * guest dereferences it, and on the console that is a fatal fault.
+ *
+ * The refusal is a NAMED EVENT, not a silent skip: the run has to be able to
+ * say "the answer was dropped because the guest had already gone away".
+ */
+static bool guestWorkerAlive(const CCHttpRequest *req)
+{
+    if (req == nullptr || req->callback == 0) {
+        rr3::guestViewWideLog("cc-worker-dead", 0, 0,
+                              "no worker: the delivery is skipped");
+        return false;
+    }
+    uint64_t vptr = 0;
+    if (!readU64((uintptr_t)req->callback, &vptr)) {
+        rr3::guestViewWideLog("cc-worker-dead",
+                              (unsigned long long)req->callback, 0,
+                              "the guest's worker is not readable: the guest "
+                              "has already released it, so the delivery is "
+                              "skipped");
+        return false;
+    }
+    return true;
+}
+
 
 /*
  * Copy `len` bytes out of guest memory a guarded word at a time. A plain
@@ -3625,6 +3701,9 @@ static bool deliverResponseBody(JNIEnv *env, CCHttpRequest *req,
         env->SetByteArrayRegion(array, 0, (jsize)len, (const jbyte *)data);
     }
 
+    if (!ccprobe::guestWorkerAlive(req)) {
+        return false;
+    }
     data_callback(env, (jobject)req, req->callback, array, (jint)len);
 
     if (authLogBudget()) {
@@ -3717,6 +3796,11 @@ static bool deliverServerTime(JNIEnv *env, CCHttpRequest *req)
      * because the guest creates an HttpRequest for other exchanges too. */
     ccprobe::noteMgr2TimeRequest((uintptr_t)req->callback, req->url,
                                   req->bodyLen, (const uint8_t *)req->body);
+    if (!ccprobe::guestWorkerAlive(req)) {
+        /* The guest has gone: there is nothing left to answer, and handing
+         * the dead worker to the guest is what killed the console. */
+        return true;
+    }
     header_callback(env, (jobject)req, req->callback, 0, (jobject)map);
     if (authLogBudget()) {
         trace("cc-srvtime: headerCallback returned");
@@ -3737,6 +3821,9 @@ static bool deliverServerTime(JNIEnv *env, CCHttpRequest *req)
         deliverResponseBody(env, req, body, bodyLen);
     }
 
+    if (!ccprobe::guestWorkerAlive(req)) {
+        return true;
+    }
     complete_callback(env, (jobject)req, req->callback, 200);
     ccprobe::probeWorker((uintptr_t)req->callback, "after-complete");
 
@@ -3961,6 +4048,9 @@ static void http_post(JNIEnv *env, jobject self)
         if (!error_callback) {
             warning("HttpRequest: errorCallback export missing; "
                     "request %p stays pending\n", (void *)req);
+            return;
+        }
+        if (!ccprobe::guestWorkerAlive(req)) {
             return;
         }
         error_callback(env, (jobject)req, req->callback, 0);

@@ -7133,6 +7133,34 @@ void forceServerVariableFeatureBits(uint64_t frames) {
                         line, 300, 0);
 }
 
+// CHECKED READS FOR THE FRAME-LOOP DIAGNOSTICS.
+//
+// Every value below is a probe, not something the guest needs, and the probes
+// follow pointers the guest wrote. On Eden a wild address reads as zero; on
+// the console it is a data abort, and the custom exception handler turns that
+// into a silent process exit. The sixth console run died exactly so, at the
+// read of `mgr + 0x10518` (far = image end + 0xf3b0, esr 0x92000007), after
+// EGL and the first frames had already run.
+//
+// probeKernelReadable() rather than dlMemoryReadable(): the latter's one-page
+// cache is confined to the sampler thread, and this runs on the render thread.
+bool flReadable(uintptr_t address, size_t bytes) {
+    if (address < 0x10000ULL || address >= 0x0000800000000000ULL) {
+        return false;
+    }
+    if (guestImageContains(address, bytes)) {
+        return true;
+    }
+    return probeKernelReadable(address) &&
+           probeKernelReadable(address + bytes - 1);
+}
+
+template <typename T>
+T flRead(uintptr_t address, T fallback) {
+    return flReadable(address, sizeof(T))
+        ? *reinterpret_cast<const volatile T*>(address) : fallback;
+}
+
 // The frame loop, verbatim, on whichever thread the dispatch above chose.
 //
 // Two things are thread-dependent and are handled here rather than at the call
@@ -7875,10 +7903,8 @@ void* frameLoopDriver(void* opaque) {
                 const uint64_t bias =
                     static_cast<uint64_t>(renderRuntime) - kRenderExportElfVa;
                 const uintptr_t slot = static_cast<uintptr_t>(bias + kAssetSingletonElfVa);
-                const uintptr_t obj =
-                    *reinterpret_cast<const volatile uintptr_t*>(slot);
-                const uintptr_t first = (obj != 0)
-                    ? *reinterpret_cast<const volatile uintptr_t*>(obj) : 0;
+                const uintptr_t obj = flRead<uintptr_t>(slot, 0);
+                const uintptr_t first = (obj != 0) ? flRead<uintptr_t>(obj, 0) : 0;
                 // +0x8d is the byte the documented freeze turns on. The chain, as
                 // recorded in jni_compat/classes/rr3_Platform.cpp's header:
                 //
@@ -7898,12 +7924,10 @@ void* frameLoopDriver(void* opaque) {
                 unsigned freeze = 0xFFFFFFFFu;
                 unsigned long long q88 = 0, q90 = 0, q98 = 0;
                 if (obj != 0) {
-                    const auto* base =
-                        reinterpret_cast<const volatile unsigned char*>(obj);
-                    freeze = base[0x8d];
-                    q88 = *reinterpret_cast<const volatile unsigned long long*>(base + 0x88);
-                    q90 = *reinterpret_cast<const volatile unsigned long long*>(base + 0x90);
-                    q98 = *reinterpret_cast<const volatile unsigned long long*>(base + 0x98);
+                    freeze = flRead<unsigned char>(obj + 0x8d, 0xFF);
+                    q88 = flRead<unsigned long long>(obj + 0x88, 0);
+                    q90 = flRead<unsigned long long>(obj + 0x90, 0);
+                    q98 = flRead<unsigned long long>(obj + 0x98, 0);
                 }
                 // The three values that make the guest log
                 // "startMusic disabled during download" (string 0x3902ff, tail
@@ -7955,8 +7979,8 @@ void* frameLoopDriver(void* opaque) {
                 unsigned long long dlNb[5] = {0, 0, 0, 0, 0};
                 int dlGuard = 0;
                 const uint64_t dlEngineElf = bias + kEngineSingletonElfVa;
-                dlEngine = *reinterpret_cast<const volatile unsigned long long*>(
-                    static_cast<uintptr_t>(dlEngineElf));
+                dlEngine = flRead<unsigned long long>(
+                    static_cast<uintptr_t>(dlEngineElf), 0);
                 // A guest pointer worth dereferencing. Deliberately wide: the
                 // guard exists to avoid faulting on the null page, not to judge
                 // whether the value is "valid". A rejection is reported as
@@ -7965,18 +7989,20 @@ void* frameLoopDriver(void* opaque) {
                 static constexpr uint64_t kPlausibleLo = 0x10000ULL;
                 static constexpr uint64_t kPlausibleHi = 0x0000800000000000ULL;
                 const bool dlEngineOk = dlEngine >= kPlausibleLo &&
-                                        dlEngine < kPlausibleHi;
+                                        dlEngine < kPlausibleHi &&
+                                        flReadable(dlEngine, 8);
                 if (dlEngineOk) {
-                    dlFirst = *reinterpret_cast<const volatile unsigned long long*>(
-                        static_cast<uintptr_t>(dlEngine));
+                    dlFirst = flRead<unsigned long long>(
+                        static_cast<uintptr_t>(dlEngine), 0);
                 } else {
                     dlGuard = 1;
                 }
                 const bool dlFirstOk =
-                    dlEngineOk && dlFirst >= kPlausibleLo && dlFirst < kPlausibleHi;
+                    dlEngineOk && dlFirst >= kPlausibleLo && dlFirst < kPlausibleHi &&
+                    flReadable(dlFirst + kEngineDownloadVecOff, 8);
                 if (dlFirstOk) {
-                    dlVecPtr = *reinterpret_cast<const volatile unsigned long long*>(
-                        static_cast<uintptr_t>(dlFirst + kEngineDownloadVecOff));
+                    dlVecPtr = flRead<unsigned long long>(
+                        static_cast<uintptr_t>(dlFirst + kEngineDownloadVecOff), 0);
                     // Neighbourhood, -0x18..+0x10 around the field at 8-byte
                     // steps (w == 3 is the field itself). Present so "this one
                     // field is null" can be told apart from "this whole region
@@ -7984,16 +8010,16 @@ void* frameLoopDriver(void* opaque) {
                     // different fixes, and the single field read cannot tell
                     // them apart.
                     for (int w = 0; w < 5; ++w) {
-                        dlNb[w] = *reinterpret_cast<const volatile unsigned long long*>(
+                        dlNb[w] = flRead<unsigned long long>(
                             static_cast<uintptr_t>(
                                 dlFirst + kEngineDownloadVecOff - 0x18
-                                + static_cast<unsigned>(w) * 8));
+                                + static_cast<unsigned>(w) * 8), 0);
                     }
                     if (dlVecPtr != 0) {
-                        dlBegin = *reinterpret_cast<const volatile unsigned long long*>(
-                            static_cast<uintptr_t>(dlVecPtr + kContainerPairOff));
-                        dlEnd = *reinterpret_cast<const volatile unsigned long long*>(
-                            static_cast<uintptr_t>(dlVecPtr + kContainerPairOff + 8));
+                        dlBegin = flRead<unsigned long long>(
+                            static_cast<uintptr_t>(dlVecPtr + kContainerPairOff), 0);
+                        dlEnd = flRead<unsigned long long>(
+                            static_cast<uintptr_t>(dlVecPtr + kContainerPairOff + 8), 0);
                     }
                 } else if (dlEngineOk) {
                     dlGuard = 2;
@@ -8042,17 +8068,22 @@ void* frameLoopDriver(void* opaque) {
                 {
                     const auto slotAddr =
                         static_cast<uintptr_t>(bias + kContentRootElfVa);
-                    rootPtr = *reinterpret_cast<const volatile unsigned long long*>(slotAddr);
-                    if (rootPtr != 0) {
+                    rootPtr = flRead<unsigned long long>(slotAddr, 0);
+                    if (rootPtr != 0 && !flReadable(static_cast<uintptr_t>(rootPtr), 1)) {
+                        __builtin_snprintf(rootText, sizeof(rootText), "<unreadable>");
+                    } else if (rootPtr != 0) {
                         const auto objAddr = static_cast<uintptr_t>(rootPtr);
                         for (int w = 0; w < 4; ++w) {
-                            head[w] = *reinterpret_cast<const volatile unsigned long long*>(
-                                objAddr + static_cast<unsigned>(w) * 8);
+                            head[w] = flRead<unsigned long long>(
+                                objAddr + static_cast<unsigned>(w) * 8, 0);
                         }
-                        const char* p = reinterpret_cast<const char*>(objAddr);
                         unsigned i = 0;
-                        for (; i + 1 < sizeof(rootText) && p[i] != '\0'; ++i) {
-                            rootText[i] = p[i];
+                        for (; i + 1 < sizeof(rootText); ++i) {
+                            const char c = flRead<char>(objAddr + i, '\0');
+                            if (c == '\0') {
+                                break;
+                            }
+                            rootText[i] = c;
                         }
                         rootText[i] = '\0';
                     }
@@ -8336,15 +8367,14 @@ void* frameLoopDriver(void* opaque) {
             static constexpr uint64_t kGateHi = 0x0000800000000000ULL;
             const uint64_t gbias =
                 static_cast<uint64_t>(renderTarget) - kRenderExportElfVa2;
-            const unsigned gOnce = *reinterpret_cast<const volatile unsigned char*>(
-                static_cast<uintptr_t>(gbias + kAsyncOnceElfVa));
-            const unsigned long long gFut =
-                *reinterpret_cast<const volatile unsigned long long*>(
-                    static_cast<uintptr_t>(gbias + kAsyncFutureElfVa));
+            const unsigned gOnce = flRead<unsigned char>(
+                static_cast<uintptr_t>(gbias + kAsyncOnceElfVa), 0xFF);
+            const unsigned long long gFut = flRead<unsigned long long>(
+                static_cast<uintptr_t>(gbias + kAsyncFutureElfVa), 0);
             unsigned long long gSt70 = 0xFFFFFFFFFFFFFFFFULL;   // "not read"
             if (gFut >= kGateLo && gFut < kGateHi) {
-                gSt70 = *reinterpret_cast<const volatile unsigned long long*>(
-                    static_cast<uintptr_t>(gFut + kAsyncStateOff));
+                gSt70 = flRead<unsigned long long>(
+                    static_cast<uintptr_t>(gFut + kAsyncStateOff), 0xFFFFFFFFFFFFFFFFULL);
             }
             const unsigned gBit2 = static_cast<unsigned>((gSt70 >> 2) & 1u);
 
@@ -8366,13 +8396,14 @@ void* frameLoopDriver(void* opaque) {
             unsigned long long abObj = 0;
             {
                 static constexpr uint64_t kAssetMgrElfVa = 0x1F6D5D0ULL;
-                abObj = *reinterpret_cast<const volatile unsigned long long*>(
-                    static_cast<uintptr_t>(gbias + kAssetMgrElfVa));
+                abObj = flRead<unsigned long long>(
+                    static_cast<uintptr_t>(gbias + kAssetMgrElfVa), 0);
                 if (abObj >= kGateLo && abObj < kGateHi) {
-                    const volatile unsigned char* b =
-                        reinterpret_cast<const volatile unsigned char*>(
-                            static_cast<uintptr_t>(abObj));
-                    ab82 = b[0x82]; ab83 = b[0x83]; ab85 = b[0x85]; ab8d = b[0x8d];
+                    const auto b = static_cast<uintptr_t>(abObj);
+                    ab82 = flRead<unsigned char>(b + 0x82, 0xFF);
+                    ab83 = flRead<unsigned char>(b + 0x83, 0xFF);
+                    ab85 = flRead<unsigned char>(b + 0x85, 0xFF);
+                    ab8d = flRead<unsigned char>(b + 0x8d, 0xFF);
                 }
             }
 
@@ -8396,23 +8427,22 @@ void* frameLoopDriver(void* opaque) {
             unsigned long long mgr10518 = 0, eng10518 = 0, engNb[3] = {0, 0, 0};
             unsigned long long engPtr = 0;
             {
-                const unsigned long long eng = *reinterpret_cast<
-                    const volatile unsigned long long*>(
-                        static_cast<uintptr_t>(gbias + 0x1F6D5D8ULL));
+                const unsigned long long eng = flRead<unsigned long long>(
+                    static_cast<uintptr_t>(gbias + 0x1F6D5D8ULL), 0);
                 engPtr = (eng >= kGateLo && eng < kGateHi)
-                    ? *reinterpret_cast<const volatile unsigned long long*>(
-                          static_cast<uintptr_t>(eng)) : 0;
+                    ? flRead<unsigned long long>(static_cast<uintptr_t>(eng), 0) : 0;
                 if (engPtr >= kGateLo && engPtr < kGateHi) {
                     for (int w = 0; w < 3; ++w) {
-                        engNb[w] = *reinterpret_cast<const volatile unsigned long long*>(
+                        engNb[w] = flRead<unsigned long long>(
                             static_cast<uintptr_t>(engPtr + 0x10508
-                                + static_cast<unsigned>(w) * 8));
+                                + static_cast<unsigned>(w) * 8), 0);
                     }
                     eng10518 = engNb[1];
                 }
+                // The console's crash site: abObj + 0x10518 was unmapped there.
                 if (abObj >= kGateLo && abObj < kGateHi) {
-                    mgr10518 = *reinterpret_cast<const volatile unsigned long long*>(
-                        static_cast<uintptr_t>(abObj + 0x10518ULL));
+                    mgr10518 = flRead<unsigned long long>(
+                        static_cast<uintptr_t>(abObj + 0x10518ULL), 0);
                 }
             }
             static unsigned long long pOnce = 0xFFFFFFFFFFFFFFFFULL,
@@ -8451,23 +8481,23 @@ void* frameLoopDriver(void* opaque) {
                 if (ns2.valid && ns2.renderer != 0 &&
                     static_cast<uint64_t>(ns2.renderer) >= kGateLo &&
                     static_cast<uint64_t>(ns2.renderer) < kGateHi) {
-                    rn80 = *reinterpret_cast<const volatile unsigned long long*>(
-                        static_cast<uintptr_t>(ns2.renderer + 0x80));
+                    rn80 = flRead<unsigned long long>(
+                        static_cast<uintptr_t>(ns2.renderer + 0x80), 0xDEADBEEFDEADBEEFULL);
                 }
             }
             unsigned e82 = 0xFFu, e83 = 0xFFu, e85 = 0xFFu, e88 = 0xFFu;
             {
                 const GuestActivitySnapshot rs = readGuestActivitySnapshot(renderTarget);
                 if (rs.valid && rs.renderer != 0) {
-                    renPtr = *reinterpret_cast<const volatile unsigned long long*>(
-                        static_cast<uintptr_t>(rs.renderer));
-                    if (renPtr >= kGateLo && renPtr < kGateHi) {
+                    renPtr = flRead<unsigned long long>(
+                        static_cast<uintptr_t>(rs.renderer), 0);
+                    if (renPtr >= kGateLo && renPtr < kGateHi &&
+                        flReadable(static_cast<uintptr_t>(renPtr), 0x90)) {
                         for (int w = 0; w < 3; ++w) {
-                            renNb[w] = *reinterpret_cast<
-                                const volatile unsigned long long*>(
-                                    static_cast<uintptr_t>(
-                                        renPtr + 0x10508
-                                        + static_cast<unsigned>(w) * 8));
+                            renNb[w] = flRead<unsigned long long>(
+                                static_cast<uintptr_t>(
+                                    renPtr + 0x10508
+                                    + static_cast<unsigned>(w) * 8), 0);
                         }
                         ren10518 = renNb[1];
                         // Gates A and B, read on the object the static trace
@@ -8508,10 +8538,11 @@ void* frameLoopDriver(void* opaque) {
                     }
                 }
                 if (engPtr >= kGateLo && engPtr < kGateHi) {
-                    const volatile unsigned char* b =
-                        reinterpret_cast<const volatile unsigned char*>(
-                            static_cast<uintptr_t>(engPtr));
-                    e82 = b[0x82]; e83 = b[0x83]; e85 = b[0x85]; e88 = b[0x88];
+                    const auto b = static_cast<uintptr_t>(engPtr);
+                    e82 = flRead<unsigned char>(b + 0x82, 0xFF);
+                    e83 = flRead<unsigned char>(b + 0x83, 0xFF);
+                    e85 = flRead<unsigned char>(b + 0x85, 0xFF);
+                    e88 = flRead<unsigned char>(b + 0x88, 0xFF);
                 }
             }
             // GATES E and F -- two levels ABOVE gate A, and until now never
@@ -8531,13 +8562,13 @@ void* frameLoopDriver(void* opaque) {
             unsigned gE = 0xFFFFFFFFu, gF = 0xFFu, gRenWord = 0xFFFFFFFFu;
             {
                 const GuestActivitySnapshot es = readGuestActivitySnapshot(renderTarget);
-                const unsigned long long gateGlobal = *reinterpret_cast<
-                    const volatile unsigned long long*>(
-                        static_cast<uintptr_t>(gbias + 0x1F78E98ULL));
+                const unsigned long long gateGlobal = flRead<unsigned long long>(
+                    static_cast<uintptr_t>(gbias + 0x1F78E98ULL), 0xFFFFFFFFULL);
                 gE = static_cast<unsigned>(gateGlobal & 0xFFFFFFFFu);
                 if (es.valid && es.renderer != 0 &&
                     static_cast<uint64_t>(es.renderer) >= kGateLo &&
-                    static_cast<uint64_t>(es.renderer) < kGateHi) {
+                    static_cast<uint64_t>(es.renderer) < kGateHi &&
+                    flReadable(static_cast<uintptr_t>(es.renderer), 12)) {
                     const volatile unsigned char* rb =
                         reinterpret_cast<const volatile unsigned char*>(
                             static_cast<uintptr_t>(es.renderer));

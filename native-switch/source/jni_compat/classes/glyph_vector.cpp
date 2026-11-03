@@ -64,6 +64,7 @@
 #include "../../eap_port/platform_adapter.h"
 #include "../../eap_port/trace_adapter.h"
 #include "../../../include/rr3/guest_view_trace.hpp"
+#include "../../../include/rr3/gfx_backend.hpp"
 #include "../../../include/rr3/gfx_text_probe.hpp"
 #include "../../../include/rr3/glyph_wrap.hpp"
 #include "../jni.h"
@@ -93,8 +94,17 @@ namespace {
 // The faces are cached: FreeType faces are expensive to open and the guest
 // creates a Font per (face, style, size) and then hands the same Font to
 // every GlyphVector that uses it.
-
-constexpr size_t kFaceSlots = 6;
+//
+// THE CACHE HAS TO BE BIG ENOUGH FOR EVERY FACE THE GUEST NAMES.  It was
+// SIX, and the guest asks for fourteen faces by name (the font report:
+// Conduit x4, Eurostile x7, HelveticaNeueBold, LCD, minion_pro_italic,
+// myriadp0, r3_symbols) plus the CJK face the port falls back to: SIXTEEN.
+// A cache that is one face short does not fail loudly -- openFace() returns
+// nullptr and the text is silently drawn with the Conduit fallback, so the
+// UI quietly loses the face the guest asked for.  MEASURED 2026-11-02: the
+// q121 run opened Conduit x4 + NotoSansCJKsc = 5 and asked for a sixth;
+// adding the icon font made it seven.
+constexpr size_t kFaceSlots = 16;
 
 struct FaceSlot {
     FT_Face face;
@@ -152,42 +162,63 @@ constexpr FaceChoice kGameFaces[] = {
     {"LCD.ttf", "romfs:/ui/LCD.ttf"},
     {"minion_pro_italic.otf", "romfs:/ui/minion_pro_italic.otf"},
     {"myriadp0.otf", "romfs:/ui/myriadp0.otf"},
+    // THE GAME'S ICON FONT.  It is opened as itself, and that is a MEASURED
+    // change -- see the note on kNonTextFaces below.
+    {"r3_symbols.ttf", "romfs:/ui/r3_symbols.ttf"},
 };
 
 // THE FACES THAT ARE NOT TEXT.
 //
-// r3_symbols.ttf and r3_decals.ttf are the game's SYMBOL fonts. Measured
-// from the files: upem 2048, ascent 2.75 em, and the '0' of r3_symbols.ttf
-// advances 2.38 em with an ink box of 2.29 x 2.28 em. Those are the big
-// placeholder boxes the game draws its currency and badge art into, not
-// letters, and drawing a paragraph with them produces solid boxes.
+// r3_decals.ttf is the game's decal font. Measured from the file: upem
+// 2048, ascent 2.75 em. The guest has not asked for it in any run that has
+// been measured, so the port draws it with a text face if it ever does.
 //
-// MEASURED 2026-11-02, AND THE REASON IT STAYS THIS WAY: the guest uses
-// r3_symbols.ttf for a WHOLE ENGLISH PARAGRAPH -- the tips screen says
+// r3_symbols.ttf is NOT in this list any more, and that is a measured
+// change (2026-11-02).
+//
+// MEASURED FROM THE GUEST'S OWN LOG: the guest asks for r3_symbols.ttf
+// EIGHTEEN TIMES PER RUN, and EVERY ONE OF THEM IS A ONE-CHARACTER DRAW.
+// The characters are not letters -- they are the game's icon art.  The
+// font rendered to a sheet (build/symbol_font_sheet.png) says:
+//
+//     U+0029  a trophy            U+0033  a plus sign
+//     U+002C  a stack of cash     U+0034  a car
+//     U+0031  the game's logo     U+010E  a house with a car
+//     U+0111  the game's logo     U+0056  a shock absorber
+//     U+00CB  a wide coin bar     U+007B  braces
+//
+// The measured codepoints, with the size the guest asked for:
+//
+//     U+0031  175 and 122 px      U+00CB  17 px
+//     U+0030   87 px              U+00C9  52 and 35 px
+//     U+0038   52 px              U+00C7  35 px
+//     U+0039   35 px              U+010E  35 px
+//     U+0056  105 px              U+00BD  52 px
+//     U+0068   52 px              U+0069  52 px
+//     U+006A   35 px              U+007B, U+007C, U+007D  35 px
+//
+// SO THE PORT WAS DRAWING EVERY ICON AS A LATIN LETTER: U+00CB came out
+// as a K with an accent, U+0111 as a d with a stroke, U+0056 as a V.  That
+// is the "the UI is missing characters" the user reported, and it was also
+// a SIZE error: the icon art is 1.00..6.22 em wide and the letter it was
+// replaced with is 0.21..0.52 em, so every icon was 2.3x..5.8x too small.
+//
+// THERE IS NO PARAGRAPH IN THIS FONT.  An earlier note here claimed the
+// guest laid out a whole English paragraph with it -- the tips screen's
 // "If you want to race in the real world, try your local track." -- and
-// opening the symbol font for it draws an empty box with a single "V" in
-// it (archive 20261102-173359-eden-rr3-q122-real-symbol-font, frame
-// 000300: the dialog's body is blank).  The substitution is what makes that
-// text READABLE, so the substitution stays.
-//
-// WHAT THE SUBSTITUTION COSTS, MEASURED: the currency readouts in the top
-// bar come out as the LETTERS "MS", "RS" and "C" instead of icons (the
-// symbol font's codepoints looked up in ConduitITCPro-Regular, 653 glyphs,
-// no symbols), and the guest lays the text out with the SYMBOL font's em
-// (2048) while the port draws it with the TEXT face's em (1000), so the
-// port's text is 2.048x the size the guest asked for.
-//
-// THE CORRECT FIX IS PER CODEPOINT, NOT PER FILE: open the requested face
-// for its metrics and for the icons it owns, and draw the codepoints it
-// does not have with the text face, scaled by upem_text/upem_symbol.  That
-// is a change to the measurement path as well as the drawing path, so it is
-// not a thing to do without measuring it.
+// that the port therefore drew the text 2.048x too big.  That was WRONG,
+// and the log says so: the tips paragraph is laid out with
+// ConduitITCPro-Medium.otf at 140 px, opened 1:1, and all 2,812 text draws
+// of a run use a text face with NO substitution at all.  The 2.048 was
+// upem 2048 against upem 1000, which says nothing about the size of a
+// paragraph that is measured with a 1000-upem face.  The window of log
+// lines that produced the wrong claim was six lines long and ran into the
+// NEXT request.
 //
 // LCD.ttf is NOT in this list, even though its upem is 2048 too: it is the
 // game's display face for the HUD's digits, and its digit advances 0.71 em
 // with an ink box 0.62 x 1.00 em. It is used as it is.
 constexpr const char* kNonTextFaces[] = {
-    "r3_symbols.ttf",
     "r3_decals.ttf",
 };
 
@@ -211,32 +242,33 @@ const char* basenameOf(const char* path) {
 
 // The face the port draws the text with.
 //
-// MEASURED from the game's own file (.build/r3_symbols.ttf, and the copy the
-// guest names at sdmc:/switch/rr3-native-rehost/.depot/r3_symbols.ttf):
+// MEASURED from the game's own file (analysis/rr3-ui-source/files/.depot/
+// r3_symbols.ttf, which is the copy the guest really maps at
+// rr3core:/files/.depot/r3_symbols.ttf, 125,764 bytes):
 //
 //   head.unitsPerEm = 2048
-//   hhea.ascender  = 5628   = 2.748 em     (a real face is 0.75..1.0 em)
+//   hhea.ascender  = 5628   = 2.748 em     (a real text face is 0.75..1.0 em)
 //   hhea.descender = 0
-//   glyph '1'      = ink 4037 x 5700 units = 1.971 x 2.783 em, advance 2.055 em
-//   glyph '0'      = ink 4680 x 4676 units = 2.285 x 2.283 em, advance 2.383 em
+//   glyph '1'      = ink 1.96 x 2.78 em, advance 2.055 em
+//   glyph '0'      = ink 2.29 x 2.28 em, advance 2.383 em
 //
-// So r3_symbols.ttf is the game's SYMBOL font: its "digits" are the big
-// placeholder boxes the game draws its currency and badge art into, and its
-// head table is scrambled (which is why the port's own Font comment calls the
-// hhea scrambled). It is not a text face, and drawing the UI's paragraphs
-// with it produces solid boxes.
+// So r3_symbols.ttf is the game's ICON font: its ASCII slots hold pictures,
+// not letters, and that is exactly how the game uses it -- eighteen
+// one-character icon draws per run (see kNonTextFaces).
 //
-// The port therefore draws text with the game's real Latin UI face, which
-// ships in the NRO's romfs (ConduitITCPro is RR3's UI typeface), and falls
-// back to the CJK face for the codepoints the Latin face does not have --
-// which is every Chinese one, and the port's UI is Chinese.
+// THE PORT DRAWS TEXT with the game's real Latin UI face, which ships in the
+// NRO's romfs (ConduitITCPro is RR3's UI typeface), and falls back to the
+// CJK face for the codepoints the Latin face does not have -- which is every
+// Chinese one, and the port's UI is Chinese.
 //
 // The romfs faces are also the port's established convention: native_ui.cpp
 // has always used exactly these files.
 FT_Face openFace(const char* romfsPath);
 
 // Is this face one of the game's SYMBOL fonts, which the port deliberately
-// replaces with a text face? (See kNonTextFaces.)
+// replaces with a text face?  (See kNonTextFaces.  r3_symbols.ttf is NOT
+// one of them any more: it is the game's ICON font and it is opened as
+// itself, so its icons are the game's icons.)
 bool isNonTextFace(const char* base) {
     if (base == nullptr) {
         return false;
@@ -248,6 +280,10 @@ bool isNonTextFace(const char* base) {
     }
     return false;
 }
+
+// The game's ICON font.  It is opened as itself, unless "iconfont=0" in
+// rr3-gfx.conf puts the old behaviour back for an A/B.
+constexpr const char* kIconFaceFile = "r3_symbols.ttf";
 
 // The face the port draws with, for a face the guest asked for.
 //
@@ -264,6 +300,12 @@ FT_Face openFaceFor(const char* requestedPath, bool bold) {
     for (const FaceChoice& choice : kGameFaces) {
         if (strcmp(base, choice.file) != 0) {
             continue;
+        }
+        if (strcmp(choice.file, kIconFaceFile) == 0 && !rr3::gfxIconFontEnabled()) {
+            // "iconfont=0": draw the icon font's characters with a text face,
+            // which is what the port did before the icon font was opened as
+            // itself.  The icons then come out as Latin letters.
+            break;
         }
         FT_Face face = openFace(choice.romfs);
         if (face != nullptr) {
@@ -812,13 +854,26 @@ void noteFace(const char* romfsPath, FT_Face face, FT_Error error, float sizePx,
     // for; the face may be a different file entirely, and the difference
     // has to be visible in the log.
     const char* actual = facePath(face);
+    // "substituted" HAS TO MEAN "THE PORT DID NOT USE THE FACE THE GUEST
+    // NAMED".  It used to compare the guest's path against the romfs path,
+    // and the guest's path is always a card path (sdmc:/...), so the
+    // comparison was ALWAYS true: every line said substituted=1, including
+    // the ones where the guest's own face was opened.  A field that is
+    // always 1 measures nothing.  The names are what have to be compared:
+    // the guest names "ConduitITCPro-Medium.otf" and the port opens
+    // "romfs:/ui/ConduitITCPro-Medium.otf" -- the same face.
+    const char* actualBase = basenameOf(actual);
+    const char* requestedBase = basenameOf(romfsPath);
+    const int substituted =
+        (actualBase == nullptr || requestedBase == nullptr ||
+         strcmp(actualBase, requestedBase) != 0) ? 1 : 0;
     char details[384];
     snprintf(details, sizeof(details),
              "req=%s face=%s substituted=%d symbol=%d openErr=%d sizeErr=%d "
              "size=%.1f upem=%.0f ascentPx=%.1f descentPx=%.1f lineH=%.1f "
              "scalable=%d glyphs=%ld",
              romfsPath, actual,
-             (actual != nullptr && strcmp(actual, romfsPath) != 0) ? 1 : 0,
+             substituted,
              isNonTextFace(basenameOf(romfsPath)) ? 1 : 0,
              (int)error, (int)sizeError, sizePx, em, ascent, descent, lineHeight,
              face != nullptr ? (face->face_flags & FT_FACE_FLAG_SCALABLE) ? 1 : 0 : 0,

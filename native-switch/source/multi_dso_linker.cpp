@@ -2483,10 +2483,22 @@ ElfLoaderSession loadLinkElfSet(const char* const* paths, size_t pathCount) {
     appendGuestBootLine(
         "sdmc:/switch/rr3-native-rehost.guest-view.log",
         "cache-flush-begin", 204, 0);
-    for (size_t index = 0; index < gLoaderImageCount; ++index) {
-        SegmentedImageMapping& mapped = gSegmentedImages[index];
-        if (mapped.processBacking != nullptr) {
-            armDCacheFlush(mapped.processBacking, gLoaderImages[index].image.size());
+    //
+    // 2026-11-03 console crash: on real hardware svcMapProcessCodeMemory makes
+    // processBacking the alias SOURCE, and the kernel takes it out of the
+    // process's normal view. Flushing it here faulted on its first cache line
+    // (esr=0x92000147, far = image 0's processBacking, x10 = far + 0x1fc8000,
+    // pc = armDCacheFlush, lr = this loop). Eden does not enforce this, so it
+    // never crashed there. mapProcessCodeImages already flushed each backing
+    // right after its memcpy, before the mapping call, so on the real-mapping
+    // path this loop has nothing left to do. The emulator fallback runs out of
+    // processBacking, so it keeps the flush.
+    if (result.segmentedMapperMode != 1) {
+        for (size_t index = 0; index < gLoaderImageCount; ++index) {
+            SegmentedImageMapping& mapped = gSegmentedImages[index];
+            if (mapped.processBacking != nullptr) {
+                armDCacheFlush(mapped.processBacking, gLoaderImages[index].image.size());
+            }
         }
     }
     appendGuestBootLine(

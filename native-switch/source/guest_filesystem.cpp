@@ -5367,12 +5367,42 @@ void buildRewrittenAssetLists() {
     std::vector<std::string> lists;
     collectVerbatimListGuestPaths(lists);
 
+    // THE BEGIN LINE, WRITTEN BEFORE THE WORK. MEASURED 2026-11-03: a console
+    // log (169,901 B / 798 lines, fresh card) ENDS at the 400th and last
+    // capped assetlist-req line, which is the line just before this pass, and
+    // this pass only logged at its END -- so "the console died in here" and
+    // "the user closed a black screen while this was still writing ~384 files
+    // to the card" looked identical. Eden takes 18.7 s for this pass on a
+    // fresh cache (archive 20261103-040937-eden-rr3-q125-consolelike-shipped).
+    {
+        char diag[160];
+        std::snprintf(diag, sizeof(diag), "lists=%zu overrides=%zu",
+                      lists.size(), overrides.size());
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "assetlist-rewrite-all-begin", 0, 0, diag);
+    }
+
     unsigned touched = 0;
+    unsigned visited = 0;
     unsigned written = 0;
     unsigned entries = 0;
     unsigned atlasEntries = 0;
     unsigned long long bytes = 0;
     for (const std::string& guestPath : lists) {
+        // A PROGRESS LINE EVERY 64 LISTS, so a log that stops inside this
+        // pass says how far it got and how fast it was going.
+        if (visited != 0 && (visited % 64u) == 0) {
+            char diag[256];
+            std::snprintf(diag, sizeof(diag),
+                          "visited=%u of=%zu touched=%u written=%u ms=%llu",
+                          visited, lists.size(), touched, written,
+                          (unsigned long long)((armGetSystemTick() - startTick) *
+                                               1000ULL /
+                                               (tickFreq != 0 ? tickFreq : 1)));
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                "assetlist-rewrite-all-progress", visited, 0, diag);
+        }
+        ++visited;
         std::string text;
         std::vector<std::string> paths;
         collectPathsFromList(guestPath.c_str(), paths, false, &text);

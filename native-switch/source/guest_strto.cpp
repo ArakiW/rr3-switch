@@ -19,6 +19,7 @@
 #include <switch.h>
 
 #include <cerrno>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -337,4 +338,94 @@ long guestAtol(const char* text) {
 
 double guestAtof(const char* text) {
     return guestStrtod(text, nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// THE GUEST'S sscanf, WITH A BOUND.
+//
+// MEASURED 2026-11-03 (round q123, archive 20261103-011044-eden-rr3-q123-
+// icon-font): the guest's thread was sampled twice inside the HOST image, at
+// pc_off=0x5ea1c0 and 0x5e8e1c, and BOTH offsets are inside
+// `__svfscanf_r` -- newlib's sscanf -- running on the guest's thread.  The
+// run then froze with the log at 1.62 MB, four frames captured, and no new
+// frame for 120 s.
+//
+// The guest's sscanf import was bound straight to the host's newlib
+// (`RR3_BIND(sscanf)` in symbol_resolver.cpp), so the host's parser walked
+// the GUEST's memory with no bound at all.  That is the q89 strtoul hang,
+// one function over: the same shape, the same silence, the same frozen log.
+//
+// ⇒ The input AND the format are copied out under a readability check with a
+// hard limit, and the host's parser only ever sees the copies.
+//
+// THE LINE IS WRITTEN BEFORE THE PARSE.  A diagnostic that runs after the
+// call is worthless here: the call is the thing that does not come back.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// How many sscanf calls are logged in full.  The guest parses the
+// gui_assets folder names ("%ux%u") and a few numbers, so this is tens of
+// calls a run; the cap is there so a pathological caller cannot turn the
+// instrument into the hang.
+constexpr unsigned kScanfLogCap = 64;
+
+unsigned g_scanfCalls = 0;
+
+const char* scanfStateName(TextState state) {
+    switch (state) {
+        case TextState::Ok: return "ok";
+        case TextState::Truncated: return "truncated";
+        default: return "unreadable";
+    }
+}
+
+}  // namespace
+
+int guestSscanf(const char* text, const char* format, ...) {
+    ++g_scanfCalls;
+    const GuestText input = takeGuestText(text);
+    const GuestText fmt = takeGuestText(format);
+
+    const bool interesting =
+        input.state != TextState::Ok || fmt.state != TextState::Ok;
+    if (interesting || g_scanfCalls <= kScanfLogCap) {
+        char head[64]{};
+        const size_t shown = input.length < 24 ? input.length : 24;
+        for (size_t i = 0; i < shown; ++i) {
+            std::snprintf(head + i * 2, 3, "%02x",
+                          static_cast<unsigned>(
+                              static_cast<unsigned char>(input.buffer[i])));
+        }
+        char fmtText[64]{};
+        const size_t fmtShown = fmt.length < 24 ? fmt.length : 24;
+        for (size_t i = 0; i < fmtShown; ++i) {
+            fmtText[i] = fmt.buffer[i];
+        }
+        char details[320];
+        std::snprintf(details, sizeof(details),
+                      "calls=%u input=%s in_len=%zu fmt=%s fmt_len=%zu "
+                      "in_head=%s fmt_text=[%s] ptr=0x%llx",
+                      g_scanfCalls, scanfStateName(input.state), input.length,
+                      scanfStateName(fmt.state), fmt.length, head, fmtText,
+                      static_cast<unsigned long long>(
+                          reinterpret_cast<uintptr_t>(text)));
+        rr3::appendGuestBootLine(kGuestViewLog,
+                                  interesting ? "guest-scanf-bounded"
+                                              : "guest-scanf",
+                                  0, 0, details);
+    }
+
+    if (input.state == TextState::Unreadable ||
+        fmt.state == TextState::Unreadable) {
+        // There is no value to be faithful to: the host's parser would have
+        // faulted on this pointer.
+        return 0;
+    }
+
+    va_list ap;
+    va_start(ap, format);
+    const int result = std::vsscanf(input.buffer, fmt.buffer, ap);
+    va_end(ap);
+    return result;
 }

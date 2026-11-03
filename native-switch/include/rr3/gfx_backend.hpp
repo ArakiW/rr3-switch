@@ -185,6 +185,12 @@ GpuIdProfile gfxGpuIdProfile();
 // 1. See ensureEarlyGuestGlContext() for why this is not optional.
 bool gfxEarlyGlContext();
 
+// "iconfont=0": draw the game's ICON font (r3_symbols.ttf) with a text face,
+// which is what the port did before it was opened as itself.  Default ON.
+// The guest asks for that face only for one-character icon draws, so drawing
+// them as Latin letters is the "the UI is missing characters" bug.
+bool gfxIconFontEnabled();
+
 // The screen size the port reports to the guest, or 0 for "answer the
 // constant this port has always answered".  These come from the card's
 // rr3-screen.txt ("platform=WxH", "ui=WxH"); an absent file means the

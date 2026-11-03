@@ -13487,3 +13487,175 @@ path as well as the drawing path, so it has to be measured, not guessed.
 
 => the symbol font change is REVERTED; the console crash fix, the prune-list
 fix, the gamepad layer and the consolidated package all stay.
+
+## THE ICON FONT, AND THE CONCLUSION ABOVE WAS WRONG
+
+The section above says the symbol font is substituted because the guest lays
+out a whole ENGLISH PARAGRAPH with it, and that the port's text comes out
+2.048x too big.  BOTH of those are wrong, and the way they were wrong is
+worth recording.
+
+### THE MEASUREMENT WAS CONTAMINATED
+
+The claim was read out of a window of six log lines after a `glyph-face`
+line.  Six lines is not a request boundary: the window ran into the NEXT
+request, so the text of one request was attributed to the face of another
+one.
+
+The log's own structure says where the boundary is.  One request is:
+
+    jni-utf163 (the string) -> cc-dispatch ... GlyphVector.init
+      -> glyph-face (the PRIMARY face) -> glyph-face (the fallback)
+      -> glyph-vector ... method=init (the result)
+
+Paired that way, on the q121 run:
+
+* **18 of 2,830 draws** ask for `r3_symbols.ttf`, and **ALL EIGHTEEN are
+  ONE-CHARACTER draws**.  Not one paragraph.
+* the other **2,812 draws** use a text face, opened **1:1**, with no
+  substitution at all: ConduitITCPro-Regular / -Medium / -Bold /
+  -ExtraBold and NotoSansCJKsc.
+
+=> the port's ROUTING was correct all along, and there was **no size error
+   on any paragraph**.  The 2.048 was upem 2048 against upem 1000, which
+   says nothing about the size of a paragraph that is measured with a
+   1000-upem face.
+
+### WHAT THE SYMBOL FONT ACTUALLY IS
+
+Rendered to a sheet (`build/symbol_font_sheet.png`), `r3_symbols.ttf` is the
+game's **ICON font**.  Its ASCII slots are PICTURES:
+
+    U+0029  a trophy         U+002C  a stack of cash
+    U+0031  the game's logo   U+0033  a plus sign
+    U+0034  a car             U+0111  the game's logo
+
+Measured outlines:
+
+    'I'  advance 1.0693 em   ink 0.972 x 0.985 em   11 contours
+    'o'  advance 1.7690 em   ink 1.671 x 0.985 em   54 contours
+    '0'  advance 2.3828 em   ink 2.285 x 2.283 em    6 contours
+
+=> 52/62 Latin slots and 10/10 digits, but the OUTLINES are art.  A letter
+   'o' with 54 contours is a picture.
+
+### THE MEASURED ICON DRAWS (18 per run)
+
+    U+0031  175 and 122 px       U+00CB   17 px
+    U+0030   87 px               U+00C9   52 and 35 px
+    U+0038   52 px               U+00C7   35 px
+    U+0039   35 px               U+010E   35 px
+    U+0056  105 px               U+00BD   52 px
+    U+0068   52 px               U+0069   52 px
+    U+006A   35 px               U+007B, U+007C, U+007D  35 px
+
+and what the port drew against what the icon font draws:
+
+    U+00CB at  17 px: now   6 x  13 px  ->  real 104 x  17 px
+    U+0031 at 175 px: now  58 x 112 px  ->  real 343 x 487 px
+    U+0056 at 105 px: now  47 x  68 px  ->  real 110 x  97 px
+
+=> every icon was a **LATIN LETTER** ('K with an accent' for U+00CB, 'd
+   with a stroke' for U+0111, 'V' for U+0056) **AND 2.3x..5.8x too small**.
+   The user's "the UI is missing characters" and "the icon is the wrong
+   size" are the SAME bug.
+
+### WHAT WAS DONE
+
+1. `r3_symbols.ttf` is opened **AS ITSELF**.  It is in `kGameFaces` and out
+   of `kNonTextFaces`; `r3_decals.ttf` stays in the not-text list.
+2. it is shipped in the romfs, and **there are two files with that name**:
+   `rr3core:/files/.depot/r3_symbols.ttf` (125,764 bytes) is the one the
+   guest maps, and `sdmc:/.../.depot/r3_symbols.ttf` (72,468 bytes) is a
+   DIFFERENT font that disagrees on the glyph at several code points.  The
+   build checks the SIZE and refuses the wrong one; `test_font_faces.py`
+   pins it.
+3. **the face cache was too small**: `kFaceSlots` was 6, and the guest
+   names 14 faces + the CJK fallback + the icon font = 16.  A short cache
+   does not fail loudly -- `openFace()` returns nullptr and the text is
+   silently drawn with the Conduit fallback, so the UI quietly loses the
+   face the guest asked for.  It is 16 now.
+4. **the `substituted=` log field was always 1**: it compared the guest's
+   card path against the romfs path, and those never match.  It compares
+   the FILE NAMES now, so a line says `substituted=0` when the guest's own
+   face was opened.
+5. the source comments and `test_font_faces.py`, which asserted the wrong
+   conclusion, are rewritten.
+
+### THE ONE THING THAT WAS RIGHT ABOUT THE OLD NOTE
+
+The symbol font really cannot draw a PARAGRAPH -- its ASCII slots are
+pictures, so a paragraph drawn with it is solid boxes.  That is why the q122
+experiment (which opened the card's 72,468-byte copy as itself) broke the
+tips screen.  But the guest never asks for a paragraph with that face, so
+the experiment was answering a question nobody asked.
+
+## THE FIFTH CONSOLE CRASH (19:45), AND WHAT IT WAS
+
+Files: `guest-view.log` (1,757,002 B, 10,577 lines), `crash-000001a77b06589b.txt`,
+`egl-probe.log`, `guest-boot.progress`, `teardown-repair.log`.
+
+### THE CONSOLE GOT MUCH FURTHER
+
+The handoff's §9/§10/§11 fixes hold.  This run reached the front end, the
+guest's own image is mapped (`dlgate: bias=0x18361f3000`), the EGL sequence
+completed, and the Cloudcell stack was live (`CC: [1] POST request
+[https://connect-dev-ss.cloudcell.com:443/time]`).  `guest-boot.progress`
+ends at `guest-controller-connected ordinal=72`.
+
+### THE CRASH
+
+    handler=0x87d3f19c0   pc=0x1837ed7370   lr=0x87d40de54
+    far=0x28   esr=0x92000005   (data abort, translation fault, level 1)
+
+`pc` is INSIDE the guest image (0x18361f3000 + 0x1AE4370) and `far` is
+exactly NULL + 0x28: the guest dereferenced a null pointer.  `lr` is in the
+HOST, and `addr2line` on the matching .elf (`nm` gives
+`__libnx_exception_handler` = 0x829c0, so base = 0x87d36f000, lr offset
+0x9ee54) says:
+
+    http_post(...)::{lambda()#1}::operator()()   cc_http_request.cpp
+    deliverServerTime                            cc_http_request.cpp
+    operator()                                   cc_http_request.cpp
+
+So the fault is inside the delivery of the `/time` answer.  The last host
+line before it is the port's own probe:
+
+    phase=cc-probe ordinal=370149934272 ... worker unreadable
+
+and the `cc-srvtime-body` line that follows EVERY successful body delivery
+is ABSENT, so the fault is in the header callback, not the body one.
+
+### WHY THE PORT SAID "unreadable"
+
+MEASURED, and this is the part that explains every "the console and the
+emulator disagree" in the HTTP area:
+
+    guest image bias   0x18361F3000
+    guest worker       0x562EA7C4C0
+    difference         0x4E2CC44C0  =  259 GiB ABOVE the image
+
+`guestReadable()` only accepts `[bias - 4 GiB, bias + 4 GiB)`, so the port
+declared a perfectly good guest object unreadable -- and then handed that
+pointer to the guest's native `headerCallback` anyway.  On Eden the same
+worker is 122 MB above the image, inside the window, and the same probe
+prints its vtable ("worker=0x2113d42280 vptr=0x21087ecb28 ...").
+
+The host's OWN addresses are BELOW the image on both machines (host objects
+0x87e1147b0 and 0x80e209c0, host stack 0x6d20958940), and the guest's heap
+is ABOVE it, so a symmetric window cannot tell them apart.
+
+### THE FIX (NRO after this)
+
+1. `guestReadable()`'s window is now ASYMMETRIC: the lower bound stays at
+   4 GiB (it is what keeps the probe out of the host's address space, which
+   is what archive 20261021-072048-eden-srvtime4 needed) and the upper
+   bound is 512 GiB, which covers the guest's heap on the console.
+2. Every hand-off of `req->callback` to the guest now goes through
+   `ccprobe::guestWorkerAlive()`: the worker must still be readable, or the
+   delivery is skipped and the refusal is logged as `cc-worker-dead`.
+   Seven call sites: the auth answer, the sync answer, the asset answer,
+   the /time body, the /time header, the /time completion and the error
+   callback.
+
+Gate: BUILD 0, INPUTS 0, SYMBOLS 0, tests 39/39.

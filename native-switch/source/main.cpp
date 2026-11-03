@@ -758,11 +758,26 @@ int main(int argc, char** argv) {
     bootPrintf("guest teardown repair selftest=%llx expected=1\n",
                 static_cast<unsigned long long>(teardownRepairSelfTest));
 
+    // 2026-11-03: two console runs ended right after the frame self-test and
+    // before census-arm (first symbol lookup in the dry load). bootPrintf is a
+    // no-op, so this stretch logged nothing. One line per step splits it.
+    rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                             "boot-step", 0, 0, "step=teardown-selftest-done");
+
     char siblingPath[0x400]{};
     const char* gameLibrary =
         selectGameLibrary(argc, argv, romfsReady, siblingPath, sizeof(siblingPath));
+    {
+        char diag[512];
+        std::snprintf(diag, sizeof(diag), "step=library-selected path=%s",
+                      gameLibrary != nullptr ? gameLibrary : "-");
+        rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                 "boot-step", 0, 0, diag);
+    }
     rr3::renderLoadingDashboard("Main ELF audit", 35);
     presentUi();
+    rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                             "boot-step", 0, 0, "step=main-elf-dashboard-presented");
     bootPrintf("\nELF preflight\n");
     bootPrintf("source: %s\n", gameLibrary != nullptr ? gameLibrary : "not found");
     rr3::ElfDryLoad gameDry{};
@@ -771,6 +786,8 @@ int main(int argc, char** argv) {
     }
     else {
         const rr3::ElfPreflight elf = rr3::inspectElfFile(gameLibrary);
+        rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                 "boot-step", 0, 0, "step=inspect-elf-done");
         if (!elf.opened || !elf.validElf || elf.error[0] != '\0') {
             bootPrintf("status: %s\n", elf.error);
         }
@@ -848,6 +865,8 @@ int main(int argc, char** argv) {
     rr3::renderLoadingDashboard("libc++ closure", 55);
     presentUi();
     const rr3::ElfDryLoad cxx = rr3::dryLoadElfFile(kCxxLibrary);
+    rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                             "boot-step", 0, 0, "step=cxx-dry-load-done");
     bootPrintf("\nlibc++ dependency dry audit\n");
     if (!cxx.opened || !cxx.validElf || !cxx.allocated || !cxx.completed ||
         cxx.error[0] != '\0') {
@@ -876,8 +895,19 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(cxx.lookupMatchedNameHash));
     }
 
+    rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                             "boot-step", 0, 0, "step=image-jit-probe-begin");
     const rr3::JitImageProbe imageJit =
         rr3::captureImageSizedJitProbe(gameDry.imageBytes + cxx.imageBytes);
+    {
+        char diag[256];
+        std::snprintf(diag, sizeof(diag),
+                      "step=image-jit-probe-done bytes=%llu create=%08x exec=%08x close=%08x",
+                      static_cast<unsigned long long>(imageJit.requestedBytes),
+                      imageJit.createResult, imageJit.executableResult, imageJit.closeResult);
+        rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                 "boot-step", 0, 0, diag);
+    }
     bootPrintf("image-sized JIT=%llu KiB create=%08x exec=%08x edge=%s/%s close=%08x\n",
                 static_cast<unsigned long long>(imageJit.requestedBytes / 1024),
                 imageJit.createResult,
@@ -887,6 +917,8 @@ int main(int argc, char** argv) {
                 imageJit.closeResult);
 
     const uint64_t rollbackSelfTest = rr3::loaderRollbackSelfTest();
+    rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                             "boot-step", 0, 0, "step=rollback-selftest-done");
     bootPrintf("loader rollback selftest=%llx expected=f\n",
                 static_cast<unsigned long long>(rollbackSelfTest));
 

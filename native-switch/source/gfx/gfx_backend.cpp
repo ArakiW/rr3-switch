@@ -334,6 +334,13 @@ struct ConfState {
     // version numbers it always did.  "glctxearly=1" brings the old
     // behaviour back for whoever wants to A/B it.
     bool earlyGlContext = false;
+    // "iconfont=0" -- draw the game's ICON font (r3_symbols.ttf) with a TEXT
+    // face, which is what the port did before the icon font was opened as
+    // itself.  Default ON, because the measured truth is that the guest asks
+    // for r3_symbols.ttf only for one-character ICON draws, and drawing
+    // them as Latin letters is the "the UI is missing characters" bug.
+    // Set 0 to put the old behaviour back for an A/B.
+    bool iconFont = true;
     // "gpuid=powervr|adreno|native" -- which GL identity the guest is told it
     // is running on. Default powervr because that is the one whose guest-side id
     // is 4, and the render loop at 0x12af190 does `cmp #4 / b.ne` and will not
@@ -678,6 +685,10 @@ void readConf() {
         else if (std::strcmp(key, "glctxearly") == 0 ||
                  std::strcmp(key, "gl-context-early") == 0) {
             s_conf.earlyGlContext = parseSwitch(value);
+        }
+        else if (std::strcmp(key, "iconfont") == 0 ||
+                 std::strcmp(key, "icon-font") == 0) {
+            s_conf.iconFont = parseSwitch(value);
         }
         else if (std::strcmp(key, "gpuid") == 0 ||
                  std::strcmp(key, "gpu-id") == 0 ||
@@ -1074,6 +1085,13 @@ GpuIdProfile gfxGpuIdProfile() {
 bool gfxEarlyGlContext() {
     ensureResolved();
     return s_conf.earlyGlContext;
+}
+
+// "iconfont=0": draw the game's icon font with a text face (the old
+// behaviour). Default on.
+bool gfxIconFontEnabled() {
+    ensureResolved();
+    return s_conf.iconFont;
 }
 
 // The screen size the port reports to the guest, or 0 for "answer the

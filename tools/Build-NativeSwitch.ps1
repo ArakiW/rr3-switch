@@ -109,6 +109,45 @@ if ($missingOptionalFonts.Count -gt 0) {
         $missingOptionalFonts.Count, ($missingOptionalFonts -join ', '))
     Write-Host ("           stage them with: python tools\stage_rr3_fonts.py <data-pack.zip>")
 }
+
+# THE GAME'S ICON FONT.
+#
+# MEASURED 2026-11-02 FROM THE GUEST'S OWN LOG: the guest asks for
+# r3_symbols.ttf EIGHTEEN TIMES PER RUN, and every one of them is a
+# ONE-CHARACTER draw of the game's ICON ART (U+0029 is a trophy, U+002C a
+# stack of cash, U+0111 the game's own logo).  The port used to answer
+# those draws with ConduitITCPro-Regular, so every icon came out as a
+# LATIN LETTER -- a K with an accent where the coin bar is, a d with a
+# stroke where the logo is -- and 2.3x..5.8x too small, because the icon art
+# is 1.0..6.2 em wide and the letter it was replaced with is 0.2..0.5 em.
+# That is the "the UI is missing characters" the user reported.
+#
+# THERE ARE TWO FILES WITH THAT NAME AND THEY ARE NOT THE SAME FONT:
+#
+#   rr3core:/files/.depot/r3_symbols.ttf   125,764 bytes  <- the copy the
+#                                                       guest really maps
+#   sdmc:/.../.depot/r3_symbols.ttf          72,468 bytes  <- a DIFFERENT
+#                                                       font (the card's
+#                                                       loose copy)
+#
+# They disagree on the glyph at several code points, so the copy that goes
+# into the romfs is checked BY SIZE and the wrong one is refused rather
+# than shipped: a wrong icon font looks like a broken UI and is very hard
+# to trace back to the file.
+$iconFontAsset = 'r3_symbols.ttf'
+$iconFontBytes = 125764
+$iconFontSource = Join-Path $originalDepotRoot $iconFontAsset
+if (Test-Path $iconFontSource -PathType Leaf) {
+    $iconFontSize = (Get-Item -LiteralPath $iconFontSource).Length
+    if ($iconFontSize -eq $iconFontBytes) {
+        Copy-Item -LiteralPath $iconFontSource -Destination (Join-Path $fontDestination $iconFontAsset) -Force
+    } else {
+        Write-Host ("font     : {0} is staged at {1} bytes, but the copy the guest maps is {2} bytes -- the staged one is a DIFFERENT font, so it is NOT copied and the icons stay letters" -f `
+            $iconFontAsset, $iconFontSize, $iconFontBytes)
+    }
+} else {
+    Write-Host ("font     : {0} is NOT staged, so the game's icons are drawn as letters" -f $iconFontAsset)
+}
 $bootstrapChineseFont = Join-Path $fontDestination 'NotoSansCJKsc-RR3Bootstrap.otf'
 $bootstrapFontLicense = Join-Path $romfsRoot 'licenses\Noto-CJK-OFL.txt'
 if (-not (Test-Path $bootstrapChineseFont -PathType Leaf)) {

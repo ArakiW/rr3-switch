@@ -190,6 +190,26 @@ extern "C" void __libnx_exception_handler(ThreadExceptionDump* dump) {
         fsFileWrite(&g_crashFile, 0, g_crashText, g_crashLength, FsWriteOption_Flush);
         mutexUnlock(&g_crashFileMutex);
     }
+    else if (!g_crashFileOpen) {
+        // The capture file is only armed for the guest view branch, so a fault
+        // earlier in boot used to end in svcExitProcess with no record at all:
+        // this handler swallows the exception, so Atmosphere writes no report
+        // for the NRO either (2026-11-03 console run: log ended inside
+        // dryLoadElfFile, and the only crash reports were hbl's). Write a
+        // fixed-name file directly. No allocation; the process is going down.
+        FsFileSystem* sd = fsdevGetDeviceFileSystem("sdmc");
+        constexpr char kEarlyPath[] = "/switch/rr3-native-rehost.crash-early.txt";
+        FsFile early{};
+        if (sd != nullptr) {
+            (void)fsFsDeleteFile(sd, kEarlyPath);
+            if (R_SUCCEEDED(fsFsCreateFile(sd, kEarlyPath, 0, 0)) &&
+                R_SUCCEEDED(fsFsOpenFile(sd, kEarlyPath,
+                                         FsOpenMode_Write | FsOpenMode_Append, &early))) {
+                fsFileWrite(&early, 0, g_crashText, g_crashLength, FsWriteOption_Flush);
+                fsFileClose(&early);
+            }
+        }
+    }
     svcExitProcess();
 }
 

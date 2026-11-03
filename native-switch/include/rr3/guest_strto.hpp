@@ -44,3 +44,22 @@ float guestStrtof(const char* text, char** end);
 int guestAtoi(const char* text);
 long guestAtol(const char* text);
 double guestAtof(const char* text);
+
+// The guest's sscanf, with a bound on how far the host may look.
+//
+// MEASURED 2026-11-03 (round q123, archive 20261103-011044-eden-rr3-q123-
+// icon-font): the guest's thread was sampled twice inside the HOST image, at
+// pc_off=0x5ea1c0 and 0x5e8e1c, and both offsets are inside
+// `__svfscanf_r` -- newlib's sscanf -- running on the GUEST's thread.  The
+// run froze with the log at 1.62 MB and no frame captured.
+//
+// The guest's sscanf import was bound straight to the host's newlib
+// (`RR3_BIND(sscanf)`), so the host's parser walked the GUEST's memory with
+// no bound at all: the same shape as the q89 strtoul hang, one function over.
+//
+// ⇒ The input AND the format are copied out under a readability check with a
+// hard limit, and the host's parser only ever sees the copies.  A string
+// that is not terminated inside the window still parses to the SAME value
+// (the copy has the same leading bytes), so the bound does not change the
+// answer -- it only stops the scan.
+int guestSscanf(const char* text, const char* format, ...);

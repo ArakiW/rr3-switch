@@ -1,5 +1,6 @@
 #include "rr3/elf_preflight.hpp"
 #include "rr3/symbol_resolver.hpp"
+#include "rr3/recovery_guard.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -336,8 +337,22 @@ ElfPreflight inspectElfFile(const char* path) {
     return result;
 }
 
+namespace {
+// 2026-11-03: a console run died after the teardown self-test and before the
+// first resolveHostSymbol() below, with no line in between. These breadcrumbs
+// split that stretch; the log is written uncached, so the last one survives.
+void dryLoadStep(const char* step, const char* path, unsigned long long value) {
+    char diag[320];
+    std::snprintf(diag, sizeof(diag), "step=%s value=0x%llx path=%s",
+                  step, value, path != nullptr ? path : "-");
+    rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                             "elf-dry-step", 0, 0, diag);
+}
+}  // namespace
+
 ElfDryLoad dryLoadElfFile(const char* path) {
     ElfDryLoad result{};
+    dryLoadStep("enter", path, 0);
     std::FILE* file = std::fopen(path, "rb");
     if (file == nullptr) {
         setError(&result, "file not found");
@@ -444,7 +459,9 @@ ElfDryLoad dryLoadElfFile(const char* path) {
     };
 
     result.imageBytes = maximumAddress - minimumAddress;
+    dryLoadStep("memalign", path, result.imageBytes);
     void* allocation = memalign(kPageSize, static_cast<size_t>(result.imageBytes));
+    dryLoadStep("memalign-done", path, reinterpret_cast<uintptr_t>(allocation));
     if (allocation == nullptr) {
         setError(&result, "image allocation failed");
         std::fclose(file);
@@ -452,16 +469,35 @@ ElfDryLoad dryLoadElfFile(const char* path) {
     }
     result.allocated = true;
     std::memset(allocation, 0, static_cast<size_t>(result.imageBytes));
+    dryLoadStep("memset-done", path, result.imageBytes);
     auto* image = static_cast<unsigned char*>(allocation);
 
+    // 2026-11-03: the console log ended at memalign-done, so the fault is in the
+    // memset above or in this copy. The copy is read in 4 MiB pieces with one
+    // line each, so the log names the segment and offset it stopped at. The
+    // linker (multi_dso_linker.cpp readFile) still reads each segment in one
+    // call; if this passes on the console and the linker then dies, a single
+    // large read is the cause.
+    constexpr uint64_t kCopyChunk = 4ULL * 1024ULL * 1024ULL;
+    unsigned segmentIndex = 0;
     for (const Elf64ProgramHeader& ph : programHeaders) {
         if (ph.type != kPtLoad) {
             continue;
         }
         const uint64_t relative = ph.virtualAddress - minimumAddress;
-        if (relative > result.imageBytes || ph.memorySize > result.imageBytes - relative ||
-            std::fseek(file, static_cast<long>(ph.offset), SEEK_SET) != 0 ||
-            std::fread(image + relative, 1, static_cast<size_t>(ph.fileSize), file) != ph.fileSize) {
+        bool copied = relative <= result.imageBytes &&
+            ph.memorySize <= result.imageBytes - relative &&
+            std::fseek(file, static_cast<long>(ph.offset), SEEK_SET) == 0;
+        for (uint64_t done = 0; copied && done < ph.fileSize; done += kCopyChunk) {
+            const uint64_t piece = std::min(kCopyChunk, ph.fileSize - done);
+            char step[48];
+            std::snprintf(step, sizeof(step), "read seg=%u off=0x%llx", segmentIndex,
+                          static_cast<unsigned long long>(done));
+            dryLoadStep(step, path, piece);
+            copied = std::fread(image + relative + done, 1, static_cast<size_t>(piece), file) == piece;
+        }
+        ++segmentIndex;
+        if (!copied) {
             setError(&result, "PT_LOAD copy failed");
             std::free(allocation);
             std::fclose(file);
@@ -470,6 +506,7 @@ ElfDryLoad dryLoadElfFile(const char* path) {
         result.copiedBytes += ph.fileSize;
         result.zeroFilledBytes += ph.memorySize - ph.fileSize;
     }
+    dryLoadStep("copied", path, result.copiedBytes);
     result.imageHash = fnv1a64(image, static_cast<size_t>(result.imageBytes));
 
     if (dynamicHeader == nullptr || dynamicHeader->fileSize == 0 ||
@@ -733,6 +770,7 @@ ElfDryLoad dryLoadElfFile(const char* path) {
     };
 
     const uintptr_t loadBias = reinterpret_cast<uintptr_t>(image) - minimumAddress;
+    dryLoadStep("relocate", path, relaSize + jumpRelSize);
     const auto processRelocations = [&](uint64_t address, uint64_t bytes) {
         if (!containsLoadFileRange(address, bytes) || bytes % sizeof(Elf64Rela) != 0) {
             ++result.invalidRelocations;
