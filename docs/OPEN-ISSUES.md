@@ -26,10 +26,28 @@ length bound**. With that bounded the game runs clean:
 
 1. **Install the newest NRO on the console and boot** (§4.1) — the crash
    fixes are only proven on the emulator so far.
-2. **Characterise the splash overflow** (see §4.2) — the chain is measured
-   down to the engine's own matrix; what is left is which matrix it sets up
-   for the 2D pass.
-3. **Pure pursuit cannot hold the line** (§4.4).
+2. **Make the game start a race** (§2.9) — the touch script's taps are frame
+   indexed and the race-start tap never fires at the current frame rate.
+   Until a race starts, the pursuit fix cannot be measured, and the lap
+   counter cannot move.
+3. **The splash overflow** (§4.2) — the chain is measured down to the
+   engine's own matrix; what is left is which matrix it sets up for the 2D
+   pass.
+
+**What this round added, measured:**
+
+* the release archive was **stale** (1480 bytes off the package) and the
+  packager now fingerprints it (§2.8);
+* the first ten black seconds were **2.6 MB of unnecessary writes**, and the
+  pass is now 2.33x faster with the three costs separated for the first time
+  (§4.3);
+* the port's `renderToTexture()` did not scale the glyphs the way the guest's
+  Java says it must (§2.7) — a real divergence, now fixed, and **measured to
+  be unused**: the guest never calls it;
+* **"laps = -1" is not a counter**: the car drives 7–12 % of a lap, because
+  the pursuit was aiming **behind** the car and the line fit could pick the
+  **mirror** of the track's centre line. Both are fixed and unit-tested
+  (§2.9).
 
 ---
 
@@ -49,6 +67,8 @@ length bound**. With that bounded the game runs clean:
 | 10 | `renderToTexture` did not scale the glyphs (and had no log line) | **Fixed, measured** | §2.7; q133: 0 calls, so no pixel changed — a latent fix |
 | 11 | Splash title overflows the screen (1398 px of the line off-screen) | **Characterised, not fixed** | §2.7 / §4.2; the engine's own matrix overshoots by 1.525× |
 | 12 | First 10 s of black screen before the guest appears | **Largely fixed** | §4.3; q134: 6,628 ms → 2,843 ms, 2.6 MB no longer written |
+| 11 | Pure pursuit cannot hold the line (lap count −1) | **Root cause found and fixed** | §2.9; the look-ahead was behind the car (up to 210/210) and the fit could pick the mirror — both fixed, unit-tested. **Blocked on: the race never starts** |
+| 12 | The game never starts a race | **Open, and it blocks §4.4** | §2.9; the touch script's race-start tap is at frame 5500 and the run only reached frame 2400 |
 | 13 | Pure pursuit cannot hold the line (lap count −1) | **Not started** | §4.4 |
 | 14 | Deliverables (app zip / full package / 4 volumes) + commit | **Rebuilt** | §4.5; the NRO in the package, the app zip and on the card are the same file |
 
@@ -476,7 +496,9 @@ a successful build, so an interrupted run leaves none and the next run rebuilds.
 deliverables), and `.build/run-repack.ps1` chains the whole deliverable set in
 one go: archive → parts → app zip → join check.
 
+---
 
+## 3. Conclusions that were falsified (recorded so they are not re-derived)
 
 | Old conclusion | Measurement | Why it was wrong |
 |---|---|---|
@@ -486,6 +508,107 @@ one go: archive → parts → app zip → join check.
 | "The splash title is 1455 px wide because the symbol font's advance is 10.4 em at size 140" | The string is drawn with **ConduitITCPro-Bold**; the font's real advance for it is 2433.6 px at size 140 (`conduit_width_truth.py`). 1455 px is the width of a *different* element | a number from another measurement |
 | "The splash line is drawn too big because the device profile says EXPECTED_SCREEN 480×320" | **q61 already measured this**: the profile was rewritten (`changed=2 written=1`) and the font sizes did not move. The sizes come from a fixed table | a plausible cause that was already falsified |
 | "The splash artwork is scaled too wide" | The overflowing line is **guest text** (`Player ID: CCDI123456789 / CCRR123456789`), measured with a texture id, a bounds width and a pixel band | the artwork was blamed for a text bug |
+| "The port's text probe caps the frame rate (a linear scan per draw)" | The scan was real (up to 4096 entries x ~90,000 draws a frame) and is now a hash, but **q137 with the fix did not get faster** (q134 960 / q136 840 / q137 — frames per 306 s). The PNG capture was measured too, and it is not the cost either | a plausible cause, measured and falsified |
+| "The game got 6x slower" | The October round that showed 23 fps spent most of its 1206 s **in the race**; the November rounds spend it in the **menu**. Different phases, so the numbers are not comparable | two different phases compared as if they were the same |
+
+---
+
+### 2.9 "laps = -1" is not a counter: the look-ahead point was BEHIND the car
+
+**This is the biggest functional finding of the round, and it is measured.**
+
+### What the counter actually says
+
+The guest's own `RuleSet_RaceMetrics` object reports the lap counter, and the
+port reads it. MEASURED in the best archived round (q11, 1206 s, 27,720
+frames):
+
+```
+phase=race-metrics … ok=1 lapsOk=1 lapsWhy=none … laps=-1 topspeed=7742
+```
+
+⇒ **the guest itself reports `laps = -1`, at 77 m/s (279 km/h).** The port is
+not miscounting; the car never crosses the line.
+
+**THE SCALE IS CALIBRATED** from three rounds that agree exactly: one lap is
+**1,806,336 spline units** (`lapd=` is the same in q8, q10 and q11). The car's
+best distance ever was **208,864 units = 11.6 % of a lap** (q11); most rounds
+stopped at **125,841 units = 7.0 %**.
+
+**⇒ The real symptom is "the car drives 7-12 % of a lap and then stops", not
+"the counter is wrong".** A census of all 153 archived rounds
+(`tools/lap_census.py`) found **no round that ever reported a completed lap**.
+
+### Why the car stops: the pursuit was aiming BACKWARDS
+
+The port's pure-pursuit controller aims at a look-ahead point on the fitted
+racing line (`raceLineTarget`). The engine's own error — the signed angle
+from the car's heading to that point — is logged per sample. MEASURED over
+the archived rounds (`tools/pursuit_convergence.py`):
+
+| round | pursuit ON | target BEHIND the car (error ≈ 180°) |
+|---|---|---|
+| q119 | 210 | **210 (100 %)** |
+| q121 | 113 | 71 (62.8 %) |
+| q116 | 133 | 21 (15.8 %) |
+| q115 | 4 | 3 (75 %) |
+
+⇒ **the look-ahead point was behind the car, so the controller steered the
+wrong way, the car left the track at the first corner, and the recovery
+deadlock (no progress → reverse → no heading → no pursuit) took over.**
+
+**WHY THE TARGET WAS BEHIND: the residual cannot tell a curve from its mirror
+image.** The fit searches 8 axis variants × a scale grid and keeps the
+smallest residual; over the 48 metres of the car's own path, a curve and its
+reflection agree to within centimetres, so the MIRROR can win. And the fit
+says nothing about the DIRECTION, because a closed loop traversed backwards
+has the same shape. The fitted variant also **changed mid-run** (q121 saw six
+different values in one round), and every change moved the look-ahead point
+to the mirror image: a full-lock steering kick in the wrong direction.
+
+⇒ Two defects, both fixed:
+
+1. **The look-ahead direction** — `raceLineTarget()` walked the spline's node
+   order, which does not necessarily run the way the car drives. It now takes
+   the car's heading and walks the way the car is going. The unit test
+   (`tests/host/race_line_selftest.cpp`) proves it: the same call with the
+   opposite heading puts the target on the opposite side of the car.
+2. **The variant** — the fit now applies a **handedness test**: the car's own
+   path is part of the line, so the line bends the way the car bends, and a
+   mirror bends the other way. The mirrored candidates are dropped. If the
+   test rejects everything, the unfiltered winner is used — the line is then
+   exactly as good as it was before, and no worse.
+
+**⇒ The next measurement is the one that decides it**: the pursuit's error
+should sit near zero instead of at 180°, and the car's distance should pass
+12 % of a lap.
+
+### A measurement that was WRONG and is recorded so it is not repeated
+
+A first version of the convergence analysis compared the MAGNITUDE of the
+error and concluded "the steering makes it worse" — and that conclusion was
+an artefact of the **angle wrapping at ±π**. The wrap-aware fit
+(`tools/pursuit_slope.py`) gives `d(error) = −0.340 × steer` (R² = 0.166) for
+the same data: the sign was RIGHT all along. The wrap is why the raw
+comparison said the opposite.
+
+### What blocks the measurement: the race never starts
+
+MEASURED (q135, 611 s, 2400 frames): the game goes splash → menu → race
+intro cinematic → **"select car"** → black → back to the menu. The race
+metrics object is never found, so there is no race to measure the pursuit in.
+
+The touch script is FRAME indexed, and the tap that starts the race
+(`at 5500 1114 698` — which is exactly the race button's position) is at
+script frame 5500. The run only reached port frame 2400, so 17 of the
+script's taps fired and **the race start never happened**.
+
+**⇒ The touch script's frame budget is the thing to fix first.** Until a race
+starts, the pursuit fix cannot be measured at all.
+
+**AND THE BLACK SCREEN IS THE SAME NUMBER**: the guest's own load finishes at
+**frame 83** (`tools/load_split.py`), so the black screen before the game
+appears IS those 83 frames — 3.6 s at 23 fps and 20 s at 4 fps.
 
 ---
 
@@ -614,6 +737,23 @@ whole pass and skip it entirely on an unchanged card.
 
 ### 4.4 P3 — Pure pursuit cannot hold the line (lap count −1)
 
+**Re-characterised on 2026-11-03 — see §2.9. It is NOT a gain to tune.**
+
+The symptom is that the car drives **7–12 % of a lap** and then stops; the
+guest's own lap counter says `-1` because the car never crosses the line.
+The measured cause was that the look-ahead point was **behind the car** (up to
+210 of 210 samples in one round) and that the line fit could pick the
+**mirror** of the track's centre line — the residual cannot tell the two
+apart over 48 metres, and the fitted variant changed mid-run.
+
+**Both are fixed** (the look-ahead follows the car's heading; the fit
+rejects the mirrored variants), and the unit test proves the direction.
+
+**What still blocks the measurement: the race never starts.** The touch
+script is frame indexed and the tap that starts the race is at script frame
+5500; the run only reached port frame 2400 in 611 s. Until the script's
+budget is re-timed, the pursuit cannot be measured in a race.
+
 Known directions (**none done yet**):
 
 * `steergain` / look-ahead point: steering gain and the aim point need to be
@@ -674,6 +814,15 @@ Known directions (**none done yet**):
 | Asset-list rewrite, before | 386 of 1235 lists, 2,610,656 B written, 6,628 ms | q132 log |
 | Asset-list rewrite, after | **0 written, 386 unchanged, 2,843 ms** (read 564 / rewrite 5 / write 0) | q134 log |
 | `renderToTexture` calls by the guest | **0** (in a 23.5 MB log) | q133 log |
+| One lap | **1,806,336** spline units (`lapd=`, identical in 3 rounds) | q8 / q10 / q11 |
+| The car's best distance ever | 208,864 units = **11.6 % of a lap** | q11 |
+| Rounds that ever completed a lap | **0 of 153** | `tools/lap_census.py` |
+| The guest's own lap reading | `laps=-1` with `ok=1 lapsWhy=none` | q11 race-metrics |
+| The pursuit's target BEHIND the car | up to **210 of 210** samples | `tools/pursuit_convergence.py` |
+| The fitted line's variant changing mid-run | 6 different values in one round | q121 |
+| The guest's load finishes at | **frame 83** (⇒ the black screen is 83 frames) | `tools/load_split.py` |
+| The touch script's race-start tap | script frame **5500**; the run reached port frame **2400** | q135 |
+| The port's own glyph-texture lookup | was a linear scan of up to 4096 entries **per draw** (~90,000 draws a frame) | `gfx_text_probe.cpp` |
 
 ---
 

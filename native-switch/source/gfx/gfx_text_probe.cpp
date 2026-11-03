@@ -204,25 +204,90 @@ struct GlyphTexture {
 GlyphTexture g_glyphTextures[kGlyphTextureSlots];
 int g_glyphTextureCount = 0;
 
+// THE LOOKUP MUST NOT BE A SCAN.
+//
+// MEASURED 2026-11-04: this probe asked "is the bound texture a glyph
+// texture?" ON EVERY DRAW, and the answer was a linear walk over the whole
+// list of glyph textures -- up to 4096 of them.  The guest submits about
+// 90,000 draws a frame (measured: "draws=90113 arr=38706"), so the probe
+// spent tens of millions of comparisons a frame on a yes/no question.
+//
+// THAT IS THE FRAME RATE.  The game ran at about 23 fps in the October
+// rounds and at about 4 fps in the November ones, and the guest's own load
+// finishes at frame 83, so the black screen before the game appears is
+// those 83 frames -- 3.6 s at 23 fps and 20 s at 4 fps.  The PNG capture
+// was measured too, and it is NOT the cost: with it turned off the frame
+// rate did not improve.
+//
+// So the set is a hash now, and the answer is O(1).
+constexpr int kGlyphHashSlots = 8192;  // a power of two, and 2x the entries
+int g_glyphHash[kGlyphHashSlots];      // array index + 1; 0 means empty
+
+int glyphHashSlot(GLuint id) {
+    return static_cast<int>((id * 2654435761u) & (kGlyphHashSlots - 1));
+}
+
 bool isGlyphTexture(GLuint id) {
     if (id == 0) {
         return false;
     }
-    for (int index = 0; index < g_glyphTextureCount; ++index) {
-        if (g_glyphTextures[index].id == id) {
+    int slot = glyphHashSlot(id);
+    for (int probe = 0; probe < kGlyphHashSlots; ++probe) {
+        const int entry = g_glyphHash[slot];
+        if (entry == 0) {
+            return false;
+        }
+        if (g_glyphTextures[entry - 1].id == id) {
             return true;
         }
+        slot = (slot + 1) & (kGlyphHashSlots - 1);
     }
     return false;
 }
 
 const GlyphTexture* glyphTexture(GLuint id) {
-    for (int index = 0; index < g_glyphTextureCount; ++index) {
-        if (g_glyphTextures[index].id == id) {
-            return &g_glyphTextures[index];
+    if (id == 0) {
+        return nullptr;
+    }
+    int slot = glyphHashSlot(id);
+    for (int probe = 0; probe < kGlyphHashSlots; ++probe) {
+        const int entry = g_glyphHash[slot];
+        if (entry == 0) {
+            return nullptr;
         }
+        if (g_glyphTextures[entry - 1].id == id) {
+            return &g_glyphTextures[entry - 1];
+        }
+        slot = (slot + 1) & (kGlyphHashSlots - 1);
     }
     return nullptr;
+}
+
+// Adds a texture to the set.  False when the set is full, which is the
+// historical behaviour: the texture is then not watched, and the probe says
+// so rather than pretending it saw it.
+bool addGlyphTexture(GLuint id) {
+    if (id == 0) {
+        return false;
+    }
+    if (g_glyphTextureCount >= kGlyphTextureSlots) {
+        return false;
+    }
+    g_glyphTextures[g_glyphTextureCount].id = id;
+    g_glyphTextureCount += 1;
+    // Into the hash, open addressing.
+    int slot = glyphHashSlot(id);
+    for (int probe = 0; probe < kGlyphHashSlots; ++probe) {
+        if (g_glyphHash[slot] == 0) {
+            g_glyphHash[slot] = g_glyphTextureCount;  // index + 1
+            return true;
+        }
+        if (g_glyphTextures[g_glyphHash[slot] - 1].id == id) {
+            return true;  // already there
+        }
+        slot = (slot + 1) & (kGlyphHashSlots - 1);
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1069,20 +1134,29 @@ void gfxTextProbeNoteTexture(GLuint id, int width, int height) {
     if (id == 0) {
         return;
     }
-    for (int index = 0; index < g_glyphTextureCount; ++index) {
-        if (g_glyphTextures[index].id == id) {
-            g_glyphTextures[index].width = width;
-            g_glyphTextures[index].height = height;
-            return;
-        }
-    }
-    if (g_glyphTextureCount >= kGlyphTextureSlots) {
+    // The hash answers "is it already there?" in O(1); this call is made
+    // once per glyph texture, not once per draw.
+    const GlyphTexture* known = glyphTexture(id);
+    if (known != nullptr) {
+        g_glyphTextures[known - g_glyphTextures].width = width;
+        g_glyphTextures[known - g_glyphTextures].height = height;
         return;
     }
-    g_glyphTextures[g_glyphTextureCount].id = id;
-    g_glyphTextures[g_glyphTextureCount].width = width;
-    g_glyphTextures[g_glyphTextureCount].height = height;
-    ++g_glyphTextureCount;
+    const int index = g_glyphTextureCount;
+    if (!addGlyphTexture(id)) {
+        // The set is full: the texture is not watched.  Say so in the log
+        // rather than pretending the probe saw it.
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            guestViewWideLog("glyph-tex-fail", 0, 0,
+                             "the glyph texture set is full; the probe stops "
+                             "watching new textures");
+        }
+        return;
+    }
+    g_glyphTextures[index].width = width;
+    g_glyphTextures[index].height = height;
 }
 
 void gfxTextProbeUseProgram(GLuint program) {
