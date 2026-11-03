@@ -67,10 +67,11 @@ length bound**. With that bounded the game runs clean:
 | 10 | `renderToTexture` did not scale the glyphs (and had no log line) | **Fixed, measured** | §2.7; q133: 0 calls, so no pixel changed — a latent fix |
 | 11 | Splash title overflows the screen (1398 px of the line off-screen) | **Characterised, not fixed** | §2.7 / §4.2; the engine's own matrix overshoots by 1.525× |
 | 12 | First 10 s of black screen before the guest appears | **Largely fixed** | §4.3; q134: 6,628 ms → 2,843 ms, 2.6 MB no longer written |
-| 11 | Pure pursuit cannot hold the line (lap count −1) | **Root cause found and fixed** | §2.9; the look-ahead was behind the car (up to 210/210) and the fit could pick the mirror — both fixed, unit-tested. **Blocked on: the race never starts** |
-| 12 | The game never starts a race | **Open, and it blocks §4.4** | §2.9; the touch script's race-start tap is at frame 5500 and the run only reached frame 2400 |
-| 13 | Pure pursuit cannot hold the line (lap count −1) | **Not started** | §4.4 |
-| 14 | Deliverables (app zip / full package / 4 volumes) + commit | **Rebuilt** | §4.5; the NRO in the package, the app zip and on the card are the same file |
+| 11 | Pure pursuit cannot hold the line (lap count −1) | **Root cause found and fixed** | §2.9; the look-ahead was behind the car (up to 210/210) and the fit could pick the mirror — both fixed, unit-tested. **Not yet measured in a race** |
+| 12 | The game never starts a race | **Fixed, and it started once** | §2.9; the tap's frame was 5500 and the round only reached 2700 — the button itself was at the right coordinate. q138 found the guest's RaceMetrics object for the first time |
+| 13 | The black screen (the guest's 83-frame load at 3–4.5 fps) | **Not solved; cause narrowed** | §4.3; the frame rate is the lever and three candidates were measured and excluded |
+| 14 | Pure pursuit cannot hold the line (lap count −1) | **Not started** | §4.4 |
+| 15 | Deliverables (app zip / full package / 4 volumes) + commit | **Rebuilt** | §4.5; the NRO in the package, the app zip and on the card are the same file |
 
 ---
 
@@ -596,19 +597,52 @@ comparison said the opposite.
 
 MEASURED (q135, 611 s, 2400 frames): the game goes splash → menu → race
 intro cinematic → **"select car"** → black → back to the menu. The race
-metrics object is never found, so there is no race to measure the pursuit in.
+metrics object is never found, so there is no race to count laps in.
 
-The touch script is FRAME indexed, and the tap that starts the race
-(`at 5500 1114 698` — which is exactly the race button's position) is at
-script frame 5500. The run only reached port frame 2400, so 17 of the
-script's taps fired and **the race start never happened**.
+**THE COORDINATE WAS NEVER WRONG.** MEASURED (q138): the guest scissors the
+race button every frame as `glScissor x=994 y=667 w=187 h=53`, so the orange
+button is at (994..1181, 667..720), centre about (1087, 693). The script's
+coordinate (1114, 698) is inside it, and the tap was delivered and **accepted**
+by the guest (`touch-inject … guest{gx=1114 gy=698 down=1}`).
 
-**⇒ The touch script's frame budget is the thing to fix first.** Until a race
-starts, the pursuit fix cannot be measured at all.
+**THE FRAME WAS WRONG, and that is the whole story.** The taps are frame
+indexed and the race button's tap sits at script frame **5500**; the menu
+phase runs at about **3–4.5 fps**, so a 600 s round only reaches frame ~2700
+and the script's last entry (frame 13440) needs about **80 minutes**. The tap
+that starts the race therefore never fired.
 
-**AND THE BLACK SCREEN IS THE SAME NUMBER**: the guest's own load finishes at
-**frame 83** (`tools/load_split.py`), so the black screen before the game
-appears IS those 83 frames — 3.6 s at 23 fps and 20 s at 4 fps.
+⇒ Fixed by putting the tap where the button is actually up. The screen
+timeline (the `ui-ctl` lines) shows the game **cycling** through the
+car-select screen — 360..660, 780..1080, 1380..1470, 1890..2160, 2340..2580 —
+with gaps where no screen is up at all, and a tap in a gap does nothing. The
+shipped script has **one** tap, at frame 450: MEASURED (q138) the race starts on
+its own at about frame 510, so a later tap would land in the race screen and
+press whatever is there.
+
+**⇒ The taps that land DURING a race are not harmless.** The round with the
+taps spread over the whole run (q139) stopped at 600 frames, while the same
+build with one tap (q138, 2760 frames) and the same taps without the pursuit
+fix (q140, 2640 frames) both ran to the end.
+
+**⇒ AND THE RACE DID START, ONCE, FOR THE FIRST TIME** (q138, frame 510):
+
+```
+phase=race-state … gm_ok=1 metrics=1
+    cls=27RuleSetModifier_RaceMetrics vptr_ok=1 mres=0x3f mfail=none
+    laps=4294967295 lapd=1314816 snode=433 thr=1
+```
+
+⇒ the guest's own RaceMetrics object was found and its members resolved, for
+the first time in any archived round, and the throttle was on. **But that
+sample has `line=0 lres=0 perr=0 pur=0 drive=0`** — the line is not fitted
+yet and the pursuit has not taken over. **⇒ The pursuit fix is unit-tested but
+NOT yet measured in a race.** That is the next measurement, and it needs a
+round where the race runs for more than a few hundred frames.
+
+**⇒ THE PRINCIPLED WAY, still open**: the port can press a control by the id
+the guest itself gives it (`rr3-ui.txt`, no frame budget). The race button's
+id has not been read out yet, because **the `ui-ctl` log line is truncated** —
+it carries 1193 controls and only 44 fit, so the button was never in the log.
 
 ---
 
@@ -821,7 +855,11 @@ Known directions (**none done yet**):
 | The pursuit's target BEHIND the car | up to **210 of 210** samples | `tools/pursuit_convergence.py` |
 | The fitted line's variant changing mid-run | 6 different values in one round | q121 |
 | The guest's load finishes at | **frame 83** (⇒ the black screen is 83 frames) | `tools/load_split.py` |
-| The touch script's race-start tap | script frame **5500**; the run reached port frame **2400** | q135 |
+| The menu phase's frame rate | **3–4.5 fps** (the October round's 23 fps was the RACE phase — not comparable) | q135 / q138 / q140 / q141 |
+| The touch script's race-start tap | script frame **5500**; a 600 s round reaches frame ~2700 | q135 |
+| The race button's rectangle | `(994,667,187,53)` — the guest scissors it every frame | q138 |
+| The first round where the guest's RaceMetrics was found | q138 frame 510: `gm_ok=1 metrics=1 vptr_ok=1 thr=1` | q138 |
+| Rounds that stopped early because a tap landed in the race | q139 (600 frames) vs q138 2760 / q140 2640 | q138–q140 |
 | The port's own glyph-texture lookup | was a linear scan of up to 4096 entries **per draw** (~90,000 draws a frame) | `gfx_text_probe.cpp` |
 
 ---
