@@ -973,6 +973,18 @@ struct RaceLineState {
     double lastX = 0.0;
     double lastY = 0.0;
     bool haveLast = false;
+    // THE CAR'S DIRECTION OF TRAVEL, as a unit vector.
+    //
+    // The look-ahead point has to be AHEAD of the car, and the only thing
+    // that says which way round the track the car goes is the direction it
+    // is travelling: the spline's node ORDER does not necessarily run the
+    // same way round, and the fit's residual cannot tell the two apart.
+    // MEASURED 2026-11-03: the pursuit's error sat at ~180 degrees in 210
+    // of 210 samples in q119, 71 of 113 in q121 and 21 of 133 in q116 -- the
+    // target was behind the car, so the controller steered the wrong way.
+    double headingX = 0.0;
+    double headingY = 0.0;
+    bool haveHeading = false;
     uint32_t generation = 0;
     uint64_t lastFitFrame = 0;
     bool fitted = false;
@@ -1033,9 +1045,23 @@ void rememberRaceLinePosition(int32_t carX, int32_t carY) {
     if (gRaceLine.haveLast) {
         const double dx = x - gRaceLine.lastX;
         const double dy = y - gRaceLine.lastY;
+        const double squared = dx * dx + dy * dy;
         // A metre, in port units.  A stationary car gives the fit nothing.
-        if (dx * dx + dy * dy < 65536.0) {
+        if (squared < 65536.0) {
             return;
+        }
+        // THE HEADING, AND ONLY WHEN THE CAR IS DRIVING FORWARD.
+        //
+        // The heading is the direction of TRAVEL, and the recovery
+        // deliberately drives the car BACKWARDS -- so a heading taken from a
+        // reversing car points behind the car, and the look-ahead point
+        // (which is chosen to be AHEAD) would be behind it too.  The last
+        // FORWARD heading is therefore kept.
+        if (!g_drive.brake) {
+            const double length = std::sqrt(squared);
+            gRaceLine.headingX = dx / length;
+            gRaceLine.headingY = dy / length;
+            gRaceLine.haveHeading = true;
         }
     }
     gRaceLine.lastX = x;
@@ -1157,6 +1183,7 @@ void fillCarState(RaceMetricsSample* out) {
             if (rr3::raceLineTarget(gRaceLine.line, *spline,
                                     static_cast<double>(out->carX),
                                     static_cast<double>(out->carY),
+                                    gRaceLine.headingX, gRaceLine.headingY,
                                     kRaceLineLookAheadMetres, &targetX,
                                     &targetY)) {
                 out->carTargetX = static_cast<int32_t>(targetX);

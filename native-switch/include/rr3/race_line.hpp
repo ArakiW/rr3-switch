@@ -70,10 +70,28 @@ bool raceLineFit(const SplineFile& spline, const char* chunkName,
 // The look-ahead point on the line, in PORT units.
 //
 // The nearest node is found first, and the target is the point L metres
-// further along the loop.  False when the line is not usable, when the car
-// is not near it, or when the target would be behind the car.
+// further along the loop IN THE DIRECTION THE CAR IS TRAVELLING.
+//
+// WHY THE DIRECTION IS AN ARGUMENT AND NOT A CONSTANT
+// ----------------------------------------------------
+// The fit's residual cannot tell the two directions apart: a closed loop
+// traversed backwards has the same SHAPE, so the fit picks the same scale,
+// the same axis variant and the same offset either way.  Only the node
+// ORDER says which way round the track the car goes, and the spline does
+// not necessarily store it that way round.
+//
+// MEASURED 2026-11-03 over the archived rounds: the pursuit's error sat at
+// ~180 degrees in 210 of 210 samples in q119, 71 of 113 in q121 and 21 of
+// 133 in q116 -- the look-ahead point was BEHIND the car, so the controller
+// steered the wrong way, the car left the track at the first corner, and
+// the guest never crossed the line.  That is where "laps = -1" came from:
+// the guest only counts a lap when the car crosses it.
+//
+// The heading is the car's direction of travel, in PORT units -- the same
+// vector the pursuit uses for its own error.  A zero heading keeps the
+// spline's own order.
 bool raceLineTarget(const RaceLine& line, const SplineFile& spline,
-                    double carX, double carY, double lookAheadMetres,
-                    double* targetX, double* targetY);
+                    double carX, double carY, double headingX, double headingY,
+                    double lookAheadMetres, double* targetX, double* targetY);
 
 }  // namespace rr3

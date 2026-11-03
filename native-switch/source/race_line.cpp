@@ -143,6 +143,50 @@ Alignment alignOntoCar(std::vector<Point> poly, const double* carX,
 
 }  // namespace
 
+// The signed turn of a polyline at one node: the sine of the turn angle.
+// Its SIGN says which way the curve bends there, and it is what tells a
+// curve from its mirror image.  It is normalised, so it does not depend on
+// the units the positions are in.
+static double turnSineAt(const std::vector<Point>& poly, size_t index) {
+    const size_t n = poly.size();
+    if (n < 3) {
+        return 0.0;
+    }
+    const size_t prev = (index + n - 1) % n;
+    const size_t next = (index + 1) % n;
+    const double ax = poly[index].x - poly[prev].x;
+    const double ay = poly[index].y - poly[prev].y;
+    const double bx = poly[next].x - poly[index].x;
+    const double by = poly[next].y - poly[index].y;
+    const double la = std::sqrt(ax * ax + ay * ay);
+    const double lb = std::sqrt(bx * bx + by * by);
+    if (la <= 0.0 || lb <= 0.0) {
+        return 0.0;
+    }
+    return (ax * by - ay * bx) / (la * lb);
+}
+
+// The same, over the CAR's own last three samples.
+//
+// The car's path IS part of the line, so its turn sign is the line's turn
+// sign.  A mirrored variant bends the other way, and the residual cannot
+// tell them apart over a short arc.
+static double carTurnSine(const double* xs, const double* ys, size_t count) {
+    if (count < 3) {
+        return 0.0;
+    }
+    const double ax = xs[count - 2] - xs[count - 3];
+    const double ay = ys[count - 2] - ys[count - 3];
+    const double bx = xs[count - 1] - xs[count - 2];
+    const double by = ys[count - 1] - ys[count - 2];
+    const double la = std::sqrt(ax * ax + ay * ay);
+    const double lb = std::sqrt(bx * bx + by * by);
+    if (la <= 0.0 || lb <= 0.0) {
+        return 0.0;
+    }
+    return (ax * by - ay * bx) / (la * lb);
+}
+
 bool raceLineFit(const SplineFile& spline, const char* chunkName,
                  const double* carX, const double* carY, size_t count,
                  RaceLine* out) {
@@ -155,20 +199,81 @@ bool raceLineFit(const SplineFile& spline, const char* chunkName,
         return false;
     }
 
+    // THE HANDEDNESS TEST.
+    //
+    // The residual cannot tell a curve from its mirror image over a short
+    // arc: the car has driven at most 48 metres (one sample per metre), and
+    // over 48 metres a curve and its reflection agree with the car's
+    // positions to within centimetres.  So the fit can pick the MIRROR,
+    // and then the look-ahead point is on the mirror image -- the wrong
+    // side of the track.
+    //
+    // MEASURED 2026-11-03: the variant CHANGED MID-RUN in q121 (six
+    // different values in one round), and every change moved the look-ahead
+    // point to the mirror image -- a full-lock steering kick in the wrong
+    // direction.  That is where "the car drives 7% of a lap and then stops"
+    // came from.
+    //
+    // What CAN tell them apart is the direction of the bend: the car's own
+    // path is part of the line, so the line bends the way the car bends,
+    // and a mirror bends the other way.
+    const double carTurn = carTurnSine(carX, carY, count);
+    // A straight section bends by nothing and says nothing, so the test only
+    // applies when the car is actually turning (about three degrees).
+    const bool turnIsUsable = std::fabs(carTurn) > 0.05;
+
     double bestResidual = 1e30;
     double bestScale = 0.0;
     Variant bestVariant{false, false, false};
+    // The unfiltered winner, used only if the test rejects EVERY variant.
+    double fallbackResidual = 1e30;
+    double fallbackScale = 0.0;
+    Variant fallbackVariant{false, false, false};
     std::vector<Point> poly;
     for (const Variant& variant : kVariants) {
         for (double scale : kScales) {
             transform(*chunk, variant, scale, &poly);
             const Alignment alignment = alignOntoCar(poly, carX, carY, count);
+            if (alignment.residual < fallbackResidual) {
+                fallbackResidual = alignment.residual;
+                fallbackScale = scale;
+                fallbackVariant = variant;
+            }
+            if (turnIsUsable) {
+                // THE NODE THE CAR IS ON, AND THE WAY THE LINE BENDS THERE.
+                // The polyline is not shifted yet -- alignOntoCar() works on a
+                // copy -- so the shift is applied to the node here.
+                size_t nearest = 0;
+                double nearestDistance = 1e30;
+                for (size_t i = 0; i < poly.size(); ++i) {
+                    const double dx = poly[i].x + alignment.shiftX - carX[count - 1];
+                    const double dy = poly[i].y + alignment.shiftY - carY[count - 1];
+                    const double d = dx * dx + dy * dy;
+                    if (d < nearestDistance) {
+                        nearestDistance = d;
+                        nearest = i;
+                    }
+                }
+                if (turnSineAt(poly, nearest) * carTurn < 0.0) {
+                    // THE MIRROR.  Dropped.
+                    continue;
+                }
+            }
             if (alignment.residual < bestResidual) {
                 bestResidual = alignment.residual;
                 bestScale = scale;
                 bestVariant = variant;
             }
         }
+    }
+    if (bestScale <= 0.0) {
+        // EVERY VARIANT WAS DROPPED, which means the test does not apply to
+        // this track (or the car is where the line's bend flips).  The
+        // unfiltered winner is used instead: the line is then exactly as
+        // good as it was before, and no worse.
+        bestResidual = fallbackResidual;
+        bestScale = fallbackScale;
+        bestVariant = fallbackVariant;
     }
     if (bestScale <= 0.0) {
         return false;
@@ -218,8 +323,8 @@ bool raceLineFit(const SplineFile& spline, const char* chunkName,
 }
 
 bool raceLineTarget(const RaceLine& line, const SplineFile& spline,
-                    double carX, double carY, double lookAheadMetres,
-                    double* targetX, double* targetY) {
+                    double carX, double carY, double headingX, double headingY,
+                    double lookAheadMetres, double* targetX, double* targetY) {
     if (!line.valid || targetX == nullptr || targetY == nullptr) {
         return false;
     }
@@ -263,11 +368,49 @@ bool raceLineTarget(const RaceLine& line, const SplineFile& spline,
         return false;
     }
 
-    // The look-ahead point: L metres further along the loop.
+    // THE DIRECTION ALONG THE LINE.
+    //
+    // The residual CANNOT tell the two directions apart: a closed loop
+    // traversed backwards has the same shape, so the fit picks the same
+    // scale, the same axis variant and the same offset either way.  The node
+    // ORDER is the only thing that says which way round the track the car
+    // goes, and the spline does not necessarily store it that way round.
+    //
+    // MEASURED 2026-11-03 over the archived rounds: the pursuit's error sat
+    // at ~180 degrees in 210 of 210 samples in q119, 71 of 113 in q121 and
+    // 21 of 133 in q116 -- the look-ahead point was BEHIND the car, so the
+    // controller was steering the wrong way.  The guest only counts a lap
+    // when the car crosses the line, and the car left the track at the
+    // first corner, so the lap counter never moved: that is where "laps =
+    // -1" came from.
+    //
+    // So the direction comes from the CAR: the step away from the nearest
+    // node has to agree with the car's heading.
+    int step = 1;
+    if (headingX != 0.0 || headingY != 0.0) {
+        const size_t next = (nearest + 1) % poly.size();
+        const size_t prev = (nearest + poly.size() - 1) % poly.size();
+        const double fx = poly[next].x - poly[nearest].x;
+        const double fy = poly[next].y - poly[nearest].y;
+        const double bx = poly[prev].x - poly[nearest].x;
+        const double by = poly[prev].y - poly[nearest].y;
+        const double forward = fx * headingX + fy * headingY;
+        const double backward = bx * headingX + by * headingY;
+        // The direction whose step agrees with the heading wins.  When the
+        // heading is unknown, or the two agree to within a hair, the
+        // spline's own order is kept.
+        if (backward > forward) {
+            step = -1;
+        }
+    }
+
+    // The look-ahead point: L metres further along the loop, IN THE
+    // DIRECTION THE CAR IS TRAVELLING.
     double travelled = 0.0;
     size_t index = nearest;
     for (size_t guard = 0; guard < poly.size(); ++guard) {
-        const size_t next = (index + 1) % poly.size();
+        const size_t next = (step > 0) ? ((index + 1) % poly.size())
+                                        : ((index + poly.size() - 1) % poly.size());
         const double dx = poly[next].x - poly[index].x;
         const double dy = poly[next].y - poly[index].y;
         const double segment = std::sqrt(dx * dx + dy * dy) / 256.0;

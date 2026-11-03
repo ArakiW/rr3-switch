@@ -105,9 +105,26 @@ int main() {
     double px = 0.0;
     double py = 0.0;
     toWorld(file.chunks[0].nodes[0].x, file.chunks[0].nodes[0].y, &px, &py);
+    // THE CAR'S HEADING: along the stored node order, from node 0 to node 1.
+    //
+    // The direction is an ARGUMENT because the fit's residual cannot tell a
+    // curve from its mirror image over a short arc: only the direction of
+    // travel says which way round the line the car goes.
+    double hx = 0.0;
+    double hy = 0.0;
+    toWorld(file.chunks[0].nodes[1].x, file.chunks[0].nodes[1].y, &hx, &hy);
+    hx -= px;
+    hy -= py;
+    {
+        const double length = std::sqrt(hx * hx + hy * hy);
+        if (length > 0.0) {
+            hx /= length;
+            hy /= length;
+        }
+    }
     double tx = 0.0;
     double ty = 0.0;
-    const bool got = rr3::raceLineTarget(line, file, px, py, 20.0, &tx, &ty);
+    const bool got = rr3::raceLineTarget(line, file, px, py, hx, hy, 20.0, &tx, &ty);
     check(got, "a target is produced");
     if (got) {
         const double distance = std::sqrt((tx - px) * (tx - px) +
@@ -126,11 +143,36 @@ int main() {
                     carToCentre, kRadius * kScale / 256.0);
         check(std::fabs(carToCentre - kRadius * kScale / 256.0) < 0.5,
               "the car is on the circle");
+
+        // THE DIRECTION TEST.
+        //
+        // The same call with the OPPOSITE heading must put the target on
+        // the other side of the car: that is the whole point of passing the
+        // heading in, and it is what the pursuit needs -- the look-ahead
+        // point has to be AHEAD of the car, and the spline's node order does
+        // not necessarily run the way the car drives.
+        double bx = 0.0;
+        double by = 0.0;
+        const bool gotBack =
+            rr3::raceLineTarget(line, file, px, py, -hx, -hy, 20.0, &bx, &by);
+        check(gotBack, "a target is produced for the opposite heading");
+        if (gotBack) {
+            const double forwardDot = (tx - px) * hx + (ty - py) * hy;
+            const double backwardDot = (bx - px) * (-hx) + (by - py) * (-hy);
+            std::printf("  forward %.1f m along the heading, backward %.1f m\n",
+                        forwardDot / 256.0, backwardDot / 256.0);
+            check(forwardDot > 0.0, "the target is AHEAD along the heading");
+            check(backwardDot > 0.0,
+                  "the opposite heading puts the target on the other side");
+            check((tx - px) * (bx - px) + (ty - py) * (by - py) < 0.0,
+                  "the two targets are on opposite sides of the car");
+        }
     }
 
     // THE GUARD: a car that is NOT on the line must be refused.
     const bool refused = !rr3::raceLineTarget(line, file, px + 40000.0,
-                                               py + 40000.0, 20.0, &tx, &ty);
+                                               py + 40000.0, 0.0, 0.0,
+                                               20.0, &tx, &ty);
     check(refused, "a car far from the line is refused");
 
     // And a fit with too few samples is refused too.
