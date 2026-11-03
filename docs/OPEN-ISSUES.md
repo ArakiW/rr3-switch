@@ -308,6 +308,18 @@ heap is **above** it, so a symmetric window cannot tell them apart.
    Seven call sites: the auth answer, the sync answer, the asset answer, the
    /time body, the /time header, the /time completion and the error callback.
 
+**THE A/B THAT CLOSES THE CHAIN** (same card, same emulator, one key changed)
+
+| Build | `iconfont` | Result |
+|---|---|---|
+| `aa3e2ed0` | 0 (old behaviour) | **3,000 frames / 305 s** — clean |
+| `f118e3b8` | 1 (icon font on) | **hang**: 4 frames, log stops at 1.62 MB |
+| `249c9f02` (this build) | 1 (icon font on) | **1,560 PNGs / 305 s** — clean |
+
+⇒ the icon font is what exposed the crash, and the worker gate + the
+asymmetric window are what fixed it. The shipping configuration (icon font
+ON) is the one that is measured clean.
+
 Gate: BUILD 0, INPUTS 0, SYMBOLS 0, tests **39/39**.
 
 ---

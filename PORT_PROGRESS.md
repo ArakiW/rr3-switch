@@ -13659,3 +13659,14 @@ is ABOVE it, so a symmetric window cannot tell them apart.
    callback.
 
 Gate: BUILD 0, INPUTS 0, SYMBOLS 0, tests 39/39.
+
+### THE A/B THAT CLOSES THE CHAIN (same card, one key changed)
+
+    build        iconfont   result
+    aa3e2ed0     0          3000 frames / 305 s   clean
+    f118e3b8     1          HANG: 4 frames, log stops at 1.62 MB
+    249c9f02     1          1560 PNGs / 305 s      clean
+
+=> the icon font exposed the crash; the worker gate and the asymmetric
+readability window fixed it.  The shipping configuration (icon font ON) is
+the measured-clean one.
