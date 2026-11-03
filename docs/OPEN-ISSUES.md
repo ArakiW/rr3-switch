@@ -368,9 +368,11 @@ $B/aarch64-none-elf-addr2line -f -C -i -e native-switch/rr3-native-rehost.elf 0x
 > ended at `verdict=TEARDOWN_REPAIR_PASS` — the startup self-tests themselves
 > passed every time. The crashes were always **after** the self-tests.
 
-### 4.2 P1 — The splash's "Version 1" is stretched 2.47×
+### 4.2 P1 — The splash's "Version 1" is clipped off the right edge
 
-**Measured (q123b, the `iconfont=0` control run)**
+**Re-characterised on 2026-11-03 — it is NOT a font problem.**
+
+What was measured first (q123b, the `iconfont=0` control run):
 
 ```
 glyph-face   req=ConduitITCPro-Bold.otf  size=140.0     <- the guest names Conduit Bold
@@ -380,20 +382,23 @@ text-quad    a_Position: v0=(2048,430) v2=(593,430)      <- actually drawn 1455 
 ```
 
 ⇒ the port measures **588 px**; the guest draws it **1455 px** wide (ratio
-**2.474**). The screen is 1280 px, so **the right half is clipped** — which is
-exactly what the frame shows.
+**2.474**) on a 1280-px screen ⇒ the right half is clipped, which is exactly
+what the frame shows.
 
-**Clue**: the guest's own 1455 px ≈ the **symbol font's** advance sum
-(≈10.4 em × 140 px = 1456 px) ⇒ **the guest's own metrics are computed with the
-symbol font while the port computes them with Conduit Bold.** The next thing to
-check is which face the port's `Font` class uses when it answers the guest's
-`getFontMetrics()` / `getSize()`.
+**But it is not the guest's text.** In the q124/q132 logs the string
+`Version 1` never appears in a `jni-utf163 … text=` line, and it is not in the
+port's source either — so it comes out of the **game's splash artwork**, and
+the artwork is being drawn too wide. The splash cycles several lines: the
+"Version 1" wordmark comes from the art, and the neighbouring
+`Player ID: CCDI123456789 / CCRR123456789` **is** a guest text (measured in
+both q123b and q132, 40 characters) and it is drawn at a plausible width.
 
-**Current state**: with the icon font open (q124) this element **disappears
-entirely** (the splash area is empty). Neither state is right, but there is no
-console feedback yet, so **nothing has been changed here** — it is deliberately
-held until P0 comes back, so the direction is decided on device evidence rather
-than on the emulator.
+⇒ **Open question for the next round**: why is the splash art scaled so that
+it overflows the screen by ~400 px? The candidate is the same class of bug as
+the icon font: the guest's layout and the port's rendering disagree about the
+size of one element. Nothing has been changed here — a wrong guess in the
+splash scaling would move the whole splash, and there is still no console
+feedback on how the splash looks on the device.
 
 ### 4.3 P2 — The first 10 seconds are black
 
@@ -410,16 +415,21 @@ Known directions (**none done yet**):
 * **the recovery logic needs an EXIT, not a reference-point reset** — resetting
   makes the car spin on the spot.
 
-### 4.5 P4 — Deliverables and commit (**not done this round**)
+### 4.5 P4 — Deliverables and commit (**done on 2026-11-03**)
 
-* ⚠️ **This round's source changes are not committed** (`git status` lists 10
-  modified files).
-* ⚠️ **`dist/` still carries the old NRO** (`rr3-switch-app-20261102.zip`,
-  45.26 MiB, NRO `fcdb4bee…`) and therefore **does not contain** the icon font
-  or the bounded `sscanf`. Needs a rebuild: app zip (≈45 MiB) + full package
-  (≈9.6 GiB / 186 files) + 4 split volumes.
-* The gate `.build\gate.ps1` needs **one more run** after the `sscanf` change
-  (the last `GATE OK` predates it).
+| Artefact | Size | Notes |
+|---|---|---|
+| `dist/rr3-switch-20261103/` | 190 files / 10.67 GiB | the card tree is **185 files / 9.58 GiB** |
+| `dist/rr3-switch-app-20261103.zip` | 45.4 MiB | app only, 18 entries |
+| `dist/rr3-switch-20261103.zip` | 7.89 GiB | 237 entries = 190 files + 46 directories |
+| `dist/parts-20261103/*.001…004` | 2 + 2 + 2 + 1.89 GiB | concatenated = the archive **byte for byte** |
+
+* The NRO in the package, the build output and the emulator card are all the
+  same file: `249c9f02…`.
+* The 20261102 deliverables were removed (they carried the NRO that crashed
+  five times on the console).
+* Committed as `b2e15180` and pushed to `origin/master`. **`git commit` must
+  use `-F <file>`** — `-m` and `-F` are mutually exclusive.
 
 ---
 

@@ -151,6 +151,56 @@ phase=guest-scanf-bounded ... input=truncated in_len=512 fmt=ok fmt_len=16
 
 **如果是新卡**：用下面的分卷整包。
 
+### 0.5 19:45 那次真机崩溃，和它牵出来的两个老坑
+
+**崩溃现场**（`rr3-native-rehost.crash-000001a77b06589b.txt`）：
+
+```
+far=0x28   esr=0x92000005   (data abort, translation fault, level 1)
+pc=0x1837ed7370   ← 在客机镜像里
+lr=0x87d40de54    ← 宿主：deliverServerTime
+```
+
+⇒ **客机解引用了 NULL+0x28**；宿主这边用 `addr2line` 解析 `lr` 落在
+`cc_http_request.cpp` 的 `deliverServerTime` —— 也就是**把 `/time` 应答交给客机**的那一步。
+客机自己的日志最后一行是 `phase=cc-probe … worker unreadable`：
+**端口明知 worker 读不出来，还是把指针交给了客机。**
+
+**坑一：端口的可读性判定把真机的客机堆判成了不可读。**
+
+| | 真机 | Eden |
+|---|---|---|
+| 客机镜像 bias | 0x18361F3000 | 0x2106880000 |
+| 客机 worker 对象 | 0x562EA7C4C0 | 0x2113D42280 |
+| 距镜像上方 | **259 GiB** | 122 MB |
+
+`guestReadable()` 原来只接受 `[bias − 4 GiB, bias + 4 GiB)` ⇒ 真机上**完全合法的客机对象**
+被判成「不可读」。而宿主自己的地址在镜像**下方**（0x87e1147b0 / 0x6d20958940）、
+客机堆在**上方** ⇒ 对称窗口分不开两者，**必须改成非对称**：
+`[bias − 4 GiB, bias + 512 GiB)`。
+
+**坑二：客机的 `sscanf` 没有长度界。** 端口把客机的 `sscanf` 直绑到宿主 newlib
+（`RR3_BIND(sscanf)`），而客机把**字体/着色器定义文件**交给一个**扫描集**格式
+`%[A-Z0-9_]`，那段内存**前 512 字节没有 NUL** ⇒ 扫描集一路匹配到堆尾。
+这和 q89 卡在 `_strtoul_l` 是**同一个形状**，只是换了个函数。
+现在输入串和格式串都先拷出来（可读性检查 + 上限），宿主解析器只看得见副本：
+**答案不变，只是扫描有界**；而且日志行写在**解析之前**（挂在里面的那次调用必须先落日志）。
+
+**另外**：7 处「把 `req->callback` 交给客机」的地方现在都先过 `guestWorkerAlive()`，
+客机已经释放的 worker 不会再被交回去 —— 这种情况会记成 `cc-worker-dead`（不再崩）。
+
+**这次还加了三样仪器**，前四次真机崩溃都是它们找出来的：
+`boot-step`（开机步骤面包屑）、`elf-dry-step`（ELF 干加载面包屑）、
+`sdmc:/switch/rr3-native-rehost.crash-early.txt`（早期崩溃的寄存器转储）。
+详见 `docs/HANDOFF-2026-11-03.md`。
+
+**这次的构建 `249c9f02…`**，模拟器实测 q132：306 秒 / 1560 帧 / 28 万行日志 / 0 崩溃，
+`Server time returned` ×1、`cc-worker-dead` ×0、`glyph-tex-fail` ×0。
+
+**你需要做的**：装新 NRO（`dist/rr3-switch-app-20261103.zip`，45.4 MiB）→ 开机 →
+回传 `guest-view.log`、`crash-early.txt`（如果有）、以及屏幕上看到什么。
+**务必留下和 NRO 同一批的 `.elf`** —— 崩溃的 PC 只能在**完全相同的那次构建**上解析。
+
 ---
 
 ## 1. 装到卡上
