@@ -43,7 +43,10 @@ Step 'pack-app-v2' {
 }
 if (-not $SkipJoinCheck) {
     Step 'join-check' {
-        & python (Join-Path $root '.build\join_check.py')
+        # THE STAMP GOES WITH IT.  The checker used to have the day hard-wired
+        # in it, so the chain proved that the OLD parts joined to the OLD
+        # archive and said nothing about the ones it had just written.
+        & python (Join-Path $root '.build\join_check.py') --stamp $Stamp
         if ($LASTEXITCODE -ne 0) { throw ("join_check failed (exit {0})" -f $LASTEXITCODE) }
     }
 }
