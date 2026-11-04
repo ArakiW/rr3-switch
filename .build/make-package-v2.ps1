@@ -155,17 +155,25 @@ foreach ($name in @('rr3-native-rehost.nro', 'rr3.romfs')) {
 Write-Host ("app        : {0:N1} MiB" -f `
     ((Get-ChildItem $dstApp -File | Measure-Object Length -Sum).Sum / 1MB))
 
-# ---- 2. the control scripts ---------------------------------------------------
+# ---- 2. the control scripts, HELD BACK UNTIL THE END --------------------------
+#
 # FROM THE REPOSITORY, not from the card: the card's copy may be an older
 # edit, and the repository's copy is what the source says.
+#
+# HELD BACK ON PURPOSE.  This used to run BEFORE the live card files, and the
+# live copy then OVERWROTE it -- so the card's copy won, which is the
+# opposite of what the comment above says.  MEASURED 2026-11-04: the card
+# carried the EXPERIMENT pad script (the weave, from the round that proved
+# the human input path), and the live copy would have put it into the
+# release tree as rr3-pad.txt -- i.e. the package would have shipped a
+# script that holds the accelerator and, before the input-path fix, that
+# also ignored the player's controller entirely.
+#
+# So the scripts are copied LAST, after the live files, and they always win.
 $scriptSource = Join-Path $projectRoot 'native-switch\card'
 $scriptNames = @('rr3-touch.txt', 'rr3-drive.txt', 'rr3-pad.txt', 'rr3-action.txt',
     'rr3-screen.txt', 'rr3-settings.txt', 'rr3-ui.txt', 'rr3-open.txt',
     'rr3-gamepad.txt')
-foreach ($name in $scriptNames) {
-    Copy-Item -LiteralPath (Join-Path $scriptSource $name) -Destination (Join-Path $dstApp $name) -Force
-}
-Write-Host ("scripts    : {0}" -f $scriptNames.Count)
 
 # ---- 3. the data volumes ------------------------------------------------------
 $dstData = Join-Path $dstApp 'data'
@@ -194,6 +202,16 @@ foreach ($rel in ($served | Sort-Object)) {
 }
 Write-Host ("live       : {0} files, {1:N2} MiB (the ones the measured run read)" -f `
     $liveCount, ($liveBytes / 1MB))
+
+# ---- 4b. the control scripts, LAST, so they win ------------------------------
+#
+# See the note at step 2: the live copy above writes the card's version of
+# every file the measured run read, and the control scripts are among them.
+# The repository's copy is the shipping truth, so it goes on last.
+foreach ($name in $scriptNames) {
+    Copy-Item -LiteralPath (Join-Path $scriptSource $name) -Destination (Join-Path $dstApp $name) -Force
+}
+Write-Host ("scripts    : {0} (the repository's copies, over the live ones)" -f $scriptNames.Count)
 
 # ---- 5. the optional full tree, as ONE archive --------------------------------
 #

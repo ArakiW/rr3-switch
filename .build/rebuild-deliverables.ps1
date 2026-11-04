@@ -22,6 +22,7 @@ $root = 'E:\AI\RealRacing3-switch'
 $cardNro = 'E:\Eden-rr3\user\sdmc\switch\rr3-native-rehost\rr3-native-rehost.nro'
 $buildNro = Join-Path $root 'native-switch\rr3-native-rehost.nro'
 $pkgNro = Join-Path $root ("dist\rr3-switch-{0}\switch\rr3-native-rehost\rr3-native-rehost.nro" -f $Stamp)
+$pkgApp = Join-Path $root ("dist\rr3-switch-{0}\switch\rr3-native-rehost" -f $Stamp)
 $appZip = Join-Path $root ("dist\rr3-switch-app-{0}.zip" -f $Stamp)
 
 function Step {
@@ -65,6 +66,46 @@ Step 'prove' {
     finally { $zip.Dispose() }
     Write-Host ("app zip: {0}" -f $app)
     if ($build.ToLowerInvariant() -ne $app) { throw 'the app zip does NOT contain the build output' }
+
+    # THE SHIPPING INPUTS ARE CHECKED, NOT ASSUMED.
+    #
+    # MEASURED 2026-11-04: the packager copied the card's copy of the control
+    # scripts OVER the repository's, because the live card files were written
+    # after them -- the opposite of what the packager's own comment said.  The
+    # card carried the EXPERIMENT pad script (the weave), so the release tree
+    # would have shipped a script that holds the accelerator and, before the
+    # input-path fix, ignores the player's controller entirely.
+    #
+    # ⇒ The packager's order is fixed, and these two files are checked here so
+    # that a future order change cannot undo it silently.
+    $pkgGamepad = Join-Path $pkgApp 'rr3-gamepad.txt'
+    $pkgPad = Join-Path $pkgApp 'rr3-pad.txt'
+    $repoGamepad = Join-Path $root 'native-switch\card\rr3-gamepad.txt'
+    $repoPad = Join-Path $root 'native-switch\card\rr3-pad.txt'
+    foreach ($pair in @(@($pkgGamepad, $repoGamepad), @($pkgPad, $repoPad))) {
+        $packageFile = $pair[0]
+        $repoFile = $pair[1]
+        if (-not (Test-Path -LiteralPath $packageFile -PathType Leaf)) {
+            throw ("the package is missing {0}" -f (Split-Path -Leaf $packageFile))
+        }
+        $inPackage = (Get-FileHash -LiteralPath $packageFile -Algorithm SHA256).Hash
+        $inRepo = (Get-FileHash -LiteralPath $repoFile -Algorithm SHA256).Hash
+        if ($inPackage -ne $inRepo) {
+            $leaf = Split-Path -Leaf $packageFile
+            throw ("the package's $leaf is NOT the repository's copy -- the packager's order is wrong again")
+        }
+        Write-Host ("{0,-18} package == repository  {1}" -f (Split-Path -Leaf $packageFile), $inPackage.Substring(0, 16))
+    }
+    $autopilot = (Select-String -LiteralPath $pkgGamepad -Pattern '^\s*autopilot\s*=\s*(\d+)' |
+        Select-Object -First 1).Matches.Groups[1].Value
+    if ($autopilot -ne '0') {
+        throw ("the package's rr3-gamepad.txt says autopilot = {0}; the shipping default is 0 (the player owns the car)" -f $autopilot)
+    }
+    $padEvents = @(Select-String -LiteralPath $pkgPad -Pattern '^\s*\[').Count
+    if ($padEvents -ne 0) {
+        throw ("the package's rr3-pad.txt has {0} event line(s); the console's file must have none, or it takes the throttle away from the player" -f $padEvents)
+    }
+    Write-Host 'the shipping inputs are the repository''s, the player owns the car, and no script holds the throttle.'
     Write-Host ''
     Write-Host 'THE BUILD OUTPUT IS IN THE PACKAGE, IN THE APP ZIP AND ON THE CARD.'
 }
