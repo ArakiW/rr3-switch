@@ -4,7 +4,7 @@
 
 > 仓库里只有移植层的源码。游戏本身的代码和数据来自你自己的那份应用。详见 [NOTICE.md](NOTICE.md)。
 
-English | [简体中文](README.md)
+[English](README_EN.md) | 简体中文
 
 ![Status](https://img.shields.io/badge/status-In%20Development-orange)
 ![Platform](https://img.shields.io/badge/platform-Nintendo%20Switch-red)
