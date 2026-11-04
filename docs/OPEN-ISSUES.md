@@ -1118,28 +1118,34 @@ Known directions (**none done yet**):
 * `steergain` / look-ahead point: steering gain and the aim point need to be
   tuned per corner;
 
-### 4.5 P4 — Deliverables and commit (**rebuilt on 2026-11-03, late**)
+### 4.5 P4 — Deliverables and commit (**rebuilt on 2026-11-04**)
 
 | Artefact | Size | Notes |
 |---|---|---|
-| `dist/rr3-switch-20261103/` | 190 files / 10.67 GiB | the card tree is **185 files / 9.58 GiB** |
-| `dist/rr3-switch-app-20261103.zip` | 45.4 MiB | app only, 18 entries |
-| `dist/rr3-switch-20261103.zip` | 7.89 GiB | 237 entries = 190 files + 46 directories |
-| `dist/parts-20261103/*.001…004` | 2 + 2 + 2 + 1.89 GiB | concatenated = the archive **byte for byte** |
+| `dist/rr3-switch-20261104/` | 190 files / 10.67 GiB | the card tree is **185 files / 9.58 GiB** |
+| `dist/rr3-switch-app-20261104.zip` | 45.4 MiB | app only, 18 entries |
+| `dist/rr3-switch-20261104.zip` | 7.89 GiB | 237 entries = 190 files + 46 directories |
+| `dist/parts-20261104/*.001…004` | 2 + 2 + 2 + 1.89 GiB | concatenated = the archive **byte for byte** |
 
 * **The NRO in the package, in the app zip and on the emulator card are all
   the same file**, and `.build/rebuild-deliverables.ps1` now PROVES it (it
   hashes all three and refuses to finish if they differ). The build this round
-  is `b71fbc5a…`.
-* **The package used to carry the NRO of an OLDER build** — the one that
-  crashed the console five times. That is the same class of bug as the stale
-  archive (§2.8), one level up, and it is why the rebuild script exists and
-  why the deliverable packagers are now versioned (`.gitignore` explains it).
-* The parts join to the archive byte for byte (sha256
-  `6001e60e…` for the archive of the earlier build; the rebuild prints its
-  own).
-* The 20261102 deliverables were removed (they carried the NRO that crashed
-  five times on the console).
+  is `1A155B37929AB0FB…`.
+* **The parts join to the archive byte for byte**, sha256
+  `f25b15a79e6de38c…` for both the joined parts and the archive.
+* **THE JOIN CHECK WAS PROVING THE WRONG DELIVERABLE, and that is fixed.**
+  The packers took a `-Stamp` argument and `join_check.py` did not: its paths
+  had 20261103 written into them, so the 20261104 rebuild proved that the OLD
+  parts joined to the OLD archive and said nothing about the ones it had just
+  written. The checker now takes the stamp, derives every path from it, and
+  refuses to run when the parts or the archive it was asked about are not
+  there.
+* **The archive fingerprint caught a partial zip TWICE** in this round: the
+  build was interrupted once (leaving a 2.69 GiB fragment of a 7.89 GiB
+  archive) and the packer reported "existing zip: 2.69 GiB is STALE (package
+  changed) -- rebuilding" and rebuilt it. The fingerprint is only written
+  after a successful build, so an interrupted run never leaves one.
+* The 20261103 deliverables were removed (they carried an older NRO).
 * **`git commit` must use `-F <file>`** — `-m` and `-F` are mutually
   exclusive.
 * **THE BUILD IS BYTE-REPRODUCIBLE.** MEASURED (2026-11-04): the gate rebuilds
