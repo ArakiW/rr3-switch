@@ -1469,11 +1469,25 @@ Known directions (**none done yet**):
 | `dist/parts-20261104/*.001…004` | 2 + 2 + 2 + 1.89 GiB | concatenated = the archive **byte for byte** |
 
 * **The NRO in the package, in the app zip and on the emulator card are all
-  the same file**, and `.build/rebuild-deliverables.ps1` now PROVES it (it
-  hashes all three and refuses to finish if they differ). The build this round
-  is `1A155B37929AB0FB…`.
+  the same file** — `5515158395016D65…` — and `.build/rebuild-deliverables.ps1`
+  PROVES it (it hashes all three and refuses to finish if they differ). The
+  build is **byte-reproducible**: the gate rebuilds it from the same tree and
+  gets the same sha256.
 * **The parts join to the archive byte for byte**, sha256
-  `f25b15a79e6de38c…` for both the joined parts and the archive.
+  `a6cb20b470ba70c50b3f17777f3ff2986b00339f1732bed9419629816c547ece` for
+  both the joined parts and the archive.
+* **THE SHIPPING INPUTS ARE CHECKED, NOT ASSUMED.** The rebuild refuses to
+  finish unless the package's `rr3-gamepad.txt` and `rr3-pad.txt` are
+  byte-for-byte the repository's copies, the gamepad file says
+  `autopilot = 0` — **the player owns the car** — and the pad file has **no
+  event lines**, because a shipped script that holds the accelerator takes the
+  throttle away from the player.
+* **THE PACKAGER USED TO REVERSE ITS OWN RULE.** Its comment said the
+  control scripts come from the repository, but its ORDER copied the card's
+  copies over them — and the card carried the *experiment* pad script, so
+  the release tree would have shipped a script that holds the throttle. The
+  order is fixed (the repository's copies go last) and the check above stops
+  it from coming back.
 * **THE JOIN CHECK WAS PROVING THE WRONG DELIVERABLE, and that is fixed.**
   The packers took a `-Stamp` argument and `join_check.py` did not: its paths
   had 20261103 written into them, so the 20261104 rebuild proved that the OLD
@@ -1491,7 +1505,7 @@ Known directions (**none done yet**):
   exclusive.
 * **THE BUILD IS BYTE-REPRODUCIBLE.** MEASURED (2026-11-04): the gate rebuilds
   the NRO from the same tree and gets **the same sha256**
-  (`1A155B37929AB0FB…`). That is what makes the four-way cross-proof
+  (`5515158395016D65…`). That is what makes the four-way cross-proof
   (§4.5) meaningful: the NRO in the package, in the app zip, on the card and
   in the build output are not four copies of "something like the build", they
   are the same file, and any rebuild from the same commit reproduces it.
