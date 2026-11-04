@@ -73,7 +73,8 @@ powershell -File .build\gate.ps1
 0 个意外缺失**。
 
 构建产物：`native-switch/rr3-native-rehost.nro`（含内嵌 RomFS）。
-**这个 NRO 里不含 EA 的任何东西**——客机二进制、文本、字体、FMOD 都来自你自己那份应用。
+**仓库里不含 EA 的任何东西**——客机二进制、文本、字体、FMOD 来自你自己那份应用，
+构建时被 stage 进 RomFS；Release 上的包因此带着它们。
 
 ## 装到主机
 
@@ -116,8 +117,8 @@ dist/                   打包产物
 ## 许可
 
 本移植层代码以 **MIT** 发布（见 [LICENSE](LICENSE)）。第三方组件与其授权见
-[NOTICE.md](NOTICE.md)。游戏本身的著作权属于 Electronic Arts，本项目不分发任何
-游戏内容。
+[NOTICE.md](NOTICE.md)。游戏本身的著作权属于 Electronic Arts；仓库不收录任何
+游戏内容，发布包里的客机运行时与资源来自使用者自己的应用副本。
 
 ## 致谢
 

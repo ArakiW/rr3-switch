@@ -39,7 +39,12 @@ interface, not by re-licensing the repository.
 
 ## Game data
 
-No Real Racing 3 code, assets, or data are distributed by this project. The
+No Real Racing 3 code, assets, or data are committed to this repository. The
 guest binary `libRealRacing3.so` and the game data volumes are taken from the
 user's own copy of the application. The port loads them at runtime and
 circumvents no protection, licence check, or DRM.
+
+The build stages those files into the RomFS that ships inside the NRO, so the
+binaries published on the [GitHub Release](https://github.com/ArakiW/rr3-switch/releases)
+carry the guest runtime and its assets. Anyone producing a build from this
+source must supply their own copy of the application to do so.

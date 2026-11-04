@@ -100,8 +100,9 @@ Gate status: **39/39 tests pass**; Cloudcell symbols **38 resolved / 16
 confirmed absent / 0 unexpected misses**.
 
 Output: `native-switch/rr3-native-rehost.nro` (with the embedded RomFS).
-**It carries no EA material** — the guest binary, text, fonts and FMOD come
-from your own copy of the application.
+**The repository carries no EA material** — the guest binary, text, fonts and
+FMOD come from your own copy of the application and are staged into the RomFS
+at build time, so the packages on the Release carry them.
 
 ## Install on the console
 
@@ -148,8 +149,9 @@ dist/                   packaged deliverables
 
 The port is released under the **MIT Licence** (see [LICENSE](LICENSE)); the
 third-party components and their terms are listed in [NOTICE.md](NOTICE.md).
-The game itself is © Electronic Arts, and this project distributes none of
-its content.
+The game itself is © Electronic Arts; the repository contains none of its
+content, and the guest runtime and assets in the published packages come from
+the user's own copy of the application.
 
 ## Acknowledgements
 

@@ -563,7 +563,19 @@ static void testCardFile(const char* path) {
     }
 
     // THE MODE THE CARD SHIPS IS THE ONE THE PORT HAS BEEN MEASURED WITH.
-    check(fromFile.autopilot == gp::kAutopilotAuto,
+    //
+    // This assertion TRACKS THE SHIPPING DECISION, so it has to move when
+    // that decision moves.  It was kAutopilotAuto until 2026-11-04, when
+    // the shipped default became kAutopilotManual: the card's own file said
+    // "autopilot = 0" while this assertion still demanded "autopilot = 1",
+    // and the gate caught the disagreement.
+    //
+    // MEASURED 2026-11-04 (q149): with the port's own closed loop out of the
+    // way, the player's input reaches the car end to end, so MANUAL is the
+    // mode the port has been measured with.  Set the card file to
+    // "autopilot = 1" for the attract mode, and this assertion has to
+    // follow it back.
+    check(fromFile.autopilot == gp::kAutopilotManual,
           "the card file ships the measured autopilot mode");
 }
 

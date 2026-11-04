@@ -146,7 +146,8 @@ phase=guest-scanf-bounded ... input=truncated in_len=512 fmt=ok fmt_len=16
 
 ### 0.4 你要做的
 
-**如果卡上已经有数据卷**：下 `rr3-switch-app-20261102.zip`（45.3 MiB，一个文件），
+**如果卡上已经有数据卷**：从 [Release](https://github.com/ArakiW/rr3-switch/releases/tag/v0.22.4) 下
+`rr3-switch-app-20261104.zip`（45.4 MiB，一个文件），
 解包，把 `switch\` 里的东西覆盖到卡根即可。**不要删 `switch/rr3-gfx.conf`。**
 
 **如果是新卡**：用下面的分卷整包。
@@ -197,7 +198,8 @@ lr=0x87d40de54    ← 宿主：deliverServerTime
 **这次的构建 `249c9f02…`**，模拟器实测 q132：306 秒 / 1560 帧 / 28 万行日志 / 0 崩溃，
 `Server time returned` ×1、`cc-worker-dead` ×0、`glyph-tex-fail` ×0。
 
-**你需要做的**：装新 NRO（`dist/rr3-switch-app-20261103.zip`，45.4 MiB）→ 开机 →
+**你需要做的**：装新 NRO（[Release](https://github.com/ArakiW/rr3-switch/releases/tag/v0.22.4) 上的
+`rr3-switch-app-20261104.zip`，45.4 MiB）→ 开机 →
 回传 `guest-view.log`、`crash-early.txt`（如果有）、以及屏幕上看到什么。
 **务必留下和 NRO 同一批的 `.elf`** —— 崩溃的 PC 只能在**完全相同的那次构建**上解析。
 
@@ -222,7 +224,8 @@ powershell -ExecutionPolicy Bypass -File Join-And-Extract.ps1 -Card F:
 ### 1.2 方式 B：只更新应用（**45 MB，一个文件**）
 
 如果卡上已经有数据卷，只想换应用和脚本（比如升到带手柄映射的这一版），
-用 `rr3-switch-app-20261102.zip`：解包，把 `switch\` 里的东西覆盖到卡根即可。
+用 [Release](https://github.com/ArakiW/rr3-switch/releases/tag/v0.22.4) 上的
+`rr3-switch-app-20261104.zip`：解包，把 `switch\` 里的东西覆盖到卡根即可。
 **不要删 `switch/rr3-gfx.conf`**（见 §4）。
 
 ### 1.3 方式 C：小卡（空间不够）
@@ -512,8 +515,8 @@ Get-Content checksums.sha256 | ForEach-Object {
 NRO 与 RomFS 的哈希可以和构建产物对照（构建是可复现的：门禁重编出来的字节完全一致）：
 
 ```
-rr3-native-rehost.nro  sha256 = 6c64057fa737437195d42ac73d861535fb6eaaa5a60489cddc38cce91888d769
-rr3.romfs              sha256 = 790e6241be77b7380e018f90522725ec8ae3d497ab52250f744b92da71e32dde
+rr3-native-rehost.nro  sha256 = 5515158395016d65d6283156d1c91d560926e58d1fe028f0cc36de6cf83c76b8
+rr3.romfs              sha256 = 1cf7b850226d3f21cd157fc725a376377d893fbd061cc6fdfa4d0644d9bea02
 ```
 
 ---
