@@ -13880,3 +13880,148 @@ writer does not fsync.
 **AND THE BUILD IS BYTE-REPRODUCIBLE**: the gate rebuilds the NRO from the
 same tree and gets the same sha256 (1A155B37929AB0FB...), which is what makes
 the deliverable's four-way cross-proof meaningful.
+
+### THE PLAYER'S CONTROLLER WAS DEAD, AND THE SWITCH THAT WAS SUPPOSED TO FIX IT DID NOT SWITCH ANYTHING
+
+The user pointed at the thing every round in this project had been getting
+wrong:
+
+    "you test every time, but you never actually let me take over the
+     controls, so of course you cannot complete a lap -- that is not the car
+     being stuck; those are two completely different directions."
+
+He was right, and the code said so.
+
+EVERY ROUND HAD BEEN MEASURING THE PORT'S OWN AUTOPILOT
+
+The card's rr3-gamepad.txt said "autopilot = 1", so the port's closed loop
+owned the steering, the throttle and the brake.  Every number this project
+has ever produced for "the lap counter" was a number about that loop.
+
+And the mode setting only governed ONE of the two input paths:
+
+    if (scriptDrives) {
+        // THE SCRIPT DRIVES THE GUEST.
+    } else {
+        // THE PHYSICAL CONTROLLER, THROUGH THE MAPPING.
+        const int mode = g_gamepadMapping.autopilot;   // <- the mode, HERE
+        if (driving && mode != kAutopilotManual) { ... the loop owns the car ... }
+    }
+
+while the script path was overridden with NO mode check at all:
+
+    if (driving) {
+        scripted.leftX = drive.steer;                  // the script's own axis
+        if (drive.throttle) scripted.buttons |= (1u << kBtnA);
+        if (drive.brake)    scripted.buttons |= (1u << kBtnX);
+    }
+
+THREE DEFECTS IN ONE PLACE
+
+1. `autopilot = 0` DID NOTHING on the path the experiments used.  MEASURED
+   (q148, the control: the card set to autopilot = 0, the old code): drive
+   engaged 201/208 samples, 8.96 % of a lap at speed 10,916 -- the autopilot
+   was driving exactly as before.  A setting that reads like "the human
+   drives" and does not.
+
+2. THE SHIPPED PACKAGE SHIPS THE EXPERIMENT SCRIPT, AND IT BLOCKED THE
+   PLAYER.  rr3-pad.txt is in the release tree, and while a script is active
+   the physical controller is ignored ENTIRELY.  So on a console with the
+   shipped package the player's own controller was DEAD -- the script owned
+   every button and every axis -- and the script holds the accelerator from
+   frame 600, so the throttle was pinned open too.
+
+3. THE SCRIPTED PATH HAD NO INSTRUMENT.  logGamepadState() -- the line that
+   reports what was asked for against what the guest got -- was only called
+   on the physical path.  A round whose script drove the guest had no
+   instrument at all, which is exactly why "did the human's input reach the
+   car?" could not be answered from the logs.
+
+THE FIX, AND WHAT IT MEASURED
+
+* the mode governs BOTH paths now: auto = the loop owns the car, assist =
+  the human wins on every control they are actually using, manual = the port
+  does not touch the car at all;
+* THE SCRIPT YIELDS TO THE HUMAN: it drives only while nobody is using a
+  physical controller (a stick off its deadzone, a trigger pulled, a button
+  held).  Inside an emulator there is no controller, so every experiment
+  keeps working exactly as before; on a console the player's stick takes over
+  the moment it moves;
+* the scripted path has its own instrument (scripted-state): what the script
+  asked for, what the guest got, whether the closed loop overrode the
+  steering, and whether a physical controller took over.
+
+MEASURED (q149, the card at autopilot = 0, the weave script holding the
+accelerator and alternating the steering axis):
+
+    f= 300 mode=0 lx_script=0.000 lx_guest=0.000 btn=0x0000 loop_steered=0
+    f= 600 mode=0 lx_script=0.000 lx_guest=0.000 btn=0x0001 loop_steered=0
+    f= 900 mode=0 lx_script=0.500 lx_guest=0.500 btn=0x0001 loop_steered=0
+    ...                                    24 consecutive samples, same shape
+    f=7200 mode=0 lx_script=0.000 lx_guest=0.000 btn=0x0001 loop_steered=0
+
+⇒ In EVERY sample the axis the script asked for is the axis the guest got,
+the accelerator is the accelerator, and the closed loop did NOT overwrite
+either.  Under the old code that value was the autopilot's steering, and
+nothing in the log said so.
+
+⇒ ⇒ AND THE CAR ANSWERED.  The guest's own distance and speed, with the
+human's input as the only source of control:
+
+    f= 750  total=   632  speed= 1750   (the accelerator took effect)
+    f= 780  total=  9116  speed= 5840
+    f= 960  total= 20910  speed= 5879
+    f=1290  total= 58924  speed= 6464
+
+and the step between samples ALTERNATES between ~1.5 m and ~23..33 m: the
+car accelerates on the straights and scrubs on the turns, i.e. the STEERING
+AXIS is reaching the car and turning it.
+
+⇒ ⇒ THE PORT IS PLAYABLE.  The lap counter's -1 was the AUTOPILOT's quality
+problem, and the autopilot is an attract mode, not the game.
+
+⇒ ⇒ SO THE SHIPPING DEFAULT CHANGES: the release tree ships autopilot = 0
+and a rr3-pad.txt with NO EVENTS (a held accelerator takes the throttle away
+from the player again).  The experiment scripts -- rr3-pad-manual.txt (the
+weave) and rr3-pad-autopilot.txt (the confirm-then-throttle one) -- stay in the
+repository and are not in the packager's list.
+
+ALSO MEASURED THIS ROUND
+
+  * THE PORT IS NOT WHAT MAKES THE MENU SLOW.  The per-frame census line now
+    carries the frame's three costs (tt / tr / ts / tp), and MEASURED (q146):
+
+        menu phase (630 frames)   whole frame mean 546 ms, median 107 ms
+            guest's render 99.0 %   the PORT'S OWN WORK 0.1 %   present 0.9 %
+        race phase (6278 frames)  whole frame mean 43 ms, median 29 ms
+            guest's render 90.2 %   the PORT'S OWN WORK 1.0 %   present 8.8 %
+
+    And the frame time is not spread out: 37 of 1767 frames took more than a
+    second and THOSE 37 FRAMES ARE 69 % of the run's frame time.  The
+    longest was 49.9 s and it holds 502 string-to-number conversions, 49 path
+    resolutions and 15 stats -- the guest loading and parsing assets inside
+    its own render call -- while the port's own work in that frame was 1 ms.
+    And it is not the port's filesystem layer either: the bulk-read path
+    served the 4.2 MB base asset list in 10 ms.
+
+    ⇒ THE MENU'S SLOWNESS ON EDEN IS THE GUEST'S OWN ARM64 CODE BEING
+    EMULATED, so Eden's 4.8 fps says NOTHING about the console, and the
+    console's black screen is much more likely to be the BOOT PHASE, which
+    the port does control.
+
+  * THE CENSUS A/B, at last (q143 census=off, q144 census=on -- the same
+    build, the same card, one file different): frames +1.3 % (noise), CPU
+    +9.0 %, log +5.2 %.  ⇒ NOT the frame-rate lever, but it costs 9 % of the
+    CPU, so the shipping configuration should have it off.
+
+  * THE TRACK'S SPLINE HOLDS A RACING LINE.  The spline has three chunks:
+    centre_spline (7,016.9 m a lap), start_spline and ai_spline
+    (6,949.8 m a lap -- 67.0 m shorter, because it cuts the corners), and the
+    two are 2.92 m (median) to 8.25 m (worst) apart.  MEASURED (q146): the
+    car sat 1.97 m from the centre line and 9..11 m from the racing line --
+    it was on the wrong line, and a car on the centre line drives on the
+    OUTSIDE of every corner.  The switch was measured (q147: rres 0.32 m, the
+    time spent reversing down from 41.5 % to 13.7 % of the race) and then
+    REVERTED, because the net lap progress went from 10.35 % to 5.14 %: a
+    20 m look-ahead overshoots the racing line's sharper apexes.  The rres
+    instrument stays.
