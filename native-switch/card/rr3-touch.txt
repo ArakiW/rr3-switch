@@ -28,6 +28,15 @@
 #     the control at the bottom right, (1114, 698) -- the coordinate the
 #     20261024-102025-eden-race-door archive used, and the one that made the
 #     guest try to load a track in f1a.
+#     -- AND IT IS NOT A PIXEL TAP ANY MORE.  MEASURED 2026-11-04 (q142): the
+#     race does NOT need a tap at all -- the port's own red-glove follower
+#     presses the button itself ("phase=ui-press ... kind=orange x=1105 y=695
+#     area=8180" at frame 420), and a tap that lands AFTER the race has
+#     started presses whatever is under it in the race screen, which is how
+#     one round stopped at 600 frames.  The race is now started by the
+#     SEMANTIC request in rr3-ui.txt (BTN_RACE), which has no frame budget
+#     and presses the control only while that control EXISTS.  So hop 6 has
+#     no event line below.
 #
 # The hops are spaced so that each transition has time to settle, and so
 # that a framebuffer capture lands on both sides of each of them.
