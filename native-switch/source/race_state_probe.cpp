@@ -1063,12 +1063,13 @@ bool refreshRaceLine(unsigned long long frame) {
     if (line.residual > 25.0) {
         return false;
     }
+    const bool sameTrack = (gRaceLine.generation == generation);
     gRaceLine.line = line;
     gRaceLine.fitted = true;
     // A NEW TRACK IS A NEW RACE.  Which way round THIS track is has to be
     // decided again: the spline's node order and the way the car drives on
     // it belong to the track, not to the process.
-    if (gRaceLine.generation != generation) {
+    if (!sameTrack) {
         gRaceLine.direction = 0;
     }
     gRaceLine.generation = generation;
@@ -1263,6 +1264,27 @@ void fillCarState(RaceMetricsSample* out) {
                 out->carTargetZ = out->carZ;
                 out->targetFromLine = true;
                 out->lineResidual = gRaceLine.line.residual;
+                // THE CAR'S DISTANCE FROM THE RACING LINE.
+                //
+                // The port follows the CENTRE line, and the track's own racing
+                // line (ai_spline) is a different line -- MEASURED 2026-11-04
+                // on Spa: 67.0 m shorter a lap, and 2.92 m (median) to 8.25 m
+                // (worst) away from the centre line.  The car hits the
+                // barriers about ten times a race while sitting within 2 m of
+                // the centre line, so the question "is it on the wrong line?"
+                // is answered by this number, in the same frame and with the
+                // same transform as the line the car IS following.
+                double racingMetres = 0.0;
+                if (rr3::raceLineDistanceToChunk(gRaceLine.line, *spline,
+                                                  "ai_spline",
+                                                  static_cast<double>(out->carX),
+                                                  static_cast<double>(out->carY),
+                                                  &racingMetres)) {
+                    out->racingResidual = static_cast<float>(racingMetres);
+                }
+                else {
+                    out->racingResidual = -1.0f;
+                }
             }
         }
     }
@@ -2572,7 +2594,7 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             "rate=%.6f prog=%.3f from_total=%d sawprog=%d "
             "car=0x%llx cnum=%u cnode=%u cprev=%u cpos=%d,%d,%d ctgt=%d,%d,%d "
             "snode=%u sdist=%u tsok=%d posok=%d ctok=%d ctdist=%.2f "
-            "line=%d lres=%.2f "
+            "line=%d lres=%.2f rres=%.2f "
             "perr=%.4f pur=%d ident=0x%llx "
             "drive=%d steer=%.3f mag=%.3f sign=%d best=%.6f flips=%d stalls=%d "
             "thr=%d brk=%d",
@@ -2631,7 +2653,7 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             m.positionPlausible ? 1 : 0,
             m.trackStateAddress != 0 ? 1 : 0,
             m.targetPlausible ? 1 : 0, m.targetDistance,
-            m.targetFromLine ? 1 : 0, m.lineResidual,
+            m.targetFromLine ? 1 : 0, m.lineResidual, m.racingResidual,
             static_cast<double>(g_drive.steerError), g_drive.pursuit ? 1 : 0,
             static_cast<unsigned long long>(m.membersIdentified),
             g_drive.enabled ? 1 : 0, static_cast<double>(g_drive.steer),

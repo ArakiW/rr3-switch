@@ -121,8 +121,29 @@
 # ---------------------------------------------------------------------------
 # These are the port's measured behaviour, one line per binding, so that you
 # can change exactly one thing and leave the rest alone.
+#
+# autopilot = 0 IS THE DEFAULT NOW, AND IT IS THE PLAYER'S CAR.
+#
+# MEASURED 2026-11-04 (q149): with the port's own closed loop out of the way,
+# the player's input reaches the car end to end -- the axis the human asked
+# for is the axis the guest got (lx_script == lx_guest), the accelerator is
+# the accelerator, the closed loop did not overwrite either, and the car
+# answered: its distance went 99,695 -> 117,526 in 240 frames at speed 7,022
+# and its path TURNED when the axis changed sign.
+#
+# ⇒ The port's closed loop is an ATTRACT MODE, not the game.  Set
+# autopilot = 1 for it (and for the rounds that measure it), and leave it at
+# 0 to drive.
+#
+# THE OLD DEFAULT WAS 1, AND THAT WAS WRONG IN A WAY NOBODY NOTICED: the
+# setting only governed the PHYSICAL-controller path, so on the path the
+# experiments used the loop overrode the input regardless -- and the shipped
+# package also shipped an experiment script that held the accelerator and
+# ignored the physical controller entirely.  MEASURED (q148, the control):
+# with autopilot = 0 and the old code, the autopilot still drove (drive
+# engaged 201/208 samples).  Both are fixed now.
 
-autopilot = 1
+autopilot = 0
 deadzone = 0.12
 
 # --- the face buttons -------------------------------------------------------

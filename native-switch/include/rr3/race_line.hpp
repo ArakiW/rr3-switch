@@ -120,4 +120,23 @@ bool raceLineTarget(const RaceLine& line, const SplineFile& spline,
                     int* direction,
                     double lookAheadMetres, double* targetX, double* targetY);
 
+// The car's distance from another chunk of the SAME spline, in metres.
+//
+// WHY: the fit's transform was established on ONE chunk (the centre line),
+// but the file holds more than one and they live in the same stored
+// coordinate system -- so the same transform puts them all in the port's
+// frame.  The racing line (ai_spline) is a DIFFERENT line from the centre
+// line: MEASURED 2026-11-04 on Spa, it is 67.0 m shorter a lap (it cuts the
+// corners) and up to 8.25 m away from the centre line.
+//
+// The port follows the centre line.  Whether that is why the car hits the
+// barriers ten times a race is a question this answers directly: the car's
+// distance from the racing line, in the same frame, with the same transform.
+//
+// The distance is to the nearest SEGMENT, not the nearest node, because the
+// nodes are ~8 m apart.
+bool raceLineDistanceToChunk(const RaceLine& line, const SplineFile& spline,
+                             const char* chunkName,
+                             double carX, double carY, double* metres);
+
 }  // namespace rr3

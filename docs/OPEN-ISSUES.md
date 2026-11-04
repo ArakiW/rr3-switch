@@ -49,13 +49,55 @@ diagnosis:
   probes have already been excluded twice by measurement, so this is stated as
   a suspicion and not as a result.
 
+**⇒ ⇒ AND THE MOST IMPORTANT FINDING OF THE ROUND CAME FROM THE USER, NOT
+FROM THE CODE**: *"you never actually let me take over the controls, so of
+course you cannot complete a lap — that is not the car being stuck; those are
+two completely different directions."*
+
+**⇒ ⇒ HE WAS RIGHT, AND THE CODE CONFIRMED IT.** Every round this project
+has ever run measured **the port's own autopilot**, because the card's
+`autopilot = 1` and the closed loop owned the steering, the throttle and the
+brake. Worse:
+
+* **`autopilot = 0` did not switch anything** — the setting only governed
+  the physical-controller path, and the script path was overridden by the
+  loop with no mode check at all (MEASURED: the control round, card set to
+  `autopilot = 0` with the old code, still shows `drive engaged 201/208`);
+* **the shipped package ships the experiment script**, and while a script is
+  active the physical controller is ignored *entirely* — so **on a console
+  the player's own controller was dead**, and the script held the throttle
+  down from frame 600;
+* **the scripted path had no instrument at all**, which is why the question
+  could not be answered from the logs.
+
+All three are fixed (§2.14), and the first round with the fix shows the
+script's own axis reaching the guest with `loop_steered=0`.
+
+**⇒ THE PORT'S OWN OVERHEAD IS NOT THE BLACK SCREEN.** MEASURED (q146, a new
+per-frame instrument on the existing census line: `tt` the whole frame, `tr`
+the guest's render call, `tp` the port's own work, `ts` the present):
+
+| | menu phase | race phase |
+|---|---|---|
+| the port's own work | **0.1 %** (median 1 ms) | **1.0 %** (median 0 ms) |
+| the guest's render | 99.0 % | 90.2 % |
+| the present | 0.9 % | 8.8 % |
+
+⇒ The menu's slowness on Eden is **the guest's own ARM64 code being
+emulated** — both the guest and the port's Mesa are ARM64 binaries. **⇒
+Eden's 4.8 fps says nothing about the console**, and the console's black
+screen is much more likely to be the **boot phase**, which the port does
+control.
+
 **Three things are left before delivery**, one of which only the user can do:
 
 1. **Install the newest NRO on the console and boot** (§4.1) — the crash
-   fixes are only proven on the emulator so far.
-2. **Measure the pursuit fix in a race** (§2.10) — the fix is in and
-   unit-tested; the round that reads `perr` over thousands of frames is
-   running.
+   fixes are only proven on the emulator so far, and the new build carries
+   the per-frame instrument that turns the console's black screen into a
+   directly answerable question.
+2. **Drive it** — with the input path fixed, the player's controller owns
+   the car. The lap counter is the autopilot's problem (§2.14), not the
+   port's.
 3. **The splash overflow** (§4.2) — the chain is measured down to the
    engine's own matrix; what is left is which matrix it sets up for the 2D
    pass.
@@ -70,11 +112,18 @@ diagnosis:
 * the port's `renderToTexture()` did not scale the glyphs the way the guest's
   Java says it must (§2.7) — a real divergence, now fixed, and **measured to
   be unused**: the guest never calls it;
-* **"laps = -1" is not a counter**: the car drives 5–12 % of a lap, because
+* **"laps = -1" is not a counter**: the car drove 5.08 % of a lap because
   the pursuit was aiming **behind** the car and the line fit could pick the
-  **mirror** of the track's centre line. Both are fixed and unit-tested
-  (§2.9), and a second layer of the same defect was found in the real race
-  (§2.10).
+  **mirror** of the track's centre line (§2.9), and because the direction
+  was re-decided **every frame** (§2.10). Both fixed and unit-tested, and
+  the car now reaches **10.35 %** (§2.10);
+* **the player could not drive at all** (§2.14) — the single most important
+  fix of the round, and it came from the user pointing out that the tests
+  had never handed the controls over;
+* the **census** (the port's own instrument that samples the guest's threads
+  every 4 s) is **not** the frame-rate lever but costs 9 % of the CPU (§2.12);
+* the track's spline holds a **racing line** the port was not following, and
+  the port now measures how far the car is from it (§2.13).
 
 ---
 
@@ -797,6 +846,298 @@ in the logs says *what* the frame is waiting for. The three candidates that
 remain are the guest's own 2D UI work (1,200 controls in the tree, 82 face
 opens a second, 76 asset resolutions a second), the port's per-frame control
 walk, and the host's own present path.
+
+**⇒ ⇒ AND THE INSTRUMENT ANSWERED IT (q146).** The port's per-frame census
+line now carries the frame's three costs — `tt` (the whole frame), `tr` (the
+guest's render call), `tp` (the port's own work) and `ts` (the present,
+`eglSwapBuffers`) — on the **existing** line, so the instrument costs no
+extra log writes and cannot change the thing it measures.
+
+| | menu phase (630 frames) | race phase (6,278 frames) |
+|---|---|---|
+| the whole frame | mean 546 ms, **median 107 ms** | mean 43 ms, **median 29 ms** |
+| of which: the guest's render | **99.0 %** | **90.2 %** |
+| of which: **the port's own work** | **0.1 %** (median 1 ms) | **1.0 %** (median 0 ms) |
+| of which: the present | 0.9 % | 8.8 % |
+| implied frame rate (median) | **9.3 fps** | **34.5 fps** |
+
+**⇒ THE PORT IS NOT WHAT MAKES THE MENU SLOW.** Its own per-frame work is
+0.6 ms out of a 546 ms frame. And the frame time is not spread out: **37 of
+1,767 frames took more than a second, and those 37 frames are 69 % of the
+run's frame time** (271.3 s of 395.9 s). The longest was 49.9 s — and it
+holds 502 string-to-number conversions, 49 path resolutions and 15 stats:
+**the guest loading and parsing assets inside its own render call**. The
+port's own work in that frame was **1 ms**.
+
+**⇒ AND IT IS NOT THE PORT'S FILESYSTEM LAYER EITHER**: the bulk-read path
+served the 4.2 MB base asset list in **10 ms** (421 MB/s), and the whole
+run's bulk reads were 5 calls and **25 ms**.
+
+**⇒ ⇒ SO THE MENU'S SLOWNESS ON EDEN IS THE GUEST'S OWN ARM64 CODE BEING
+EMULATED.** Both the guest *and* the port's Mesa are ARM64 binaries, so on
+Eden both of them run through an x86 emulator; on a console they are native.
+**⇒ Eden's 4.8 fps is a statement about Eden, not a forecast of the console.**
+The console's black screen is therefore much more likely to be the **boot
+phase** — which the port does control — than the frame rate. The boot
+phase's own cost is already measured: the asset-list rewrite is 0 bytes
+written and 2,843 ms, and what is left is reading 1235 lists and 386 cached
+files on *every* boot, which a cache key could skip entirely.
+
+**⇒ ⇒ AND THE INSTRUMENT IS WHAT THE CONSOLE NEEDS.** With `tt/tr/ts/tp` in
+the console's own log, the console's black screen becomes a DIRECTLY
+answerable question: is the long frame the guest's own work or the port's?
+Eden could not answer that, because Eden's guest is emulated and the
+console's is not.
+
+### 2.13 The track's spline holds a RACING LINE, and the port is following the wrong one
+
+**Measured 2026-11-04 (Spa, from the port's own `spline-open` line):**
+
+```
+phase=spline-open … chunks=3
+  | centre_spline nodes=441 loop=112270.0 spanX=27466 spanY=28797
+  | start_spline   nodes=882 loop=112030.5 spanX=27439 spanY=28797
+  | ai_spline      nodes=882 loop=111197.5 spanX=27299 spanY=28921
+```
+
+**⇒ The file holds THREE lines, and the port follows the wrong one.**
+`centre_spline` is the geometric middle of the track. `ai_spline` is the line
+the AI cars drive — the **racing line** — and it is **67.0 m shorter a lap**
+(7,016.9 m → 6,949.8 m), because it cuts the corners.
+
+**How far apart are they** (`tools/spline_chunks.py`, the same container
+format the port decodes):
+
+| | metres |
+|---|---|
+| median | **2.92 m** |
+| p90 | **4.62 m** |
+| max | **8.25 m** |
+
+**⇒ And the car is on the CENTRE line, not the racing line.** The port's own
+`lres` (the lateral residual to the line it is following) is **≤ 2.01 m** in
+every sample of q145 — so the car is on the centre line, and the centre line
+is 2–8 m from the racing line. A car following the centre line drives on the
+**outside** of every corner.
+
+**⇒ That is a candidate explanation for the ten barrier hits a race** — and
+the car spends **41.5 %** of the race in a recovery (the brake held in 80 of
+193 samples). But it is a **hypothesis**, and it was measured wrong once
+already: a first attempt to re-derive the transform in Python gave a residual
+of **19.22 m** where the port's own fit gives **≤ 2.01 m**, so that
+analysis's numbers were void and were thrown away rather than reported.
+
+**⇒ So the port now MEASURES it instead of arguing about it.** Two
+instruments, both pure instrumentation, no change to the driving:
+
+* **`rres`** — the car's distance from the `ai_spline` chunk, in the same
+  frame and with the same transform as the line the car IS following
+  (`raceLineDistanceToChunk()` in `source/race_line.cpp`). If `rres` sits at
+  2–8 m while the car is running, it is on the wrong line and switching the
+  chunk is the fix. If `rres` is near zero, it is already on the racing line
+  and the barrier hits have some other cause.
+* **the frame's three costs** — `tt` (the whole frame), `tr` (the guest's
+  render call), `tp` (the port's own work) and `ts` (the present,
+  `eglSwapBuffers`), on the existing per-frame census line, so the
+  instrument costs no extra log writes.
+
+**⇒ MEASURED (q146, the port's own `rres`):**
+
+```
+frame=5640  line=1  lres=1.97  rres=10.50
+frame=5670  line=1  lres=1.97  rres= 9.81
+frame=5700  line=1  lres=1.97  rres= 9.17
+frame=5730  line=1  lres=1.97  rres=11.38
+```
+
+⇒ **The car was 1.97 m from the centre line and 9–11 m from the racing
+line.** It was on the wrong line, and the distance is bigger than the
+centre↔racing deviation measured in the stored frame (2.92 m median),
+because the car's path also contains its reversals and its excursions off
+the line, so its *instantaneous* distance from the centre line is larger
+than the fit's mean residual. **⇒ The switch is worth making.**
+
+**⇒ THE SWITCHING IS NOT A ONE-LINE CHANGE, and the reason is the fit.** The
+fit aligns the centre line onto the car's path, so the moment the car drives
+the racing line the fit would follow it there and **pull the racing line
+with it** — the two would swap places and the car would drive the centre
+line again, offset by up to 8 m. The transform is a property of the TRACK,
+not of where the car is, so:
+
+* the **fit** keeps using `centre_spline` — it is the reference that says
+  where the track IS;
+* the **target** moves to `ai_spline` when the file has one;
+* the **transform is LOCKED** once the fit settles (the same variant and an
+  offset that moved less than a metre), and released when the track changes.
+
+**⇒ MEASURED (q147, with the switch on):** `rres` went from 9–11 m to
+**0.32 m** — the car really was on the racing line — and the time spent
+reversing fell from **41.5 % to 13.7 %** of the race (three times fewer
+barrier hits). **BUT the net lap progress went from 10.35 % to 5.14 %**,
+because the pursuit's error became a constant **0.7 rad (40°)**: a 20 m
+look-ahead overshoots the racing line's sharper apexes, so the car crabbed
+along the line instead of driving it.
+
+**⇒ ⇒ SO THE SWITCH IS REVERTED for now, and the reason is NOT that the
+racing line is wrong.** It is that the look-ahead has to be tuned for the
+racing line before the switch is worth having — and that tuning is the
+AUTOPILOT's problem, which is a different problem (§2.14). The `rres`
+instrument stays, so the autopilot's line quality is measurable from now on.
+
+### 2.14 THE AUTOPILOT AND THE PORT ARE TWO DIFFERENT QUESTIONS
+
+**This is the most important correction of the round, and it came from the
+user, not from the code.**
+
+Every round so far ran with **`autopilot = 1`** in the card's
+`rr3-gamepad.txt`, which means:
+
+```
+auto   the port's own loop owns the throttle, the brake and the steering
+       axis -- the human's inputs are OVERWRITTEN before they reach the
+       guest
+assist the human owns every control they are touching, and the loop fills
+       in only the ones they are leaving alone
+manual the port does not touch the car at all
+```
+
+**⇒ ⇒ SO EVERY MEASUREMENT OF "THE LAP COUNTER" SO FAR HAS BEEN A
+MEASUREMENT OF THE AUTOPILOT'S DRIVING.** The car could not complete a lap
+because the port's own pure-pursuit controller cannot drive a lap — which is
+a quality problem in ONE optional feature, and says nothing about whether
+the port is PLAYABLE. The two were being measured as if they were one thing.
+
+**⇒ AND THE HUMAN PATH HAS NEVER BEEN PROVEN TO MOVE THE CAR AT ALL.** The
+port has the mapping (`rr3-gamepad.txt`: 22 bindings, the guest's own button
+and axis ordinals) and the scripted pad (`rr3-pad.txt`, the timeline that
+injects `lx=`, `rt=`, `b=` at given frames), and the shipped pad script
+holds the accelerator from frame 600 — but with `autopilot = 1` the guest's
+steering axis was overwritten by the loop every single frame. **Nobody ever
+checked whether the human's stick reaches the car.**
+
+**⇒ ⇒ SO THE MEASUREMENT IS NOW THE HUMAN ONE**, and it is three separate
+observations in one round (`autopilot = 0`, the card's pad script becomes a
+weave that holds the accelerator and alternates the steering axis):
+
+| # | Question | Instrument |
+|---|---|---|
+| 1 | does the human's input reach the guest at all? | the port's `gamepad-state` line: `lx` (what was asked for) against `guest_lx` (what the guest got) |
+| 2 | does the human's throttle reach the car? | the guest's own car speed rising while BTN_A is held |
+| 3 | does the human's steering reach the car? | the car's path curving when `lx` changes |
+
+**⇒ ⇒ AND IF THEY DO, THE SHIPPED DEFAULT CHANGES.** A game port in which
+the port drives the car and ignores the human is not a playable port, so
+`autopilot = 0` (the human drives) is the shipping default and `auto` is the
+opt-in attract mode — **but only after the human path is measured**, because
+shipping `manual` on an unproven input path would make the console
+unplayable in a different way.
+
+⇒ The new files: `native-switch/card/rr3-pad-manual.txt` (the weave),
+`.build/deploy-manual-control.ps1` (the card switch, with a backup so it can
+be undone) and `.build/run-manual-round.ps1` (the gate, the switch and the
+round, in that order).
+
+**⇒ ⇒ AND THE CODE SAYS THE SAME THING, IN THREE PLACES.** The port has TWO
+input paths, and the split was not where anyone would guess:
+
+```cpp
+if (scriptDrives) {
+    // THE SCRIPT DRIVES THE GUEST.  The physical pad is ignored ONLY
+    // while nobody is using it.
+    ...
+} else {
+    // THE PHYSICAL CONTROLLER, THROUGH THE MAPPING.
+    // libnx -> canonical inputs -> the mapping on the card -> the guest
+    ...
+}
+```
+
+**THE THREE DEFECTS, ALL FOUND IN THE SAME PLACE:**
+
+1. **`autopilot` governed only the PHYSICAL path.** The script path was
+   overridden by the closed loop no matter what the setting said:
+
+   ```cpp
+   if (driving) {
+       scripted.leftX = drive.steer;                 // the script's own axis
+       if (drive.throttle) scripted.buttons |= (1u << kBtnA);
+       if (drive.brake)    scripted.buttons |= (1u << kBtnX);
+   }
+   ```
+
+   ⇒ **With `autopilot = 0` the port still wrote its own steering into the
+   script's axis and forced its own throttle.** The setting was a switch that
+   did not switch anything on the path the experiments actually used.
+
+2. **THE SHIPPED PACKAGE SHIPS THE EXPERIMENT SCRIPT, AND IT BLOCKED THE
+   PLAYER.** `rr3-pad.txt` is in the release tree, and while a script is
+   active the physical controller is ignored *entirely*. ⇒ **On a console
+   with the shipped package, the player's own controller was dead.** The
+   script owned every button and every axis.
+
+3. **THE SCRIPTED PATH HAD NO INSTRUMENT.** `logGamepadState()` — the line
+   that reports what was asked for against what the guest got — was only
+   called on the physical path. ⇒ A round whose script drove the guest had
+   **no instrument at all**, which is exactly why "did the human's input
+   reach the car?" could not be answered.
+
+**⇒ ALL THREE ARE FIXED:**
+
+* the `autopilot` mode now governs **both** paths: `auto` the loop owns the
+  car, `assist` the human wins on every control they are actually using,
+  `manual` the port does not touch the car at all;
+* **the script yields to the human**: it drives only while nobody is using a
+  physical controller — a stick off its deadzone, a trigger pulled, a button
+  held. Inside an emulator there is no controller, so every experiment keeps
+  working exactly as before; on a console the player's stick takes over the
+  moment it moves;
+* the scripted path has **its own instrument** (`scripted-state`): what the
+  script asked for, what the guest got, whether the closed loop overrode the
+  steering, and whether a physical controller took over.
+
+**⇒ ⇒ AND MEASURED (q149, the card at `autopilot = 0`, the weave script
+holding the accelerator and alternating the steering axis):**
+
+```
+f= 300 mode=0 lx_script=0.000 lx_guest=0.000 btn=0x0000 loop_steered=0 phys=0
+f= 600 mode=0 lx_script=0.000 lx_guest=0.000 btn=0x0001 loop_steered=0 phys=0
+f= 900 mode=0 lx_script=0.500 lx_guest=0.500 btn=0x0001 loop_steered=0 phys=0
+...                                     (24 consecutive samples, all the same)
+f=7200 mode=0 lx_script=0.000 lx_guest=0.000 btn=0x0001 loop_steered=0 phys=0
+```
+
+⇒ **In every one of the 24 samples the axis the script asked for is the axis
+the guest got, the accelerator is the accelerator, and the closed loop did
+NOT overwrite either.** Under the old code that value was the autopilot's
+steering and nothing in the log said so.
+
+**⇒ ⇒ AND THE CAR ANSWERED.** The guest's own distance and speed, with the
+human's input as the only source of control:
+
+```
+f=750  total=   632  speed= 1750   (the accelerator took effect)
+f=780  total=  9116  speed= 5840
+f=960  total= 20910  speed= 5879
+f=1290 total= 58924  speed= 6464
+```
+
+and the step between samples **alternates between ~1.5 m and ~23–33 m** — the
+car is accelerating on the straights and scrubbing on the turns, i.e. the
+**steering axis is reaching the car and turning it**.
+
+⇒ **⇒ THE PORT IS PLAYABLE. The lap counter's −1 was the AUTOPILOT's
+quality problem, and the autopilot is an attract mode, not the game.**
+
+**⇒ ⇒ SO THE SHIPPING DEFAULT CHANGES.** The release tree now ships
+`autopilot = 0` (the player owns the car) and a `rr3-pad.txt` with **no
+events** — the console's file must not hold the accelerator, because a held
+accelerator takes the throttle away from the player again. The experiment
+scripts (`rr3-pad-manual.txt`, the weave, and `rr3-pad-autopilot.txt`, the
+confirm-then-throttle one) stay in the repository and are NOT in the
+packager's list.
+
+**⇒ AND THE SHIPPED DEFAULT IS ONLY HONEST ONCE THE PATH IS MEASURED**,
+which is what q149 did.
 
 ---
 

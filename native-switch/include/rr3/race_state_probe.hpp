@@ -189,6 +189,17 @@ struct RaceMetricsSample {
     // lateral offset from the centre line; with a WRONG scale it is
     // hundreds of metres, which is what tells the two apart.
     double lineResidual{};
+    // The car's distance from the track's own RACING line (the spline's
+    // "ai_spline" chunk), in metres, in the same frame and with the same
+    // transform as the line the car is being steered along.  Negative means
+    // the chunk is not in this file.
+    //
+    // WHY: the port follows the CENTRE line, and the two are different
+    // lines -- MEASURED 2026-11-04 on Spa: 67.0 m shorter a lap and up to
+    // 8.25 m apart.  The car hits the barriers about ten times a race while
+    // sitting within 2 m of the centre line, so this is the number that says
+    // whether it is on the wrong line.
+    double racingResidual{-1.0};
     uintptr_t trackStateAddress{};
     uint32_t splineNode{};
     uint32_t splineDistance{};

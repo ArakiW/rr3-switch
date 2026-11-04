@@ -7244,7 +7244,33 @@ void* frameLoopDriver(void* opaque) {
     startGuestPcSampler();
     g_samplerPhase.store(kSamplerPhaseFrameLoopHost, std::memory_order_relaxed);
     runSamplerSelfTest();
+    // THE FRAME'S THREE COSTS.
+    //
+    // WHY: the frame rate is a PHASE measurement (MEASURED 2026-11-04: the
+    // menu phase runs at 4.8 fps and the race phase at 15..17 fps on Eden),
+    // while the CPU is flat at 1.30..1.56 cores in every healthy round.  A
+    // flat CPU with a 3x frame-rate spread means the extra time per frame is
+    // WAITING, and nothing in the log says what it is waiting for.
+    //
+    // So the frame is split into the three things it can wait on:
+    //
+    //   tr   the guest's own render call (on Eden, an ARM64 program being
+    //        emulated on an x86 host)
+    //   tp   the port's own per-frame work and the input/Cloudcell pumps
+    //   ts   eglSwapBuffers -- the PRESENT, i.e. the host's display path
+    //   tt   the whole iteration
+    //
+    // These ride on the EXISTING per-frame census line, which is written every
+    // 60 frames, so the instrument costs no extra log writes and cannot
+    // change the thing it measures.  The values are the PREVIOUS iteration's,
+    // because the census line is written before the swap it reports.
+    uint64_t prevTopTick = 0;
+    uint64_t prevRenderTick = 0;
+    uint64_t prevSwapTick = 0;
+    bool havePrevTiming = false;
     while (probe.frameLoopActive) {
+        // The top of the iteration: everything below is inside this window.
+        const uint64_t tickTop = armGetSystemTick();
         // Publish the guest's own frame counter for the host sampler thread,
         // which labels its menu-gate samples with it. The frame loop is the
         // only place that knows it.
@@ -8933,10 +8959,16 @@ void* frameLoopDriver(void* opaque) {
             }
         }
 
+        // THE GUEST'S OWN FRAME, TIMED.  This is the one that is emulated on
+        // Eden and native on a console, so the two are not comparable -- but
+        // the SHARE of the frame it takes is the question.  It is declared
+        // out here because the swap below needs it.
+        uint64_t tickRender = tickTop;
         if (RR3_FRAME_LOOP_RENDER) {
         hdTargetBind();
         reinterpret_cast<void (*)(void*, void*, int, uint32_t)>(renderTarget)(
             jniEnvironment, activityObject, 2, 0);
+        tickRender = armGetSystemTick();
         // WHAT THE GUEST'S FRAME LEFT BEHIND.  Recorded before the blit,
         // because the blit rebinds framebuffer 0 and would erase the
         // evidence.
@@ -8956,12 +8988,35 @@ void* frameLoopDriver(void* opaque) {
             if (want) {
                 glGetIntegerv(GL_FRAMEBUFFER_BINDING, &g_hdBoundAfterRender);
                 glGetIntegerv(GL_VIEWPORT, g_hdViewportAfterRender);
-                char cdiag[288];
+                char cdiag[384];
+                // THE FRAME'S THREE COSTS.  See the comment at the top of the
+                // loop: the frame rate is a phase measurement and the CPU is
+                // flat, so the only way to know what the frame waits on is to
+                // time the three things it can wait on.  The numbers are the
+                // PREVIOUS iteration's, because this line is written before
+                // the swap it reports.
+                unsigned long long tt = 0;
+                unsigned long long tr = 0;
+                unsigned long long ts = 0;
+                unsigned long long tp = 0;
+                if (havePrevTiming) {
+                    const uint64_t freq = armGetSystemTickFreq();
+                    if (freq != 0) {
+                        tt = (unsigned long long)((prevSwapTick - prevTopTick) *
+                                                  1000ULL / freq);
+                        tr = (unsigned long long)((prevRenderTick - prevTopTick) *
+                                                  1000ULL / freq);
+                        ts = (unsigned long long)((prevSwapTick - prevRenderTick) *
+                                                  1000ULL / freq);
+                        tp = tt > tr + ts ? tt - tr - ts : 0;
+                    }
+                }
                 std::snprintf(
                     cdiag, sizeof(cdiag),
                     "frame=%llu census bound=%d viewport=%d,%d,%d,%d"
                     " scene=fbo=%u size=%ux%u binds=%u changes=%u vpChanges=%u"
-                    " draws=%u arr=%u",
+                    " draws=%u arr=%u"
+                    " tt=%llu tr=%llu ts=%llu tp=%llu",
                     static_cast<unsigned long long>(frames),
                     static_cast<int>(g_hdBoundAfterRender),
                     static_cast<int>(g_hdViewportAfterRender[0]),
@@ -8971,7 +9026,8 @@ void* frameLoopDriver(void* opaque) {
                     stats.lastNonZeroFramebuffer, stats.lastNonZeroFboWidth,
                     stats.lastNonZeroFboHeight, stats.bindFramebuffer,
                     stats.fboBindChanges, stats.viewportChanges,
-                    stats.drawElements, stats.drawArrays);
+                    stats.drawElements, stats.drawArrays,
+                    tt, tr, ts, tp);
                 appendGuestBootLine(
                     "sdmc:/switch/rr3-native-rehost.guest-view.log",
                     "guest-frame-census", 249, 0, cdiag);
@@ -9887,6 +9943,17 @@ void* frameLoopDriver(void* opaque) {
                 break;
             }
         }
+        // THE PRESENT, TIMED, AND THE ITERATION CLOSED.
+        //
+        // eglSwapBuffers is the host's display path: on Eden it is the
+        // emulator's present, on a console it is NVN's.  It is the third
+        // thing a frame can wait on, and the only one the port does not
+        // control.
+        const uint64_t tickSwap = armGetSystemTick();
+        prevTopTick = tickTop;
+        prevRenderTick = tickRender;
+        prevSwapTick = tickSwap;
+        havePrevTiming = true;
         ++frames;
         if ((padGetButtonsDown(&framePad) & HidNpadButton_Plus) != 0) {
             probe.frameLoopActive = false;

@@ -1,0 +1,81 @@
+# THE MANUAL CONTROL SCRIPT: PROVE THE HUMAN'S INPUT REACHES THE CAR.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# Every round so far ran with "autopilot = 1", where the PORT'S OWN CLOSED
+# LOOP owns the steering, the throttle and the brake and the human's inputs
+# are overwritten before they reach the guest.  So every measurement of "the
+# lap counter" so far has been a measurement of the AUTOPILOT's driving --
+# which is a different thing from whether the port is PLAYABLE.
+#
+# This script is the other half of the question.  It holds the accelerator
+# (the guest's BTN_A, bit 0) and WEAVES THE STEERING AXIS, so that a round
+# can show three separate things at once:
+#
+#   1. the port's own gamepad-state line: lx (what the script asked for)
+#      EQUALS guest_lx (what the guest actually received) -- the input path
+#      is intact;
+#   2. the guest's car accelerates while BTN_A is held -- the throttle
+#      reaches the car;
+#   3. the car's path curves when lx changes -- the steering reaches the car.
+#
+# THE WEAVE
+# ---------
+# The steering alternates every 150 frames between +0.5 and -0.5.  A slow
+# weave rather than a slalom, because the point is that the car's heading
+# VISIBLY follows the stick, not that the car drives well.  (Driving well is
+# the autopilot's job, and it is a different job.)
+#
+# The frames are the PORT'S frame counter, the same counter the touch script
+# uses.  At the measured frame rates (13..34 fps) 150 frames is 4..11 s.
+#
+# The format is pinned by native-switch/tests/test_guest_pad_script_format.py:
+#
+#     [at <frame>] lx=<f> ly=<f> rx=<f> ry=<f> lt=<f> rt=<f> b=<hex>
+#
+# Every key is optional and a key that is absent keeps the value it had
+# before.  `b` is a hex bitmask over the guest's ControllerButtons ordinals
+# (bit 0 = BTN_A, bit 2 = BTN_X).
+#
+# WHY BTN_A IS HELD FROM FRAME 600
+# --------------------------------
+# MEASURED 2026-11-02 (q109, archive 20261102-054302-eden-rr3-q109-confirm-
+# button): holding BTN_A over the window dismisses the guest's in-race
+# tutorial dialog -- the synthetic touch does NOT (the layer that owns the
+# coach mark is not the layer the port's touch reaches).  The same button is
+# also the accelerator, so one hold does both.
+[at 0] lx=0 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x000
+[at 600] lx=0 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 750] lx=-0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 900] lx=0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 1050] lx=-0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 1200] lx=0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 1350] lx=-0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 1500] lx=0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 1650] lx=-0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 1800] lx=0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 1950] lx=-0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 2100] lx=0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 2250] lx=-0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 2400] lx=0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 2550] lx=-0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 2700] lx=0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 2850] lx=-0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 3000] lx=0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 3150] lx=-0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 3300] lx=0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 3450] lx=-0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 3600] lx=0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 3750] lx=-0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 3900] lx=0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 4050] lx=-0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 4200] lx=0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 4350] lx=-0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 4500] lx=0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 4650] lx=-0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 4800] lx=0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 4950] lx=-0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 5100] lx=0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 5250] lx=-0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 5400] lx=0.5 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+[at 5550] lx=0 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001

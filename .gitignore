@@ -54,6 +54,9 @@ reference/
 #   .build/deploy-card-romfs.ps1     put the build's NRO + romfs on the card
 #   .build/deploy-census-conf.ps1    the census kill switch, on or off
 #   .build/run-lock-census.ps1       the census A/B: two rounds, one variable
+#   .build/run-pinned-round.ps1      one round with a named census setting
+#   .build/gate-and-round.ps1        the gate and then one round, in that order
+#   .build/retry-push.ps1            retry the push until GitHub answers again
 #
 # WHY THEY HAVE TO BE TRACKED: the archive packer silently reused a STALE
 # archive on 2026-11-03 and shipped one 1480 bytes off the package.  A fix to

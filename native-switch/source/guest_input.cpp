@@ -289,6 +289,39 @@ void logGamepadState(unsigned long long frame, const rr3::gamepad::State& canoni
                         "gamepad-state", 0, 0, detail);
 }
 
+// THE SCRIPTED PATH'S OWN INSTRUMENT.
+//
+// WHY IT IS HERE: the gamepad-state line is on the PHYSICAL path, so a round
+// whose script drove the guest had NO instrument at all -- which is exactly
+// the round where the question "did the human's input reach the car?" was
+// being asked and could not be answered.
+//
+// MEASURED 2026-11-04: the port's own loop folded its steering into the
+// script's axis, so the number the script asked for and the number the guest
+// got were two different values, and NOTHING in the log said so.  Every round
+// up to that point was therefore a measurement of the autopilot's driving
+// with no instrument saying so.
+//
+// `lx_script` is what the script asked for, `lx_guest` is what went to the
+// guest, and `loop_steered` says whether the closed loop overrode it.
+void logScriptedState(unsigned long long frame, double lxScript, double lxGuest,
+                      unsigned buttons, bool loopSteered, bool physicalActive,
+                      int mode) {
+    static unsigned long long s_lastLogged = 0;
+    if (frame < s_lastLogged + 300ULL) {
+        return;
+    }
+    s_lastLogged = frame;
+    char detail[288];
+    std::snprintf(detail, sizeof(detail),
+                  "f=%llu mode=%d path=script lx_script=%.3f lx_guest=%.3f "
+                  "buttons=0x%04x loop_steered=%d physical_active=%d",
+                  frame, mode, lxScript, lxGuest, buttons,
+                  loopSteered ? 1 : 0, physicalActive ? 1 : 0);
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "scripted-state", 0, 0, detail);
+}
+
 void** jniTable(void* env) {
     return static_cast<void**>(*static_cast<void**>(env));
 }
@@ -581,66 +614,13 @@ void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
 
     const bool driving = raceStateDriveEnabled();
     const RaceDriveState& drive = raceDriveState();
+    const int mode = g_gamepadMapping.autopilot;
 
-    if (driving) {
-        scripted.leftX = drive.steer;
-        // THE THROTTLE IS RELEASABLE.  The recovery has to reverse the car
-        // off a barrier, and the guest's own message is "hold the brake to
-        // reverse" -- which only reverses when the throttle is LET GO.
-        // Holding both was just braking, so the recovery could never free
-        // the car: measured on the guest's own controller state, button 0
-        // (the throttle) was down in every single frame of the 2026-10-28
-        // race and button 2 (the brake) was never pressed at all.
-        if (drive.throttle) {
-            scripted.buttons |= (1u << kBtnA);
-        } else {
-            scripted.buttons &= ~(1u << kBtnA);
-        }
-        if (drive.brake) {
-            scripted.buttons |= (1u << kBtnX);
-        } else {
-            scripted.buttons &= ~(1u << kBtnX);
-        }
-    }
-
-    if (scriptedActive) {
-        // The script drives the guest. The physical pad is ignored entirely
-        // while it is active, so the two can never fight over one button.
-        for (int i = 0; i < 15; ++i) {
-            const bool pressed = (scripted.buttons >> i) & 1u;
-            emitOrdinalButton(jniEnvironment, activityObject, deviceId, i,
-                              pressed, &g_lastOrdinal[i]);
-        }
-        emitAxis(jniEnvironment, activityObject, deviceId, scripted.leftX,
-                 kAxisLThumbX, &g_lastLx);
-        emitAxis(jniEnvironment, activityObject, deviceId, scripted.leftY,
-                 kAxisLThumbY, &g_lastLy);
-        emitAxis(jniEnvironment, activityObject, deviceId, scripted.rightX,
-                 kAxisRThumbX, &g_lastRx);
-        emitAxis(jniEnvironment, activityObject, deviceId, scripted.rightY,
-                 kAxisRThumbY, &g_lastRy);
-        emitAxis(jniEnvironment, activityObject, deviceId, scripted.leftTrigger,
-                 kAxisLTrigger, &g_lastLt);
-        emitAxis(jniEnvironment, activityObject, deviceId, scripted.rightTrigger,
-                 kAxisRTrigger, &g_lastRt);
-    } else {
-    // THE PHYSICAL CONTROLLER, THROUGH THE MAPPING.
+    // THE PHYSICAL CONTROLLER'S STATE, READ BEFORE THE BRANCH.
     //
-    //   libnx  ->  canonical inputs  ->  the mapping on the card  ->  the guest
-    //
-    // The canonical layer exists so the rest of the port never asks "which
-    // controller is this?".  A Pro Controller, a DualShock 4 that the
-    // console presents as a Pro Controller, and (on a CFW console, through
-    // hidretro / dinput_redux) a DualSense or an Xbox pad all arrive as
-    // the same canonical inputs, and the mapping file says what each of
-    // them does to the guest.
-    //
-    // The mapping's DEFAULTS are the port's measured behaviour, so with no
-    // file on the card this path reproduces what it always did: ZR drove
-    // BTN_A and BTN_R2 and the right trigger axis, ZL drove BTN_L2 and the
-    // left trigger axis, the left stick click drove BTN_START, the right
-    // stick click drove BTN_DPAD_CENTER, and the sticks went across as
-    // (x, -y).
+    // It used to be read INSIDE the physical branch, so the script branch
+    // could not ask whether anyone was actually using a controller.  That is
+    // the question that decides who owns the car.
     const HidAnalogStickState left = padGetStickPos(pad, 0);
     const HidAnalogStickState right = padGetStickPos(pad, 1);
     auto norm = [](int raw) {
@@ -674,6 +654,150 @@ void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
     physical.lt = triggerValue(pad, held, HidNpadButton_ZL, 0);
     physical.rt = triggerValue(pad, held, HidNpadButton_ZR, 1);
 
+    // THE SCRIPT YIELDS TO THE HUMAN.
+    //
+    // THE DEFECT THIS FIXES, MEASURED 2026-11-04: the script path was "the
+    // script drives the guest, the physical pad is ignored entirely while it
+    // is active", and the card SHIPS a script (rr3-pad.txt).  So on a console
+    // with the shipped package, the player's own controller was DEAD: the
+    // script owned every button and every axis and the game could not be
+    // played at all.
+    //
+    // ⇒ The script is an EXPERIMENT TOOL.  It drives the guest when there is
+    // nobody else: inside an emulator there is no physical controller, so the
+    // script is the only source of input and every experiment keeps working.
+    // The moment a physical controller is actually USED -- a stick off its
+    // deadzone, a trigger pulled, a button held -- the script stands down and
+    // the human drives.
+    //
+    // "actually used" and not merely "connected": a console with a pad
+    // plugged in and left on the table must not steal the input from the
+    // experiment, and a pad that is being rested on must not steal it from
+    // the script either.
+    const uint64_t kPhysicalButtons =
+        HidNpadButton_A | HidNpadButton_B | HidNpadButton_X | HidNpadButton_Y |
+        HidNpadButton_L | HidNpadButton_R | HidNpadButton_ZL |
+        HidNpadButton_ZR | HidNpadButton_Minus | HidNpadButton_Plus |
+        HidNpadButton_Left | HidNpadButton_Right | HidNpadButton_Up |
+        HidNpadButton_Down | HidNpadButton_StickL | HidNpadButton_StickR;
+    const bool physicalActive =
+        (held & kPhysicalButtons) != 0 ||
+        physical.lx != 0.0f || physical.ly != 0.0f ||
+        physical.rx != 0.0f || physical.ry != 0.0f ||
+        physical.lt > 0.0f || physical.rt > 0.0f;
+    const bool scriptDrives = scriptedActive && !physicalActive;
+    // What the script asked for, before anything can override it.  The
+    // instrument compares this with what the guest actually got.
+    const double scriptLeftX = static_cast<double>(scripted.leftX);
+
+    // THE CLOSED LOOP'S OVERRIDES, AND THE MODE THAT DECIDES THEM.
+    //
+    // The `autopilot` setting used to govern ONLY the physical-controller
+    // path, so the script path was overridden by the loop no matter what the
+    // setting said: with "autopilot = 0" the port still wrote its own
+    // steering into the script's axis and forced its own throttle.  MEASURED
+    // 2026-11-04: that is why the human's stick had never been able to reach
+    // the car, and why every round so far measured the AUTOPILOT's driving
+    // rather than whether the port is playable.
+    //
+    // ⇒ The mode decides, on BOTH paths:
+    //   auto    the loop owns the throttle, the brake and the steering axis
+    //   assist  the human wins on every control they are actively using
+    //   manual  the port does not touch the car at all
+    if (driving && mode != rr3::gamepad::kAutopilotManual) {
+        if (mode == rr3::gamepad::kAutopilotAssist) {
+            // ON THE SCRIPTED PATH THE HUMAN IS THE SCRIPT, so "actively
+            // using" means "the script moved it".
+            if (scripted.leftX == 0.0f) {
+                scripted.leftX = drive.steer;
+            }
+            if ((scripted.buttons & (1u << kBtnA)) == 0) {
+                if (drive.throttle) {
+                    scripted.buttons |= (1u << kBtnA);
+                } else {
+                    scripted.buttons &= ~(1u << kBtnA);
+                }
+            }
+            if ((scripted.buttons & (1u << kBtnX)) == 0) {
+                if (drive.brake) {
+                    scripted.buttons |= (1u << kBtnX);
+                } else {
+                    scripted.buttons &= ~(1u << kBtnX);
+                }
+            }
+        } else {
+            scripted.leftX = drive.steer;
+            // THE THROTTLE IS RELEASABLE.  The recovery has to reverse the car
+            // off a barrier, and the guest's own message is "hold the brake to
+            // reverse" -- which only reverses when the throttle is LET GO.
+            // Holding both was just braking, so the recovery could never free
+            // the car: measured on the guest's own controller state, button 0
+            // (the throttle) was down in every single frame of the 2026-10-28
+            // race and button 2 (the brake) was never pressed at all.
+            if (drive.throttle) {
+                scripted.buttons |= (1u << kBtnA);
+            } else {
+                scripted.buttons &= ~(1u << kBtnA);
+            }
+            if (drive.brake) {
+                scripted.buttons |= (1u << kBtnX);
+            } else {
+                scripted.buttons &= ~(1u << kBtnX);
+            }
+        }
+    }
+
+    if (scriptDrives) {
+        // The script drives the guest.  The physical pad is ignored ONLY
+        // while nobody is using it (see "THE SCRIPT YIELDS TO THE HUMAN"),
+        // so the two can never fight over one button.
+        for (int i = 0; i < 15; ++i) {
+            const bool pressed = (scripted.buttons >> i) & 1u;
+            emitOrdinalButton(jniEnvironment, activityObject, deviceId, i,
+                              pressed, &g_lastOrdinal[i]);
+        }
+        emitAxis(jniEnvironment, activityObject, deviceId, scripted.leftX,
+                 kAxisLThumbX, &g_lastLx);
+        emitAxis(jniEnvironment, activityObject, deviceId, scripted.leftY,
+                 kAxisLThumbY, &g_lastLy);
+        emitAxis(jniEnvironment, activityObject, deviceId, scripted.rightX,
+                 kAxisRThumbX, &g_lastRx);
+        emitAxis(jniEnvironment, activityObject, deviceId, scripted.rightY,
+                 kAxisRThumbY, &g_lastRy);
+        emitAxis(jniEnvironment, activityObject, deviceId, scripted.leftTrigger,
+                 kAxisLTrigger, &g_lastLt);
+        emitAxis(jniEnvironment, activityObject, deviceId, scripted.rightTrigger,
+                 kAxisRTrigger, &g_lastRt);
+        // THE INSTRUMENT FOR THIS PATH.  It says what the script asked for,
+        // what the guest got, whether the closed loop overrode the steering
+        // and whether a physical controller took over.  Without it a round
+        // whose script drove the guest had no instrument at all.
+        logScriptedState(g_frameCounter, scriptLeftX,
+                         static_cast<double>(scripted.leftX),
+                         scripted.buttons,
+                         scriptLeftX != static_cast<double>(scripted.leftX),
+                         physicalActive, mode);
+    } else {
+    // THE PHYSICAL CONTROLLER, THROUGH THE MAPPING.
+    //
+    //   libnx  ->  canonical inputs  ->  the mapping on the card  ->  the guest
+    //
+    // The canonical layer exists so the rest of the port never asks "which
+    // controller is this?".  A Pro Controller, a DualShock 4 that the
+    // console presents as a Pro Controller, and (on a CFW console, through
+    // hidretro / dinput_redux) a DualSense or an Xbox pad all arrive as
+    // the same canonical inputs, and the mapping file says what each of
+    // them does to the guest.
+    //
+    // The mapping's DEFAULTS are the port's measured behaviour, so with no
+    // file on the card this path reproduces what it always did: ZR drove
+    // BTN_A and BTN_R2 and the right trigger axis, ZL drove BTN_L2 and the
+    // left trigger axis, the left stick click drove BTN_START, the right
+    // stick click drove BTN_DPAD_CENTER, and the sticks went across as
+    // (x, -y).
+    //
+    // THE PHYSICAL STATE ITSELF IS READ ABOVE, before the branch, because
+    // the script branch has to know whether anyone is using a controller.
     const rr3::gamepad::State canonical =
         rr3::gamepad::canonicalFromNpad(physical);
     rr3::gamepad::GuestState guest;
@@ -693,7 +817,6 @@ void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
     // In "auto" the loop's throttle is forced ON while it is driving, which
     // is what the port has always done on this path; the scripted path
     // above is the one that can release it.
-    const int mode = g_gamepadMapping.autopilot;
     bool loopOwnsSteer = false;
     bool loopOwnsThrottle = false;
     bool loopOwnsBrake = false;

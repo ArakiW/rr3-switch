@@ -38,6 +38,36 @@ struct Point {
     double y = 0.0;
 };
 
+// THE CHUNK'S NODES IN THE PORT'S FRAME.
+//
+// The fit's transform (scale, axes, offset) was established by aligning ONE
+// chunk -- the centre line -- onto the car's path.  The other chunks of the
+// same file live in the SAME stored coordinate system, so the SAME transform
+// puts them in the port's frame too.  That is what makes the racing line
+// (ai_spline) comparable with the centre line the car is on.
+//
+// MEASURED 2026-11-04 (Spa): the centre line is 7,016.9 m a lap and the
+// racing line 6,949.8 m -- 67.0 m shorter, i.e. it cuts the corners -- and
+// the two are 2.92 m apart at the median and 8.25 m at the worst.
+void buildChunkPolyline(const RaceLine& line, const SplineChunk& chunk,
+                         std::vector<Point>* out) {
+    out->clear();
+    out->reserve(chunk.nodes.size());
+    for (const SplineNode& node : chunk.nodes) {
+        double x = static_cast<double>(node.x);
+        double y = static_cast<double>(node.y);
+        if (line.swapAxes) {
+            const double t = x;
+            x = y;
+            y = t;
+        }
+        if (line.flipX) x = -x;
+        if (line.flipY) y = -y;
+        out->push_back(Point{x * line.scale + line.offsetX,
+                             y * line.scale + line.offsetY});
+    }
+}
+
 // The stored nodes, in the candidate's axes and scale.
 void transform(const SplineChunk& chunk, const Variant& variant, double scale,
                std::vector<Point>* out) {
@@ -335,20 +365,7 @@ bool raceLineTarget(const RaceLine& line, const SplineFile& spline,
     }
     // The nodes in the port's frame.
     std::vector<Point> poly;
-    poly.reserve(chunk->nodes.size());
-    for (const SplineNode& node : chunk->nodes) {
-        double x = static_cast<double>(node.x);
-        double y = static_cast<double>(node.y);
-        if (line.swapAxes) {
-            const double t = x;
-            x = y;
-            y = t;
-        }
-        if (line.flipX) x = -x;
-        if (line.flipY) y = -y;
-        poly.push_back(Point{x * line.scale + line.offsetX,
-                             y * line.scale + line.offsetY});
-    }
+    buildChunkPolyline(line, *chunk, &poly);
 
     // The nearest node.
     size_t nearest = 0;
@@ -444,6 +461,59 @@ bool raceLineTarget(const RaceLine& line, const SplineFile& spline,
         index = next;
     }
     return false;
+}
+
+// THE CAR'S DISTANCE FROM A CHUNK, IN METRES.
+//
+// WHY IT IS HERE: the port follows the CENTRE line, and the track's own
+// racing line (ai_spline) is a different line -- 67 m shorter a lap on Spa,
+// and up to 8.25 m away from the centre line.  A car that hits the barriers
+// ten times a race while sitting within 2 m of the centre line is on the
+// wrong line, and the number that says so is the car's distance from the
+// racing line.
+//
+// The distance is to the nearest SEGMENT, not the nearest node: the nodes
+// are ~8 m apart, so a node distance would overstate it by metres.
+//
+// The transform is the one the fit established, so the two lines are in the
+// same frame and the comparison is meaningful.
+bool raceLineDistanceToChunk(const RaceLine& line, const SplineFile& spline,
+                             const char* chunkName,
+                             double carX, double carY, double* metres) {
+    if (!line.valid || metres == nullptr || chunkName == nullptr) {
+        return false;
+    }
+    const SplineChunk* chunk = spline.chunk(chunkName);
+    if (chunk == nullptr || chunk->nodes.size() < 8) {
+        return false;
+    }
+    std::vector<Point> poly;
+    buildChunkPolyline(line, *chunk, &poly);
+    double best = 1e30;
+    for (size_t i = 0; i < poly.size(); ++i) {
+        const Point& a = poly[i];
+        const Point& b = poly[(i + 1) % poly.size()];
+        const double dx = b.x - a.x;
+        const double dy = b.y - a.y;
+        const double length2 = dx * dx + dy * dy;
+        if (length2 <= 0.0) {
+            continue;
+        }
+        double t = ((carX - a.x) * dx + (carY - a.y) * dy) / length2;
+        if (t < 0.0) t = 0.0;
+        if (t > 1.0) t = 1.0;
+        const double qx = a.x + dx * t;
+        const double qy = a.y + dy * t;
+        const double d = (carX - qx) * (carX - qx) + (carY - qy) * (carY - qy);
+        if (d < best) {
+            best = d;
+        }
+    }
+    if (best >= 1e30) {
+        return false;
+    }
+    *metres = std::sqrt(best) / 256.0;
+    return true;
 }
 
 }  // namespace rr3
