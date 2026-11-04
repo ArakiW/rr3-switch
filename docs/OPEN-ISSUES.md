@@ -679,10 +679,11 @@ most once per 1,200 frames, so it cannot become a recovery loop.
 drives on.
 
 **⇒ BUT THE LAP COUNTER IS STILL −1, AND NOW THE REASON IS CLEAR.** The car
-is at 10.35 % of a lap and spends **40 % of the race stuck against
-barriers** (10 recoveries in 193 samples). At the rate it makes progress when
-it is NOT stuck (178 units a frame) a lap is ~10,000 frames; at the rate it
-actually manages it is ~56,000 frames. **⇒ The next lever is not the pursuit
+is at 10.35 % of a lap and spends **41.5 % of the race in a recovery** — the
+brake was held in **80 of 193 samples** and the recovery fired **10 times**.
+At the rate it makes progress when it is NOT stuck (178 units a frame) a lap
+is ~10,000 frames; at the rate it actually manages it is ~56,000 frames.
+**⇒ The next lever is not the pursuit
 any more, it is the quality of the line following** — the look-ahead distance
 (20 m), the steering gain, and how much of the track the car can actually
 hold. The car is on the line to within 2 m, but it is still hitting the
@@ -1101,7 +1102,8 @@ distance from 8.65 % to **10.35 %** of a lap, and the recoveries from 4 to
 **10** — the car gets free and drives on instead of flat-lining.
 
 ⇒ **The lap counter is still −1, and now the reason is clear**: the car
-spends **40 % of the race stuck against barriers**. At the rate it makes
+spends **41.5 % of the race in a recovery** (the brake held in 80 of 193
+samples; the recovery fired 10 times). At the rate it makes
 progress when it is not stuck (178 units a frame) a lap is ~10,000 frames; at
 the rate it actually manages, ~56,000. **⇒ The next lever is the quality of
 the line following** — the look-ahead distance (20 m), the steering gain, and
