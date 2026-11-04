@@ -50,10 +50,17 @@ reference/
 #   .build/run-repack.ps1            the chain: archive -> parts -> app -> join
 #   .build/rebuild-deliverables.ps1  refresh the tree, then PROVE the NRO in it
 #   .build/run-round.ps1             build -> gate -> deploy -> Eden, in one go
+#   .build/deploy-nro.ps1            put ONE named NRO on the card (the A/B tool)
+#   .build/deploy-card-romfs.ps1     put the build's NRO + romfs on the card
+#   .build/deploy-census-conf.ps1    the census kill switch, on or off
+#   .build/run-lock-census.ps1       the census A/B: two rounds, one variable
 #
 # WHY THEY HAVE TO BE TRACKED: the archive packer silently reused a STALE
 # archive on 2026-11-03 and shipped one 1480 bytes off the package.  A fix to
 # a script that nobody can recover from a commit is a fix that does not exist.
+# The same is true of the EXPERIMENT scripts: a measurement nobody can repeat
+# is a measurement nobody can check, and the census A/B is the measurement the
+# frame-rate question now rests on.
 native-switch/build/
 native-switch/*.nro
 native-switch/*.elf

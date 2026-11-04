@@ -823,17 +823,38 @@ void noteFace(const char* romfsPath, FT_Face face, FT_Error error, float sizePx,
     // in turn, so a single global key alternates for ever and the dedup never
     // fires: one run logged 50,064 of these lines for 4,045 createTexture()
     // calls, which is most of a 60 MB log.
-    static char seenKeys[8][96] = {{0}};
+    //
+    // AND THE TABLE HAS TO BE BIGGER THAN THE NUMBER OF DISTINCT KEYS.
+    // MEASURED 2026-11-04 (q142, archive
+    // 20261104-145617-eden-rr3-q142-corners): the 8-slot table was smaller
+    // than the number of (face, size) pairs the guest asks for -- seven
+    // faces at dozens of sizes each -- so the cache thrashed and the run
+    // wrote 33,643 of these lines.  That is 16 % of the whole guest log, and
+    // every line is one fprintf plus one fflush on the emulated card.
+    //
+    // The key is a 64-bit hash of the pair instead of the pair itself, so
+    // the table costs 32 KB instead of 200 KB of strings.  A collision can
+    // only cost one diagnostic line.
+    constexpr size_t kGlyphFaceSlots = 4096;
+    static uint64_t seenHashes[kGlyphFaceSlots] = {0};
     static size_t seenCount = 0;
-    char key[96];
-    snprintf(key, sizeof(key), "%s|%.1f", romfsPath, sizePx);
+    uint64_t hash = 1469598103934665603ULL;
+    for (const char* p = romfsPath; p != nullptr && *p != '\0'; ++p) {
+        hash ^= static_cast<uint8_t>(*p);
+        hash *= 1099511628211ULL;
+    }
+    hash ^= static_cast<uint64_t>(static_cast<int64_t>(sizePx * 16.0));
+    hash *= 1099511628211ULL;
+    if (hash == 0) {
+        hash = 1;
+    }
     for (size_t i = 0; i < seenCount; ++i) {
-        if (strcmp(seenKeys[i], key) == 0) {
+        if (seenHashes[i] == hash) {
             return;
         }
     }
-    if (seenCount < 8) {
-        snprintf(seenKeys[seenCount], sizeof(seenKeys[seenCount]), "%s", key);
+    if (seenCount < kGlyphFaceSlots) {
+        seenHashes[seenCount] = hash;
         ++seenCount;
     }
     const float em = face != nullptr && face->size != nullptr

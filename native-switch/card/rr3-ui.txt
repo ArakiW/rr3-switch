@@ -37,3 +37,16 @@
 #     BTN_CONTINUE          the continue button, on 72 screens
 #     BANK_SCROLLER         the bank screen's scroller
 #     SCROLLER_FRAME        a frame inside a screen
+
+#
+# START THE RACE BY ITS CONTROL ID, NOT BY A PIXEL AND NOT BY A FRAME.
+# The id is the guest's own: MainMenu.gui declares BTN_RACE at
+# x=0.509 y=0.781 w=0.460 h=0.144 (relative), which on a 1280x720 screen
+# is (652..1241, 562..666) -- the orange race button.
+# A semantic request has NO frame budget: the port presses it when the
+# control exists, at the rectangle the guest's own screen tree gives.
+# MEASURED 2026-11-04: the frame-indexed pixel tap on the same button
+# never fired (the menu phase runs at 3..4.5 fps, so the script's frame
+# 5500 is 80 minutes away) and a tap in the wrong frame lands in a gap
+# where no screen is up at all.
+BTN_RACE

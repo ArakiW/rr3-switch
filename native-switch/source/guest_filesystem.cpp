@@ -26,6 +26,46 @@
 #include <vector>
 
 namespace rr3 {
+// THE PATH-RESOLUTION LOG, DEDUPED.
+//
+// The guest asks for the same paths over and over -- a font, a texture, a
+// track -- and every one of those asks was written to the guest-view log.
+// MEASURED 2026-11-04 (q142, archive
+// 20261104-145617-eden-rr3-q142-corners): 31,315 "map-app" lines, 15 % of
+// the whole log, and every one of them is an fprintf plus an fflush on the
+// emulated card.
+//
+// The set of DISTINCT paths a run resolves is small (tens to hundreds), so a
+// hash set of the paths already reported keeps the information and drops the
+// repetition.  The key is a 64-bit hash, so a collision can only cost one
+// diagnostic line.
+void logResolvedPathOnce(const char* path) {
+    constexpr size_t kPathSlots = 2048;
+    static uint64_t seen[ kPathSlots ] = {0};
+    static size_t seenCount = 0;
+    if (path == nullptr || path[0] == '\0') {
+        return;
+    }
+    uint64_t hash = 1469598103934665603ULL;
+    for (const char* p = path; *p != '\0'; ++p) {
+        hash ^= static_cast<uint8_t>(*p);
+        hash *= 1099511628211ULL;
+    }
+    if (hash == 0) {
+        hash = 1;
+    }
+    for (size_t i = 0; i < seenCount; ++i) {
+        if (seen[i] == hash) {
+            return;
+        }
+    }
+    if (seenCount < kPathSlots) {
+        seen[seenCount] = hash;
+        ++seenCount;
+    }
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "map-app", 0, 0, path);
+}
 // A forward declaration for the SHARED OVERRIDE SET: the ONE set the base-list
 // rewrite, the per-category gui list rewrite, the completed gui-assets
 // manifest, the census, the inventory and the digest audit all read, so none
@@ -1405,8 +1445,7 @@ bool mapAppRootToContent(const char* path, bool writing, Resolution& resolution)
         if (!docOk) {
             return false;
         }
-        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
-                            "map-app", 0, 0, resolution.primary);
+        logResolvedPathOnce(resolution.primary);
         return true;
     }
     // Only true save/cloudcell sidecars stay on SD. Do NOT exclude every
@@ -1644,8 +1683,7 @@ bool mapAppRootToContent(const char* path, bool writing, Resolution& resolution)
                               "%s", cardPath);
             }
         }
-        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
-                            "map-app", 0, 0, resolution.primary);
+        logResolvedPathOnce(resolution.primary);
     }
     return ok;
 }

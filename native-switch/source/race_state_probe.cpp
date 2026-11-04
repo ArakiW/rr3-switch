@@ -902,6 +902,20 @@ constexpr float kDriveRecoveryMagnitude = 0.60f;
 // How long the recovery holds the brake: ~7.3 s at 30.35 ms/frame.  The old
 // value, 45 frames, is a TAP, and a tap does not reverse anything.
 constexpr unsigned long long kDriveRecoveryFrames = 240ULL;
+// A CAR THAT IS PINNED, as opposed to one that is crawling.
+//
+// The stall test asks "has the car made a METRE of progress", and the metre
+// is too coarse to tell a car that is crawling at less than a metre a second
+// from a car that is pressed against a barrier.  The car's own position
+// tells them apart: 1 metre of world movement, for 1,200 frames.
+//
+// MEASURED 2026-11-04 (q143): the pinned car's spline node index stood at
+// 319 for 2,700 frames and its distance moved 10 units per 30 frames, while
+// the lateral residual was 2.07 m -- inside the "on the line" exemption that
+// keeps the recovery from firing.  The recovery never ran, and the car never
+// moved again.
+constexpr double kPinnedDistance = 256.0;
+constexpr unsigned long long kPinnedFrames = 1200ULL;
 uint32_t g_lastTotalLaps = 0xFFFFFFFFu;
 unsigned long long g_brakeUntilFrame = 0;
 unsigned long long g_lastFlipFrame = 0;
@@ -985,6 +999,24 @@ struct RaceLineState {
     double headingX = 0.0;
     double headingY = 0.0;
     bool haveHeading = false;
+    // THE DIRECTION ROUND THE TRACK, LOCKED FOR THE WHOLE RACE.
+    //
+    // 0 means "not decided yet"; +1/-1 is the decision.  It is decided ONCE,
+    // from a WINDOWED motion vector (the car's displacement over the whole
+    // position ring), and then held: the track does not change direction
+    // while the car drives on it.
+    //
+    // MEASURED 2026-11-04 (q142): re-deciding it every frame made the
+    // look-ahead point jump to the other side of the car whenever the car's
+    // direction of travel reversed.  The controller then saw the sum of two
+    // flips and slammed full lock first one way and then the other; the car
+    // drove 6,581 units backwards and the pursuit never settled.
+    int direction = 0;
+    // The car's displacement over the position ring: a motion vector that a
+    // single-frame wobble cannot reverse.
+    double motionX = 0.0;
+    double motionY = 0.0;
+    bool haveMotion = false;
     uint32_t generation = 0;
     uint64_t lastFitFrame = 0;
     bool fitted = false;
@@ -1033,6 +1065,12 @@ bool refreshRaceLine(unsigned long long frame) {
     }
     gRaceLine.line = line;
     gRaceLine.fitted = true;
+    // A NEW TRACK IS A NEW RACE.  Which way round THIS track is has to be
+    // decided again: the spline's node order and the way the car drives on
+    // it belong to the track, not to the process.
+    if (gRaceLine.generation != generation) {
+        gRaceLine.direction = 0;
+    }
     gRaceLine.generation = generation;
     gRaceLine.lastFitFrame = frame;
     return true;
@@ -1072,6 +1110,27 @@ void rememberRaceLinePosition(int32_t carX, int32_t carY) {
     gRaceLine.head = (gRaceLine.head + 1) % kRaceLineSamples;
     if (gRaceLine.count < kRaceLineSamples) {
         ++gRaceLine.count;
+    }
+    // THE WINDOWED MOTION VECTOR.
+    //
+    // The ring now holds the car's last kRaceLineSamples positions, so the
+    // oldest one (at `head`, the slot the next write will overwrite) is
+    // kRaceLineSamples movements back.  The displacement across that window
+    // is the car's direction of travel averaged over dozens of frames, which
+    // a single-frame wobble -- a kerb, a bump, a one-frame reversal -- cannot
+    // reverse.  It is what the direction round the track is decided from.
+    if (gRaceLine.count >= kRaceLineSamples) {
+        const size_t oldest = gRaceLine.head;
+        const double mx = x - gRaceLine.x[oldest];
+        const double my = y - gRaceLine.y[oldest];
+        const double length = std::sqrt(mx * mx + my * my);
+        // 20 m in port units: below that the car has not really travelled
+        // yet and the vector is mostly noise.
+        if (length > 5120.0) {
+            gRaceLine.motionX = mx / length;
+            gRaceLine.motionY = my / length;
+            gRaceLine.haveMotion = true;
+        }
     }
 }
 
@@ -1183,7 +1242,20 @@ void fillCarState(RaceMetricsSample* out) {
             if (rr3::raceLineTarget(gRaceLine.line, *spline,
                                     static_cast<double>(out->carX),
                                     static_cast<double>(out->carY),
-                                    gRaceLine.headingX, gRaceLine.headingY,
+                                    // THE WINDOWED MOTION VECTOR, not the
+                                    // instantaneous heading.  The direction
+                                    // round the track is decided ONCE, from a
+                                    // vector that dozens of frames of travel
+                                    // agree on; the instantaneous heading
+                                    // reverses the moment the car is nudged,
+                                    // and MEASURED 2026-11-04 (q142) that
+                                    // moved the look-ahead point to the other
+                                    // side of the car and started a loop
+                                    // that ended with the car driving
+                                    // backwards at 5 % of a lap.
+                                    gRaceLine.haveMotion ? gRaceLine.motionX : 0.0,
+                                    gRaceLine.haveMotion ? gRaceLine.motionY : 0.0,
+                                    &gRaceLine.direction,
                                     kRaceLineLookAheadMetres, &targetX,
                                     &targetY)) {
                 out->carTargetX = static_cast<int32_t>(targetX);
@@ -2124,9 +2196,55 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
     // line -- the one thing that is certainly wrong.
     //
     // So the stall test also requires that the car is OFF the line.
+    //
+    // AND A CAR THAT IS PINNED IS ON THE RACING LINE TOO.
+    //
+    // MEASURED 2026-11-04 (q143): that exemption is what pinned a car that
+    // was genuinely STUCK.  The car reached 8.95 % of a lap (161,757 units)
+    // and then stopped for good: the guest's own spline node index stood at
+    // 319 for 2,700 frames and the distance moved 10 units per 30 frames
+    // (about 1.3 mm a frame), while the lateral residual was 2.07 m -- INSIDE
+    // the 3 m exemption -- and the throttle was on.  The recovery never fired,
+    // because the exemption said "on the line", and the car stayed pinned for
+    // the rest of the round.
+    //
+    // THE DISCRIMINATOR IS THE CAR'S OWN POSITION, NOT THE PROGRESS METER.
+    // The progress metric has a one-metre granularity, so a car that crawls
+    // at less than a metre a second and a car that is pressed against a
+    // barrier look exactly the same to it.  A crawling car's POSITION
+    // changes; a pinned car's does not.
+    //
+    // AND THE START SEQUENCE IS STILL PROTECTED: there the position does not
+    // change either, because the guest holds the car at the grid.  So the
+    // pinned test also requires that the car has ALREADY made progress in
+    // this race: a car that has never moved is being HELD, not stuck.
+    bool pinned = false;
+    {
+        static double s_posX = 0.0;
+        static double s_posY = 0.0;
+        static unsigned long long s_posMoveFrame = 0;
+        static bool s_havePos = false;
+        const double px = static_cast<double>(m.carX);
+        const double py = static_cast<double>(m.carY);
+        if (!s_havePos) {
+            s_posX = px;
+            s_posY = py;
+            s_posMoveFrame = frame;
+            s_havePos = true;
+        } else {
+            const double dx = px - s_posX;
+            const double dy = py - s_posY;
+            if (dx * dx + dy * dy >= kPinnedDistance * kPinnedDistance) {
+                s_posX = px;
+                s_posY = py;
+                s_posMoveFrame = frame;
+            }
+        }
+        pinned = g_sawProgress && frame - s_posMoveFrame > kPinnedFrames;
+    }
     const bool onLine = m.targetFromLine && m.lineResidual > 0.0f &&
                         m.lineResidual < 3.0f;
-    if (g_lastProgressFrame != 0 && !onLine &&
+    if (g_lastProgressFrame != 0 && (!onLine || pinned) &&
         frame - g_lastProgressFrame > 240ULL) {
         ++g_drive.stalls;
         g_drive.bestRate = 0.0f;
@@ -2360,6 +2478,30 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
     }
     if (g_drive.steer < -1.0f) {
         g_drive.steer = -1.0f;
+    }
+    // THE THROTTLE IS LET GO WHEN THE CAR IS POINTING THE WRONG WAY.
+    //
+    // An error of more than ~86 degrees means the car is not on the line
+    // pointing along it: it is spun, or it is facing back down the track.
+    // Full throttle at full lock in that state does not turn the car
+    // around -- it swings the car PAST the target, the car ends up
+    // travelling backwards, the travel direction reverses, and the error
+    // flips again.
+    //
+    // MEASURED 2026-11-04 (q142, archive
+    // 20261104-145617-eden-rr3-q142-corners): the error went to -3.0505 rad
+    // at frame 1950 and the car then lost 6,581 units of progress between
+    // frames 2010 and 2040 -- it drove BACKWARDS -- while the error swung
+    // between -3.05 and +2.99 rad from one sample to the next.  The error
+    // itself was not noise: the car really was going the wrong way.  The
+    // throttle was what turned a turn-around into a spin.
+    //
+    // So the throttle is released and the car coasts round the turn.  The
+    // brake stays off: the guest reverses only when the brake is held AND
+    // the throttle is let go, and a car that reverses here is the loop this
+    // whole thing is about.
+    if (pursuit && std::fabs(steerError) > 1.5) {
+        g_drive.throttle = false;
     }
 }
 

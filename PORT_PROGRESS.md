@@ -13750,3 +13750,133 @@ boot.  The pass now compares and writes nothing when they match:
 
 **6,628 ms -> 2,843 ms on Eden (2.33x), and the three costs are separated for
 the first time: the write was the other ~6,000 ms.**
+
+### THE FIRST REAL RACE (q142), AND THE DIRECTION THAT WAS DECIDED EVERY FRAME
+
+q142 is the first archived round in which the game ran a RACE for thousands of
+frames (4,200 of them), so the pursuit could be measured instead of inferred.
+
+**AND THE RACE NEVER NEEDED THE TOUCH SCRIPT.**  MEASURED:
+
+    phase=ui-press ... kind=orange x=1105 y=695 area=8180 w=326 h=45  (frame 420)
+
+The port's own red-glove follower presses the race button, at the rectangle
+the guest scissors every frame as `glScissor x=994 y=667 w=187 h=53`.  The
+frame-450 pixel tap shipped in the previous commit is withdrawn; the SEMANTIC
+request (`BTN_RACE` in rr3-ui.txt, found in the guest's own MainMenu.gui by
+tools/find_gui_button.py) takes its place, and the port presses a control only
+while that control EXISTS -- so in the race screen it is a no-op.
+
+**WHAT THE PURSUIT DID OVER 4,200 FRAMES**
+
+    race samples        141 (frames 570..4770, 4200 frames of race)
+    progress            total 0 -> 91810  = 5.08 % of a lap (the lap is 1806336)
+    pursuit error       perr min -3.0505 max 3.0260 rad  (63/141 samples behind the car)
+    lateral residual    lres max 2.00
+    stalls / flips      6 / 3
+
+The car was 2 m from the line, the look-ahead point was 16..43 m away, and the
+error was still 180 degrees.  That is not geometry: a car 2 m from the line
+with a target 20 m ahead cannot be more than atan(2/20) ~ 6 degrees off.  The
+only way to get 180 degrees is that the car's own direction of travel had
+REVERSED -- and the port was making it reverse:
+
+    int step = 1;
+    if (headingX != 0.0 || headingY != 0.0) {
+        ...
+        if (backward > forward) { step = -1; }   // <- re-decided EVERY frame
+
+The target jumped to the other side of the car, the controller saw the sum of
+two flips and slammed full lock, and the car drove backwards (6,581 units of
+progress lost between frames 2010 and 2040), which reversed the heading again.
+
+**THE FIX**: the direction belongs to the RACE, not to the frame.  It is now
+locked (an in/out argument of raceLineTarget, so the function stays free of
+hidden state and the host self-test can drive it), it is decided ONCE from a
+windowed motion vector -- the car's displacement over the whole 48-sample
+position ring, which a single-frame wobble cannot reverse -- and the throttle
+is let go when the error is more than ~86 degrees, because a car that is
+spun or facing back down the track has to turn around and full throttle at
+full lock turns a turn-around into a spin.
+
+**MEASURED (q143, the next build):**
+
+                       q142 (before)   q143 (after)
+    target behind the car   63/141 = 45 %   21/160 = 13 %
+    distance covered        5.08 % of a lap   8.65 % of a lap
+    frames of race               4,200            4,770
+
+### THE FRAME RATE IS A PHASE MEASUREMENT, AND THE CPU IS THE SAME IN BOTH PHASES
+
+Every healthy round of 2026-11-03/04 uses **1.39..1.56 cores of CPU**, and the
+frame rate still varies 4.9x across the same builds (2.35 fps in q133, 11.44
+in q142).  The extra time per frame is therefore WAITING, not computing.
+"3..4.5 fps" was the MENU phase; the race phase does 15..17 fps on Eden.
+
+**THE CENSUS A/B, at last (q143 census=off, q144 census=on -- the same build
+330cd54d, the same card, the same scripts, 405 s each, one file different):**
+
+                       census=off    census=on     difference
+    frames                  5,410        5,481      +1.3 %
+    log bytes          34,085,625    35,856,215      +5.2 %
+    CPU cores                 1.299         1.416      +9.0 %
+    CPU seconds               513.3        559.5      +9.0 %
+
+=> THE CENSUS IS NOT THE FRAME-RATE LEVER.  It costs ~9 % of the CPU and ~5 %
+of the log and buys nothing in frames (+1.3 % is noise).  It also does not
+perturb the driving (13 % vs 14 % of the samples with the target behind the
+car).  And the PNG capture is now excluded a third time, and cleanly: the
+probe conf says pngfrom=1300 and q143's race started at frame 630, so the
+MENU phase -- the slow phase -- captured no PNG at all and still ran at
+4.8 fps.
+
+### THE CAR WAS PINNED AGAINST A BARRIER, AND THE STALL TEST SAID "ON THE LINE"
+
+MEASURED (q143): the car reached its best at frame ~1,830 (161,757 units =
+8.95 %) and then stopped for good.  From frame ~2,700 to the end of the round
+the guest's own SPLINE NODE INDEX stood at 319 and the distance moved by 10
+units per 30 frames -- about 1.3 mm a frame -- with the throttle on and the
+pursuit's error small and steady.
+
+And the reason is in the port:
+
+    const bool onLine = m.targetFromLine && m.lineResidual > 0.0f &&
+                        m.lineResidual < 3.0f;
+    if (g_lastProgressFrame != 0 && !onLine &&
+        frame - g_lastProgressFrame > 240ULL) { /* the recovery */ }
+
+A car that is ON the line is never recovered, because the rule was "a car on
+the racing line that is not advancing is being HELD (the start sequence holds
+the car at the grid) or it is CRAWLING" (q117).  The pinned car's lateral
+residual was 2.07 m -- INSIDE the 3 m exemption -- so the recovery never ran.
+
+FIXED, and the discriminator is the car's own POSITION, not the progress
+meter: the progress metric has a one-metre granularity, so a car crawling at
+less than a metre a second and a car pressed against a barrier look exactly
+the same to it.  A crawling car's position changes; a pinned car's does not.
+The test is "the world position has not moved by a metre for 1,200 frames",
+and it also requires that the car has ALREADY made progress in the race --
+otherwise the start sequence's hold at the grid is a pinned car too.  The
+recovery fires at most once per 1,200 frames, so it cannot become a loop.
+
+### THE PORT'S OWN LOG WAS 31 % REPETITIVE
+
+q142's guest-view log was 45.2 MB / 205,983 lines in 409 s -- 504 lines a
+second, each an fprintf plus an fflush on the emulated card -- and 31 % of it
+was the same two lines again:
+
+    glyph-face      33,643 lines  (16 %)   the dedup table held EIGHT (face, size)
+                                           pairs and the guest names 7 faces at
+                                           dozens of sizes each, so it thrashed
+    map-app         31,315 lines  (15 %)   and it had NO dedup at all
+
+Fixed: 4096 slots keyed by a 64-bit hash of the (face, size) pair, and a
+2048-slot hash set of the paths already reported.  MEASURED (q143): the log
+went from 205,983 lines / 45.2 MB to 165,107 lines / 34.1 MB at the same wall
+clock -- -20 % of the volume.  The frame-rate effect is NOT measured: the
+port's probes have already been excluded twice by measurement, and the log
+writer does not fsync.
+
+**AND THE BUILD IS BYTE-REPRODUCIBLE**: the gate rebuilds the NRO from the
+same tree and gets the same sha256 (1A155B37929AB0FB...), which is what makes
+the deliverable's four-way cross-proof meaningful.

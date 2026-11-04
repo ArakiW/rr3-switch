@@ -124,8 +124,17 @@ int main() {
     }
     double tx = 0.0;
     double ty = 0.0;
-    const bool got = rr3::raceLineTarget(line, file, px, py, hx, hy, 20.0, &tx, &ty);
+    // THE LOCK.  The direction belongs to the race, not to the frame: it is
+    // decided once and then held.  MEASURED 2026-11-04 (q142): re-deciding
+    // it every frame moved the look-ahead point to the other side of the car
+    // whenever the car's direction of travel reversed, and the controller
+    // slammed full lock first one way and then the other.
+    int direction = 0;
+    const bool got = rr3::raceLineTarget(line, file, px, py, hx, hy, &direction,
+                                          20.0, &tx, &ty);
     check(got, "a target is produced");
+    check(direction == 1 || direction == -1,
+          "the direction round the track is decided and reported back");
     if (got) {
         const double distance = std::sqrt((tx - px) * (tx - px) +
                                           (ty - py) * (ty - py)) / 256.0;
@@ -151,10 +160,18 @@ int main() {
         // heading in, and it is what the pursuit needs -- the look-ahead
         // point has to be AHEAD of the car, and the spline's node order does
         // not necessarily run the way the car drives.
+        //
+        // AND THE LOCK OVERRIDES THE HEADING.  A locked race does not change
+        // its direction round the track because the car was nudged, so the
+        // opposite heading with the SAME lock has to produce the SAME side.
         double bx = 0.0;
         double by = 0.0;
+        // A FRESH decision (direction 0): an unlocked race that is handed
+        // the opposite heading has to pick the other side of the line.
+        int backDirection = 0;
         const bool gotBack =
-            rr3::raceLineTarget(line, file, px, py, -hx, -hy, 20.0, &bx, &by);
+            rr3::raceLineTarget(line, file, px, py, -hx, -hy, &backDirection,
+                                20.0, &bx, &by);
         check(gotBack, "a target is produced for the opposite heading");
         if (gotBack) {
             const double forwardDot = (tx - px) * hx + (ty - py) * hy;
@@ -167,11 +184,32 @@ int main() {
             check((tx - px) * (bx - px) + (ty - py) * (by - py) < 0.0,
                   "the two targets are on opposite sides of the car");
         }
+
+        // THE LOCK HOLDS.  The same locked direction, with the heading
+        // reversed, has to keep the target on the SAME side of the car.
+        // This is the case that was measured failing in q142: the target
+        // jumped to the other side, the error became the sum of two flips,
+        // and the car drove backwards.
+        double lx = 0.0;
+        double ly = 0.0;
+        int lockedDirection = direction;
+        const bool gotLocked =
+            rr3::raceLineTarget(line, file, px, py, -hx, -hy, &lockedDirection,
+                                20.0, &lx, &ly);
+        check(gotLocked, "a locked race produces a target");
+        if (gotLocked) {
+            check(lockedDirection == direction,
+                  "the lock is not changed by a reversed heading");
+            check((tx - px) * (lx - px) + (ty - py) * (ly - py) > 0.0,
+                  "a locked race keeps the target on the same side of the car");
+        }
     }
 
     // THE GUARD: a car that is NOT on the line must be refused.
+    int refusedDirection = 0;
     const bool refused = !rr3::raceLineTarget(line, file, px + 40000.0,
                                                py + 40000.0, 0.0, 0.0,
+                                               &refusedDirection,
                                                20.0, &tx, &ty);
     check(refused, "a car far from the line is refused");
 

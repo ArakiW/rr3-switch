@@ -204,8 +204,6 @@ at 4840 913 500 up
 at 5000 913 500 down
 at 5040 913 500 up
 
-# HOP 6 -- the car select screen's START THE RACE, (1114, 698).
-
 # HOP 7 -- the CONTINUE button of the modal that appears when the track
 # load finishes.  The load finishes when the assets finish arriving, and
 # that is not a fixed frame, so the click is repeated across the window
@@ -220,29 +218,3 @@ at 11800 855 484 down
 at 11840 855 484 up
 at 13400 855 484 down
 at 13440 855 484 up
-
-
-#
-# the car-select screen, with gaps where no screen is up at all, and the
-# menu phase runs at about 3..4.5 fps -- so the script's old frame 5500
-
-#
-# the car-select screen, with gaps where no screen is up at all, and the
-# menu phase runs at about 3..4.5 fps -- so the script's old frame 5500
-
-#
-# the car-select screen, with gaps where no screen is up at all, and the
-# menu phase runs at about 3..4.5 fps -- so the script's old frame 5500
-
-#
-# THE TAPS THAT START THE RACE.
-# MEASURED 2026-11-04 (q138): the race button is the bottom-right one --
-# the guest scissors it every frame as (994,667,187,53), so its centre is
-# about (1087, 693).  The screen timeline shows the game CYCLING through
-# the car-select screen, with gaps where no screen is up at all, and the
-# menu phase runs at about 3..4.5 fps -- so the script's old frame 5500
-# never fires in a 600 s round (it needs 13,440 frames, about 80
-# minutes).  Hence several taps, spread over the frames where the button
-# is actually up.
-at 450 1114 698 down
-at 490 1114 698 up

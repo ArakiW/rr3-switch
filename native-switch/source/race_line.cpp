@@ -324,6 +324,7 @@ bool raceLineFit(const SplineFile& spline, const char* chunkName,
 
 bool raceLineTarget(const RaceLine& line, const SplineFile& spline,
                     double carX, double carY, double headingX, double headingY,
+                    int* direction,
                     double lookAheadMetres, double* targetX, double* targetY) {
     if (!line.valid || targetX == nullptr || targetY == nullptr) {
         return false;
@@ -386,8 +387,23 @@ bool raceLineTarget(const RaceLine& line, const SplineFile& spline,
     //
     // So the direction comes from the CAR: the step away from the nearest
     // node has to agree with the car's heading.
+    //
+    // AND IT IS DECIDED ONCE.  MEASURED 2026-11-04 (q142): re-deciding it
+    // every frame made the look-ahead point jump to the other side of the car
+    // whenever the car's direction of travel reversed, and the error the
+    // controller saw was the SUM of two flips (~180 + ~180), so it slammed
+    // full lock first one way and then the other.  The car drove backwards,
+    // which reversed the heading again, and the loop never settled: the car
+    // reached 5.08 % of a lap and stopped there.
+    //
+    // The track does not change direction while the car drives on it, so the
+    // decision belongs to the race.  `direction` carries it in and out; the
+    // caller owns it, which keeps this function free of hidden state.
     int step = 1;
-    if (headingX != 0.0 || headingY != 0.0) {
+    if (direction != nullptr && *direction != 0) {
+        // LOCKED.  The race already decided which way round the track is.
+        step = (*direction > 0) ? 1 : -1;
+    } else if (headingX != 0.0 || headingY != 0.0) {
         const size_t next = (nearest + 1) % poly.size();
         const size_t prev = (nearest + poly.size() - 1) % poly.size();
         const double fx = poly[next].x - poly[nearest].x;
@@ -401,6 +417,9 @@ bool raceLineTarget(const RaceLine& line, const SplineFile& spline,
         // spline's own order is kept.
         if (backward > forward) {
             step = -1;
+        }
+        if (direction != nullptr) {
+            *direction = step;
         }
     }
 

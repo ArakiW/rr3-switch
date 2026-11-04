@@ -376,6 +376,63 @@ void logSample(unsigned long long frame, const UiControlSample& sample) {
         }
     }
     appendGuestBootLine(kGuestViewLogPath, "ui-ctl", 130, 0, detail);
+
+    // THE BOTTOM-RIGHT CONTROLS, ON THEIR OWN LINE.
+    //
+    // WHY: the list above is capped at 44 entries, and the walk finds 1193
+    // controls on the car-select screen -- so the control that starts the
+    // race was never in the log.  MEASURED 2026-11-04: the guest scissors
+    // the race button every frame as (994,667,187,53), i.e. it is in the
+    // bottom-right corner, and it was still not in the line.
+    //
+    // The action buttons of every screen live in that corner, so that corner
+    // is worth a line of its own, uncapped.
+    {
+        char corner[3072];
+        int cornerWritten = std::snprintf(corner, sizeof(corner),
+                                          "f=%llu screen=%s controls=%d",
+                                          frame,
+                                          sample.screen[0] ? sample.screen : "-",
+                                          sample.count);
+        int cornerShown = 0;
+        for (int i = 0; i < sample.count; ++i) {
+            const UiControl& control = sample.items[i];
+            const int cx = control.x + control.w / 2;
+            const int cy = control.y + control.h / 2;
+            if (cx < 700 || cy < 480) {
+                continue;
+            }
+            // THE GIANT CONTAINERS ARE NOT CONTROLS A DRIVER CAN USE.
+            //
+            // The guest's control tree mixes two coordinate systems: the leaf
+            // controls are in SCREEN PIXELS, and the containers are in 1/100
+            // of a UI unit (ANIM_IN(0,0,95623,54174) is the 960x540 UI
+            // space).  So a container can be 95,623 units wide while a real
+            // button is 187 pixels wide -- and the containers come FIRST in
+            // the walk, so they fill the 3 KB line before any button is
+            // reached.
+            //
+            // MEASURED 2026-11-04 (q142): the car-select screen's line held
+            // 90 entries and every one of them was a container or a frame.
+            // A control wider or taller than the 1280x720 screen in pixels
+            // is a container in the other unit system, so it is skipped.
+            if (control.w > 1200 || control.h > 1200 || control.w <= 0 || control.h <= 0) {
+                continue;
+            }
+            if (cornerWritten <= 0 ||
+                cornerWritten >= static_cast<int>(sizeof(corner)) - 80) {
+                break;
+            }
+            cornerWritten += std::snprintf(corner + cornerWritten,
+                                           sizeof(corner) - static_cast<size_t>(cornerWritten),
+                                           " %s(%d,%d,%d,%d)", control.name,
+                                           control.x, control.y, control.w, control.h);
+            ++cornerShown;
+        }
+        if (cornerShown > 0) {
+            appendGuestBootLine(kGuestViewLogPath, "ui-ctl-br", 131, 0, corner);
+        }
+    }
 }
 
 // ---- the screen registry ---------------------------------------------------

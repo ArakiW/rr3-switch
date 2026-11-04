@@ -1,6 +1,6 @@
 # Real Racing 3 → Nintendo Switch: Open Issues & Handoff
 
-> Snapshot: 2026-11-03 02:00 (emulator: Eden — runs q123 / q123b / q124)
+> Snapshot: 2026-11-04 (emulator: Eden — runs q135 … q144)
 > Repo: `https://github.com/ArakiW/rr3-switch`
 > Machine-readable companions: `docs/FEATURE-MATRIX.md` (feature matrix),
 > `PORT_PROGRESS.md` (chronological log), `tools/README-hardware-test.md` (device install & test guide)
@@ -15,21 +15,47 @@ something (a guest pointer, a mapped page) without checking that it was still
 valid. The fifth one, at 19:45 on 2026-11-03, is fixed in the build described
 below.
 
-**The UI work from this round is also done and measured**: the guest's icon
-font (`r3_symbols.ttf`) was being swapped for a text face, so **every icon
-came out as a Latin letter and 2.3–5.8× too small**. Opening the real icon
-font then exposed a **second, older bug: the guest's own `sscanf` had no
-length bound**. With that bounded the game runs clean:
-**q124 = 3,120 frames / 305 s / 35 MB of log, no hang, no regression.**
+**And on 2026-11-04 the port ran a REAL RACE for 4,200 frames** (q142) — the
+first time any archived round has got that far. That round is what turned the
+remaining work from guesswork into measurement, and it moved the whole
+diagnosis:
+
+* **The race starts on its own** — the port's own red-glove follower presses
+  the race button at (1105, 695), which is the button the guest scissors every
+  frame as `glScissor x=994 y=667 w=187 h=53`. The touch script was never the
+  problem.
+* **The pursuit's error was not "a bit off": it swung to ±3 rad (180°)** in
+  63 of 141 samples, while the car was **2 m from the line** with the target
+  **20 m ahead**. That is only possible if the car's direction of travel had
+  reversed — and the cause was in the port: the side of the line the
+  look-ahead point was taken from was **re-decided every frame** from the
+  car's instantaneous heading, so a momentary reversal moved the target to the
+  other side of the car, the controller saw two flips at once and slammed full
+  lock, and the car drove backwards (6,581 units of progress lost between two
+  samples). **Fixed**: the direction is now **locked for the race** and decided
+  once from a windowed motion vector, and the throttle is let go when the car
+  is facing the wrong way (§2.10). Unit-tested: 22 checks, all ok.
+* **"3–4.5 fps" was the menu phase, not the game.** Every healthy round uses
+  **1.39–1.56 cores of CPU** and the frame rate still varies 4.9× — so the
+  difference is **waiting**, not computing. q142, which spent most of its time
+  in the race, did **11.44 fps with a smaller log** (§2.12). The CPU is flat,
+  so the next lever is the wait, and the guest-thread census — the port's own
+  instrument that touches the guest's threads every 4 s, with a kill switch
+  that **has never been run** — is being A/B'd now.
+* **The port's own log was 31 % repetitive** (33,643 `glyph-face` + 31,315
+  `map-app` lines, 504 lines/second, one `fflush` each) because both dedup
+  tables were smaller than the number of distinct keys. Both are fixed
+  (§2.11). The effect on the frame rate is **not yet measured** — the port's
+  probes have already been excluded twice by measurement, so this is stated as
+  a suspicion and not as a result.
 
 **Three things are left before delivery**, one of which only the user can do:
 
 1. **Install the newest NRO on the console and boot** (§4.1) — the crash
    fixes are only proven on the emulator so far.
-2. **Make the game start a race** (§2.9) — the touch script's taps are frame
-   indexed and the race-start tap never fires at the current frame rate.
-   Until a race starts, the pursuit fix cannot be measured, and the lap
-   counter cannot move.
+2. **Measure the pursuit fix in a race** (§2.10) — the fix is in and
+   unit-tested; the round that reads `perr` over thousands of frames is
+   running.
 3. **The splash overflow** (§4.2) — the chain is measured down to the
    engine's own matrix; what is left is which matrix it sets up for the 2D
    pass.
@@ -44,10 +70,11 @@ length bound**. With that bounded the game runs clean:
 * the port's `renderToTexture()` did not scale the glyphs the way the guest's
   Java says it must (§2.7) — a real divergence, now fixed, and **measured to
   be unused**: the guest never calls it;
-* **"laps = -1" is not a counter**: the car drives 7–12 % of a lap, because
+* **"laps = -1" is not a counter**: the car drives 5–12 % of a lap, because
   the pursuit was aiming **behind** the car and the line fit could pick the
   **mirror** of the track's centre line. Both are fixed and unit-tested
-  (§2.9).
+  (§2.9), and a second layer of the same defect was found in the real race
+  (§2.10).
 
 ---
 
@@ -67,11 +94,11 @@ length bound**. With that bounded the game runs clean:
 | 10 | `renderToTexture` did not scale the glyphs (and had no log line) | **Fixed, measured** | §2.7; q133: 0 calls, so no pixel changed — a latent fix |
 | 11 | Splash title overflows the screen (1398 px of the line off-screen) | **Characterised, not fixed** | §2.7 / §4.2; the engine's own matrix overshoots by 1.525× |
 | 12 | First 10 s of black screen before the guest appears | **Largely fixed** | §4.3; q134: 6,628 ms → 2,843 ms, 2.6 MB no longer written |
-| 11 | Pure pursuit cannot hold the line (lap count −1) | **Root cause found and fixed** | §2.9; the look-ahead was behind the car (up to 210/210) and the fit could pick the mirror — both fixed, unit-tested. **Not yet measured in a race** |
-| 12 | The game never starts a race | **Fixed, and it started once** | §2.9; the tap's frame was 5500 and the round only reached 2700 — the button itself was at the right coordinate. q138 found the guest's RaceMetrics object for the first time |
-| 13 | The black screen (the guest's 83-frame load at 3–4.5 fps) | **Not solved; cause narrowed** | §4.3; the frame rate is the lever and three candidates were measured and excluded |
-| 14 | Pure pursuit cannot hold the line (lap count −1) | **Not started** | §4.4 |
-| 15 | Deliverables (app zip / full package / 4 volumes) + commit | **Rebuilt** | §4.5; the NRO in the package, the app zip and on the card are the same file |
+| 11 | Pure pursuit cannot hold the line (lap count −1) | **Root cause found and fixed, twice** | §2.9 + §2.10; layer 1: the look-ahead was behind the car (up to 210/210) and the fit could pick the mirror. Layer 2 (found in a REAL race, q142): the side of the line was re-decided every frame, so the target jumped to the car's other side and the controller drove it backwards. Both fixed, unit-tested (22 checks) |
+| 12 | The game never starts a race | **Fixed — and it was never the touch script** | §2.10; the port's own red-glove follower presses the race button at (1105,695), the rectangle the guest scissors every frame. q142 ran 4,200 frames of race |
+| 13 | The black screen (the guest's 83-frame load at 3–4.5 fps) | **Not solved; the rate is a PHASE measurement** | §2.12; 3–4.5 fps is the MENU phase, the race phase does 11.44 fps, and the CPU is flat at 1.39–1.56 cores in every round ⇒ the difference is waiting. The census A/B is running |
+| 14 | The port's own log was 31 % repetitive (504 lines/s, one fflush each) | **Fixed; the frame-rate effect NOT measured** | §2.11; the `glyph-face` dedup table held 8 (face,size) pairs and the guest asks for 7 faces at dozens of sizes, and `map-app` had no dedup at all |
+| 15 | Deliverables (app zip / full package / 4 volumes) + commit | **Rebuilt, and stale again** | §4.5; the NRO in the package, the app zip and on the card are the same file — but every build since has made them stale, so the rebuild has to be the LAST step |
 
 ---
 
@@ -511,6 +538,264 @@ one go: archive → parts → app zip → join check.
 | "The splash artwork is scaled too wide" | The overflowing line is **guest text** (`Player ID: CCDI123456789 / CCRR123456789`), measured with a texture id, a bounds width and a pixel band | the artwork was blamed for a text bug |
 | "The port's text probe caps the frame rate (a linear scan per draw)" | The scan was real (up to 4096 entries x ~90,000 draws a frame) and is now a hash, but **q137 with the fix did not get faster** (q134 960 / q136 840 / q137 — frames per 306 s). The PNG capture was measured too, and it is not the cost either | a plausible cause, measured and falsified |
 | "The game got 6x slower" | The October round that showed 23 fps spent most of its 1206 s **in the race**; the November rounds spend it in the **menu**. Different phases, so the numbers are not comparable | two different phases compared as if they were the same |
+| "The game runs at 3–4.5 fps" | That was the **menu** phase. MEASURED 2026-11-04 (q142): the same build, the same card and the same ~1.44 cores of CPU produced **4,680 frames in 409 s = 11.44 fps**, because most of that round was **in the race**. The CPU cores are the same in both phases (1.44–1.56 in every healthy round), so the phase difference is a difference in **waiting**, not in computing | one phase's rate was quoted as the game's rate |
+| "The pursuit fix is verified — the last sample's error was 0.0391 rad" | A **single** sample is not a measurement. MEASURED (q142): over the 141 samples the error ranged from **−3.05 to +3.03 rad**, and **63 of 141** samples were more than 1 rad off. The good sample was the tail of a series that had been oscillating | one sample read as the distribution |
+| "The port's own probes cost the frame rate (glyph-face / map-app)" | The volume is real (33,643 + 31,315 lines = **31 %** of a 45 MB log, one `fflush` each) but **no A/B has been run** on the log-volume cut yet, and the port's probes were **already excluded** by two measured A/Bs (PNG capture, glyph-texture hash) | a plausible cause, not yet a measurement — stated as a suspicion, not a result |
+
+---
+
+### 2.10 The look-ahead point moved to the OTHER SIDE of the car, because the direction was re-decided every frame
+
+**Measured 2026-11-04 (q142, archive `20261104-145617-eden-rr3-q142-corners`).**
+This is the first round in which the game ran a **real race for thousands of
+frames**, so the pursuit could finally be measured instead of inferred.
+
+**The race started on its own.** MEASURED: the port's own red-glove follower
+pressed the race button —
+
+```
+phase=ui-press … kind=orange x=1105 y=695 area=8180 w=326 h=45   (frame 420)
+```
+
+— which is the button the guest scissors every frame as
+`glScissor x=994 y=667 w=187 h=53`. **⇒ The race-start path was never the
+touch script.** (The script's own frame-450 tap was still on the card in that
+round, which is why the earlier rounds appeared to start "by accident".)
+
+**What the pursuit did over the race** (141 samples, frames 570..4770):
+
+| Measure | Value |
+|---|---|
+| frames of race | 4,200 |
+| distance covered | 91,810 spline units = **5.08 %** of a lap (the lap is 1,806,336) |
+| pursuit error `perr` | **−3.05 … +3.03 rad** (63 of 141 samples worse than 1 rad) |
+| lateral residual `lres` | ≤ **2.00 m** — the car was ON the line |
+| distance to the look-ahead point | 16–43 m |
+| best / worst | `best=3.98`, `stalls=6`, `flips=3` |
+
+**⇒ The car was on the line and the target was 20 m away, and the error was
+still 180°.** A car 2 m from the line with a target 20 m ahead cannot have a
+180° error: the angle is bounded by `atan(2/20) ≈ 6°`. **⇒ The only way to get
+180° is that the car's own direction of travel had reversed.**
+
+**And the reason is in the source.** `raceLineTarget()` decided which side of
+the line to take the look-ahead point from **on every single frame**, using
+the car's instantaneous heading:
+
+```cpp
+int step = 1;
+if (headingX != 0.0 || headingY != 0.0) {
+    ...
+    if (backward > forward) { step = -1; }   // <- re-decided EVERY frame
+}
+```
+
+⇒ the closed loop, all of it visible in q142's samples:
+
+1. the car is nudged and its direction of travel reverses for a moment;
+2. `step` flips, so **the look-ahead point jumps to the other side of the
+   car**;
+3. the error the controller sees is now the sum of two flips (the heading's
+   and the target's) — the samples go `+0.44 → −3.05 → +2.99 → −2.73 rad`
+   from one 30-frame sample to the next;
+4. the controller saturates the steering (`steer = ±1.0`, full lock) and the
+   throttle is on;
+5. the car swings past the target, **drives backwards** — q142: it LOST
+   6,581 units of progress between frames 2010 and 2040 — which reverses the
+   heading, which repeats step 1.
+
+**⇒ The track does not change direction while the car drives on it, so the
+decision belongs to the RACE, not to the frame.**
+
+**Fixed (this round), in three parts:**
+
+1. **The direction is locked.** `raceLineTarget()` takes the direction as an
+   in/out argument: 0 means "not decided yet", and a non-zero value is held
+   for the whole race. The caller owns the lock, so the function stays free
+   of hidden state and the host self-test can exercise it directly.
+2. **The one decision is made from a WINDOWED motion vector** — the car's
+   displacement over the whole 48-sample position ring — not from the
+   instantaneous heading. A single-frame wobble cannot reverse it. The lock
+   is reset when the track changes (`splineGeneration`).
+3. **The throttle is let go when the error is more than ~86°.** A car that is
+   spun or facing back down the track has to turn around, and full throttle at
+   full lock turns a turn-around into a spin. The brake stays off, because the
+   guest reverses only when the brake is held **and** the throttle is let go —
+   and a car that reverses here is the loop above.
+
+**Unit test** (`tests/host/race_line_selftest.cpp`, 22 checks, all ok): three
+new ones prove the lock — *the direction is decided and reported back*, *the
+lock is not changed by a reversed heading*, and *a locked race keeps the
+target on the same side of the car*.
+
+**⇒ MEASURED, in the next round (q143, the same build with the census off):**
+
+| Measure | q142 (before) | q143 (after) |
+|---|---|---|
+| samples with the target behind the car (\|perr\| > 1 rad) | **63 of 141 = 45 %** | **21 of 160 = 13 %** |
+| distance covered | 91,810 units = **5.08 %** of a lap | 156,244 units = **8.65 %** |
+| frames of race | 4,200 | **4,770** |
+| stalls | 6 | 4 |
+
+⇒ **The lock works**: the look-ahead point stopped jumping to the other side
+of the car, and the car drove 70 % further around the lap. **And it is not
+enough**: the car still does not finish a lap.
+
+**⇒ AND THE NEXT BOTTLENECK IS NOW VISIBLE, and it is not the pursuit.**
+MEASURED (q143): the car reached its best at **frame ~1,830** (161,757 units
+= 8.95 %) and then **stopped for good**. From frame ~2,700 to the end of the
+round (2,700 frames) the guest's own **spline node index stood at 319** and
+the distance moved by **10 units per 30 frames** — about 1.3 mm a frame, with
+the throttle on and the pursuit's error small and steady. **The car is pinned
+against a barrier**, and the port's recovery (which fires 4 times in the whole
+round) does not free it.
+
+⇒ The pursuit's error is now good enough (13 % of samples off, and the car is
+2 m from the line), so the next thing to fix is the **stuck car**: the
+recovery needs an EXIT rather than a reference-point reset, and the stall
+detector has to notice a car that is pinned while the pursuit keeps asking it
+to turn.
+
+**⇒ FIXED AND MEASURED (q145, the next build).** The discriminator is the
+car's own **POSITION**, not the progress meter: the progress metric has a
+one-metre granularity, so a car crawling at less than a metre a second and a
+car pressed against a barrier look exactly the same to it. A crawling car's
+position changes; a pinned car's does not. So the test is *"the world
+position has not moved by a metre for 1,200 frames"*, and it also requires
+that the car has **already made progress in this race** — otherwise the start
+sequence's hold at the grid is a pinned car too. The recovery then fires at
+most once per 1,200 frames, so it cannot become a recovery loop.
+
+| Measure | q143 (pinned) | q145 (fixed) |
+|---|---|---|
+| frames of race | 4,770 | **5,760** |
+| distance covered | 8.65 % of a lap | **10.35 %** |
+| recoveries fired | 4 | **10** |
+| frames in the round | 5,410 | **6,240** |
+
+⇒ **The car is no longer pinned.** The progress curve used to flat-line at
+92,871 for 2,700 frames; it now oscillates and climbs
+(93,872 → 130,177 → 177,324 → 162,471 → 186,921), i.e. the car gets free and
+drives on.
+
+**⇒ BUT THE LAP COUNTER IS STILL −1, AND NOW THE REASON IS CLEAR.** The car
+is at 10.35 % of a lap and spends **40 % of the race stuck against
+barriers** (10 recoveries in 193 samples). At the rate it makes progress when
+it is NOT stuck (178 units a frame) a lap is ~10,000 frames; at the rate it
+actually manages it is ~56,000 frames. **⇒ The next lever is not the pursuit
+any more, it is the quality of the line following** — the look-ahead distance
+(20 m), the steering gain, and how much of the track the car can actually
+hold. The car is on the line to within 2 m, but it is still hitting the
+barriers.
+
+### 2.11 The port's own log was 31 % repetitive, and the deduplication tables were too small
+
+**Measured 2026-11-04 (q142).** The guest-view log was 45.2 MB / 205,983 lines
+in 409 s — **504 lines a second**, each one an `fprintf` plus an `fflush` on
+the emulated card (the log writer does not `fsync`; that was moved off the
+card in an earlier round). The volume is not the game's: it is the port's own
+probes.
+
+| Phase | Lines | Share |
+|---|---|---|
+| `glyph-face` | 33,643 | 16 % |
+| `map-app` | 31,315 | 15 % |
+| `jni-void` + `cc-dispatch` + `jni-utf163` | 50,878 | 25 % |
+
+**Both of the big two were the same line repeated**, and both dedup tables
+were too small for the number of distinct keys:
+
+* `glyph-face` kept **8** (face, size) pairs. The guest names **7 faces at
+  dozens of sizes each**, so the table thrashed and the dedup never fired:
+  16,823 of the 33,643 lines were the same CJK bootstrap face at some size.
+* `map-app` had **no** dedup at all: the guest resolves the same paths over
+  and over.
+
+**Fixed**: the `glyph-face` table is now 4096 slots keyed by a 64-bit hash of
+the (face, size) pair, and `map-app` gets a 2048-slot hash set of the paths
+already reported. The information is kept (every distinct pair and path is
+still logged once); the repetition is gone.
+
+**⇒ What this has NOT yet proved**: that the log volume was costing frame
+rate. The port's probes have already been excluded twice by measurement (the
+PNG capture, the glyph-texture hash), and the log writer does not `fsync`. The
+honest statement is that this is a **large, cheap, safe reduction of the
+port's own overhead**, and its effect on the frame rate is **not yet
+measured**.
+
+### 2.12 The frame rate is a PHASE measurement, and the CPU is the same in both phases
+
+**Measured 2026-11-04, over every archived round of 2026-11-03/04** (one
+instrument: `run-summary.txt` + `eden-cpu-series.csv`, so every round is read
+the same way):
+
+| Round | Wall | Frames | fps | CPU cores | ms CPU/frame | Log |
+|---|---|---|---|---|---|---|
+| q132 | 306 s | 1,560 | 5.10 | 1.47 | 276 | 49.1 MB |
+| q133 | 306 s | 720 | 2.35 | 1.50 | 613 | 47.3 MB |
+| q134 | 306 s | 960 | 3.14 | 1.47 | 450 | 51.8 MB |
+| q136 | 307 s | 840 | 2.74 | 1.49 | 523 | 51.9 MB |
+| q137 | 306 s | 1,080 | 3.53 | 1.54 | 419 | 52.8 MB |
+| q138 | 612 s | 2,760 | 4.51 | 1.44 | 314 | 130.3 MB |
+| q140 | 610 s | 2,640 | 4.33 | 1.39 | 316 | 124.9 MB |
+| q141 | 606 s | 2,280 | 3.76 | 1.56 | 407 | 114.3 MB |
+| **q142** | **409 s** | **4,680** | **11.44** | **1.44** | **122** | **43.1 MB** |
+
+**⇒ Every healthy round uses 1.39–1.56 cores of CPU, and the frame rate
+varies 4.9× across the same builds.** Since the CPU is flat, the extra time
+per frame is **waiting**, not computing. And q142 — the one round that spent
+most of its time **in a race** — is 3× faster than the menu rounds with a
+**smaller** log (43.1 MB vs 51.8 MB).
+
+**⇒ Two conclusions, one of them a correction:**
+
+* the black screen's "3–4.5 fps" is the **menu** phase; the game in a race
+  does 11.4 fps on Eden;
+* **any frame-rate comparison has to name its phase.** The October 23 fps and
+  the November 3.9 fps were the same mistake twice.
+
+**⇒ The next measurement is a paired A/B on the one switch that was never
+tried**: the guest-thread census, which sweeps and samples the guest's threads
+every 4 s and has a kill switch (`census=off` in
+`sdmc:/switch/rr3-census.conf`) that **has never been run**. The census
+A/B is running with the pursuit fix in the same build, as two rounds that
+differ in that file and in nothing else.
+
+**⇒ MEASURED (the pair is in: q143 census=off, q144 census=on — the same
+build `330cd54d`, the same card, the same scripts, 405 s each):**
+
+| | census=off | census=on | difference |
+|---|---|---|---|
+| frames | 5,410 | 5,481 | **+1.3 %** |
+| log bytes | 34,085,625 | 35,856,215 | +5.2 % |
+| CPU cores | 1.299 | 1.416 | **+9.0 %** |
+| CPU seconds | 513.3 | 559.5 | +9.0 % |
+
+**⇒ THE CENSUS IS NOT THE FRAME-RATE LEVER.** +1.3 % of frames is inside the
+noise, and it does not perturb the driving either (the share of samples with
+the look-ahead point behind the car was 13 % with the census off and 14 %
+with it on). What it does cost is **~9 % of the CPU** and ~5 % of the log —
+worth switching off for the console, not worth calling a fix.
+
+**⇒ AND THE PNG CAPTURE IS EXCLUDED A THIRD TIME, AND CLEANLY.** The probe
+conf says `pngfrom=1300`, and q143's race started at frame 630 — so the
+**menu** phase, the slow phase, captured **no PNG at all**, and the menu
+still ran at 4.8 fps.
+
+**⇒ THE PHASE SPLIT, measured from the two new rounds** (the race starts at
+the frame the guest reports the RaceMetrics object):
+
+| Phase | Frame rate on Eden |
+|---|---|
+| menu (the front end) | **4.8 fps** |
+| race | **15–17 fps** |
+
+⇒ **⇒ The next instrument is a per-frame HOST TIMESTAMP**, because the frame
+rate is now known to be phase-dependent while the CPU is flat, and nothing
+in the logs says *what* the frame is waiting for. The three candidates that
+remain are the guest's own 2D UI work (1,200 controls in the tree, 82 face
+opens a second, 76 asset resolutions a second), the port's per-frame control
+walk, and the host's own present path.
 
 ---
 
@@ -771,29 +1056,65 @@ whole pass and skip it entirely on an unchanged card.
 
 ### 4.4 P3 — Pure pursuit cannot hold the line (lap count −1)
 
-**Re-characterised on 2026-11-03 — see §2.9. It is NOT a gain to tune.**
+**Re-characterised twice — §2.9 (layer 1) and §2.10 (layer 2, found in a real
+race). It is NOT a gain to tune.**
 
-The symptom is that the car drives **7–12 % of a lap** and then stops; the
+The symptom is that the car drives a few per cent of a lap and then stops; the
 guest's own lap counter says `-1` because the car never crosses the line.
-The measured cause was that the look-ahead point was **behind the car** (up to
-210 of 210 samples in one round) and that the line fit could pick the
-**mirror** of the track's centre line — the residual cannot tell the two
-apart over 48 metres, and the fitted variant changed mid-run.
 
-**Both are fixed** (the look-ahead follows the car's heading; the fit
-rejects the mirrored variants), and the unit test proves the direction.
+| Layer | Defect | Status |
+|---|---|---|
+| 1 | the look-ahead point was **behind the car** (up to 210 of 210 samples) | fixed — the direction follows the car's heading |
+| 1 | the line fit could pick the **mirror** of the centre line (the residual cannot tell a curve from its reflection) | fixed — the fit now applies a handedness test, with a fallback to the unfiltered winner |
+| 2 | the side of the line the target was taken from was **re-decided every frame** from the car's instantaneous heading | fixed — the direction is **locked for the race** and decided once from a windowed motion vector |
 
-**What still blocks the measurement: the race never starts.** The touch
-script is frame indexed and the tap that starts the race is at script frame
-5500; the run only reached port frame 2400 in 611 s. Until the script's
-budget is re-timed, the pursuit cannot be measured in a race.
+**MEASURED in the first real race (q142, 4,200 frames of race):** the car
+reached **5.08 %** of a lap and stopped; the pursuit error swung between
+**−3.05 and +3.03 rad** in 63 of 141 samples; the lateral residual was
+**≤ 2.00 m** and the target was **16–43 m** away. That combination is only
+possible if the car's direction of travel had reversed — and the port was
+making it reverse (§2.10).
+
+**⇒ The measurement that decides it is running**: `perr` should stay inside
+±1 rad for the whole race instead of swinging to ±3, and the distance should
+pass the 5.08 % it stopped at.
+
+**MEASURED (q143, the next round):** the look-ahead point stopped jumping to
+the other side of the car — **45 % → 13 %** of the samples had the target
+behind it — and the car drove **70 % further** (5.08 % → 8.65 % of a lap).
+**⇒ The pursuit is no longer the bottleneck.**
+
+**⇒ THE BOTTLENECK WAS A STUCK CAR, and it is fixed (q145).** MEASURED (q143):
+the car reached its best at frame ~1,830 and then stopped for good. From frame
+~2,700 to the end of the round the guest's own **spline node index stood at
+319** and the distance moved by **10 units per 30 frames** (~1.3 mm a frame),
+with the throttle on and the pursuit's error small and steady. The car was
+**pinned against a barrier**, and the recovery — which fires 4 times in the
+whole round — did not free it, because the stall test does not recover a car
+that is **on the racing line** (the rule from q117: "a car on the line that
+is not advancing is being HELD or it is CRAWLING"), and the pinned car's
+lateral residual was 2.07 m — inside the 3 m exemption.
+
+**FIXED (q145)**: the discriminator is the car's own **position**, not the
+progress meter. MEASURED: the race grew from 4,770 to **5,760 frames**, the
+distance from 8.65 % to **10.35 %** of a lap, and the recoveries from 4 to
+**10** — the car gets free and drives on instead of flat-lining.
+
+⇒ **The lap counter is still −1, and now the reason is clear**: the car
+spends **40 % of the race stuck against barriers**. At the rate it makes
+progress when it is not stuck (178 units a frame) a lap is ~10,000 frames; at
+the rate it actually manages, ~56,000. **⇒ The next lever is the quality of
+the line following** — the look-ahead distance (20 m), the steering gain, and
+how much of the track the car can hold. The car is on the line to within 2 m
+and still hits the barriers.
+
+⇒ The **recovery needs an EXIT**, not a reference-point reset — resetting
+makes the car spin on the spot (already noted, and now the blocking item).
 
 Known directions (**none done yet**):
 
 * `steergain` / look-ahead point: steering gain and the aim point need to be
   tuned per corner;
-* **the recovery logic needs an EXIT, not a reference-point reset** — resetting
-  makes the car spin on the spot.
 
 ### 4.5 P4 — Deliverables and commit (**rebuilt on 2026-11-03, late**)
 
@@ -819,6 +1140,12 @@ Known directions (**none done yet**):
   five times on the console).
 * **`git commit` must use `-F <file>`** — `-m` and `-F` are mutually
   exclusive.
+* **THE BUILD IS BYTE-REPRODUCIBLE.** MEASURED (2026-11-04): the gate rebuilds
+  the NRO from the same tree and gets **the same sha256**
+  (`1A155B37929AB0FB…`). That is what makes the four-way cross-proof
+  (§4.5) meaningful: the NRO in the package, in the app zip, on the card and
+  in the build output are not four copies of "something like the build", they
+  are the same file, and any rebuild from the same commit reproduces it.
 
 ---
 
@@ -855,8 +1182,25 @@ Known directions (**none done yet**):
 | The pursuit's target BEHIND the car | up to **210 of 210** samples | `tools/pursuit_convergence.py` |
 | The fitted line's variant changing mid-run | 6 different values in one round | q121 |
 | The guest's load finishes at | **frame 83** (⇒ the black screen is 83 frames) | `tools/load_split.py` |
-| The menu phase's frame rate | **3–4.5 fps** (the October round's 23 fps was the RACE phase — not comparable) | q135 / q138 / q140 / q141 |
-| The touch script's race-start tap | script frame **5500**; a 600 s round reaches frame ~2700 | q135 |
+| The menu phase's frame rate | **3–4.5 fps** — and that is the MENU phase, not the game (§2.12) | q135 / q138 / q140 / q141 |
+| The race phase's frame rate | **11.44 fps** (4,680 frames / 409 s) | q142 |
+| CPU cores, every healthy round | **1.39–1.56** — flat, so the frame-rate spread is WAITING | q132..q142 |
+| The touch script's race-start tap | **withdrawn** — the port's own red-glove follower presses the race button at (1105, 695) | q142 `ui-press` |
+| A race, end to end | **4,200 frames** of race, 141 pursuit samples | q142 |
+| … how far the car got | 91,810 units = **5.08 %** of a lap | q142 `tools/race_progress.py` |
+| … the pursuit error over that race | **−3.05 … +3.03 rad**, 63 of 141 samples worse than 1 rad | q142 `tools/race_progress.py` |
+| … the lateral residual | ≤ **2.00 m** (the car WAS on the line) | q142 |
+| … progress lost to the loop | **6,581 units** between frames 2010 and 2040 — the car drove backwards | q142 |
+| The guest-view log, old build | 45.2 MB / **205,983 lines** / 409 s = 504 lines a second | q142 |
+| … of which repetitive | `glyph-face` 33,643 + `map-app` 31,315 = **31 %** | q142 |
+| … `glyph-face` dedup table | **8** slots for 7 faces × dozens of sizes ⇒ thrashing | q142 |
+| The guest-view log, after the dedup fix | 34.1 MB / **165,107 lines** at the same wall clock (**−20 %**) | q143 |
+| The census A/B (the switch that had never been run) | frames **+1.3 %** (noise), CPU **+9.0 %**, log **+5.2 %** ⇒ **not** the frame-rate lever | q143 vs q144 |
+| The menu phase's frame rate | **4.8 fps** (the race phase does 15–17 fps) | q143 |
+| The PNG capture in the menu phase | **none** (`pngfrom=1300`, the race starts at frame 630) ⇒ the PNG capture is excluded again, cleanly | q143 |
+| The pursuit fix, measured | target behind the car **45 % → 13 %**, distance **5.08 % → 8.65 %** of a lap | q142 → q143 |
+| The pinned-car fix, measured | race frames **4,770 → 5,760**, distance **8.65 % → 10.35 %**, recoveries **4 → 10** | q143 → q145 |
+| The car's best distance ever | **186,921 units = 10.35 %** of a lap | q145 |
 | The race button's rectangle | `(994,667,187,53)` — the guest scissors it every frame | q138 |
 | The first round where the guest's RaceMetrics was found | q138 frame 510: `gm_ok=1 metrics=1 vptr_ok=1 thr=1` | q138 |
 | Rounds that stopped early because a tap landed in the race | q139 (600 frames) vs q138 2760 / q140 2640 | q138–q140 |

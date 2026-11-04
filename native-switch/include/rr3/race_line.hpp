@@ -90,8 +90,34 @@ bool raceLineFit(const SplineFile& spline, const char* chunkName,
 // The heading is the car's direction of travel, in PORT units -- the same
 // vector the pursuit uses for its own error.  A zero heading keeps the
 // spline's own order.
+//
+// THE DIRECTION IS LOCKED, AND THAT IS THE POINT
+// ----------------------------------------------
+// `direction` is an IN/OUT argument: 0 means "not decided yet", and a
+// non-zero value means "this is the direction round the track, and it does
+// not change again".  On the way out it holds the decision that was used.
+//
+// WHY IT HAS TO BE LOCKED
+// MEASURED 2026-11-04 (q142, archive
+// 20261104-145617-eden-rr3-q142-corners): the pursuit ran 141 samples and the
+// error went -0.47 -> +0.44 -> -3.05 -> +2.99 -> -2.73 rad in a few frames
+// each.  The car was never more than 2 m from the line and the look-ahead
+// point was 16..43 m away, so an error of ~180 degrees is not geometry: it is
+// the car's direction of travel having REVERSED.  And because the side of the
+// line the target was taken from was re-decided from that same reversing
+// heading EVERY FRAME, the target jumped to the other side of the car at the
+// same moment, the error became the sum of two flips, and the controller
+// slammed full lock first one way and then the other.  The car then drove
+// backwards, which reversed the heading again: a closed loop that never
+// settles.  The car reached 5.08 % of a lap and stopped.
+//
+// The track does not change direction while the car drives on it, so the
+// decision belongs to the RACE, not to the frame.  The caller owns the lock,
+// which also keeps this function free of hidden state (the host self-test
+// exercises it directly).
 bool raceLineTarget(const RaceLine& line, const SplineFile& spline,
                     double carX, double carY, double headingX, double headingY,
+                    int* direction,
                     double lookAheadMetres, double* targetX, double* targetY);
 
 }  // namespace rr3
