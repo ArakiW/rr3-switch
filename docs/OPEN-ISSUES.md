@@ -1657,9 +1657,21 @@ power-cycled.  The port stopped writing its log entirely.
   `view-gl-finish-enter`, `view-swap-enter`, `view-render-ret` or
   `guest-frame-census`.  The host called the guest's `onViewChangedJNI`
   (`guest_view_probe.cpp:2902`) and never got back.
-* **The freeze happened 33 minutes after the console booted.**  `boot_ms` is
-  `armGetSystemTick()*1000/freq`, a wall-clock stamp since boot; the values in
-  the log run 1842279 -> 2009900.
+* **The freeze happened 33.5 minutes after the console booted, and the log
+  covers the last 2.8 minutes of it.**  `boot_ms` is
+  `armGetSystemTick()*1000/freq`, a wall-clock stamp in MILLISECONDS since
+  boot; the values in the log run 1842279 -> 2009900, i.e. 1842.3 s ->
+  2009.9 s, a window of 167.6 s.  So the console was powered on, the game
+  was launched 30.7 minutes later, and the port froze 33.5 minutes after the
+  boot, 2.8 minutes into its own life.
+  **The two numbers are easy to confuse, and the confusion points at a
+  completely different bug**: reading the millisecond value as seconds says
+  "the port idled for half an hour and then froze", which would point at a
+  timeout or a stalled asset; reading it as minutes says "the port worked
+  for 168 s and then froze", which is what the evidence supports.
+  The reaper's own `waited_ns` reaches 93 s, longer than the 168 s window,
+  because that counter accumulates across waits and is reported per slice --
+  it measures the reaper's cumulative patience, not the process age.
 * **The port died parked in a condition-variable wait.**  The progress file's
   last line is `phase=view-sync-blocked-cond-wait ordinal=53`, which is
   `guestViewTraceSyncBlocked("cond-wait", 53)` from `guestPthreadCondWait`.
@@ -1861,6 +1873,39 @@ ZERO, and the wait demonstrably blocked for 120 s.  The difference between
 **AND THE LEDGER BUDGET HOLDS.**  12 lines for a run that did 3 waits of up
 to 120 s each, against q151's 1,048,302.  The guest log is 24 MB instead of
 186 MB.
+
+### TWO CORRECTIONS TO WHAT WAS WRITTEN BEFORE
+
+**1. The freeze was 33.5 MINUTES after the console booted, not 33 seconds.**
+`boot_ms` is `armGetSystemTick()*1000/freq` -- MILLISECONDS since boot.  The
+values in the log run 1842279 -> 2009900, i.e. 1842.3 s -> 2009.9 s.  So:
+
+* the console was powered on,
+* the game was launched 30.7 minutes later,
+* the port froze 33.5 minutes after the boot, 2.8 minutes into its own life.
+
+The millisecond value read as seconds says "the port idled for half an hour
+and then froze", which would point at a timeout or a stalled asset.  Read as
+minutes it says "the port worked for 168 s and then froze", which is what the
+evidence supports.  The two readings point at completely different bugs, so
+the unit was checked by arithmetic rather than by reading.
+
+**2. The uncommitted "clean loader" work IS in the published NRO.**  The
+shipped build came from the working tree, and the ELF carries both
+`resolvePortAssetPath` and `selectGameLibrary` (verified by scanning the
+symbol table of `native-switch/rr3-native-rehost.elf`).
+
+It is INERT in the default build, and that is worth being precise about:
+`resolvePortAssetPath` is a FALLBACK chain -- RomFS first, then the card --
+and the default build's RomFS still holds the files, so the chain resolves
+inside the RomFS exactly as before.  Only the `-CleanLoader` build (which
+leaves the EA files out of the RomFS) takes the second branch.  So the
+published binary behaves identically to the committed source; the difference
+is that the binary contains more than the commit says it does, which is a
+bookkeeping problem, not a behaviour one.
+
+⇒ The clean-loader work is either finished and verified, or reverted.  It is
+not left half in a release.
 
 ### STILL OPEN
 
