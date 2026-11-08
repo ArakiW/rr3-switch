@@ -547,6 +547,30 @@ bool mapGuestZeroPage() {
 
 } // namespace
 
+// RELEASE THE DIAGNOSTIC CONSOLE, EXACTLY ONCE.
+//
+// WHY IT IS A FUNCTION AND NOT A CALL SITE: the console owns the default
+// NWindow.  Releasing it twice is a double release of libnx's deko3d
+// console, and the window must be released exactly once.
+//
+// WHY IT HAS TO HAPPEN AT ALL, AND WHY IT HAPPENS HERE: MEASURED 2026-11-09
+// (the clean loader), the port hung at eglCreateWindowSurface and rendered
+// nothing.  The native UI could not open a face in a RomFS with no game
+// faces, so the port took its diagnostic path, opened the text console --
+// which bound deko3d to nwindowGetDefault() -- and never released it.  Mesa
+// then tried to create an EGL surface on a window the console still owned
+// and blocked in the kernel's buffer queue.
+//
+// So the window is released WHERE IT IS HANDED OVER, before Mesa takes it,
+// and the flag is cleared so the cleanup path cannot release it again.
+void releaseDiagnosticConsole(bool& diagnosticConsole) {
+    if (!diagnosticConsole) {
+        return;
+    }
+    consoleExit(nullptr);
+    diagnosticConsole = false;
+}
+
 int main(int argc, char** argv) {
     runtimeTrace("[rr3] main entry\n");
     // The Cloudcell defer-queue drain starts HERE, before anything else.
@@ -607,8 +631,7 @@ int main(int argc, char** argv) {
         pathExists("sdmc:/switch/rr3-native-rehost/debug-console.flag");
     if (diagnosticConsole) {
         consoleInit(nullptr);
-    }
-    runtimeTrace("[rr3] ui backend selected\n");
+    }    runtimeTrace("[rr3] ui backend selected\n");
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     PadState pad{};
     padInitializeDefault(&pad);
@@ -922,10 +945,22 @@ int main(int argc, char** argv) {
     bootPrintf("loader rollback selftest=%llx expected=f\n",
                 static_cast<unsigned long long>(rollbackSelfTest));
 
+    // THE DSOs THE GUEST NEEDS, WITH THE CARD FALLBACK.
+    //
+    // The guest's own DSOs (its main binary, Nimble and FMOD) are EA's files
+    // and a build that carries no EA material does not have them in the
+    // RomFS.  The fallback chain finds them on the card instead, next to the
+    // NRO, where the user put them from their own copy of the application.
+    // The guest's MAIN binary already has this chain (selectGameLibrary above);
+    // this is the same shape for the two the guest links against.
+    char nimblePath[512];
+    char fmodPath[512];
+    rr3::resolvePortAssetPath("romfs:/libNimble.so", nimblePath, sizeof(nimblePath));
+    rr3::resolvePortAssetPath("romfs:/libfmodex.so", fmodPath, sizeof(fmodPath));
     const char* loaderPaths[] = {
         gameLibrary,
-        "romfs:/libNimble.so",
-        "romfs:/libfmodex.so",
+        nimblePath,
+        fmodPath,
         kCxxLibrary,
     };
     rr3::renderLoadingDashboard("Core DSO link and permissions", 75);
@@ -1258,6 +1293,26 @@ int main(int argc, char** argv) {
             rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "view-ui-exit", 233, 0);
             rr3::nativeUiExit();
             rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "view-ui-exited", 234, 0);
+            // RELEASE THE CONSOLE'S WINDOW BEFORE MESA TAKES THE SAME ONE.
+            //
+            // MEASURED 2026-11-09 (clean loader): the port hung at
+            // eglCreateWindowSurface and rendered nothing, while the same
+            // source with a full RomFS ran fine.  The chain was:
+            //
+            //   the native UI could not open a face (the clean RomFS has
+            //   no game faces) -> returned false -> main() took the
+            //   diagnostic path and opened the text console ->
+            //   libnx bound deko3d to nwindowGetDefault() ->
+            //   the native UI's exit closed the port's own framebuffer but
+            //   NEVER released the console -> Mesa then tried to create an
+            //   EGL surface on a window the console still owned, and
+            //   blocked in the kernel's buffer queue.
+            //
+            // A rule that lives in one file is not a rule: the console was
+            // released nowhere, because nothing had ever had to release it.
+            // So it is released HERE, where the window is handed over, and
+            // it is released whether or not the console was ever opened.
+            releaseDiagnosticConsole(diagnosticConsole);
             NWindow* viewWindow = nwindowGetDefault();
             rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "view-probe-call", 235, 0);
             dashboard.viewProbe =
@@ -1575,8 +1630,8 @@ int main(int argc, char** argv) {
     if (R_SUCCEEDED(socketResult)) {
         socketExit();
     }
-    if (diagnosticConsole) {
-        consoleExit(nullptr);
-    }
+    // The same helper the view hand-over uses, so the console is released
+    // exactly once whichever path gets there first.
+    releaseDiagnosticConsole(diagnosticConsole);
     return 0;
 }

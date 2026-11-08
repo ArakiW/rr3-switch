@@ -4886,6 +4886,62 @@ void censusGuiAssetRequest(const char* guestPath, int rc, bool isOpen) {
 
 } // namespace
 
+// THE PORT'S OWN ASSET PATH, WITH A CARD FALLBACK.
+//
+// See the declaration in include/rr3/guest_filesystem.hpp for why the chain
+// exists.  The short version: the RomFS may carry the guest's DSOs and the
+// game's UI faces, and a build that does not (a "clean" one, which carries no
+// EA material) finds them on the card instead.
+//
+// IT LIVES OUTSIDE THE ANONYMOUS NAMESPACE ON PURPOSE: it is called from
+// other translation units (the font opener, the loader), so it has to have
+// external linkage.
+bool resolvePortAssetPath(const char* romfsPath, char* outPath, size_t outPathSize) {
+    if (romfsPath == nullptr || outPath == nullptr || outPathSize == 0) {
+        return false;
+    }
+    if (pathExists(romfsPath)) {
+        std::snprintf(outPath, outPathSize, "%s", romfsPath);
+        return true;
+    }
+    // "romfs:/ui/X" -> "sdmc:/switch/rr3-native-rehost/ui/X"
+    const char* colon = std::strchr(romfsPath, ':');
+    if (colon == nullptr) {
+        std::snprintf(outPath, outPathSize, "%s", romfsPath);
+        return true;
+    }
+    const char* tail = colon + 1;
+    while (*tail == '/') {
+        ++tail;
+    }
+    if (*tail == '\0') {
+        std::snprintf(outPath, outPathSize, "%s", romfsPath);
+        return true;
+    }
+    const int written = std::snprintf(outPath, outPathSize, "%s/%s",
+                                     "sdmc:/switch/rr3-native-rehost", tail);
+    if (written <= 0 || static_cast<size_t>(written) >= outPathSize) {
+        std::snprintf(outPath, outPathSize, "%s", romfsPath);
+        return true;
+    }
+    if (pathExists(outPath)) {
+        return true;
+    }
+    // NEITHER PLACE HAS IT.
+    //
+    // The chain is a fallback, not a promise: it says "look here first, then
+    // there", and when neither place has the file the honest answer is
+    // FALSE.  Returning true with the RomFS path would send the caller off
+    // to open a file that is not there -- and an open of a missing RomFS
+    // entry is exactly what hung the clean build (MEASURED 2026-11-09), so
+    // the false answer has to be the false one.
+    //
+    // The path is still written out, so a caller that wants to report which
+    // path it tried has it.
+    std::snprintf(outPath, outPathSize, "%s", romfsPath);
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // THE SHARED ASSET RESOLVER, AND THE ASSET LIST THAT MATCHES IT.
 //

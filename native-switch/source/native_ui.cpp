@@ -1,6 +1,7 @@
 #include "rr3/native_ui.hpp"
 #include "rr3/ui_dashboard.hpp"
 #include "rr3/gfx_backend.hpp"
+#include "rr3/guest_filesystem.hpp"
 
 #include <switch.h>
 #include <ft2build.h>
@@ -208,23 +209,111 @@ void statusRow(int y, const char* label, const char* value, uint32_t color) {
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// THE PORT'S OWN FILES, WITH THE CARD FALLBACK.
+//
+// A "clean" build ships no EA material in the RomFS: the guest's faces and
+// its .depot text come from the user's own copy of the application, which
+// the user puts next to the NRO on the card.  The ROMFS path is therefore
+// only the FIRST place to look, and the card is the second.
+//
+// WHY IT MATTERS, MEASURED: a clean build hung at eglCreateWindowSurface
+// and rendered nothing, while the same source with a full RomFS ran fine.
+// The difference was this file: nativeUiInit() opened the faces straight
+// out of "romfs:/ui/..." with no fallback, and the read of a file that is
+// not there is what stopped the port before it ever made a window.
+//
+// THE SAME CLASS OF BUG, IN ONE PLACE: glyph_vector.cpp already had this
+// chain, and native_ui.cpp did not, and the two were written at different
+// times.  A rule that lives in one file is not a rule.
+// ---------------------------------------------------------------------------
+namespace {
+
+// The port's own file, wherever it lives: the RomFS first, the card
+// second.
+const char* portPath(const char* romfsPath, char* buffer, size_t size) {
+    rr3::resolvePortAssetPath(romfsPath, buffer, size);
+    return buffer;
+}
+
+// Open a face, and say whether it was the face that was asked for or the
+// OFL bootstrap one.
+//
+// The bootstrap face is opened ONCE and shared, so the fallback does not
+// open it four times.  It is opened on demand because the fallback is only
+// reached when the asked-for face was missing.
+bool openFaceOrBootstrap(const char* romfsPath, char* pathBuffer, size_t pathSize,
+                          FT_Face* out) {
+    if (FT_New_Face(gUi.library, portPath(romfsPath, pathBuffer, pathSize), 0,
+                     out) == 0) {
+        return true;
+    }
+    *out = nullptr;
+    return false;
+}
+
+} // namespace
+
 bool nativeUiInit() {
     if (gUi.active) return true;
-    if (FT_Init_FreeType(&gUi.library) != 0 ||
-        FT_New_Face(gUi.library, "romfs:/ui/ConduitITCPro-Regular.otf", 0,
-                    &gUi.regular) != 0 ||
-        FT_New_Face(gUi.library, "romfs:/ui/ConduitITCPro-Bold.otf", 0,
-                    &gUi.bold) != 0 ||
-        FT_New_Face(gUi.library, "romfs:/ui/EurostileLTStd-Bold.otf", 0,
-                    &gUi.numeric) != 0 ||
-        FT_New_Face(gUi.library,
-                    "romfs:/ui/NotoSansCJKsc-RR3Bootstrap.otf", 0,
-                    &gUi.chinese) != 0) {
+    if (FT_Init_FreeType(&gUi.library) != 0) {
         nativeUiExit();
         return false;
     }
+    // THE FACES, ONE AT A TIME, WITH A FALLBACK.
+    //
+    // WHY NOT ONE EXPRESSION: a failure anywhere in it meant the WHOLE
+    // dashboard failed, and the port then took main.cpp's diagnostic path --
+    // consoleInit(nullptr) -- which binds deko3d to nwindowGetDefault().  The
+    // console was never released, so Mesa's later eglCreateWindowSurface
+    // blocked on a window the console still owned.  MEASURED 2026-11-09: the
+    // clean loader hung exactly there and rendered nothing.
+    //
+    // So each face is opened on its own, and a face that is not there is
+    // replaced by the OFL bootstrap face -- which the clean build always
+    // carries, because it is Noto CJK under the SIL OFL and this project owns
+    // it.  A missing game face must never be able to take the whole port
+    // down the console path.
+    char regularPath[512];
+    char boldPath[512];
+    char numericPath[512];
+    char chinesePath[512];
+    const bool haveRegular = openFaceOrBootstrap(
+        "romfs:/ui/ConduitITCPro-Regular.otf", regularPath, sizeof(regularPath),
+        &gUi.regular);
+    const bool haveBold = openFaceOrBootstrap(
+        "romfs:/ui/ConduitITCPro-Bold.otf", boldPath, sizeof(boldPath),
+        &gUi.bold);
+    const bool haveNumeric = openFaceOrBootstrap(
+        "romfs:/ui/EurostileLTStd-Bold.otf", numericPath, sizeof(numericPath),
+        &gUi.numeric);
+    // The Chinese face is the bootstrap one itself, so it has no fallback: if
+    // it is missing the port cannot draw the Simplified Chinese catalogue and
+    // there is nothing to fall back TO.
+    const bool haveChinese =
+        FT_New_Face(gUi.library,
+                    portPath("romfs:/ui/NotoSansCJKsc-RR3Bootstrap.otf",
+                             chinesePath, sizeof(chinesePath)), 0,
+                    &gUi.chinese) == 0;
+    if (!haveChinese) {
+        nativeUiExit();
+        return false;
+    }
+    // The faces that were not found fall back to the one that was, so the
+    // dashboard always has a face to draw with.
+    if (!haveRegular) gUi.regular = gUi.chinese;
+    if (!haveBold) gUi.bold = gUi.chinese;
+    if (!haveNumeric) gUi.numeric = gUi.chinese;
     constexpr unsigned char kOriginalCatalogHeader[] = {0x86, 0x5f, 0xed};
     const bool looseData = externalDataStatus().looseFallback;
+    // The .depot paths, resolved through the card fallback.  They are
+    // buffers because a resolved path is a different string from the RomFS
+    // one, and the calls below take a const char*.
+    char chineseCatalogPath[512];
+    char languagesPath[512];
+    char englishCatalogPath[512];
+    char motionManifestPath[512];
+    char motionPrefixPath[512];
     const char* externalChinese = looseData
         ? "sdmc:/switch/rr3-native-rehost/data/loose/files/.depot/text_cn-Hans.txt"
         : "rr3core:/files/.depot/text_cn-Hans.txt";
@@ -237,20 +326,24 @@ bool nativeUiInit() {
         fileContainsText(externalLanguages,
                          "Chinese simplified,cn-Hans");
     gUi.originalChineseCatalog = gUi.originalChineseExternal ||
-        (fileStartsWith("romfs:/original/.depot/text_cn-Hans.txt",
+        (fileStartsWith(portPath("romfs:/original/.depot/text_cn-Hans.txt",
+                                 chineseCatalogPath, sizeof(chineseCatalogPath)),
                         kOriginalCatalogHeader,
                         sizeof(kOriginalCatalogHeader)) &&
-         fileContainsText("romfs:/original/.depot/langs.utf8",
+         fileContainsText(portPath("romfs:/original/.depot/langs.utf8",
+                                  languagesPath, sizeof(languagesPath)),
                           "Chinese simplified,cn-Hans"));
     gUi.originalEnglishCatalog = fileStartsWith(
-        "romfs:/original/.depot/text_en.txt",
+        portPath("romfs:/original/.depot/text_en.txt",
+                 englishCatalogPath, sizeof(englishCatalogPath)),
         kOriginalCatalogHeader, sizeof(kOriginalCatalogHeader));
     const char* externalMotionManifest = looseData
         ? "sdmc:/switch/rr3-native-rehost/data/loose/files/.depot/MenuTransitions.xml"
         : "rr3core:/files/.depot/MenuTransitions.xml";
     const char* motionManifest = fileExists(externalMotionManifest)
         ? externalMotionManifest
-        : "romfs:/original/.depot/MenuTransitions.xml";
+        : portPath("romfs:/original/.depot/MenuTransitions.xml",
+                   motionManifestPath, sizeof(motionManifestPath));
     gUi.originalMotionManifest = fileContainsText(
         motionManifest,
         "<KeyFrame start=\"0\" end=\"40\"/>") &&
@@ -263,7 +356,8 @@ bool nativeUiInit() {
         ? (looseData
             ? "sdmc:/switch/rr3-native-rehost/data/loose/files/.depot/Tracks/Menu/processed/"
             : "rr3track:/files/.depot/Tracks/Menu/processed/")
-        : "romfs:/original/.depot/Tracks/Menu/processed/";
+        : portPath("romfs:/original/.depot/Tracks/Menu/processed/",
+                   motionPrefixPath, sizeof(motionPrefixPath));
     char motionPath[0x180]{};
     std::snprintf(motionPath, sizeof(motionPath), "%smenu_transition.banim", motionPrefix);
     gUi.originalMotionTracks = fileExists(motionPath);
@@ -301,10 +395,25 @@ bool nativeUiInit() {
 }
 
 void nativeUiExit() {
+    // THE FACES MAY SHARE ONE POINTER.
+    //
+    // nativeUiInit() falls back to the OFL bootstrap face when a game face
+    // is not there, so regular, bold and numeric can all BE the chinese
+    // face.  Closing the same FT_Face three times is a double free, and a
+    // double free in a destructor path is exactly the kind of crash that
+    // looks like "the console froze for no reason".
+    //
+    // So each pointer is closed ONCE, and a pointer that is the same object
+    // as one already closed is skipped.
     if (gUi.chinese) FT_Done_Face(gUi.chinese);
-    if (gUi.numeric) FT_Done_Face(gUi.numeric);
-    if (gUi.bold) FT_Done_Face(gUi.bold);
-    if (gUi.regular) FT_Done_Face(gUi.regular);
+    if (gUi.numeric && gUi.numeric != gUi.chinese) FT_Done_Face(gUi.numeric);
+    if (gUi.bold && gUi.bold != gUi.chinese && gUi.bold != gUi.numeric) {
+        FT_Done_Face(gUi.bold);
+    }
+    if (gUi.regular && gUi.regular != gUi.chinese && gUi.regular != gUi.numeric &&
+        gUi.regular != gUi.bold) {
+        FT_Done_Face(gUi.regular);
+    }
     if (gUi.library) FT_Done_FreeType(gUi.library);
     if (gUi.framebuffer.has_init) framebufferClose(&gUi.framebuffer);
     gUi = {};

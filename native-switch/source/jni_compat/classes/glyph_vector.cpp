@@ -67,6 +67,7 @@
 #include "../../../include/rr3/gfx_backend.hpp"
 #include "../../../include/rr3/gfx_text_probe.hpp"
 #include "../../../include/rr3/glyph_wrap.hpp"
+#include "../../../include/rr3/guest_filesystem.hpp"
 #include "../jni.h"
 #include "../jni_internals.h"
 #include "glyph_vector.h"
@@ -319,8 +320,15 @@ FT_Face openFaceFor(const char* requestedPath, bool bold) {
 }
 
 FT_Face openFace(const char* romfsPath) {
+    // THE CARD FALLBACK.  A build that does not carry the game's faces in the
+    // RomFS -- a clean one, which carries no EA material -- finds them next
+    // to the NRO on the card, where the user put them from their own copy of
+    // the application.  A build that DOES carry them resolves to the same
+    // RomFS path it always did, so nothing changes for the normal build.
+    char path[512];
+    rr3::resolvePortAssetPath(romfsPath, path, sizeof(path));
     for (size_t i = 0; i < g_faceCount; ++i) {
-        if (strcmp(g_faces[i].key, romfsPath) == 0) {
+        if (strcmp(g_faces[i].key, path) == 0) {
             return g_faces[i].face;
         }
     }
@@ -328,12 +336,12 @@ FT_Face openFace(const char* romfsPath) {
         return nullptr;
     }
     FT_Face face = nullptr;
-    if (FT_New_Face(g_library, romfsPath, 0, &face) != 0 || face == nullptr) {
+    if (FT_New_Face(g_library, path, 0, &face) != 0 || face == nullptr) {
         return nullptr;
     }
     FaceSlot& slot = g_faces[g_faceCount];
     slot.face = face;
-    snprintf(slot.key, sizeof(slot.key), "%s", romfsPath);
+    snprintf(slot.key, sizeof(slot.key), "%s", path);
     ++g_faceCount;
     return face;
 }

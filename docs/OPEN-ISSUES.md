@@ -1948,6 +1948,67 @@ threads.  If the device freeze turns out to be that, the fix is to give the
 worker threads their own context or to serialise their GL work onto the
 main thread -- a bigger change than an instrument.
 
+### The clean loader hung, and the cause was a rule that lived in one file
+
+The clean build is the one this project actually wants to publish: an NRO
+that carries NO EA material at all, with the guest's own files found on the
+card next to it.  It had never been RUN, and it hung.
+
+MEASURED 2026-11-09, on Eden:
+
+  * the clean build's RomFS holds three files -- the OFL bootstrap face,
+    libc++ and the font licence -- and the NRO is 11,565,161 bytes instead
+    of 53,694,961;
+  * the guest's files WERE on the card, and they WERE found: the guest
+    booted (`guest-boot: recovery=1 initActive=1 initDone=1 extData=1`), the
+    view callbacks resolved, and the guest got as far as VIEW CHANGED;
+  * and then the port stopped, with the log's last line
+    `view-egl-config-ok` -- which is written at guest_view_probe.cpp:2594,
+    immediately before `eglCreateWindowSurface` -- and 0 frames rendered.
+
+THE CONTROL THAT PROVED IT WAS THE ROMFS AND NOT THE CODE: the same source,
+rebuilt with the full RomFS, produced the NRO byte-for-byte identical to the
+published one (d8d8e76a...) and ran normally through
+view-egl-config-ok -> view-egl-surface-ok -> view-egl-context-ok ->
+view-egl-current-ok and rendered 480 frames.  So the only variable was the
+RomFS content.  A bisect then narrowed it: clean + the game's faces in the
+RomFS rendered fine (480 frames, 21286 draws); clean without them hung.
+
+THE CAUSE, IN TWO STEPS.
+
+1. `nativeUiInit()` (native_ui.cpp) opened the faces STRAIGHT out of
+   "romfs:/ui/ConduitITCPro-Regular.otf" and friends, with no card
+   fallback.  In a clean RomFS those files are not there, so the open
+   failed and `nativeUiInit()` returned false.  `glyph_vector.cpp` had the
+   fallback chain; `native_ui.cpp` did not, because the two were written at
+   different times.  **A rule that lives in one file is not a rule.**
+
+2. A false `nativeUiInit()` sends main.cpp down its diagnostic path, which
+   calls `consoleInit(nullptr)`.  libnx binds deko3d to
+   `nwindowGetDefault()`, and `nativeUiExit()` closed the port's own
+   framebuffer but NEVER called `consoleExit()`.  Mesa then tried to create
+   an EGL surface on a window the console still owned, and blocked in the
+   kernel's buffer queue -- which is why the hang looked like a GPU problem
+   and was not one.
+
+THE FIX, IN THREE PARTS.
+
+  * Every RomFS path in native_ui.cpp now goes through
+    `resolvePortAssetPath()`, so the port finds its files wherever they are.
+  * A face that is not there is replaced by the OFL bootstrap face, which
+    the clean build always carries (it is Noto CJK under the SIL OFL and
+    this project owns it).  A missing game face can no longer take the
+    whole port down the console path.
+  * `main.cpp` now calls `consoleExit(nullptr)` before handing
+    `nwindowGetDefault()` to Mesa, so the window is released whether or not
+    the console was ever opened.
+
+AND A BUG THE FIX ITSELF WOULD HAVE INTRODUCED: with the fallback, three of
+the four face pointers can be the SAME FT_Face, and `nativeUiExit()` closed
+each of them -- a double free, in a destructor path, which is exactly the
+kind of crash that looks like "the console froze for no reason".  The exit
+path now closes each distinct pointer once.
+
 ### STILL OPEN
 
 * **Why did the console FREEZE HARD rather than just the app hang?**  The

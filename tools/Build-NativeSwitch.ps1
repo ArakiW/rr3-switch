@@ -2,7 +2,22 @@
 param(
     [ValidateRange(1, 32)]
     [int]$Jobs = 8,
-    [switch]$Clean
+    [switch]$Clean,
+    # THE CLEAN LOADER: a build that carries NO EA material.
+    #
+    # WHY IT EXISTS.  The RomFS carries the guest's DSOs (libRealRacing3.so,
+    # libNimble.so, libfmodex.so), the game's UI faces and the .depot text --
+    # all of them EA's files.  This project does not redistribute them (see
+    # NOTICE.md), so a build that is going to be PUBLISHED must not carry
+    # them.  With -CleanLoader the RomFS keeps only what this project owns
+    # (libc++_shared.so and the font licence), and the guest's own files are
+    # found on the CARD instead: the port looks for them next to the NRO
+    # (resolvePortAssetPath() in source/guest_filesystem.cpp, and
+    # selectGameLibrary() in source/main.cpp), where the user puts them from
+    # their own copy of the application.
+    #
+    # A build WITHOUT this switch is the normal one and is unchanged.
+    [switch]$CleanLoader
 )
 
 $ErrorActionPreference = 'Stop'
@@ -29,8 +44,61 @@ $allManagedDependencyNames = @(
 if (-not (Test-Path $gameLibrary -PathType Leaf)) {
     throw "Missing game library: $gameLibrary"
 }
-New-Item -ItemType Directory -Force -Path $romfsRoot | Out-Null
+New-Item -ItemType Directory -Force -Path $romfsRoot |Out-Null
+
+# THE CLEAN LOADER STAGES NOTHING OF THE GUEST'S.
+#
+# Everything the guest brings with it -- its own binary, Nimble, FMOD, the UI
+# faces, the .depot text -- is EA's material, and this project does not
+# redistribute it.  A clean build leaves it all out and the port finds it on
+# the card instead.
+if ($CleanLoader) {
+    Write-Host 'clean     : the CLEAN LOADER -- no EA material is staged into the RomFS.'
+    Write-Host '           the guest binary, Nimble, FMOD and the UI faces are found on the'
+    Write-Host '           card next to the NRO (see rr3::resolvePortAssetPath()).'
+    # Anything left over from an earlier build would defeat the whole point.
+    foreach ($stale in @('libRealRacing3.so', 'libNimble.so', 'libfmodex.so')) {
+        $stalePath = Join-Path $romfsRoot $stale
+        if (Test-Path $stalePath -PathType Leaf) {
+            Remove-Item -LiteralPath $stalePath -Force
+        }
+    }
+    # THE GAME'S OWN FACES GO; THE BOOTSTRAP CHINESE FACE STAYS.
+    #
+    # NotoSansCJKsc-RR3Bootstrap.otf is Noto CJK under the SIL OFL (the
+    # licence text is shipped with it), and the port needs it for the
+    # Simplified Chinese catalogue.  The rest of the faces are the game's own
+    # typography -- Conduit, Eurostile, Helvetica Neue, minion, myriad and the
+    # icon font r3_symbols.ttf -- and those are EA's.
+    #
+    # The bootstrap face is not COPIED into the tree by this script (it is
+    # staged once, by hand, into the build tree), so it is carried across the
+    # deletion rather than expected to reappear.
+    $cleanKeptFont = Join-Path $romfsRoot 'ui\NotoSansCJKsc-RR3Bootstrap.otf'
+    $cleanHeldFont = Join-Path $env:TEMP 'rr3-clean-bootstrap-font.otf'
+    $cleanKeptBytes = 0
+    if (Test-Path $cleanKeptFont -PathType Leaf) {
+        Copy-Item -LiteralPath $cleanKeptFont -Destination $cleanHeldFont -Force
+        $cleanKeptBytes = (Get-Item -LiteralPath $cleanHeldFont).Length
+    }
+    $staleUi = Join-Path $romfsRoot 'ui'
+    if (Test-Path $staleUi -PathType Container) {
+        Remove-Item -LiteralPath $staleUi -Recurse -Force
+    }
+    if ($cleanKeptBytes -gt 0) {
+        New-Item -ItemType Directory -Force -Path $staleUi | Out-Null
+        Copy-Item -LiteralPath $cleanHeldFont -Destination $cleanKeptFont -Force
+        Remove-Item -LiteralPath $cleanHeldFont -Force
+        Write-Host ("font     : the OFL bootstrap face is kept ({0} bytes); the game's own faces are not staged" -f $cleanKeptBytes)
+    }
+    $staleOriginal = Join-Path $romfsRoot 'original'
+    if (Test-Path $staleOriginal -PathType Container) {
+        Remove-Item -LiteralPath $staleOriginal -Recurse -Force
+    }
+}
+else {
 Copy-Item -LiteralPath $gameLibrary -Destination $embeddedLibrary -Force
+}
 foreach ($managedName in $allManagedDependencyNames) {
     if ($managedName -notin $dependencyNames) {
         $staleEmbeddedDependency = Join-Path $romfsRoot $managedName
@@ -40,6 +108,12 @@ foreach ($managedName in $allManagedDependencyNames) {
     }
 }
 foreach ($dependencyName in $dependencyNames) {
+    # IN A CLEAN BUILD ONLY libc++ GOES IN.  Nimble and FMOD are the guest's
+    # own libraries (Nimble is EA's telemetry/ARCore library, FMOD is its
+    # audio runtime), so they are found on the card instead.
+    if ($CleanLoader -and $dependencyName -ne 'libc++_shared.so') {
+        continue
+    }
     $dependency = Join-Path $projectRoot "reverse\native\arm64\$dependencyName"
     if (-not (Test-Path $dependency -PathType Leaf)) {
         throw "Missing embedded dependency: $dependency"
@@ -88,6 +162,9 @@ $optionalFontAssets = @(
 )
 $fontDestination = Join-Path $romfsRoot 'ui'
 New-Item -ItemType Directory -Force -Path $fontDestination | Out-Null
+# IN A CLEAN BUILD NO GAME FACE IS STAGED.  They are EA's fonts, and the port
+# finds them on the card next to the NRO when they are not in the RomFS.
+if (-not $CleanLoader) {
 foreach ($assetName in $requiredFontAssets) {
     $assetSource = Join-Path $originalDepotRoot $assetName
     if (-not (Test-Path $assetSource -PathType Leaf)) {
@@ -108,6 +185,10 @@ if ($missingOptionalFonts.Count -gt 0) {
     Write-Host ("font     : {0} of the game's own faces are NOT staged, so text that asks for them will be drawn with the Conduit fallback: {1}" -f `
         $missingOptionalFonts.Count, ($missingOptionalFonts -join ', '))
     Write-Host ("           stage them with: python tools\stage_rr3_fonts.py <data-pack.zip>")
+}
+}
+else {
+    Write-Host ("font     : none staged (the clean loader finds the game's own faces on the card)")
 }
 
 # THE GAME'S ICON FONT.
@@ -137,6 +218,11 @@ if ($missingOptionalFonts.Count -gt 0) {
 $iconFontAsset = 'r3_symbols.ttf'
 $iconFontBytes = 125764
 $iconFontSource = Join-Path $originalDepotRoot $iconFontAsset
+if ($CleanLoader) {
+    # THE ICON FONT IS THE GAME'S OWN TOO.  A clean build does not stage it.
+    Write-Host ("font     : {0} is not staged (the clean loader finds it on the card)" -f $iconFontAsset)
+}
+else {
 if (Test-Path $iconFontSource -PathType Leaf) {
     $iconFontSize = (Get-Item -LiteralPath $iconFontSource).Length
     if ($iconFontSize -eq $iconFontBytes) {
@@ -147,6 +233,7 @@ if (Test-Path $iconFontSource -PathType Leaf) {
     }
 } else {
     Write-Host ("font     : {0} is NOT staged, so the game's icons are drawn as letters" -f $iconFontAsset)
+}
 }
 $bootstrapChineseFont = Join-Path $fontDestination 'NotoSansCJKsc-RR3Bootstrap.otf'
 $bootstrapFontLicense = Join-Path $romfsRoot 'licenses\Noto-CJK-OFL.txt'
@@ -173,6 +260,7 @@ $originalAssets = @(
     'Tracks\Menu\processed\garage_mycars.banim'
 )
 $originalDestination = Join-Path $romfsRoot 'original\.depot'
+if (-not $CleanLoader) {
 foreach ($relativeAsset in $originalAssets) {
     $assetSource = Join-Path $originalDepotRoot $relativeAsset
     if (-not (Test-Path $assetSource -PathType Leaf)) {
@@ -181,6 +269,10 @@ foreach ($relativeAsset in $originalAssets) {
     $assetDestination = Join-Path $originalDestination $relativeAsset
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $assetDestination) | Out-Null
     Copy-Item -LiteralPath $assetSource -Destination $assetDestination -Force
+}
+}
+else {
+    Write-Host ("original : {0} of the game's own .depot files are not staged (the clean loader takes them from the card's data volumes)" -f $originalAssets.Count)
 }
 
 $localMsys = Join-Path $projectRoot '.tools\devkitPro\msys64'

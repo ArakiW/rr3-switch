@@ -105,6 +105,30 @@ bool bionicDirentLayoutSelfTest();
 bool resolveAssetLocalFile(const char* assetPath, char* outPath, size_t outPathSize,
                            char digest[33], unsigned long long* sizeOut);
 
+// THE PORT'S OWN ASSET PATH, WITH A CARD FALLBACK.
+//
+// WHY THIS EXISTS.  The port's RomFS carries the GUEST'S assets: the three
+// guest DSOs (libRealRacing3.so, libNimble.so, libfmodex.so) and the game's
+// UI faces.  Those are EA's files, and this project does not redistribute
+// them (see NOTICE.md).  A "clean" build therefore leaves them OUT of the
+// RomFS, and the user puts them on the card themselves, from their own copy
+// of the application.
+//
+// ⇒ The lookup is a CHAIN, and the chain is the same shape as the one the
+// guest binary already uses (see selectGameLibrary() in source/main.cpp):
+//
+//     romfs:/ui/ConduitITCPro-Bold.otf
+//         -> sdmc:/switch/rr3-native-rehost/ui/ConduitITCPro-Bold.otf
+//
+// So a build that carries the assets in the RomFS behaves exactly as it does
+// today, and a build that does not finds them on the card instead.
+//
+// The CALLER owns the buffer: the answer can be one of two paths and both
+// may have to be alive at the same time (the loader's DSO list holds three
+// of them at once).
+// ---------------------------------------------------------------------------
+bool resolvePortAssetPath(const char* romfsPath, char* outPath, size_t outPathSize);
+
 // Rewrites an asset list so that every entry describes the bytes the port
 // will actually serve for that path.
 //

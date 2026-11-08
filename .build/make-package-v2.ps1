@@ -62,7 +62,19 @@
 [CmdletBinding()]
 param(
     [string]$Stamp = '20261102',
-    [string]$RunLog = ''
+    [string]$RunLog = '',
+    # A CLEAN PACKAGE carries no EA material at all.
+    #
+    # WHY IT EXISTS: the step that copies "the live card files, at their real
+    # relative paths" is what makes a package usable on a card that has the
+    # data volumes but not the guest's own files.  For a clean package that
+    # is exactly WRONG: the guest's binary, its fonts and its .depot text are
+    # EA's, they belong on the CARD (where the user puts them from their own
+    # copy of the application), and they must not be shipped.
+    #
+    # With this switch the package carries the NRO (which has no EA material
+    # in it), the control scripts and the configuration, and nothing else.
+    [switch]$CleanPackage
 )
 
 $ErrorActionPreference = 'Stop'
@@ -176,32 +188,47 @@ $scriptNames = @('rr3-touch.txt', 'rr3-drive.txt', 'rr3-pad.txt', 'rr3-action.tx
     'rr3-gamepad.txt')
 
 # ---- 3. the data volumes ------------------------------------------------------
+#
+# NOT in a clean package: the data volumes are EA's, and the user puts them
+# on the card from their own copy of the application (see NOTICE.md).
 $dstData = Join-Path $dstApp 'data'
-New-Item -ItemType Directory -Force -Path $dstData | Out-Null
-foreach ($file in @(Get-ChildItem (Join-Path $cardApp 'data') -File)) {
-    Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $dstData $file.Name) -Force
+if (-not $CleanPackage) {
+    New-Item -ItemType Directory -Force -Path $dstData | Out-Null
+    foreach ($file in @(Get-ChildItem (Join-Path $cardApp 'data') -File)) {
+        Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $dstData $file.Name) -Force
+    }
+    Write-Host ("data       : {0} files, {1:N1} MiB" -f `
+        (Get-ChildItem $dstData -File).Count, `
+        ((Get-ChildItem $dstData -File | Measure-Object Length -Sum).Sum / 1MB))
+} else {
+    Write-Host 'data       : none (a clean package ships none; the user supplies them)'
 }
-Write-Host ("data       : {0} files, {1:N1} MiB" -f `
-    (Get-ChildItem $dstData -File).Count, `
-    ((Get-ChildItem $dstData -File | Measure-Object Length -Sum).Sum / 1MB))
 
 # ---- 4. the live card files, at their real relative paths ----------------------
+#
+# NOT in a clean package: these are the files the measured run read, and among
+# them are the guest's own binary, its faces and its .depot text.  They are
+# EA's material and they belong on the card, not in a download.
 $liveCount = 0
 $liveBytes = 0
-foreach ($rel in ($served | Sort-Object)) {
-    $source = Join-Path $cardApp ($rel -replace '/', '\')
-    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { continue }
-    $target = Join-Path $dstApp ($rel -replace '/', '\')
-    $parent = Split-Path -Parent $target
-    if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
-        New-Item -ItemType Directory -Force -Path $parent | Out-Null
+if (-not $CleanPackage) {
+    foreach ($rel in ($served | Sort-Object)) {
+        $source = Join-Path $cardApp ($rel -replace '/', '\')
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { continue }
+        $target = Join-Path $dstApp ($rel -replace '/', '\')
+        $parent = Split-Path -Parent $target
+        if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+            New-Item -ItemType Directory -Force -Path $parent | Out-Null
+        }
+        Copy-Item -LiteralPath $source -Destination $target -Force
+        $liveCount++
+        $liveBytes += (Get-Item $source).Length
     }
-    Copy-Item -LiteralPath $source -Destination $target -Force
-    $liveCount++
-    $liveBytes += (Get-Item $source).Length
+    Write-Host ("live       : {0} files, {1:N2} MiB (the ones the measured run read)" -f `
+        $liveCount, ($liveBytes / 1MB))
+} else {
+    Write-Host 'live       : none (a clean package ships none; the user supplies them)'
 }
-Write-Host ("live       : {0} files, {1:N2} MiB (the ones the measured run read)" -f `
-    $liveCount, ($liveBytes / 1MB))
 
 # ---- 4b. the control scripts, LAST, so they win ------------------------------
 #
@@ -217,28 +244,35 @@ Write-Host ("scripts    : {0} (the repository's copies, over the live ones)" -f 
 #
 # The safety net.  It is NOT installed by default: it is the 10,413 files the
 # measured run did not read, and putting them back is a deliberate act.
-$optional = Join-Path $pkg 'optional'
-New-Item -ItemType Directory -Force -Path $optional | Out-Null
-$staging = Join-Path $pkg '.staging'
-New-Item -ItemType Directory -Force -Path $staging | Out-Null
-foreach ($dir in @('.depot', 'apk')) {
-    $from = Join-Path $cardApp $dir
-    if (-not (Test-Path -LiteralPath $from -PathType Container)) { continue }
-    & robocopy.exe $from (Join-Path $staging $dir) /E /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null
-    if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $dir (code $LASTEXITCODE)" }
+#
+# NOT in a clean package: this archive is the game's own data, and it is
+# EA's.  A clean package that carried it would not be a clean package.
+if (-not $CleanPackage) {
+    $optional = Join-Path $pkg 'optional'
+    New-Item -ItemType Directory -Force -Path $optional | Out-Null
+    $staging = Join-Path $pkg '.staging'
+    New-Item -ItemType Directory -Force -Path $staging | Out-Null
+    foreach ($dir in @('.depot', 'apk')) {
+        $from = Join-Path $cardApp $dir
+        if (-not (Test-Path -LiteralPath $from -PathType Container)) { continue }
+        & robocopy.exe $from (Join-Path $staging $dir) /E /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null
+        if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $dir (code $LASTEXITCODE)" }
+    }
+    $fullArchive = Join-Path $optional 'card-depot-full.zip'
+    Write-Host 'packing    : optional\card-depot-full.zip ...'
+    & tar.exe -a -cf $fullArchive -C $staging .
+    if ($LASTEXITCODE -ne 0) { throw "tar failed (code $LASTEXITCODE)" }
+    # Empty the staging directory with robocopy /MIR against an empty one, so that
+    # nothing has to be deleted recursively.
+    $empty = Join-Path $pkg '.empty'
+    New-Item -ItemType Directory -Force -Path $empty | Out-Null
+    & robocopy.exe $empty $staging /MIR /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null
+    Remove-Item -LiteralPath $staging -Force
+    Remove-Item -LiteralPath $empty -Force
+    Write-Host ("optional   : {0:N1} MiB" -f ((Get-Item $fullArchive).Length / 1MB))
+} else {
+    Write-Host 'optional   : none (a clean package ships none; the user supplies them)'
 }
-$fullArchive = Join-Path $optional 'card-depot-full.zip'
-Write-Host 'packing    : optional\card-depot-full.zip ...'
-& tar.exe -a -cf $fullArchive -C $staging .
-if ($LASTEXITCODE -ne 0) { throw "tar failed (code $LASTEXITCODE)" }
-# Empty the staging directory with robocopy /MIR against an empty one, so that
-# nothing has to be deleted recursively.
-$empty = Join-Path $pkg '.empty'
-New-Item -ItemType Directory -Force -Path $empty | Out-Null
-& robocopy.exe $empty $staging /MIR /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null
-Remove-Item -LiteralPath $staging -Force
-Remove-Item -LiteralPath $empty -Force
-Write-Host ("optional   : {0:N1} MiB" -f ((Get-Item $fullArchive).Length / 1MB))
 
 # ---- 6. the port's conf, the installer, the readme ----------------------------
 Copy-Item -LiteralPath (Join-Path $projectRoot 'tools\rr3-gfx.conf') `
