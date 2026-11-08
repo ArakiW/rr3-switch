@@ -1907,6 +1907,47 @@ bookkeeping problem, not a behaviour one.
 ⇒ The clean-loader work is either finished and verified, or reverted.  It is
 not left half in a release.
 
+### The Antigravity CLI review of the no-context observer
+
+The observer was reviewed adversarially by the Antigravity CLI
+(`gemini-3.8-flash-high`), and it found three REAL defects in the first
+version -- the kind that only a second pair of eyes catches:
+
+1. **THE LOG PATH WAS NOT BOUNDED.**  The record array was capped at 32
+   entries, but the code FELL THROUGH to the log write when the slot index
+   went past the cap, so a busy thread could write a line per call anyway.
+   That is the same failure as the 186 MB log, one layer down: the budget was
+   on the records, not on the lines.  Fixed: the out-of-budget branch now
+   returns, and the surplus is counted.
+2. **THE TALLY LOST UPDATES.**  `store(recorded + 1)` after a relaxed LOAD is
+   a read-modify-write, so two threads could both see the same value and one
+   increment would vanish -- which would let the budget be overrun.  Fixed
+   with `fetch_add`.
+3. **RE-ENTRANCY.**  The observer writes to the card, and the card write runs
+   under a non-recursive mutex; a GL call reached from inside that write
+   would re-enter the observer and deadlock the thread.  Fixed with a
+   thread-local guard.
+
+It also extended the coverage from the 9 tracers the first version hooked
+to **23**, adding the ones a worker thread is most likely to use --
+`glCompressedTexImage2D` (texture decompression upload), `glDrawArrays`,
+`glDrawElements`, `glGetString`, `glClear`, `glViewport`, `glScissor`,
+`glUseProgram`, `glCheckFramebufferStatus` and the bind/gen family.
+
+**WHAT IS STILL INVISIBLE, STATED PLAINLY.**  The observer hooks the
+`guestViewTracedGl*` tracers.  The guest's OTHER GL imports -- about sixty
+of them, bound with `RR3_BIND` in symbol_resolver.cpp, including
+`glFinish`, `glBufferData`, `glUniform*` and `glEnable` -- reach the driver
+directly and are NOT observed.  The dangerous ones (the draw calls, the
+shader calls, the texture uploads) ARE observed, but the coverage is not
+complete and the next device run could still show a context-less call on a
+symbol this observer does not see.
+
+The port still does not make the EGL context current on the guest's worker
+threads.  If the device freeze turns out to be that, the fix is to give the
+worker threads their own context or to serialise their GL work onto the
+main thread -- a bigger change than an instrument.
+
 ### STILL OPEN
 
 * **Why did the console FREEZE HARD rather than just the app hang?**  The
