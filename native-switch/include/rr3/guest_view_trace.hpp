@@ -69,6 +69,23 @@ void* guestViewTracedMemset(void* destination, int value, size_t length);
 unsigned int guestViewTraceLastStage();
 bool guestViewTraceReached(unsigned int stage);
 
+// HOW MANY GL CALLS THE GUEST MADE FROM A THREAD WITH NO EGL CONTEXT.
+//
+// WHY IT IS COUNTED RATHER THAN ONLY LOGGED.  The port makes the EGL context
+// current on the main thread only, so every GL call a guest WORKER thread
+// makes has no context.  On the emulator's software Mesa that is a harmless
+// no-op; on the real NVN driver it can wedge the channel and take the whole
+// console down with it.  The count is what makes the absence explainable:
+// "zero context-less calls" and "the observer never ran" must not look the
+// same in a log.
+//
+// The count is read at the end of the run, and the line is written EVEN WHEN
+// IT IS ZERO.
+uint32_t guestViewGlNoContextCount();
+// How many of those calls were recorded (the observer keeps a bounded number
+// of records; the rest are counted only).
+uint32_t guestViewGlNoContextRecorded();
+
 // Host-symbol target used by the stack-protector shim. When the Guest View
 // trace is enabled, it records the first stack-canary failure without
 // suppressing the subsequent abort.

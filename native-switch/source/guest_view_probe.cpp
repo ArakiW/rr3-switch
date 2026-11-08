@@ -3161,6 +3161,32 @@ GuestViewProbe runGuestViewProbe(NWindow* window, const char* progressPath) {
     probe.postGlMalloc40FirstReturned = guestViewTraceReached(28);
     probe.postGlMalloc40SecondCalled = guestViewTraceReached(29);
     probe.postGlMalloc40SecondReturned = guestViewTraceReached(30);
+
+    // HOW MANY GL CALLS CAME FROM A THREAD WITH NO EGL CONTEXT.
+    //
+    // Written HERE, before the trace is disabled and before the first
+    // swap, because that is the last moment the port is certain to still be
+    // able to write.  The line is written EVEN WHEN THE COUNT IS ZERO, so
+    // that "the guest made no context-less call" and "the observer never
+    // ran" cannot be mistaken for each other.
+    //
+    // WHY IT MATTERS ON HARDWARE.  The port makes the EGL context current on
+    // the main thread only.  A guest worker thread therefore has no context,
+    // and on the real NVN driver a context-less GL call can wedge the
+    // channel and freeze the whole console.  The emulator's software Mesa
+    // turns the same call into a no-op, so the emulator cannot show this at
+    // all -- which is why the number has to be carried to the device.
+    {
+        const uint32_t noContext = guestViewGlNoContextCount();
+        const uint32_t recorded = guestViewGlNoContextRecorded();
+        char details[192];
+        std::snprintf(details, sizeof(details),
+                      "calls=%u recorded=%u "
+                      "note=the_port_makes_the_context_current_on_the_main_thread_only",
+                      noContext, recorded);
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "gl-no-context-summary", noContext, recorded, details);
+    }
     disableGuestViewGlTrace();
 
     writeGuestBootProgress(progressPath, "view-gl-finish-enter", 47, 0);

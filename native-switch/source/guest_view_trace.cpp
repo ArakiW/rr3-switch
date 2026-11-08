@@ -6,6 +6,7 @@
 #include "rr3/recovery_guard.hpp"
 
 #include <EGL/egl.h>
+#include <switch.h>
 
 #include <atomic>
 #include <cstdint>
@@ -211,6 +212,20 @@ unsigned int stageFor(GLenum name, bool returned) {
     return base + (returned ? 1U : 0U);
 }
 
+// THE CONTEXT-LESS GL CALL COUNTER.
+//
+// It is declared HERE, above checkpointPhase(), because the count has to ride
+// along with every progress checkpoint: the summary line written at the end
+// of the run is useless for the case this instrument exists for, because the
+// device froze INSIDE onViewChangedJNI and never reached that line.  The
+// progress file's LAST LINE is the only thing that survives a freeze.
+std::atomic<uint32_t> g_glNoContextCount{0};
+std::atomic<uint32_t> g_glNoContextRecorded{0};
+std::atomic<bool> g_glNoContextBudgetSpent{false};
+// The thread that owns the EGL context, so that a call from anywhere else is
+// recognisable as "a call from a thread the context is not on".
+std::atomic<uint32_t> g_glContextOwnerHandle{0};
+
 void checkpointPhase(const char* phase, unsigned int stage,
                      unsigned long long target, bool durable = true) {
     if (phase == nullptr || g_progressPath == nullptr ||
@@ -225,7 +240,8 @@ void checkpointPhase(const char* phase, unsigned int stage,
         __builtin_snprintf(details, sizeof(details),
             "trace=callers-v1 malloc40_caller=%016llx copy_caller=%016llx "
             "dst=%016llx src=%016llx len=%llx free_caller=%016llx ptr=%016llx"
-            " gltrace=shader-v1 gl_caller=%016llx gl_object=%x",
+            " gltrace=shader-v1 gl_caller=%016llx gl_object=%x"
+            " gl_no_ctx_calls=%u gl_no_ctx_recorded=%u",
             static_cast<unsigned long long>(g_second40Caller),
             static_cast<unsigned long long>(g_copyCaller),
             static_cast<unsigned long long>(g_copyDestination),
@@ -233,17 +249,28 @@ void checkpointPhase(const char* phase, unsigned int stage,
             static_cast<unsigned long long>(g_copyLength),
             static_cast<unsigned long long>(g_freeCaller),
             static_cast<unsigned long long>(g_freeAddress),
-            static_cast<unsigned long long>(g_glCaller), g_glObject);
+            static_cast<unsigned long long>(g_glCaller), g_glObject,
+            g_glNoContextCount.load(std::memory_order_relaxed),
+            g_glNoContextRecorded.load(std::memory_order_relaxed));
+    } else {
+        // THE COUNT RIDES ALONG WITH EVERY CHECKPOINT, not only with the
+        // stage>=30 ones.  The progress file keeps ONE line and overwrites it,
+        // so the line that survives a freeze is whichever checkpoint ran
+        // last -- and if the count were only on the stage>=30 checkpoints, a
+        // freeze before the first of those would leave a line with no count
+        // on it, which is exactly the case where the number is wanted.
+        __builtin_snprintf(details, sizeof(details),
+            "gl_no_ctx_calls=%u gl_no_ctx_recorded=%u",
+            g_glNoContextCount.load(std::memory_order_relaxed),
+            g_glNoContextRecorded.load(std::memory_order_relaxed));
     }
     // Only the blocked-wait breadcrumb passes durable=false: it is the one
     // progress write that repeats on a guest-blocking timer, and it must not
     // pay for the whole-card fsync that the durable stage checkpoints need.
     if (durable) {
-        writeGuestBootProgress(g_progressPath, phase, stage, target,
-                               stage >= 30 ? details : nullptr);
+        writeGuestBootProgress(g_progressPath, phase, stage, target, details);
     } else {
-        writeGuestBootProgressNoSync(g_progressPath, phase, stage, target,
-                                     stage >= 30 ? details : nullptr);
+        writeGuestBootProgressNoSync(g_progressPath, phase, stage, target, details);
     }
     g_checkpointInProgress = false;
 }
@@ -306,7 +333,120 @@ unsigned int memsetStage(size_t length, bool returned) {
     return base + (returned ? 1U : 0U);
 }
 
+// ---------------------------------------------------------------------------
+// A GL CALL FROM A THREAD WITH NO EGL CONTEXT.
+//
+// MEASURED 2026-11-09 on the console: the whole system froze solid about
+// 2.8 minutes into the port's life.  The guest had started, it had created
+// seven framebuffers (all GL_FRAMEBUFFER_COMPLETE), it had NOT rendered a
+// single frame, and it died inside its own onViewChangedJNI with the
+// progress file's last line reading "view-sync-blocked-cond-wait".  The last
+// GL thing the tracer saw was a shader program.
+//
+// THE BLIND SPOT THIS CLOSES.  `g_enabled` above is thread_local, and it is
+// only turned on by the thread that calls enableGuestViewGlTrace() -- the
+// main thread.  So every GL call a guest WORKER thread makes is invisible:
+// the tracers take their early-out and forward straight to the driver.
+//
+// WHY THAT MATTERS ON HARDWARE AND NOT ON THE EMULATOR.  The port makes the
+// EGL context current ON THE MAIN THREAD ONLY, and EGL binds a context to
+// one thread at a time, so a guest worker thread has NO current context.
+// On the emulator's software Mesa a context-less GL call is a harmless
+// no-op; on the real NVN driver it reaches driver internals with no
+// dispatch table, and a wedged NVN channel takes the compositor -- and
+// therefore the whole console -- with it.  The emulator cannot show this,
+// because the emulator never has the problem.
+//
+// SO THIS IS A NARROW OBSERVER, NOT A GLOBAL TRACE.  Making g_enabled
+// global would turn on the existing checkpoint writer (an fsync per
+// checkpoint) on every worker thread, and this project has already
+// measured that a diagnostic which becomes the loudest thing in the system
+// is a second outage: 2026-11-09's own fix grew the guest log to 186 MB
+// in four minutes before it was given a total budget.
+//
+// What this does instead: a boolean check (is there a current context?) and,
+// only when the answer is NO, one bounded record and one log line.  The
+// line is written BEFORE the real GL call, so if that call is what wedges
+// the GPU, the evidence is already on the card.
+// ---------------------------------------------------------------------------
+constexpr size_t kGlNoContextRecords = 32;
+
+struct GlNoContextRecord {
+    uint32_t threadHandle{};
+    uintptr_t callerPc{};
+    uintptr_t eglContext{};
+    const char* fn{};
+};
+
+GlNoContextRecord g_glNoContextRecords[kGlNoContextRecords];
+std::atomic<uint32_t> g_glNoContextRecordIndex{0};
+
+// THE OBSERVER.  Called from the GL tracers BEFORE the real call.
+void noteGlCallWithoutContext(const char* fn, uintptr_t callerPc) {
+    static thread_local bool s_inObserver = false;
+    if (s_inObserver) {
+        return;
+    }
+    // The check has to be cheap: it runs on every traced GL call.
+    if (::eglGetCurrentContext() != EGL_NO_CONTEXT) {
+        return;
+    }
+    s_inObserver = true;
+
+    const uint32_t seen = g_glNoContextCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint32_t slot = g_glNoContextRecordIndex.fetch_add(1, std::memory_order_relaxed);
+    if (slot >= kGlNoContextRecords) {
+        if (!g_glNoContextBudgetSpent.exchange(true, std::memory_order_relaxed)) {
+            char details[160];
+            __builtin_snprintf(details, sizeof(details),
+                               "budget=%u calls=%u "
+                               "note=the_observer_stopped_recording_but_the_calls_continue",
+                               static_cast<unsigned>(kGlNoContextRecords), seen);
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                "gl-no-context-budget", 0, seen, details);
+        }
+        s_inObserver = false;
+        return;
+    }
+
+    g_glNoContextRecords[slot].threadHandle = threadGetCurHandle();
+    g_glNoContextRecords[slot].callerPc = callerPc;
+    g_glNoContextRecords[slot].eglContext = 0;
+    g_glNoContextRecords[slot].fn = fn;
+    g_glNoContextRecorded.fetch_add(1, std::memory_order_relaxed);
+
+    const uint32_t owner = g_glContextOwnerHandle.load(std::memory_order_relaxed);
+    const uint32_t self = threadGetCurHandle();
+    char details[256];
+    __builtin_snprintf(details, sizeof(details),
+                       "fn=%s caller_pc=0x%llx egl_ctx=0x%llx thread=0x%x "
+                       "context_owner_thread=0x%x is_owner=%d calls=%u",
+                       fn != nullptr ? fn : "?",
+                       (unsigned long long)callerPc,
+                       (unsigned long long)0,
+                       self, owner,
+                       (owner != 0 && owner == self) ? 1 : 0, seen);
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "gl-no-context", seen, self, details);
+    s_inObserver = false;
+}
+
 } // namespace
+
+// THE TWO PUBLIC READ-OUTS.  They live OUTSIDE the anonymous namespace on
+// purpose: the caller is in another translation unit
+// (guest_view_probe.cpp), so they need external linkage.
+//
+// They are written so that a count of ZERO is a fact, not an absence: the
+// caller prints the number every run, so "the guest made no context-less GL
+// call" and "the observer never ran" cannot be mistaken for each other.
+uint32_t guestViewGlNoContextCount() {
+    return g_glNoContextCount.load(std::memory_order_relaxed);
+}
+
+uint32_t guestViewGlNoContextRecorded() {
+    return g_glNoContextRecorded.load(std::memory_order_relaxed);
+}
 
 void hostDrawMagentaQuad() {
     if (!ensureHostQuadPipeline()) {
@@ -456,6 +596,10 @@ void enableGuestViewGlTrace(const char* progressPath) {
     g_progressPath = progressPath;
     g_lastStage = 0;
     g_seenStages = 0;
+    // THE THREAD THAT OWNS THE EGL CONTEXT.  The port makes the context
+    // current on this thread only, so a GL call from any other thread has no
+    // context -- and that is the fact the no-context observer reports.
+    g_glContextOwnerHandle.store(threadGetCurHandle(), std::memory_order_relaxed);
     g_traceTpidrEl0 = readTpidrEl0();
     g_traceCanary = readGuestCanary(g_traceTpidrEl0);
     g_traceCanaryReadable = g_traceTpidrEl0 != 0;
@@ -501,6 +645,8 @@ void disableGuestViewGlTrace() {
 }
 
 const GLubyte* guestViewTracedGlGetString(GLenum name) {
+    noteGlCallWithoutContext("glGetString",
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     if (!g_enabled || glStringName(name) == nullptr) {
         return ::glGetString(name);
     }
@@ -699,6 +845,11 @@ void* guestViewTracedMemset(void* destination, int value, size_t length) {
 }
 
 GLuint guestViewTracedGlCreateShader(GLenum type) {
+    // BEFORE the early-out: a worker thread takes exactly this path, and a
+    // worker thread is the one with no EGL context.  See the observer's
+    // comment above.
+    noteGlCallWithoutContext("glCreateShader",
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     if (!g_enabled || g_checkpointInProgress) {
         return ::glCreateShader(type);
     }
@@ -717,6 +868,8 @@ GLuint guestViewTracedGlCreateShader(GLenum type) {
 
 void guestViewTracedGlShaderSource(GLuint shader, GLsizei count,
                                    const GLchar* const* strings, const GLint* lengths) {
+    noteGlCallWithoutContext("glShaderSource",
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     if (!g_enabled || g_checkpointInProgress) {
         ::glShaderSource(shader, count, strings, lengths);
         return;
@@ -750,6 +903,11 @@ void guestViewTracedGlShaderSource(GLuint shader, GLsizei count,
 }
 
 void guestViewTracedGlCompileShader(GLuint shader) {
+    // BEFORE the early-out: see the observer's comment.  A shader compiled on
+    // a thread with no context is the single most suspicious thing a guest
+    // can do to an NVN driver.
+    noteGlCallWithoutContext("glCompileShader",
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     if (!g_enabled || g_checkpointInProgress) {
         ::glCompileShader(shader);
         return;
@@ -769,6 +927,9 @@ void guestViewTracedGlCompileShader(GLuint shader) {
 }
 
 void guestViewTracedGlLinkProgram(GLuint program) {
+    // BEFORE the early-out: see the observer's comment.
+    noteGlCallWithoutContext("glLinkProgram",
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     if (!g_enabled || g_checkpointInProgress) {
         ::glLinkProgram(program);
         return;
@@ -790,6 +951,8 @@ void guestViewTracedGlLinkProgram(GLuint program) {
 void guestViewTracedGlShaderBinary(GLsizei count, const GLuint* shaders,
                                    GLenum binaryformat, const void* binary,
                                    GLsizei length) {
+    noteGlCallWithoutContext("glShaderBinary",
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                         "glShaderBinary",
                         static_cast<unsigned long long>(count),
@@ -801,6 +964,7 @@ void guestViewTracedGlShaderBinary(GLsizei count, const GLuint* shaders,
 bool guestViewTraceReached(unsigned int stage) {
     return stage < 64 && (g_seenStages & (1ULL << stage)) != 0;
 }
+
 
 void guestViewTraceSyncBlocked(const char* primitive, unsigned int stage) {
     if (g_progressPath == nullptr || primitive == nullptr || g_checkpointInProgress) {
@@ -861,6 +1025,8 @@ void resetGuestViewGlStats() {
 }
 
 void guestViewTracedGlClear(GLbitfield mask) {
+    noteGlCallWithoutContext("glClear",
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     if (g_glStatsEnabled) {
         ++g_glStats.clears;
     }
@@ -868,6 +1034,8 @@ void guestViewTracedGlClear(GLbitfield mask) {
 }
 
 void guestViewTracedGlDrawArrays(GLenum mode, GLint first, GLsizei count) {
+    noteGlCallWithoutContext("glDrawArrays",
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     if (g_glStatsEnabled) {
         ++g_glStats.drawArrays;
         g_glStats.lastDrawMode = mode;
@@ -942,6 +1110,8 @@ void guestViewTracedGlDrawArrays(GLenum mode, GLint first, GLsizei count) {
 
 void guestViewTracedGlDrawElements(GLenum mode, GLsizei count, GLenum type,
                                    const void* indices) {
+    noteGlCallWithoutContext("glDrawElements",
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     if (g_glStatsEnabled) {
         ++g_glStats.drawElements;
         g_glStats.lastDrawMode = mode;
@@ -973,6 +1143,8 @@ void guestViewTracedGlDrawElements(GLenum mode, GLsizei count, GLenum type,
 void guestViewTracedGlTexImage2D(GLenum target, GLint level, GLint internalformat,
                                  GLsizei width, GLsizei height, GLint border,
                                  GLenum format, GLenum type, const void* pixels) {
+    noteGlCallWithoutContext("glTexImage2D",
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     if (g_glStatsEnabled) {
         ++g_glStats.texImage2D;
         // The size of the texture the guest is creating, against the texture
@@ -1022,6 +1194,8 @@ void guestViewTracedGlCompressedTexImage2D(GLenum target, GLint level,
                                            GLenum internalformat, GLsizei width,
                                            GLsizei height, GLint border,
                                            GLsizei imageSize, const void* data) {
+    noteGlCallWithoutContext("glCompressedTexImage2D",
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     if (g_glStatsEnabled) {
         ++g_glStats.compressedTexImage2D;
         // Same as glTexImage2D: the size of the texture being created, so the
@@ -1043,6 +1217,12 @@ void guestViewTracedGlCompressedTexImage2D(GLenum target, GLint level,
 }
 
 void guestViewTracedGlBindFramebuffer(GLenum target, GLuint framebuffer) {
+    // BEFORE everything else, including the host-binding exclusion below:
+    // the question is "did the guest make this call from a thread with no
+    // context", and the port's own binds are a separate case (the port's
+    // blit has the context).
+    noteGlCallWithoutContext("glBindFramebuffer",
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     // THE GUEST'S "BIND THE DEFAULT FRAMEBUFFER" MEANS "BIND THE PORT'S
     // TARGET", WHEN THE PORT HAS ONE.
     //
@@ -1149,6 +1329,8 @@ void guestViewTracedGlBindFramebuffer(GLenum target, GLuint framebuffer) {
 }
 
 void guestViewTracedGlGenFramebuffers(GLsizei n, GLuint* framebuffers) {
+    noteGlCallWithoutContext("glGenFramebuffers",
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     if (g_glStatsEnabled) {
         g_glStats.genFramebuffers += static_cast<uint32_t>(n);
     }
@@ -1158,6 +1340,8 @@ void guestViewTracedGlGenFramebuffers(GLsizei n, GLuint* framebuffers) {
 void guestViewTracedGlFramebufferTexture2D(GLenum target, GLenum attachment,
                                            GLenum textarget, GLuint texture,
                                            GLint level) {
+    noteGlCallWithoutContext("glFramebufferTexture2D",
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     if (g_glStatsEnabled) {
         ++g_glStats.framebufferTexture2D;
         // WHICH TEXTURE IS ON WHICH FRAMEBUFFER.  Together with the texture
@@ -1170,6 +1354,8 @@ void guestViewTracedGlFramebufferTexture2D(GLenum target, GLenum attachment,
 }
 
 void guestViewTracedGlUseProgram(GLuint program) {
+    noteGlCallWithoutContext("glUseProgram",
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     if (g_glStatsEnabled) {
         ++g_glStats.useProgram;
         if (g_glStats.useProgram <= 6) {
@@ -1183,6 +1369,8 @@ void guestViewTracedGlUseProgram(GLuint program) {
 }
 
 void guestViewTracedGlViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
+    noteGlCallWithoutContext("glViewport",
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     if (g_glStatsEnabled) {
         ++g_glStats.viewports;
         const bool changed =
@@ -1252,6 +1440,8 @@ void guestViewTracedGlViewport(GLint x, GLint y, GLsizei width, GLsizei height) 
 }
 
 void guestViewTracedGlScissor(GLint x, GLint y, GLsizei width, GLsizei height) {
+    noteGlCallWithoutContext("glScissor",
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     if (g_glStatsEnabled) {
         ++g_glStats.scissors;
         // The rectangle itself, not just the count. gui14 measured the whole
@@ -1282,6 +1472,8 @@ void guestViewTracedGlScissor(GLint x, GLint y, GLsizei width, GLsizei height) {
 }
 
 GLenum guestViewTracedGlCheckFramebufferStatus(GLenum target) {
+    noteGlCallWithoutContext("glCheckFramebufferStatus",
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     const GLenum status = ::glCheckFramebufferStatus(target);
     if (g_glStatsEnabled) {
         ++g_glStats.fboChecks;
@@ -1294,6 +1486,8 @@ GLenum guestViewTracedGlCheckFramebufferStatus(GLenum target) {
 }
 
 void guestViewTracedGlBindBuffer(GLenum target, GLuint buffer) {
+    noteGlCallWithoutContext("glBindBuffer",
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     if (g_glStatsEnabled) {
         ++g_glStats.bindBuffer;
         g_glStats.lastBoundBuffer = buffer;
@@ -1305,6 +1499,8 @@ void guestViewTracedGlBindBuffer(GLenum target, GLuint buffer) {
 }
 
 void guestViewTracedGlBindTexture(GLenum target, GLuint texture) {
+    noteGlCallWithoutContext("glBindTexture",
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     if (g_glStatsEnabled) {
         ++g_glStats.bindTexture;
         g_glStats.lastBoundTexture = texture;
@@ -1326,6 +1522,8 @@ void guestViewTracedGlBindTexture(GLenum target, GLuint texture) {
 }
 
 void guestViewTracedGlGenTextures(GLsizei n, GLuint* textures) {
+    noteGlCallWithoutContext("glGenTextures",
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     ::glGenTextures(n, textures);
     if (g_glStatsEnabled) {
         g_glStats.genTextures += static_cast<uint32_t>(n > 0 ? n : 0);
@@ -1340,6 +1538,8 @@ void guestViewTracedGlGenTextures(GLsizei n, GLuint* textures) {
 }
 
 void guestViewTracedGlGenBuffers(GLsizei n, GLuint* buffers) {
+    noteGlCallWithoutContext("glGenBuffers",
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     ::glGenBuffers(n, buffers);
     if (g_glStatsEnabled) {
         g_glStats.genBuffers += static_cast<uint32_t>(n > 0 ? n : 0);
@@ -1358,6 +1558,8 @@ void guestViewTracedGlGenBuffers(GLsizei n, GLuint* buffers) {
 void guestViewTracedGlVertexAttribPointer(GLuint index, GLint size, GLenum type,
                                           GLboolean normalized, GLsizei stride,
                                           const void* pointer) {
+    noteGlCallWithoutContext("glVertexAttribPointer",
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     if (g_glStatsEnabled) {
         ++g_glStats.vertexAttribPointer;
     }
