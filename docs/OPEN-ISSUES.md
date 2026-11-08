@@ -1633,3 +1633,99 @@ python 'E:\AI\RealRacing3-switch\.build\nro_sym.py' 0x5ea1c0 # host PC offset ->
   **read out of the guest**, not inferred.
 * A hang and a regression look identical from the inside ⇒ **re-run the same
   binary** to tell them apart before changing code.
+---
+
+## 8. The 2026-11-09 console freeze: the port's log stopped mid-frame
+
+### What happened
+
+The console froze / black-screened with the v0.22.5 build and had to be
+power-cycled.  The port stopped writing its log entirely.
+
+### CONFIRMED from the device logs
+
+* **The guest started.**  All four DSOs loaded, 181 constructors ran, and the
+  guest logged `VIEW CHANGED 1280x720`.  So not a loader, JNI or DSO problem.
+* **The framebuffers are FINE.**  Seven were created and every one reported
+  `status=0x8cd5` -- that is `GL_FRAMEBUFFER_COMPLETE`, not an error.
+  `guest_view_trace.cpp:1125` calls `glCheckFramebufferStatus(GL_FRAMEBUFFER)`.
+  I first read `0x8cd5` as `EGL_BAD_MATCH` and the code corrected me: the FBO
+  path was never the suspect.
+* **The texture sizes are normal.**  The `ordinal` field packs
+  `(width << 16) | height`: 1280x720 and 640x360.
+* **NOT ONE FRAME WAS RENDERED.**  The log never contains `view-render-enter`,
+  `view-gl-finish-enter`, `view-swap-enter`, `view-render-ret` or
+  `guest-frame-census`.  The host called the guest's `onViewChangedJNI`
+  (`guest_view_probe.cpp:2902`) and never got back.
+* **The freeze happened 33 minutes after the console booted.**  `boot_ms` is
+  `armGetSystemTick()*1000/freq`, a wall-clock stamp since boot; the values in
+  the log run 1842279 -> 2009900.
+* **The port died parked in a condition-variable wait.**  The progress file's
+  last line is `phase=view-sync-blocked-cond-wait ordinal=53`, which is
+  `guestViewTraceSyncBlocked("cond-wait", 53)` from `guestPthreadCondWait`.
+* **THE INSTRUMENT THAT COULD HAVE NAMED THE OBJECT WAS OFF.**  The card
+  carried `sdmc:/switch/rr3-census.conf` containing `census=off`, left over
+  from an emulator round.  `censusArm()` returns immediately in that case, so
+  the log holds no `census-arm` line and no `census-wait` line -- and
+  `census-wait` is exactly the line that prints
+  `obj/waits/signals/deficit/wait_caller`.
+
+### The analysis
+
+The guest's `onViewChangedJNI` parks a worker thread on a condition variable
+that nothing ever signals, and the host waits for it forever.  The port could
+not say WHICH condition variable, because the census that names it was
+switched off on the card, and the census is periodic anyway, so a freeze
+before the first sweep leaves nothing even when it is on.
+
+This is the project's own lesson arriving from the other direction: **a path
+without an instrument is a path that cannot be explained.**
+
+### The fix (all three in `native-switch/source/pthread_bridge.cpp`)
+
+1. **The waiter writes its own ledger.**  `condWaitLedgerOf()` reads the
+   condvar's own counters (waits, signals, deficit, last waiter) under the
+   registry lock, and `guestPthreadCondWait` writes them out the first time it
+   times out, every 30 s after that, and once at the budget.  It needs no
+   census and cannot be switched off, so a dead wait is self-describing.
+2. **The wait is bounded.**  After 120 s it gives up and returns `ETIMEDOUT`.
+   A wait that was going to be signalled later still gets its signal: the
+   budget ends the WAITING, not the predicate.  An unbounded wait turned a
+   guest bug into a silent wedge with no end and no answer.
+3. **A census that is off says so.**  `censusArm()` now writes one line:
+   `census-arm ... SKIPPED reason=census-disabled`.  "No census line" and
+   "the census broke" look identical in a log; now they do not.
+
+### The card was dirty (measured)
+
+`E:\Eden-rr3\user\sdmc\switch` carried, from the emulator rounds:
+
+```
+rr3-census.conf                        census=off
+rr3-probe.conf                         pngfrom=1300 | pngto=5200 | pngevery=20 | pngmax=250
+rr3-native-rehost.crash-*.txt          143 files
+rr3-native-rehost.guest-view.log       40,159,486 bytes
+rr3-native-rehost.teardown-repair.log  5,488,499 bytes
+```
+
+45.6 MB of debris plus the census kill switch.  The release package ships none
+of it, so it was never going to be overwritten -- it SURVIVED, and the console
+inherited every file the emulator rounds had left behind.
+
+`.build/clean-card-residue.ps1` reports and removes exactly this set and puts
+`census=on` back.  **Run it before a console round.**
+
+### STILL OPEN
+
+* **Why did the console FREEZE HARD rather than just the app hang?**  The
+  analysis explains a wedge, not a machine-level freeze.  The candidates
+  being checked against the code: `glFinish()` at `guest_view_probe.cpp:3167`
+  waiting on a stuck GPU queue; a guest thread spinning at a non-timesliced
+  priority (0x2C is not time-sliced on Horizon); or a thread left PAUSED by
+  the census sampler -- `svcSetThreadActivity` pauses guest threads, and a
+  paused-but-never-resumed thread is a different failure from a parked one.
+* **Which condition variable was it?**  The next build's `cond-wait-ledger`
+  line answers this, and the answer is not in this archive.
+* **What was the guest waiting for?**  The guest's own `onViewChangedJNI` is
+  doing something that expects a worker thread to make progress.  That is
+  guest behaviour, and it needs the ledger to identify it.

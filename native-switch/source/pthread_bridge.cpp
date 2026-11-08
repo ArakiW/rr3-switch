@@ -4329,6 +4329,27 @@ extern "C" void rr3RootPcSamplerStart(void) {
 
 void censusArm() {
     if (censusDisabled()) {
+        // THE INSTRUMENT THAT WAS OFF, SAID OUT LOUD.
+        //
+        // MEASURED 2026-11-09 on the console: the port froze with the guest's
+        // onViewChangedJNI never returning, and the log held no census line at
+        // all -- not because the census was slow, but because rr3-census.conf
+        // on the card said "census=off".  The absence and a failure look
+        // identical in a log, so the absence now says which one it is: a
+        // reader who finds no census line learns that the census was turned
+        // off, instead of wondering whether it broke.
+        //
+        // ONCE, not once per symbol: censusArm() is called from
+        // resolveHostSymbol, which the guest linker runs for EVERY symbol it
+        // resolves, so an unguarded line here would write hundreds of
+        // identical lines during relocation.
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            guestViewWideLog("census-arm", 0, 0,
+                             "SKIPPED reason=census-disabled "
+                             "note=the_census_would_have_named_the_blocked_object");
+        }
         return;
     }
     bool start = false;
@@ -4651,6 +4672,66 @@ void noteCondSignal(void* condition) {
         ++slot->signals;
     }
     mutexUnlock(&gRegistryLock);
+}
+
+// ---------------------------------------------------------------------------
+// THE COND-VAR LEDGER, READABLE BY THE WAITER ITSELF.
+//
+// WHY THIS EXISTS.  MEASURED 2026-11-09 on the console: the port froze with
+// the guest's onViewChangedJNI never returning, and the ONLY breadcrumb in
+// the progress file was "view-sync-blocked-cond-wait".  That names the
+// primitive but not the OBJECT: which condition variable was waited on, how
+// many times, and -- the whole question -- whether anything ever signalled
+// it.
+//
+// The census could answer it (the "census-wait" line prints exactly
+// obj/waits/signals/deficit/wait_caller), but the census is (a) periodic, so
+// a freeze that happens before the first sweep leaves nothing, and (b)
+// switchable off with "census=off" in rr3-census.conf, which is exactly the
+// state the card was in.  So the instrument that would have named the
+// object was not running, and the freeze was unexplainable from the logs.
+//
+// ⇒ The WAITER reads its own ledger and writes it out.  It does not need
+// the census, it does not need a sweep, and it cannot be switched off.  A
+// dead wait that reaches the ledger is self-describing.
+//
+// THE READ IS TAKEN OUTSIDE THE WAIT, AND THAT IS NOT AN ACCIDENT.
+//
+// gRegistryLock and the guest's host mutex are two different locks, and
+// there is already an AB-BA shape between them in this file:
+//   - guestPthreadMutexLock:  holds the guest's host mutex, then takes
+//     gRegistryLock (mutexNoteAcquire),
+//   - guestPthreadMutexUnlock: releases the host mutex, then takes
+//     gRegistryLock (mutexNoteRelease).
+// A thread that takes gRegistryLock while HOLDING the host mutex therefore
+// walks into that shape.  The ledger read below is taken BEFORE the wait
+// starts and BEFORE the host mutex is touched, so it cannot join it.
+//
+// What that costs: the ledger is a snapshot from before the wait, so the
+// signals that arrive DURING the wait are not in it.  The deficit that
+// matters -- "this waiter was never signalled" -- is visible anyway, and
+// the waiter counts its own timeouts, which is the number that says "this
+// wait has been going on for N seconds with nothing happening".
+// ---------------------------------------------------------------------------
+struct CondWaitLedger {
+    bool known{};
+    uint64_t waits{};
+    uint64_t signals{};
+    const void* lastWaitReturn{};
+};
+
+CondWaitLedger condWaitLedgerOf(void* condition) {
+    CondWaitLedger ledger{};
+    mutexLock(&gRegistryLock);
+    ObjectSlot<pthread_cond_t>* slot = findSlot(gConditions, condition);
+    if (slot != nullptr) {
+        ledger.known = true;
+        ledger.waits = slot->waits;
+        ledger.signals = slot->signals;
+        ledger.lastWaitReturn = slot->lastWaitReturn;
+    }
+    mutexUnlock(&gRegistryLock);
+    return ledger;
 }
 
 void noteMutexWait(void* mutex, const void* caller) {
@@ -6009,14 +6090,66 @@ int guestPthreadCondDestroy(void* condition) {
     return result;
 }
 
+// ---------------------------------------------------------------------------
+// THE GUEST'S CONDITION WAIT, AND WHAT IT COSTS WHEN NOTHING SIGNALS IT.
+//
+// MEASURED 2026-11-09 on the console: the port froze with the guest's
+// onViewChangedJNI never returning.  The progress file's last line was
+// "view-sync-blocked-cond-wait", which names the primitive and nothing else.
+// The census that WOULD have named the object ("census-wait" prints
+// obj/waits/signals/deficit/wait_caller) was off -- "census=off" in
+// rr3-census.conf on the card -- and is periodic besides, so a freeze
+// before the first sweep leaves nothing at all.
+//
+// Three changes, all in this function, so that the next freeze is
+// self-explaining:
+//
+//   1. The waiter writes its OWN ledger (which object, how many waits, how
+//      many signals, the deficit, who called the wait) the FIRST time it
+//      times out.  It does not need the census and cannot be switched off.
+//   2. It writes that ledger again at the WAIT BUDGET, once, so a wait that
+//      eventually gives up still says which object it was on.
+//   3. The wait is BOUNDED.  A guest cond wait that is never signalled is
+//      a guest bug, but an unbounded wait turns it into a silent wedge with
+//      no end and no answer.  After the budget the wait returns ETIMEDOUT,
+//      which is the same answer a real timed wait gives, and the guest can
+//      decide what to do about it.  A wait that was going to be signalled
+//      long after the budget still gets its signal: the budget only ends the
+//      WAITING, and a later signal is not lost (the host condvar keeps the
+//      predicate, and the next wait returns immediately if it was signalled
+//      in between).
+//
+// The budget is generous on purpose: it is a backstop against a silent
+// wedge, not a timeout for a slow-but-alive guest.  120 s is longer than
+// any honest wait in this game and short enough that a wedge is reported
+// while somebody is still looking.
+// ---------------------------------------------------------------------------
+constexpr uint64_t kCondWaitBudgetMs = 120000;
+constexpr uint64_t kCondWaitReportEveryMs = 30000;
+
 int guestPthreadCondWait(void* condition, void* mutex) {
     CENSUS_IMPORT("pthread_cond_wait");
-    noteCondWait(condition, __builtin_return_address(0));
+    const void* caller = __builtin_return_address(0);
+    noteCondWait(condition, caller);
     pthread_cond_t* hostCondition = nullptr;
     pthread_mutex_t* hostMutex = nullptr;
     int result = getCondition(condition, &hostCondition);
     if (result == 0) result = getMutex(mutex, &hostMutex);
     if (result != 0) return result;
+
+    // THE LEDGER, TAKEN HERE, BEFORE ANY WAIT.
+    //
+    // Not inside the loop and not after a timeout: at that point the guest's
+    // host mutex is HELD again (pthread_cond_timedwait re-acquires it on
+    // return), and taking gRegistryLock while holding it joins the AB-BA
+    // shape that already exists between the two locks in this file.  See the
+    // note on condWaitLedgerOf above.
+    const CondWaitLedger ledger = condWaitLedgerOf(condition);
+    const uint64_t deficitAtEntry = (ledger.waits > ledger.signals)
+        ? (ledger.waits - ledger.signals) : 0;
+
+    uint64_t waitedMs = 0;
+    bool ledgerWritten = false;
     for (;;) {
         guestViewTraceSyncBlocked("cond-wait", 53);
         struct timespec deadline{};
@@ -6025,6 +6158,44 @@ int guestPthreadCondWait(void* condition, void* mutex) {
         const int waitResult = ::pthread_cond_timedwait(hostCondition, hostMutex, &deadline);
         if (waitResult == 0) return 0;
         if (waitResult != ETIMEDOUT) return waitResult;
+        waitedMs += 1000;
+
+        // The ledger line.  ONE line per report point, not one per second:
+        // a wait that runs for the whole budget would otherwise write
+        // 120 lines of the same thing into a card that is already the size
+        // the freeze made it.
+        const bool due = !ledgerWritten ||
+                         (waitedMs % kCondWaitReportEveryMs) == 0 ||
+                         waitedMs >= kCondWaitBudgetMs;
+        if (due) {
+            char details[256];
+            __builtin_snprintf(details, sizeof(details),
+                               "obj=%p known=%d waited_ms=%llu waits=%llu "
+                               "signals=%llu deficit_at_entry=%llu "
+                               "wait_caller=%p budget_ms=%llu outcome=%s",
+                               condition,
+                               ledger.known ? 1 : 0,
+                               (unsigned long long)waitedMs,
+                               (unsigned long long)ledger.waits,
+                               (unsigned long long)ledger.signals,
+                               (unsigned long long)deficitAtEntry,
+                               ledger.lastWaitReturn,
+                               (unsigned long long)kCondWaitBudgetMs,
+                               waitedMs >= kCondWaitBudgetMs ? "GIVING-UP"
+                                                           : "still-waiting");
+            guestViewWideLog("cond-wait-ledger", waitedMs, deficitAtEntry, details);
+            ledgerWritten = true;
+        }
+
+        if (waitedMs >= kCondWaitBudgetMs) {
+            // The wait is over and nothing signalled it.  Say so once more,
+            // as a terminal line, because this is the line a reader looks
+            // for when they ask "what did the port give up on".
+            guestViewWideLog("cond-wait-abandoned", waitedMs, 0,
+                             "reason=no-signal-within-budget "
+                             "note=the_guest_was_waiting_on_this_object");
+            return ETIMEDOUT;
+        }
     }
 }
 
