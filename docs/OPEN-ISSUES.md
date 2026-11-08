@@ -1817,6 +1817,51 @@ budget per wait: the first N are written, the rest are counted silently, and
 the moment the budget is spent one line says so.  A real wedge needs one
 line; a busy-but-healthy waiter needs none.
 
+### q152: the fix holds, measured
+
+Round q152 (Eden, `census=off` on the card) ran the corrected build -- the
+epoch baseline taken on entry, and the ledger's total line budget.  The
+three rounds together are the measurement:
+
+| | q150 | q151 | q152 |
+|---|---|---|---|
+| frames rendered | 532 (stopped) | 1481 | **3762** |
+| screenshots captured | 5 | - | **84** |
+| ledger lines written | 5 | 1,048,302 | **12** |
+| `outcome=SIGNAL-SEEN` | 0 | 1,048,302 | **0** |
+| `outcome=GIVING-UP` | 1 | 0 | **2** |
+| guest log size | 15.9 MB | 186 MB | **24 MB** |
+
+**THE LEDGER NOW READS CORRECTLY.**  Every line says the same thing:
+
+```
+cond-wait-ledger ... obj=0x211002f780 known=1 waited_ms=1000  waits=1 signals=1
+    deficit_at_entry=0 epoch=1 wait_caller=0x210940aa30 outcome=still-waiting
+cond-wait-ledger ... waited_ms=30000 waits=1 signals=1 ... outcome=still-waiting
+cond-wait-ledger ... waited_ms=60000 waits=1 signals=1 ... outcome=still-waiting
+cond-wait-ledger ... waited_ms=90000 waits=1 signals=1 ... outcome=still-waiting
+cond-wait-ledger ... waited_ms=120000 waits=1 signals=1 ... outcome=GIVING-UP
+cond-wait-abandoned ... reason=no-signal-within-budget returned=0_like_a_spurious_wakeup
+```
+
+`waits` climbs, `signals` stays at 1, `epoch` stays at 1.  So the condition
+variable was signalled exactly ONCE, ever, and that signal was already old
+when the waiter arrived -- which is why the epoch baseline does not mistake
+it for a fresh one.  The wait REALLY blocked (waited_ms 1 -> 30 -> 60 -> 90
+-> 120), the budget expired, the port gave up and returned 0, and the guest
+kept going: **3762 frames**.
+
+**THE SIGNAL LOSS IS FIXED, AND THE FALSE-SIGNAL IS GONE.**  q151 reported
+1,048,302 `SIGNAL-SEEN` because the baseline was 0 and the epoch was 1, so
+every wait concluded "a signal arrived" without ever waiting.  q152 reports
+ZERO, and the wait demonstrably blocked for 120 s.  The difference between
+"the wait returned immediately" and "the wait really waited" is exactly the
+`waited_ms` field, which is why that field is in the line.
+
+**AND THE LEDGER BUDGET HOLDS.**  12 lines for a run that did 3 waits of up
+to 120 s each, against q151's 1,048,302.  The guest log is 24 MB instead of
+186 MB.
+
 ### STILL OPEN
 
 * **Why did the console FREEZE HARD rather than just the app hang?**  The

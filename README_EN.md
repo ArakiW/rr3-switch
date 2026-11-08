@@ -34,7 +34,7 @@ and a controller really drives the car.**
 | Music and sound | ✅ |
 | A full lap driven by you, with a working lap counter | ✅ |
 | The port's own attract-mode autopilot completing a lap | ⚠️ not yet |
-| Occasional black screen on the console | ⚠️ still being chased |
+| Occasional black screen on the console | ⚠️ cause found, fix in the next build |
 
 The full status of every item is in
 [docs/FEATURE-MATRIX.md](docs/FEATURE-MATRIX.md).
@@ -75,8 +75,11 @@ live in this repository.
 - **The pursuit direction is no longer re-decided every frame**, so the car no
   longer drives itself backwards.
 - **A car pinned against a barrier can get free**, instead of staying stuck.
-- **The black screen has an account**: every frame now logs where its time
-  went, so it no longer has to be guessed at.
+- **The console freeze is now explained.** The guest was waiting on a condition
+  variable whose signal was dropped -- a host condition variable has no memory
+  of its own. The wait now keeps its own ledger, never waits forever, and the
+  simulator measurement went from **532 frames (stuck) to 3762 frames
+  (rendering)**.
 
 <details>
 <summary>The measured numbers from this round</summary>
@@ -87,10 +90,12 @@ live in this repository.
 - After locking the direction: the samples with the target behind the car went
   45 % → 13 %, lap progress 5.08 % → 8.65 %.
 - After the unstuck fix: race frames 4770 → 5760, lap progress 8.65 % → 10.35 %.
+- The freeze fix, measured on the same simulator, the same card and with the
+  census switched off: rendered frames **532 → 3762**, screenshots **5 → 84**,
+  diagnostic log **186 MB → 24 MB**.
 - On Eden the port's own share of a frame is 0.1 % (menu) / 1.0 % (race); the
   rest is the guest's ARM64 code being **emulated** ⇒ **the emulator's frame
-  rate says nothing about the console**, and the console's black screen is far
-  more likely to be the boot phase.
+  rate says nothing about the console**.
 - Diagnostic log volume cut by 20 %.
 
 The derivation and the raw data for each of these are in
