@@ -385,5 +385,5 @@ cd native-switch/tests && python test_*.py
 ## 十、GitHub 发布
 
 - **仓库**: https://github.com/ArakiW/rr3-switch
-- **最新 Release**: https://github.com/ArakiW/rr3-switch/releases/tag/v0.22.6
+- **最新 Release**: https://github.com/ArakiW/rr3-switch/releases/tag/v0.22.7
 - **文件**: `rr3-switch-app-20261109.zip` (45.4 MiB), `rr3-native-rehost-20261104.nro` (53.7 MB)

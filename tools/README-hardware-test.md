@@ -146,7 +146,7 @@ phase=guest-scanf-bounded ... input=truncated in_len=512 fmt=ok fmt_len=16
 
 ### 0.4 你要做的
 
-**如果卡上已经有数据卷**：从 [Release](https://github.com/ArakiW/rr3-switch/releases/tag/v0.22.6) 下
+**如果卡上已经有数据卷**：从 [Release](https://github.com/ArakiW/rr3-switch/releases/tag/v0.22.7) 下
 `rr3-switch-app-20261109.zip`（45.4 MiB，一个文件），
 解包，把 `switch\` 里的东西覆盖到卡根即可。**不要删 `switch/rr3-gfx.conf`。**
 
@@ -218,7 +218,7 @@ lr=0x87d40de54    ← 宿主：deliverServerTime
 **这次的构建 `249c9f02…`**，模拟器实测 q132：306 秒 / 1560 帧 / 28 万行日志 / 0 崩溃，
 `Server time returned` ×1、`cc-worker-dead` ×0、`glyph-tex-fail` ×0。
 
-**你需要做的**：装新 NRO（[Release](https://github.com/ArakiW/rr3-switch/releases/tag/v0.22.6) 上的
+**你需要做的**：装新 NRO（[Release](https://github.com/ArakiW/rr3-switch/releases/tag/v0.22.7) 上的
 `rr3-switch-app-20261109.zip`，45.4 MiB）→ 开机 →
 回传 `guest-view.log`、`crash-early.txt`（如果有）、以及屏幕上看到什么。
 **务必留下和 NRO 同一批的 `.elf`** —— 崩溃的 PC 只能在**完全相同的那次构建**上解析。
@@ -244,7 +244,7 @@ powershell -ExecutionPolicy Bypass -File Join-And-Extract.ps1 -Card F:
 ### 1.2 方式 B：只更新应用（**45 MB，一个文件**）
 
 如果卡上已经有数据卷，只想换应用和脚本（比如升到带手柄映射的这一版），
-用 [Release](https://github.com/ArakiW/rr3-switch/releases/tag/v0.22.6) 上的
+用 [Release](https://github.com/ArakiW/rr3-switch/releases/tag/v0.22.7) 上的
 `rr3-switch-app-20261109.zip`：解包，把 `switch\` 里的东西覆盖到卡根即可。
 **不要删 `switch/rr3-gfx.conf`**（见 §4）。
 
