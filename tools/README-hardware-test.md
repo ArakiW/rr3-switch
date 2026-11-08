@@ -146,9 +146,29 @@ phase=guest-scanf-bounded ... input=truncated in_len=512 fmt=ok fmt_len=16
 
 ### 0.4 你要做的
 
-**如果卡上已经有数据卷**：从 [Release](https://github.com/ArakiW/rr3-switch/releases/tag/v0.22.5) 下
-`rr3-switch-app-20261104.zip`（45.4 MiB，一个文件），
+**如果卡上已经有数据卷**：从 [Release](https://github.com/ArakiW/rr3-switch/releases/tag/v0.22.6) 下
+`rr3-switch-app-20261109.zip`（45.4 MiB，一个文件），
 解包，把 `switch\` 里的东西覆盖到卡根即可。**不要删 `switch/rr3-gfx.conf`。**
+
+**⚠️ 但请先删掉一个文件：`sdmc:/switch/rr3-census.conf`。**
+
+这是 2026-11-09 那次真机冻死的直接诱因。它是模拟器调试时留下的残留，内容是
+`census=off`，作用是关掉端口里最重的那套诊断仪表。它**不在发布包里**，所以装新包
+不会覆盖它 ⇒ 它会一直留在卡上 ⇒ 真机上如果再冻死，日志里就什么都不会留下，
+因为唯一能告诉你"卡在哪个条件变量"的那行输出被关掉了。
+
+```
+# 在电脑上（把 F: 换成你的卡）
+del F:\switch\rr3-census.conf
+```
+
+顺带也建议清掉这些调试残留（一次真机测试留下的，不影响运行，但会一直涨）：
+
+```
+del F:\switch\rr3-native-rehost.crash-*.txt
+del F:\switch\rr3-native-rehost.guest-view.log
+del F:\switch\rr3-native-rehost.teardown-repair.log
+```
 
 **如果是新卡**：用下面的分卷整包。
 
@@ -198,8 +218,8 @@ lr=0x87d40de54    ← 宿主：deliverServerTime
 **这次的构建 `249c9f02…`**，模拟器实测 q132：306 秒 / 1560 帧 / 28 万行日志 / 0 崩溃，
 `Server time returned` ×1、`cc-worker-dead` ×0、`glyph-tex-fail` ×0。
 
-**你需要做的**：装新 NRO（[Release](https://github.com/ArakiW/rr3-switch/releases/tag/v0.22.5) 上的
-`rr3-switch-app-20261104.zip`，45.4 MiB）→ 开机 →
+**你需要做的**：装新 NRO（[Release](https://github.com/ArakiW/rr3-switch/releases/tag/v0.22.6) 上的
+`rr3-switch-app-20261109.zip`，45.4 MiB）→ 开机 →
 回传 `guest-view.log`、`crash-early.txt`（如果有）、以及屏幕上看到什么。
 **务必留下和 NRO 同一批的 `.elf`** —— 崩溃的 PC 只能在**完全相同的那次构建**上解析。
 
@@ -224,8 +244,8 @@ powershell -ExecutionPolicy Bypass -File Join-And-Extract.ps1 -Card F:
 ### 1.2 方式 B：只更新应用（**45 MB，一个文件**）
 
 如果卡上已经有数据卷，只想换应用和脚本（比如升到带手柄映射的这一版），
-用 [Release](https://github.com/ArakiW/rr3-switch/releases/tag/v0.22.5) 上的
-`rr3-switch-app-20261104.zip`：解包，把 `switch\` 里的东西覆盖到卡根即可。
+用 [Release](https://github.com/ArakiW/rr3-switch/releases/tag/v0.22.6) 上的
+`rr3-switch-app-20261109.zip`：解包，把 `switch\` 里的东西覆盖到卡根即可。
 **不要删 `switch/rr3-gfx.conf`**（见 §4）。
 
 ### 1.3 方式 C：小卡（空间不够）
