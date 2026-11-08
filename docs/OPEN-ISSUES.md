@@ -1688,13 +1688,28 @@ without an instrument is a path that cannot be explained.**
    registry lock, and `guestPthreadCondWait` writes them out the first time it
    times out, every 30 s after that, and once at the budget.  It needs no
    census and cannot be switched off, so a dead wait is self-describing.
-2. **The wait is bounded.**  After 120 s it gives up and returns `ETIMEDOUT`.
-   A wait that was going to be signalled later still gets its signal: the
-   budget ends the WAITING, not the predicate.  An unbounded wait turned a
-   guest bug into a silent wedge with no end and no answer.
-3. **A census that is off says so.**  `censusArm()` now writes one line:
+2. **The wait is bounded.**  After 120 s it gives up -- and it gives up by
+   returning **0**, the same answer a spurious wake-up gives, NOT
+   `ETIMEDOUT`.  POSIX says `pthread_cond_wait` returns 0 and nothing else;
+   `ETIMEDOUT` belongs to `pthread_cond_timedwait`, libc++'s
+   `std::condition_variable::wait` throws `std::system_error` on a non-zero
+   return, and a guest that checks the return code can assert -- so returning
+   an error from a wait that merely ran out of patience would turn a slow
+   guest into a CRASHING one.  The guest's own `while (!ready) cond_wait()`
+   loop re-evaluates its predicate and comes back for another round, which is
+   what it does after any spurious wake-up.  An unbounded wait turned a guest
+   bug into a silent wedge with no end and no answer.
+3. **The signal is not lost.**  A host `pthread_cond_t` has no memory, so a
+   signal that arrives while nobody is blocked is gone.  The bridge counts
+   the signals itself (`ObjectSlot::signalEpoch`) and the waiter checks the
+   epoch before every wait: if the epoch moved, the signal was for THIS
+   waiter and the wait returns immediately instead of blocking again.  See
+   the q150 section below for the measurement that made this necessary.
+4. **A census that is off says so.**  `censusArm()` now writes one line:
    `census-arm ... SKIPPED reason=census-disabled`.  "No census line" and
-   "the census broke" look identical in a log; now they do not.
+   "the census broke" look identical in a log; now they do not.  The line is
+   written ONCE, because `censusArm()` is called from `resolveHostSymbol` for
+   every symbol the guest linker resolves.
 
 ### The card was dirty (measured)
 
@@ -1714,6 +1729,93 @@ inherited every file the emulator rounds had left behind.
 
 `.build/clean-card-residue.ps1` reports and removes exactly this set and puts
 `census=on` back.  **Run it before a console round.**
+
+### q150: the instrument proved itself, and it named the shape of the bug
+
+Round q150 (Eden, `census=off` on the card, exactly the console's state) ran
+the new build and produced the first line that ever named the object the
+guest was waiting on:
+
+```
+phase=cond-wait-ledger ordinal=120000 obj=0x210fc01900 known=1 waited_ms=120000
+    waits=1 signals=1 deficit_at_entry=0 wait_caller=0x2109028a30
+    budget_ms=120000 outcome=GIVING-UP
+phase=cond-wait-abandoned ordinal=120000 reason=no-signal-within-budget
+```
+
+**`waits=1 signals=1` IS THE WHOLE STORY.**  The condition variable WAS
+signalled -- once -- and the waiter still ran out the clock.  So the freeze
+is not "nobody signalled it": it is **"the signal did not reach the waiter"**.
+
+That is a well-known shape: a host `pthread_cond_t` has NO memory.  A signal
+that arrives while nobody is blocked is gone.  The guest's producer
+signalled, the waiter was not yet inside the wait (or had just come out of
+it), and the notification was dropped on the floor.  The guest then sat in
+the wait forever with nothing else to wake it.
+
+⇒ The bridge now counts the signals itself (`ObjectSlot::signalEpoch`), and
+the waiter checks the epoch before every wait: if the epoch moved since the
+last look, the signal was for THIS waiter and the wait returns immediately
+instead of blocking again.  The bridge's condvar now behaves like a
+condition variable with a predicate, which is what the guest's
+`while (!ready) cond_wait(&c, &m);` loop assumes it is talking to.
+
+**AND THE GIVE-UP RETURNS 0, NOT ETIMEDOUT.**  POSIX says `pthread_cond_wait`
+returns 0 and nothing else; `ETIMEDOUT` belongs to `pthread_cond_timedwait`.
+libc++'s `std::condition_variable::wait` throws `std::system_error` on a
+non-zero return, and a guest that checks the return code can assert.  So
+returning an error from a wait that merely ran out of patience would turn a
+slow guest into a CRASHING one.  The wait gives up by returning 0 -- the
+same answer a spurious wake-up gives -- and the guest's own predicate loop
+re-evaluates and comes back for another round.
+
+(That correction came from the Antigravity CLI review of this change, which
+caught the `ETIMEDOUT` return as a real defect in the first draft.  The
+review also confirmed that the ledger read must happen BEFORE the first
+wait, because `pthread_cond_timedwait` re-acquires the guest's host mutex on
+return, and taking `gRegistryLock` while holding it walks into the AB-BA
+shape that already exists between those two locks in this file.)
+
+### q151: the epoch works, and it was also wrong the first time
+
+Round q151 (Eden, `census=off`) ran the epoch build and produced 1,048,302
+`cond-wait-ledger` lines -- every one of them `outcome=SIGNAL-SEEN` -- and
+the guest rendered 1481 frames instead of the 532 q150 reached before it
+stopped.
+
+**The epoch is what made the difference**, and the numbers say why: on ONE
+condition variable (`obj=0x210fa33d20`), `waits` climbed to 1,048,302 while
+`signals` stayed at **1**.  So the guest was waiting on a condition variable
+that had been signalled exactly once, ever -- and every one of those waits
+was answered immediately instead of blocking.
+
+**AND THAT WAS A BUG IN MY OWN FIRST VERSION.**  The epoch comparison was
+
+```c
+if (ledger.signalEpoch != 0 && ledger.signalEpoch != lastSeenEpoch) { ... }
+```
+
+with `lastSeenEpoch` initialised to 0 and never set to the epoch observed on
+entry.  So on the very first pass `signalEpoch` was 1 (one historical signal
+from before this guest ever waited) and `lastSeenEpoch` was 0, and the wait
+concluded "a signal arrived" -- WITHOUT EVER WAITING.  The guest was not
+unblocked because the lost signal was fixed; it was unblocked because the
+wait stopped waiting at all.
+
+The fix is the BASELINE: the epoch observed BEFORE the first wait is what the
+waiter compares against, so a signal that was already delivered before the
+waiter arrived is not mistaken for a fresh one.  A signal that arrives while
+the waiter is blocked wakes it directly (the host condvar does that), and a
+signal that arrives in the gap between one wait and the next is caught by the
+epoch on the next pass.
+
+**THE OTHER MEASUREMENT FROM q151 IS ABOUT THE LOG, NOT THE DEADLOCK.**  One
+line per wait grew the guest log to 186 MB in four minutes -- 864,728 waits,
+864,728 lines -- and the log became a second way for the card to fill up.
+The ledger therefore has a TOTAL budget for the process (64 lines), not a
+budget per wait: the first N are written, the rest are counted silently, and
+the moment the budget is spent one line says so.  A real wedge needs one
+line; a busy-but-healthy waiter needs none.
 
 ### STILL OPEN
 

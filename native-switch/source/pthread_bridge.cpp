@@ -61,6 +61,21 @@ struct ObjectSlot {
     uint64_t signals{};
     const void* lastWaitReturn{};
     uint32_t waitersPeak{};
+    // THE SIGNAL EPOCH.  A host pthread_cond_t has NO memory: a signal that
+    // arrives while nobody is blocked is lost forever.  A guest that waits on
+    // a condition variable and gives up (see guestPthreadCondWait) would
+    // then miss a signal that was meant for it, and a slow wait would turn
+    // into a permanent deadlock.
+    //
+    // ⇒ The bridge counts the signals itself.  A waiter records the epoch it
+    // last saw and, before it waits again, asks whether the epoch moved; if
+    // it did, the signal was for THIS waiter and it returns immediately.
+    // That makes the bridge's condvar behave like a condition variable with a
+    // predicate, which is what the guest's `while (!ready) cond_wait()` loop
+    // assumes it is talking to.
+    //
+    // Only meaningful for gConditions; the other slot types leave it zero.
+    uint64_t signalEpoch{};
     // Mutex ownership ledger. Populated only for gMutexes, and deliberately
     // kept in the HOST side table rather than read out of the guest struct:
     // the bridge never interprets guest pthread_mutex_t bytes, and it still
@@ -4327,6 +4342,13 @@ extern "C" void rr3RootPcSamplerStart(void) {
     }
 }
 
+// The one-shot flag for the "the census is off" line.  A plain bool, like
+// the other one-shot flags in this file (gCensusReporterWakeReported,
+// gCensusReporterStarted, gReaperStarted): the only writer is the thread
+// that relocates the guest image, and a function-local static would carry a
+// dynamic initialiser into the middle of that relocation.
+bool gCensusDisabledReported = false;
+
 void censusArm() {
     if (censusDisabled()) {
         // THE INSTRUMENT THAT WAS OFF, SAID OUT LOUD.
@@ -4343,9 +4365,13 @@ void censusArm() {
         // resolveHostSymbol, which the guest linker runs for EVERY symbol it
         // resolves, so an unguarded line here would write hundreds of
         // identical lines during relocation.
-        static bool reported = false;
-        if (!reported) {
-            reported = true;
+        //
+        // A plain file-scope bool, like the other one-shot flags in this file
+        // (gCensusReporterWakeReported, gReaperStarted): the only writer is
+        // the relocating thread, and a function-local static would carry a
+        // dynamic initialiser into the middle of image relocation.
+        if (!gCensusDisabledReported) {
+            gCensusDisabledReported = true;
             guestViewWideLog("census-arm", 0, 0,
                              "SKIPPED reason=census-disabled "
                              "note=the_census_would_have_named_the_blocked_object");
@@ -4670,6 +4696,10 @@ void noteCondSignal(void* condition) {
     ObjectSlot<pthread_cond_t>* slot = findSlot(gConditions, condition);
     if (slot != nullptr) {
         ++slot->signals;
+        // The epoch moves with every signal, so a waiter that gave up can
+        // still tell that a signal was meant for it.  See the signalEpoch
+        // field on ObjectSlot.
+        ++slot->signalEpoch;
     }
     mutexUnlock(&gRegistryLock);
 }
@@ -4695,28 +4725,26 @@ void noteCondSignal(void* condition) {
 // the census, it does not need a sweep, and it cannot be switched off.  A
 // dead wait that reaches the ledger is self-describing.
 //
-// THE READ IS TAKEN OUTSIDE THE WAIT, AND THAT IS NOT AN ACCIDENT.
+// THE READ TAKES gRegistryLock WHILE THE GUEST'S HOST MUTEX IS HELD, AND
+// THAT IS SAFE BECAUSE IT IS THE ORDER THIS FILE ALREADY USES.
 //
-// gRegistryLock and the guest's host mutex are two different locks, and
-// there is already an AB-BA shape between them in this file:
-//   - guestPthreadMutexLock:  holds the guest's host mutex, then takes
-//     gRegistryLock (mutexNoteAcquire),
-//   - guestPthreadMutexUnlock: releases the host mutex, then takes
-//     gRegistryLock (mutexNoteRelease).
-// A thread that takes gRegistryLock while HOLDING the host mutex therefore
-// walks into that shape.  The ledger read below is taken BEFORE the wait
-// starts and BEFORE the host mutex is touched, so it cannot join it.
+// The order is hostMutex -> gRegistryLock: noteCondWait on entry to a wait,
+// and mutexNoteAcquire on a successful guest lock.  Nothing in this file
+// takes a host mutex while holding gRegistryLock, so there is no inversion
+// for this read to join.  (Checked explicitly, because a ledger read that
+// took the two locks the other way round would be a deadlock waiting to
+// happen, and the port already holds a guest-visible mutex here.)
 //
-// What that costs: the ledger is a snapshot from before the wait, so the
-// signals that arrive DURING the wait are not in it.  The deficit that
-// matters -- "this waiter was never signalled" -- is visible anyway, and
-// the waiter counts its own timeouts, which is the number that says "this
-// wait has been going on for N seconds with nothing happening".
+// What the read costs: the ledger is a snapshot, so a signal that arrives
+// AFTER it is not in it.  That is why the wait re-reads it on every pass
+// through the loop, and why the epoch -- not the snapshot -- is what decides
+// whether a signal was missed.
 // ---------------------------------------------------------------------------
 struct CondWaitLedger {
     bool known{};
     uint64_t waits{};
     uint64_t signals{};
+    uint64_t signalEpoch{};
     const void* lastWaitReturn{};
 };
 
@@ -4728,10 +4756,66 @@ CondWaitLedger condWaitLedgerOf(void* condition) {
         ledger.known = true;
         ledger.waits = slot->waits;
         ledger.signals = slot->signals;
+        ledger.signalEpoch = slot->signalEpoch;
         ledger.lastWaitReturn = slot->lastWaitReturn;
     }
     mutexUnlock(&gRegistryLock);
     return ledger;
+}
+
+// THE LEDGER'S TOTAL LINE BUDGET.
+//
+// The budget is per PROCESS, not per wait: q151 showed one hot condition
+// variable being waited on 864,728 times in 240 s, and a line per wait grew
+// the guest log to 186 MB.  The count is kept here and the lines are counted
+// even after the budget is spent, so "the budget was spent" is visible.
+// The whole process gets this many ledger lines.  q151 needed 5 for a real
+// wedge and used 864,728 for a busy-but-healthy waiter.
+constexpr uint64_t kCondWaitLedgerLines = 64;
+
+uint64_t gCondWaitLedgerLinesWritten = 0;
+uint64_t gCondWaitLedgerLinesSuppressed = 0;
+
+void condWaitLedgerBudgetSpent(uint64_t suppressed);
+
+void condWaitLedgerLine(uint64_t ordinal, uint64_t deficit, const char* details) {
+    bool spent = false;
+    uint64_t suppressed = 0;
+    mutexLock(&gRegistryLock);
+    const bool withinBudget = gCondWaitLedgerLinesWritten < kCondWaitLedgerLines;
+    if (withinBudget) {
+        ++gCondWaitLedgerLinesWritten;
+    }
+    else {
+        ++gCondWaitLedgerLinesSuppressed;
+        spent = true;
+        suppressed = gCondWaitLedgerLinesSuppressed;
+    }
+    mutexUnlock(&gRegistryLock);
+    if (!withinBudget) {
+        if (spent) {
+            condWaitLedgerBudgetSpent(suppressed);
+        }
+        return;
+    }
+    guestViewWideLog("cond-wait-ledger", ordinal, deficit, details);
+}
+
+// The one line that says the budget was spent.  Written by whoever crosses
+// the line, once.
+void condWaitLedgerBudgetSpent(uint64_t suppressed) {
+    static bool reported = false;
+    if (reported) {
+        return;
+    }
+    reported = true;
+    char details[192];
+    __builtin_snprintf(details, sizeof(details),
+                       "budget_lines=%llu suppressed=%llu "
+                       "note=the_ledger_stopped_writing_but_the_waits_continue",
+                       (unsigned long long)kCondWaitLedgerLines,
+                       (unsigned long long)suppressed);
+    guestViewWideLog("cond-wait-ledger-budget", 0, 0, details);
 }
 
 void noteMutexWait(void* mutex, const void* caller) {
@@ -6109,24 +6193,48 @@ int guestPthreadCondDestroy(void* condition) {
 //      times out.  It does not need the census and cannot be switched off.
 //   2. It writes that ledger again at the WAIT BUDGET, once, so a wait that
 //      eventually gives up still says which object it was on.
-//   3. The wait is BOUNDED.  A guest cond wait that is never signalled is
-//      a guest bug, but an unbounded wait turns it into a silent wedge with
-//      no end and no answer.  After the budget the wait returns ETIMEDOUT,
-//      which is the same answer a real timed wait gives, and the guest can
-//      decide what to do about it.  A wait that was going to be signalled
-//      long after the budget still gets its signal: the budget only ends the
-//      WAITING, and a later signal is not lost (the host condvar keeps the
-//      predicate, and the next wait returns immediately if it was signalled
-//      in between).
+//   3. The wait is BOUNDED, and giving up is SAFE.
+//
+// WHY GIVING UP RETURNS 0 AND NOT ETIMEDOUT.  POSIX says pthread_cond_wait
+// returns 0 and nothing else; ETIMEDOUT belongs to pthread_cond_timedwait.
+// A guest that uses the timed variant (libc++'s std::condition_variable::wait
+// does) throws std::system_error on a non-zero return, and a guest that
+// checks the return code can assert.  Returning an error from a wait that
+// simply ran out of patience would turn a slow guest into a CRASHING one.
+//
+// So the wait gives up by returning 0 -- the same answer a spurious wake-up
+// gives.  The guest's own `while (!ready) cond_wait(&c, &m);` loop then
+// re-evaluates its predicate and comes back for another round, which is
+// exactly what it would do after a spurious wake-up.
+//
+// AND THE SIGNAL IS NOT LOST.  A host pthread_cond_t has no memory: a
+// signal that arrives while nobody is blocked is gone.  That is why the
+// bridge counts the signals itself (ObjectSlot::signalEpoch) and the waiter
+// checks the epoch before every wait: if the epoch moved since the last
+// look, the signal was for THIS waiter and the wait returns immediately
+// instead of blocking again.
 //
 // The budget is generous on purpose: it is a backstop against a silent
 // wedge, not a timeout for a slow-but-alive guest.  120 s is longer than
 // any honest wait in this game and short enough that a wedge is reported
 // while somebody is still looking.
+//
+// THE LOG BUDGET.  MEASURED 2026-11-09 (round q151): with the epoch in
+// place the guest's ONE hot condition variable was waited on 864,728 times
+// in 240 s, and every one of those waits was answered by a signal that the
+// host condvar had dropped.  Each one wrote a ledger line, and the guest's
+// log grew to 186 MB in four minutes -- the log became a second way for the
+// card to fill up.
+//
+// So the ledger has a TOTAL budget for the process, not a budget per wait:
+// the first N lines are written and the rest are counted silently.  N is
+// big enough to cover the real cases (a wedge needs one line, a slow guest
+// needs a handful) and small enough that the log cannot become the problem.
+// The count is still reported ONCE at the end, so "the budget was spent" is
+// visible rather than silent.
 // ---------------------------------------------------------------------------
 constexpr uint64_t kCondWaitBudgetMs = 120000;
 constexpr uint64_t kCondWaitReportEveryMs = 30000;
-
 int guestPthreadCondWait(void* condition, void* mutex) {
     CENSUS_IMPORT("pthread_cond_wait");
     const void* caller = __builtin_return_address(0);
@@ -6137,20 +6245,55 @@ int guestPthreadCondWait(void* condition, void* mutex) {
     if (result == 0) result = getMutex(mutex, &hostMutex);
     if (result != 0) return result;
 
-    // THE LEDGER, TAKEN HERE, BEFORE ANY WAIT.
+    // THE LEDGER AND THE EPOCH BASELINE.
     //
-    // Not inside the loop and not after a timeout: at that point the guest's
-    // host mutex is HELD again (pthread_cond_timedwait re-acquires it on
-    // return), and taking gRegistryLock while holding it joins the AB-BA
-    // shape that already exists between the two locks in this file.  See the
-    // note on condWaitLedgerOf above.
-    const CondWaitLedger ledger = condWaitLedgerOf(condition);
-    const uint64_t deficitAtEntry = (ledger.waits > ledger.signals)
+    // The epoch is re-read on every pass through the loop, because a signal
+    // that arrives while this waiter is blocked has to be seen by the NEXT
+    // pass, not by the one that is already inside the wait.  The read is
+    // safe here: it takes gRegistryLock while the guest's host mutex is
+    // held, which is the SAME order the rest of this file already uses
+    // (noteCondWait on entry, mutexNoteAcquire on a successful lock), and
+    // nothing in this file takes a host mutex while holding gRegistryLock,
+    // so there is no inversion to create.
+    CondWaitLedger ledger = condWaitLedgerOf(condition);
+    uint64_t deficitAtEntry = (ledger.waits > ledger.signals)
         ? (ledger.waits - ledger.signals) : 0;
+
+    // THE BASELINE EPOCH.  A signal that was already delivered BEFORE this
+    // waiter arrived is not this waiter's signal: the guest's predicate was
+    // false when it called wait, so a signal from before the call says
+    // nothing about it.  Without this baseline the first pass would see
+    // epoch != 0 and mistake an old signal for a fresh one, and the wait
+    // would return immediately without ever waiting.
+    uint64_t lastSeenEpoch = ledger.signalEpoch;
 
     uint64_t waitedMs = 0;
     bool ledgerWritten = false;
     for (;;) {
+        // NOT blocked is still this waiter's signal.  The epoch is what
+        // makes that true on a host condvar, which has no memory of its own.
+        ledger = condWaitLedgerOf(condition);
+        if (ledger.signalEpoch != 0 && ledger.signalEpoch != lastSeenEpoch) {
+            // It fired while we were away: do not go back to sleep.
+            if (!ledgerWritten) {
+                char details[256];
+                __builtin_snprintf(details, sizeof(details),
+                                   "obj=%p known=1 waited_ms=%llu waits=%llu "
+                                   "signals=%llu deficit_at_entry=%llu "
+                                   "wait_caller=%p budget_ms=%llu outcome=SIGNAL-SEEN",
+                                   condition,
+                                   (unsigned long long)waitedMs,
+                                   (unsigned long long)ledger.waits,
+                                   (unsigned long long)ledger.signals,
+                                   (unsigned long long)deficitAtEntry,
+                                   ledger.lastWaitReturn,
+                                   (unsigned long long)kCondWaitBudgetMs);
+                condWaitLedgerLine(waitedMs, deficitAtEntry, details);
+            }
+            return 0;
+        }
+        lastSeenEpoch = ledger.signalEpoch;
+
         guestViewTraceSyncBlocked("cond-wait", 53);
         struct timespec deadline{};
         clock_gettime(CLOCK_REALTIME, &deadline);
@@ -6171,7 +6314,7 @@ int guestPthreadCondWait(void* condition, void* mutex) {
             char details[256];
             __builtin_snprintf(details, sizeof(details),
                                "obj=%p known=%d waited_ms=%llu waits=%llu "
-                               "signals=%llu deficit_at_entry=%llu "
+                               "signals=%llu deficit_at_entry=%llu epoch=%llu "
                                "wait_caller=%p budget_ms=%llu outcome=%s",
                                condition,
                                ledger.known ? 1 : 0,
@@ -6179,22 +6322,40 @@ int guestPthreadCondWait(void* condition, void* mutex) {
                                (unsigned long long)ledger.waits,
                                (unsigned long long)ledger.signals,
                                (unsigned long long)deficitAtEntry,
+                               (unsigned long long)ledger.signalEpoch,
                                ledger.lastWaitReturn,
                                (unsigned long long)kCondWaitBudgetMs,
                                waitedMs >= kCondWaitBudgetMs ? "GIVING-UP"
                                                            : "still-waiting");
-            guestViewWideLog("cond-wait-ledger", waitedMs, deficitAtEntry, details);
+            condWaitLedgerLine(waitedMs, deficitAtEntry, details);
             ledgerWritten = true;
         }
 
         if (waitedMs >= kCondWaitBudgetMs) {
-            // The wait is over and nothing signalled it.  Say so once more,
-            // as a terminal line, because this is the line a reader looks
-            // for when they ask "what did the port give up on".
+            // The wait is over and nothing signalled it.  Say so once, as a
+            // terminal line, because this is the line a reader looks for when
+            // they ask "what did the port give up on" -- and then return 0,
+            // the same answer a spurious wake-up gives, so the guest's own
+            // predicate loop decides what to do next.
+            //
+            // The epoch is re-read here so that a signal that arrived during
+            // the last slice is not thrown away with the wait.
+            const CondWaitLedger fresh = condWaitLedgerOf(condition);
+            if (fresh.signalEpoch != lastSeenEpoch) {
+                ledger = fresh;
+                char details[192];
+                __builtin_snprintf(details, sizeof(details),
+                                   "obj=%p outcome=SIGNAL-SEEN-AT-BUDGET "
+                                   "note=the_signal_arrived_before_the_budget_expired",
+                                   condition);
+                condWaitLedgerLine(waitedMs, deficitAtEntry, details);
+                return 0;
+            }
             guestViewWideLog("cond-wait-abandoned", waitedMs, 0,
                              "reason=no-signal-within-budget "
-                             "note=the_guest_was_waiting_on_this_object");
-            return ETIMEDOUT;
+                             "note=the_guest_was_waiting_on_this_object "
+                             "returned=0_like_a_spurious_wakeup");
+            return 0;
         }
     }
 }
