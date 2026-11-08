@@ -32,14 +32,15 @@
 
 ## 怎么装
 
-1. 去 [Releases](https://github.com/ArakiW/rr3-switch/releases/latest) 下最新的 zip（约 45 MB）
+1. 去 [Releases](https://github.com/ArakiW/rr3-switch/releases/latest) 下最新的 zip（**约 6.5 MB**）
 2. 解压，把 `switch\` 里的东西覆盖到卡根目录
-3. 游戏自己的文件从你自己的应用里取，端口会在 NRO 同目录（`sdmc:/switch/rr3-native-rehost/`）找到它们
+3. **发布包不含游戏的内容**——从你自己的应用副本里取出客机运行时、界面字体和 `.depot` 文本，
+   放到卡的 `sdmc:/switch/rr3-native-rehost/` 旁边（程序会自己去那里找）
 4. 用 Homebrew Launcher 启动
 5. 进比赛后，**比赛里的教程框要自己按一下 A**
 6. 右扳机 / A 是油门，左摇杆是转向
 
-完整步骤（分卷整包、小卡空间不够的装法、该回传哪些日志）见
+完整步骤（放哪些文件、分卷整包、小卡空间不够的装法、该回传哪些日志）见
 **[tools/README-hardware-test.md](tools/README-hardware-test.md)**。
 
 默认是**你自己开车**。想看端口自己开，把 `rr3-gamepad.txt` 里的 `autopilot = 0` 改成 `1`。
@@ -47,15 +48,20 @@
 ## 怎么构建
 
 ```powershell
-powershell -File tools\Build-NativeSwitch.ps1   # 构建
-powershell -File .build\gate.ps1                # 构建 + 自检
+powershell -File tools\Build-NativeSwitch.ps1              # 构建（完整）
+powershell -File tools\Build-NativeSwitch.ps1 -CleanLoader  # 构建（干净：RomFS 里不放任何 EA 材料）
+powershell -File .build\gate.ps1                           # 构建 + 自检
 ```
 
-需要 devkitPro 的 devkitA64 和 libnx。构建时会把你自己那份应用里的东西打进 RomFS，
-所以仓库里不需要存放任何游戏内容。
+需要 devkitPro 的 devkitA64 和 libnx。
+
+**干净构建**（`-CleanLoader`）是你要发布的那一个：它的 RomFS 里只有本项目自己的东西
+（libc++、OFL 授权的中文引导字体、字体许可），游戏的内容由使用者自己放到卡上。
+默认构建会把它们打进 RomFS，所以仓库里不需要存放任何游戏内容——两种都成立。
 
 ## 最近修好了什么
 
+- **发布包第一次可以不含任何 EA 材料**：6.5 MiB，实测 NRO 里没有 EA 文件的字节。
 - **车终于归玩家开了。** 以前那个开关只管手柄那条路，你的主机摇杆其实是死的。
 - **追踪方向不再每帧乱翻**，车不会被自己的控制器推着倒着走。
 - **被护栏卡住能脱困**，不会撞一次就钉死在那儿不动。
@@ -107,7 +113,7 @@ dist/                   打包产物
 
 本移植层代码以 **MIT** 发布（见 [LICENSE](LICENSE)）。第三方组件与其授权见
 [NOTICE.md](NOTICE.md)。游戏本身的著作权属于 Electronic Arts；仓库不收录任何
-游戏内容，发布包里的客机运行时与资源来自使用者自己的应用副本。
+游戏内容，**发布包也不含**——游戏的内容由使用者从自己的应用副本取出放到卡上。
 
 ## 致谢
 

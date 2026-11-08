@@ -13,7 +13,11 @@
 # Usage: powershell -File .build\rebuild-deliverables.ps1 -Stamp 20261103
 
 param(
-    [string]$Stamp = '20261103'
+    [string]$Stamp = '20261103',
+    # A CLEAN PACKAGE ships no EA material: no guest binary, no game faces,
+    # no .depot text, no data volumes, no optional archive.  See
+    # make-package-v2.ps1 for why each of those is excluded.
+    [switch]$CleanPackage
 )
 
 $ErrorActionPreference = 'Stop'
@@ -33,7 +37,12 @@ function Step {
 }
 
 Step 'make-package' {
-    & (Join-Path $root '.build\make-package-v2.ps1') -Stamp $Stamp
+    if ($CleanPackage) {
+        & (Join-Path $root '.build\make-package-v2.ps1') -Stamp $Stamp -CleanPackage
+    }
+    else {
+        & (Join-Path $root '.build\make-package-v2.ps1') -Stamp $Stamp
+    }
 }
 Step 'repack' {
     & (Join-Path $root '.build\run-repack.ps1') -Stamp $Stamp

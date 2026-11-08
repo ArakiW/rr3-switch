@@ -146,9 +146,24 @@ phase=guest-scanf-bounded ... input=truncated in_len=512 fmt=ok fmt_len=16
 
 ### 0.4 你要做的
 
-**如果卡上已经有数据卷**：从 [Release](https://github.com/ArakiW/rr3-switch/releases/tag/v0.22.7) 下
-`rr3-switch-app-20261109.zip`（45.4 MiB，一个文件），
+**如果卡上已经有数据卷**：从 [Release](https://github.com/ArakiW/rr3-switch/releases/tag/v0.22.8) 下
+`rr3-switch-app-20261109.zip`（**6.5 MiB**，一个文件），
 解包，把 `switch\` 里的东西覆盖到卡根即可。**不要删 `switch/rr3-gfx.conf`。**
+
+**这个包里没有 EA 的任何东西**——NRO 内嵌的 RomFS 只有三个文件（本项目自己的 libc++、
+OFL 授权的中文引导字体、和那份字体的许可说明）。所以你**还要自己把游戏的内容放上去**：
+
+```
+sdmc:/switch/rr3-native-rehost/
+  libRealRacing3.so          ← 你的应用副本里的客机运行时
+  libNimble.so                ← 同上
+  libfmodex.so                ← 同上
+  ui/                         ← 界面字体（Conduit / Eurostile / Helvetica / minion / myriad / r3_symbols）
+  original/.depot/            ← 文本（text_en.txt / text_cn-Hans.txt / langs.utf8 / MenuTransitions.xml …）
+```
+
+程序会自己去这些地方找（找不到就诚实地报告"客机没起来"，不会挂死）。
+具体哪些文件、从哪里取，见下面 §1 的说明。
 
 **⚠️ 但请先删掉一个文件：`sdmc:/switch/rr3-census.conf`。**
 
@@ -226,6 +241,26 @@ lr=0x87d40de54    ← 宿主：deliverServerTime
 ---
 
 ## 1. 装到卡上
+
+### 1.0 先把游戏的内容放上去（发布包里没有这些）
+
+从 v0.22.8 起，**发布包不含任何 EA 材料**（NRO 内嵌的 RomFS 只有三个文件：本项目自己的
+libc++、OFL 授权的中文引导字体、和那份字体的许可说明）。所以下面这些要**你自己**从
+你自己的应用副本里取出来，放到卡的 `sdmc:/switch/rr3-native-rehost/` 旁边：
+
+```
+libRealRacing3.so        客机运行时（应用副本 lib/arm64-v8a/ 里）
+libNimble.so              同上
+libfmodex.so              同上
+ui/                       界面字体（Conduit / Eurostile / Helvetica Neue / minion / myriad / r3_symbols）
+original/.depot/          文本（text_en.txt / text_cn-Hans.txt / langs.utf8 / MenuTransitions.xml / Tracks/…）
+```
+
+程序会自己去这些位置找（内置资源优先，卡上回退），找不到就**诚实地报告客机没起来**，
+不会挂死。
+
+> 这些文件来自你自己的应用副本，端口不分发它们（见 [NOTICE.md](https://github.com/ArakiW/rr3-switch/blob/master/NOTICE.md)）。
+> 如果你手上有**旧的完整包**（10.7 GiB 那个），它已经带着这些文件，解包即可。
 
 ### 1.1 方式 A：分卷 zip（推荐，脚本全自动）
 

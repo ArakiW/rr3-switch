@@ -41,17 +41,19 @@ The full status of every item is in
 
 ## Installing it
 
-1. Download the latest zip (about 45 MB) from
+1. Download the latest zip (**about 6.5 MB**) from
    [Releases](https://github.com/ArakiW/rr3-switch/releases/latest)
 2. Unpack it and copy the contents of `switch\` over the root of your card
-3. The game's own files come from your own copy of the application — the port
-   looks for them next to the NRO, in `sdmc:/switch/rr3-native-rehost/`
+3. **The package carries no game content.** Take the guest runtime, the UI
+   faces and the `.depot` text out of your own copy of the application and put
+   them next to the NRO, in `sdmc:/switch/rr3-native-rehost/` -- that is where
+   the port looks for them.
 4. Launch it from Homebrew Launcher
 5. Once you are in a race, **press A once** to dismiss the guest's tutorial dialog
 6. Right trigger / A is the throttle, left stick steers
 
-The full procedure — the split volumes, the small-card variant, and which logs
-to send back — is in
+The full procedure — which files to place, the split volumes, the small-card
+variant, and which logs to send back — is in
 **[tools/README-hardware-test.md](tools/README-hardware-test.md)**.
 
 By default **you drive**. To watch the port drive instead, change
@@ -60,16 +62,23 @@ By default **you drive**. To watch the port drive instead, change
 ## Building
 
 ```powershell
-powershell -File tools\Build-NativeSwitch.ps1   # build
-powershell -File .build\gate.ps1                # build + self-checks
+powershell -File tools\Build-NativeSwitch.ps1              # build (full)
+powershell -File tools\Build-NativeSwitch.ps1 -CleanLoader  # build (clean: no EA material in the RomFS)
+powershell -File .build\gate.ps1                           # build + self-checks
 ```
 
-Needs devkitPro's devkitA64 and libnx. The build stages the contents of your
-own copy of the application into the RomFS, so nothing from the game has to
-live in this repository.
+Needs devkitPro's devkitA64 and libnx.
+
+**The clean build** (`-CleanLoader`) is the one to publish: its RomFS holds
+only what this project owns (libc++, the OFL Chinese bootstrap face and that
+face's licence), and the game's own files go on the card, put there by the
+user. The default build stages them into the RomFS instead, so nothing from
+the game has to live in this repository either way.
 
 ## What was fixed recently
 
+- **The published package can carry no EA material at all**: 6.5 MiB, and the
+  NRO is measured to contain no EA file's bytes.
 - **The car belongs to the player now.** The switch used to govern only the
   controller path, so a console player's stick was dead.
 - **The pursuit direction is no longer re-decided every frame**, so the car no
@@ -133,8 +142,8 @@ dist/                   packaged deliverables
 The port is released under the **MIT Licence** (see [LICENSE](LICENSE)); the
 third-party components and their terms are listed in [NOTICE.md](NOTICE.md).
 The game itself is © Electronic Arts; the repository contains none of its
-content, and the guest runtime and assets in the published packages come from
-the user's own copy of the application.
+content and **neither does the published package** -- the game's files go on
+the card, taken by the user from their own copy of the application.
 
 ## Acknowledgements
 

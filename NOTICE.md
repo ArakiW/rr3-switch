@@ -44,7 +44,17 @@ guest binary `libRealRacing3.so` and the game data volumes are taken from the
 user's own copy of the application. The port loads them at runtime and
 circumvents no protection, licence check, or DRM.
 
-The build stages those files into the RomFS that ships inside the NRO, so the
-binaries published on the [GitHub Release](https://github.com/ArakiW/rr3-switch/releases)
-carry the guest runtime and its assets. Anyone producing a build from this
-source must supply their own copy of the application to do so.
+The published package is built with `-CleanLoader`, so its RomFS holds only
+what this project owns: `libc++_shared.so`, the OFL-licensed Chinese
+bootstrap face, and that face's licence text.  The guest's own files -- its
+runtime, the interface faces and the `.depot` text -- are found on the card
+next to the NRO, where the user put them.  The port's code contains the
+*names* of those files (it has to, to look for them); it contains none of
+their bytes.
+
+A build without `-CleanLoader` stages the same files into the RomFS, so the
+build output carries EA material.  That is a build-time choice, not a
+distribution one: the release is the clean build.
+
+Anyone producing a build from this source must supply their own copy of the
+application to do so.
