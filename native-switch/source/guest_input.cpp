@@ -76,6 +76,7 @@
 #include "rr3/race_state_probe.hpp"
 #include "rr3/recovery_guard.hpp"
 #include "rr3/ui_control_probe.hpp"
+#include "rr3/front_end_driver.hpp"
 
 #include <switch.h>
 
@@ -611,6 +612,7 @@ void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
     // This is a CALL INTO the guest, so it is pumped from the input pump,
     // which is the guest's own thread, and it installs the guest's TLS.
     pumpUiScreenOpen(g_frameCounter);
+    pumpFrontEndDriver(g_frameCounter);
 
     const bool driving = raceStateDriveEnabled();
     const RaceDriveState& drive = raceDriveState();

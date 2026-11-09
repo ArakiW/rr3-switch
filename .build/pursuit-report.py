@@ -124,9 +124,37 @@ def main() -> int:
             except ValueError:
                 pass
 
+    # THE LAP PROGRESS IS `total`, NOT `prog`.
+    #
+    # The project's own record says "The car's best distance ever | 186,921
+    # units = 10.35 % of a lap | q145", and q145's last race-state line
+    # reads `total=186921 ... prog=9799`.  So the lap progress is the
+    # guest's TOTAL SPLINE DISTANCE, and `prog` is a different quantity --
+    # printing it under the name "progress" was an instrument that lied.
+    #
+    # The number that matters is the MAXIMUM over the round: it is the
+    # furthest point the car reached, and it is directly comparable with
+    # 186,921 / 10.35 %.
+    best_total = 0
+    best_total_frame = 0
+    for l in states:
+        m = re.search(r"\btotal=(\d+)", l)
+        if m:
+            v = int(m.group(1))
+            if v > best_total:
+                best_total = v
+                f = re.search(r"\bf=(\d+)", l)
+                best_total_frame = int(f.group(1)) if f else 0
+    reference_units = 186921.0
+    reference_percent = 10.35
+    if best_total:
+        print(f"lap      : best total={best_total} units = "
+              f"{best_total / reference_units * reference_percent:.2f} % of a lap "
+              f"(at frame {best_total_frame}; the reference is 186921 units = 10.35 %)")
     if progress:
-        print(f"progress: first={progress[0]:.3f} last={progress[-1]:.3f} "
-              f"max={max(progress):.3f}")
+        print(f"prog     : first={progress[0]:.3f} last={progress[-1]:.3f} "
+              f"max={max(progress):.3f}   (the guest's own progress member, "
+              f"NOT the lap distance)")
     if laps:
         print(f"laps   : {laps[-1]} (max {max(laps)})")
     if rres:
