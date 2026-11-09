@@ -792,4 +792,56 @@ bool raceLineDistanceToChunk(const RaceLine& line, const SplineFile& spline,
     return true;
 }
 
+// THE CHUNK THE CAR IS ACTUALLY ON.
+//
+// WHY IT IS HERE
+// --------------
+// The fit's transform -- the scale, the offset and the axis variant -- is a
+// property of the TRACK, not of the chunk.  Every chunk of one spline file
+// lives in the same stored coordinate system, so the transform the fit
+// already established puts them all in the port's frame.  That is what makes
+// this possible WITHOUT A RE-FIT: the chunk the car is on is found with the
+// transform, not with a new fit.
+//
+// MEASURED 2026-11-10 (round pursuit1): the chunk the line had been fitted
+// on was 13,215 m from the car -- the pursuit's own `ctdist` -- so the port
+// had no line to aim at, the guest's own target was refused (it is garbage
+// when the car is off the line: 13,076 m and 47,014 m measured), and the
+// pursuit was off (pur=0) for the whole round.
+//
+// The distance to each chunk is to its nearest SEGMENT, in metres, and the
+// smallest one wins.
+bool raceLineNearestChunk(const RaceLine& line, const SplineFile& spline,
+                          double carX, double carY,
+                          char* chunkName, size_t chunkNameSize,
+                          double* metres) {
+    if (!line.valid || chunkName == nullptr || chunkNameSize == 0) {
+        return false;
+    }
+    double best = 1e30;
+    bool found = false;
+    for (const SplineChunk& chunk : spline.chunks) {
+        if (chunk.nodes.size() < 8) {
+            continue;
+        }
+        double distance = 0.0;
+        if (!raceLineDistanceToChunk(line, spline, chunk.name.c_str(), carX, carY,
+                                     &distance)) {
+            continue;
+        }
+        if (distance < best) {
+            best = distance;
+            found = true;
+            std::snprintf(chunkName, chunkNameSize, "%s", chunk.name.c_str());
+        }
+    }
+    if (!found) {
+        return false;
+    }
+    if (metres != nullptr) {
+        *metres = best;
+    }
+    return true;
+}
+
 }  // namespace rr3

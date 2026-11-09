@@ -200,6 +200,15 @@ struct RaceMetricsSample {
     // sitting within 2 m of the centre line, so this is the number that says
     // whether it is on the wrong line.
     double racingResidual{-1.0};
+    // THE CAR'S DISTANCE TO THE CHUNK THE TARGET CAME FROM, IN METRES.
+    //
+    // WHY IT IS REPORTED: the line is fitted on ONE chunk, and the car can be
+    // on another one -- MEASURED 2026-11-10 (round pursuit1): the fitted chunk
+    // was 13,215 m from the car, so the port had no line to aim at and the
+    // pursuit was off for the whole round.  The port now picks the chunk the
+    // car is on (the transform is a property of the track, so no re-fit is
+    // needed), and this number says how far the car is from THAT chunk.
+    double chunkForTarget{-1.0};
     // THE LOOK-AHEAD DISTANCE THE PURSUIT USED, IN METRES.
     //
     // WHY IT IS REPORTED: the look-ahead is the single number that decides

@@ -425,6 +425,56 @@ int main() {
         check(!gotFar, "a car 500 m off the line gets no target at all");
     }
 
+    // ---------------------------------------------------------------------
+    // 6. THE CHUNK THE CAR IS ACTUALLY ON.
+    //
+    //    MEASURED 2026-11-10 (round pursuit1): the chunk the line had been
+    //    fitted on was 13,215 m from the car -- the pursuit's own `ctdist` --
+    //    so the port had no line to aim at, the guest's own target was
+    //    refused (it is garbage when the car is off the line) and the pursuit
+    //    was off for the whole round.
+    //
+    //    The transform is a property of the TRACK, so the chunk the car is on
+    //    can be found with the transform the fit already established -- no
+    //    re-fit is needed.  This test has teeth: without the picker the port
+    //    would keep aiming at the first chunk, which is 187 m away here.
+    // ---------------------------------------------------------------------
+    {
+        rr3::SplineFile twoChunks = makeCircle();
+        // A second chunk, 3,000 stored units away: 3,000 * 16 = 48,000 port
+        // units = 187.5 m in the port's frame.
+        rr3::SplineChunk second = twoChunks.chunks[0];
+        second.name = "second_spline";
+        for (rr3::SplineNode& node : second.nodes) {
+            node.y += 3000;
+        }
+        twoChunks.chunks.push_back(second);
+
+        // The car sits on the SECOND circle.
+        double secondX = 0.0;
+        double secondY = 0.0;
+        toWorld(second.nodes[0].x, second.nodes[0].y, &secondX, &secondY);
+        char chunk[32] = {0};
+        double metres = -1.0;
+        const bool got = rr3::raceLineNearestChunk(line, twoChunks, secondX, secondY,
+                                                   chunk, sizeof(chunk), &metres);
+        check(got, "the chunk the car is on is found");
+        check(std::strcmp(chunk, "second_spline") == 0,
+              "it is the chunk the car is on, not the fitted one");
+        std::printf("  car on the second chunk : %s at %.2f m\n", chunk, metres);
+        check(metres < 5.0, "the distance to that chunk is small");
+
+        // And the car on the FIRST circle still picks the first chunk.
+        double firstX = 0.0;
+        double firstY = 0.0;
+        toWorld(file.chunks[0].nodes[0].x, file.chunks[0].nodes[0].y, &firstX, &firstY);
+        char chunk2[32] = {0};
+        const bool got2 = rr3::raceLineNearestChunk(line, twoChunks, firstX, firstY,
+                                                    chunk2, sizeof(chunk2), nullptr);
+        check(got2 && std::strcmp(chunk2, "centre_spline") == 0,
+              "the car on the first chunk picks the first chunk");
+    }
+
     std::printf("%s\n", failures == 0 ? "race_line selftest: OK" : "race_line selftest: FAILED");
     return failures == 0 ? 0 : 1;
 }

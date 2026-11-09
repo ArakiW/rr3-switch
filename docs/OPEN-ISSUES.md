@@ -3220,7 +3220,55 @@ on, and the chunk boundaries are in the spline -- so that "the nearest point
 of the line" is always metres away and not kilometres.  Until that is done,
 the fallback only covers the case where the car is a hundred metres off the
 line it was fitted on, which is the spin-into-the-runoff case and not the
-wrong-chunk case.**
+wrong-chunk case.
+
+### 9.23 The chunk follows the car: the line is picked with the transform the fit already has
+
+**THE FIX, AND WHY IT NEEDS NO RE-FIT:** the transform -- the scale, the
+offset and the axis variant -- is a property of the TRACK, not of the chunk.
+Every chunk of one spline file lives in the same stored coordinate system, so
+the transform the fit established puts them all in the port's frame.  So the
+chunk the car is ON can be found with that transform: `raceLineNearestChunk()`
+walks the chunks, measures the car's distance to the nearest SEGMENT of each
+one, and the smallest distance wins.
+
+The host test has teeth -- the second chunk is 187.5 m from the first, so a
+picker that kept the fitted chunk would be 187 m out:
+```
+  the chunk the car is on is found                           ok
+  it is the chunk the car is on, not the fitted one          ok
+  car on the second chunk : second_spline at 0.09 m
+  the distance to that chunk is small                        ok
+  the car on the first chunk picks the first chunk           ok
+```
+
+**MEASURED (round `chunk1`, same state, same volumes, same build otherwise):**
+```
+    frame   total    perr  pur  steer   mag  flips stalls thr brk   la  ctdist
+     3390   93520  -1.376   1  1.000  0.11     3      1   1   0  20.0   10.45
+     3870  106015   2.415   1 -1.000  0.11     4      2   0   1  20.0   16.49
+     5790   94034  -2.464   1  1.000  0.59     6      7   0   0   0.0   38.66
+    pursuit on 150/193 samples; flips=6 stalls=7; final total=94034
+```
+against the round before it (hybrid1), whose last sample had `ctdist=13215.19`
+-- the fitted chunk 13 km from the car, the pursuit off (pur=0), flips=9,
+stalls=7 and a final total of 89,623.
+
+⇒ **THE TARGET IS NOW METRES AWAY INSTEAD OF KILOMETRES** (`ctdist` 10.45 m,
+16.49 m, 38.66 m against 13,215 m), the pursuit is on for 150 of 193 samples,
+the flips are down from 9 to 6 and the lap progress is up from 89,623 to
+94,034.  The new `cchunk` field on the race-state line reports the car's
+distance to the chunk the target came from, so the "the line was fitted on the
+wrong chunk" case is visible from now on instead of having to be inferred.
+
+⇒ **WHAT IS STILL MISSING:** seven stalls and a lap progress of 94,034 against
+the reference round's 186,921.  The line is now the right one and the target
+is sane, so the remaining loss is in the CONTROL, not in the geometry: the
+error still swings to +/-2.4 rad (the car is spun or facing back down the
+track) and the recovery's full lock is still what ends the races.  The next
+measurement is the error's cause: whether the car is facing the wrong way
+(the direction lock) or simply too far off the line to recover at this
+throttle.**
 
 ⇒ **AND THE PORT-SIDE EXPERIMENT IS KEPT, OFF BY DEFAULT:** `swdxt=1` still
 decodes DXT on the CPU (9.19 proved the mechanism and proved that the port

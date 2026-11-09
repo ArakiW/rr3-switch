@@ -171,4 +171,25 @@ bool raceLineDistanceToChunk(const RaceLine& line, const SplineFile& spline,
                              const char* chunkName,
                              double carX, double carY, double* metres);
 
+// THE CHUNK THE CAR IS ACTUALLY ON.
+//
+// WHY: the fit's transform -- the scale, the offset and the axis variant --
+// is a property of the TRACK, not of the chunk: every chunk of the same
+// spline file lives in the same stored coordinate system, so the same
+// transform puts them all in the port's frame.  That is why the chunk the car
+// is on can be found with the transform the fit already established, and NO
+// RE-FIT IS NEEDED.
+//
+// MEASURED 2026-11-10 (round pursuit1): the fitted chunk was 13,215 m from
+// the car -- the pursuit's own `ctdist` -- so the port had no line to aim at
+// at all, the guest's own (garbage) target was refused, and the pursuit was
+// off (pur=0) for the whole round.
+//
+// The distance to each chunk is to its nearest SEGMENT, in metres, and the
+// chunk with the smallest distance wins.
+bool raceLineNearestChunk(const RaceLine& line, const SplineFile& spline,
+                          double carX, double carY,
+                          char* chunkName, size_t chunkNameSize,
+                          double* metres);
+
 }  // namespace rr3

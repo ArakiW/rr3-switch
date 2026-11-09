@@ -1368,7 +1368,44 @@ void fillCarState(RaceMetricsSample* out) {
             // constant otherwise.  ONE call site, so there is one way to be
             // wrong instead of two.
             double lookAheadUsed = 0.0;
-            if (rr3::raceLineTargetAdaptive(gRaceLine.line, *spline,
+            // THE CHUNK THE CAR IS ACTUALLY ON, NOT THE CHUNK THE LINE WAS
+            // FITTED ON.
+            //
+            // MEASURED 2026-11-10 (round pursuit1): the chunk the line had
+            // been fitted on was 13,215 m from the car -- the pursuit's own
+            // `ctdist` -- so the port had no line to aim at, the guest's own
+            // target was refused (it is garbage when the car is off the
+            // line: 13,076 m and 47,014 m measured) and the pursuit stayed
+            // off (pur=0) for the whole round.
+            //
+            // The transform is a property of the TRACK, so the chunk the car
+            // is on can be found with the transform the fit already
+            // established -- no re-fit is needed.  The line is then used with
+            // that chunk, and "the nearest point of the line" is metres away
+            // instead of kilometres.
+            rr3::RaceLine lineForTarget = gRaceLine.line;
+            {
+                double currentMetres = 0.0;
+                double nearestMetres = 0.0;
+                char nearestChunk[32] = {0};
+                const bool haveCurrent = rr3::raceLineDistanceToChunk(
+                    gRaceLine.line, *spline, gRaceLine.line.chunk,
+                    static_cast<double>(out->carX), static_cast<double>(out->carY),
+                    &currentMetres);
+                const bool haveNearest = rr3::raceLineNearestChunk(
+                    gRaceLine.line, *spline, static_cast<double>(out->carX),
+                    static_cast<double>(out->carY), nearestChunk,
+                    sizeof(nearestChunk), &nearestMetres);
+                if (haveNearest && (!haveCurrent || nearestMetres + 1.0 < currentMetres)) {
+                    std::snprintf(lineForTarget.chunk, sizeof(lineForTarget.chunk),
+                                  "%s", nearestChunk);
+                    out->chunkForTarget = nearestMetres;
+                }
+                else {
+                    out->chunkForTarget = haveCurrent ? currentMetres : -1.0f;
+                }
+            }
+            if (rr3::raceLineTargetAdaptive(lineForTarget, *spline,
                                     static_cast<double>(out->carX),
                                     static_cast<double>(out->carY),
                                     // THE WINDOWED MOTION VECTOR, not the
@@ -2771,6 +2808,7 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             "car=0x%llx cnum=%u cnode=%u cprev=%u cpos=%d,%d,%d ctgt=%d,%d,%d "
             "snode=%u sdist=%u tsok=%d posok=%d ctok=%d ctdist=%.2f "
             "line=%d lres=%.2f rres=%.2f la=%.2f lachunk=%s lam=%s dir=%d mot=%.3f,%.3f "
+            "cchunk=%.2f "
             "perr=%.4f pur=%d ident=0x%llx "
             "drive=%d steer=%.3f mag=%.3f sign=%d best=%.6f flips=%d stalls=%d "
             "thr=%d brk=%d",
@@ -2832,6 +2870,11 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             m.targetFromLine ? 1 : 0, m.lineResidual, m.racingResidual,
             static_cast<double>(m.lookAheadMetres), raceLineChunk(),
             raceLineLookAheadMode(),
+            // THE CAR'S DISTANCE TO THE CHUNK THE TARGET CAME FROM.  A large
+            // number here is the "the line was fitted on the wrong chunk" case
+            // (13,215 m measured on 2026-11-10), and it is what the chunk
+            // picker has to keep small.
+            static_cast<double>(m.chunkForTarget),
             // THE DIRECTION LOCK, AND THE MOTION VECTOR IT CAME FROM.
             //
             // MEASURED 2026-11-09 (round m1): the car turned around and drove
