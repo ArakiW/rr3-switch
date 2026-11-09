@@ -3058,3 +3058,55 @@ not the same as the content set a device has after the game has run on it.
 **THE MISSING FILES ARE THE ONES THE APP GENERATES, AND ONLY THE DEVICE HAS
 THEM.**
 
+### 9.21 THE MAGENTA FIX THAT ACTUALLY SHIPS: the volumes are built from the ETC pack, not the DXT pack
+
+**THE ROOT CAUSE, IN ONE LINE:** the guest asks for a texture by SPELLING and
+walks the list `pvr -> etc -> dxt -> atc`, taking the first one that EXISTS.
+The card's loose `.depot` carries the pvr/etc spellings for the 82 cars it
+has; the seven external volumes were built from the DXT pack, which carries
+ONLY the dxt spelling.  A car the card does not have therefore fell through
+to dxt -- and Mesa's S3TC decode zeroes the green channel of that texture.
+**⇒ THE MAGENTA IS NOT A BUG IN THE PORT.  IT IS THE WRONG PACK ON THE CARD.**
+
+**WHY THE DXT PATH IS WRONG AND THE ETC PATH IS NOT (measured):**
+- dxt: the guest uploads it with `internal=0x83f1/0x83f3` and it arrives on
+  screen with its green channel zeroed (9.18).
+- etc: the SAME guest uploads it with `internal=0x8d64` (GL_ETC1_RGB8_OES) and
+  it renders correctly -- that is what the 82 cars on the card have been doing
+  all along.
+
+**THE FIX, AND IT IS A CONTENT FIX, NOT A CODE CHANGE:**
+rebuild the seven volumes from the ETC pack (`ETC_960x640+2048x1536...zip`,
+6.1 GB, in the repository root) with
+`tools/prepare_rr3_external_data.py`, and put them on the card with
+`.build/deploy-etc-volumes.ps1` (one volume at a time -- the card has no room
+for two copies -- with every sha256 checked against the manifest the rebuild
+wrote).
+
+Coverage was compared before the rebuild, because a rebuild that drops assets
+would trade one fault for another:
+```
+DXT: 50,608 members  gui=2,825  gui_assets=12,653  tracks=12,229  vehicles=17,732
+ETC: 50,168 members  gui=2,825  gui_assets=12,305  tracks=12,233  vehicles=17,679
+```
+and the ETC pack carries BOTH naming shapes the guest asks for: the single
+`livery/<car>_ext.etc.dds.z` (the DTM cars) and the per-colour
+`livery/<car>_ext_<colour>.etc.dds.z` (the older cars) -- 2,746 livery files.
+
+**MEASURED AFTER THE REBUILD (round `etcv1`, the ETC volumes on the card):**
+```
+phase=ctex-upload ordinal=1 call=1 level=0 w=512 h=512 size=131072 internal=0x8d64(ETC1_RGB8) err=0x0 recent_fourcc=ETC
+...
+S3TC uploads: 0        ETC1 uploads: 32
+```
+⇒ **NO texture of the car pipeline goes through Mesa's S3TC decoder any more,
+so the magenta has no path left to come from.**  And the volumes are now
+smaller than the ones they replace (gui-hd 1,443,906,568 against 1,663,784,980
+bytes, and so on), so the card gained space as well.
+
+⇒ **AND THE PORT-SIDE EXPERIMENT IS KEPT, OFF BY DEFAULT:** `swdxt=1` still
+decodes DXT on the CPU (9.19 proved the mechanism and proved that the port
+cannot attribute an upload to the file it served).  It is the tool to use if a
+future pack ships a texture format the GPU cannot decode and there is no
+alternative spelling of it in the pack.
+
