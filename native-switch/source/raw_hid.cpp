@@ -624,6 +624,50 @@ bool pollRawHidInput(rr3::gamepad::NpadState* outState, RawHidDevice* outActiveD
     return false;
 }
 
+// THE DEVICE INVENTORY.
+//
+// Every device the port can see, named, with the layout the port recognised
+// for it.  See the header for why this is separate from the state line.
+void logRawHidInventory(uint64_t frame) {
+    if ((frame % 300) != 0) {
+        return;
+    }
+    RawHidDevice devices[kMaxTrackedDevices];
+    const size_t count = enumerateRawHidDevices(devices, kMaxTrackedDevices);
+
+    unsigned raw = 0;
+    unsigned npad = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (devices[i].isNpadReported) {
+            ++npad;
+        } else {
+            ++raw;
+        }
+        char details[320];
+        std::snprintf(details, sizeof(details),
+                      "dev=\"%s\" vid=0x%04x pid=0x%04x layout=%s report_len=%llu "
+                      "npad_reported=%d connected=%d",
+                      devices[i].name,
+                      static_cast<unsigned>(devices[i].vid),
+                      static_cast<unsigned>(devices[i].pid),
+                      layoutName(devices[i].layout),
+                      static_cast<unsigned long long>(devices[i].reportLength),
+                      devices[i].isNpadReported ? 1 : 0,
+                      devices[i].connected ? 1 : 0);
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "hid-device", static_cast<unsigned>(i),
+                            devices[i].deviceId, details);
+    }
+
+    char summary[192];
+    std::snprintf(summary, sizeof(summary),
+                   "devices=%llu raw=%u npad=%u "
+                   "note=an_Xbox_or_DS_pad_that_is_not_listed_here_is_not_reachable",
+                   static_cast<unsigned long long>(count), raw, npad);
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "hid-inventory", 0, 0, summary);
+}
+
 void logRawHidState(uint64_t frame, const RawHidDevice* activeDevice,
                     const rr3::gamepad::NpadState* state) {
     if ((frame % 300) != 0) {

@@ -98,6 +98,21 @@ bool pollRawHidInput(rr3::gamepad::NpadState* outState, RawHidDevice* outActiveD
 void logRawHidState(uint64_t frame, const RawHidDevice* activeDevice,
                     const rr3::gamepad::NpadState* state);
 
+// THE DEVICE INVENTORY: every device the port can see, named.
+//
+// WHY IT IS SEPARATE FROM THE STATE LINE.  The state line only says
+// something when a button is actually pressed, so "my controller does
+// nothing" and "the port never saw my controller" are the SAME observation
+// in the log -- which is exactly the question the user asked and could not
+// be answered.
+//
+// ⇒ The inventory names every device, whether the HID service reports it as
+// an Npad or the port found it as a raw one, with its VID/PID, its name and
+// the layout the port recognised.  A device the port cannot identify is
+// reported as unknown rather than dropped, because an unrecognised device
+// that is REPORTED is a finding and a silently ignored one is the bug.
+void logRawHidInventory(uint64_t frame);
+
 // Host test helper: injects a mock raw HID report
 void injectMockRawHidReport(const RawHidDevice& dev, const uint8_t* report, size_t length);
 void clearMockRawHidReports();

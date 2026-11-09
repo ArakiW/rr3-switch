@@ -928,6 +928,13 @@ void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
     logGamepadState(g_frameCounter, canonical, guest, driving, mode);
     logTriggerState(g_frameCounter, pad, held);
     rr3::raw_hid::logRawHidState(g_frameCounter, rawActive ? &rawDev : nullptr, &physical);
+    // THE DEVICE INVENTORY, EVERY 300 FRAMES, UNCONDITIONALLY.
+    //
+    // It is deliberately NOT next to the other loggers: the question it
+    // answers -- "does the port see my controller at all?" -- has to be
+    // answerable on a round where nobody touched anything, and that is
+    // exactly the round where the state line says nothing.
+    rr3::raw_hid::logRawHidInventory(g_frameCounter);
     }
 
     ++g_frameCounter;

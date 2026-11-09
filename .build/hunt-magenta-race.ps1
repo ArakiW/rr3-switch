@@ -15,12 +15,28 @@
 # Usage: powershell -File .build\hunt-magenta-race.ps1 -Rounds 4
 param(
     [int]$Rounds = 4,
-    [int]$Seconds = 400
+    [int]$Seconds = 400,
+    [string]$Nro = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $root = 'E:\AI\RealRacing3-switch'
 $app = 'E:\Eden-rr3\user\sdmc\switch\rr3-native-rehost'
+
+# THE BINARY IS PINNED, NOT A PATH.
+#
+# A path would let a rebuild change what the later rounds run, which is
+# exactly the kind of uncontrolled variable this hunt exists to remove: the
+# rounds have to differ ONLY in how many races have happened, which is the
+# event.  So the NRO is copied to a name that carries its hash, and the
+# rounds run that copy.
+if ($Nro -eq '') {
+    $built = Join-Path $root 'native-switch\rr3-native-rehost.nro'
+    $hash = (Get-FileHash -LiteralPath $built -Algorithm SHA256).Hash.Substring(0, 16)
+    $Nro = Join-Path $root (".build\pinned-{0}.nro" -f $hash)
+    Copy-Item -LiteralPath $built -Destination $Nro -Force
+}
+Write-Host ("=== the pinned binary: {0} ===" -f $Nro)
 
 Write-Host '=== input mode: autopilot, blind navigation (the path that reaches a race) ==='
 & (Join-Path $root '.build\deploy-ui-requests-blind.ps1')
@@ -33,7 +49,7 @@ for ($i = 1; $i -le $Rounds; $i++) {
     # how many races have happened -- which is the event.
     & (Join-Path $root '.build\guest-state.ps1') -Restore -Tag 'baseline'
     & (Join-Path $root '.build\run-pinned-round.ps1') -Tag $tag -Seconds $Seconds -CensusOff `
-        -Nro (Join-Path $root 'native-switch\rr3-native-rehost.nro')
+        -Nro $nro
 
     # WHAT DID THIS ROUND LOOK LIKE?
     $run = Get-ChildItem -LiteralPath (Join-Path $root '.build\eden-runs') -Directory |
