@@ -61,15 +61,24 @@ Write-Host ("=== the NRO every cell runs: {0} ===" -f $nroHash.Substring(0, 16))
 # THE AUTOPILOT, NOT THE MANUAL SCRIPT: this measures the port's own closed
 # loop, which is the thing that has to complete a lap.
 #
-# THE PULSE.  MEASURED 2026-11-09: with the plain script, which HOLDS the
-# guest's BTN_A down for the whole round, the guest never sees a
-# button-down TRANSITION, so a modal dialog (the "you received 50 gold"
-# popup, which the guest PERSISTS between rounds) waits for a press that
-# never comes and the guest sits in the front end forever.  Three rounds
-# drew EXACTLY 10,394 things in 400 s and stopped in the same place.  With
-# the pulse, the same build and the same card reached the race.
-Write-Host '=== input mode: autopilot (pulsing confirm) ==='
-& (Join-Path $root '.build\deploy-input-mode.ps1') -Mode autopilot-pulse
+# THE HELD SCRIPT, NOT THE PULSE.  MEASURED 2026-11-09 (rounds v3, v4, v5):
+# a PULSE produces a button-down TRANSITION, and the event map is a
+# scrolling world map, so a pulse WALKS the selection -- which is how the
+# guest ended up on a manufacturer cup whose assets are not on the card, and
+# stuck on a 0 % progress bar (v4).  A HELD button produces no transition,
+# so it never walks the map, and the guest stays on the streamable group it
+# started on.
+#
+# The navigation is done BY NAME instead, through rr3-ui.txt: the port taps
+# MAP_EVENT_CARD_BTN on the event map and BTN_RACE on the race start screen.
+# With that, round v5 reached the race with the normal 7 start lights and 10
+# race screens, and the flip fix took the flips from 7 to 1 and the stalls
+# from 5 to 0.
+Write-Host '=== input mode: autopilot (held confirm; the port navigates by name) ==='
+& (Join-Path $root '.build\deploy-input-mode.ps1') -Mode autopilot
+
+# AND THE SEMANTIC CONTROL REQUESTS, which are what actually navigate.
+& (Join-Path $root '.build\deploy-ui-requests.ps1')
 
 foreach ($combo in $combos) {
     if ($Only -ne '' -and $combo.name -ne $Only) {
