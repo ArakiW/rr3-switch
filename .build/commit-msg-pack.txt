@@ -1,0 +1,24 @@
+THE APP PACKAGE IS REBUILT FROM THE CURRENT BUILD, BY A SCRIPT
+
+WHY: the package that went out on 2026-11-10 carried the NRO from 01:23, and
+the port has been rebuilt and measured four times since -- the race-state
+instrument fix, the pursuit's control law, and the two rounds that measured
+them.  A console test with a stale NRO measures the stale NRO.
+
+.build/pack-app-dated.ps1 builds it, and the pieces come from named places:
+
+  the NRO and the romfs   the CURRENT build (native-switch\), so the package
+                          always carries the build that was gated;
+  the nine control files  native-switch\card\, the SHIPPING versions -- the
+                          console's rr3-pad.txt has NO events, because the
+                          player's own controller drives the car;
+  rr3-gfx.conf            the card's, because the card is the state that was
+                          actually MEASURED;
+  the two install scripts and the README from tools\.
+
+IT DOES NOT CARRY THE ASSETS: the seven data volumes and the .depot tree are
+the guest's own data, they have not changed, and the console already has them.
+
+THE REBUILT PACKAGE: dist/rr3-switch-app-20261110.zip, 45.5 MiB, carrying the
+NRO of 2026-11-10 07:46:28 (53,731,825 bytes, sha256 D93AFD7B5DF894CF...), the
+same bytes that are on the emulator card and in the build tree.
