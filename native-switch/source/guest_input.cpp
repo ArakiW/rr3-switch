@@ -612,7 +612,24 @@ void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
     // This is a CALL INTO the guest, so it is pumped from the input pump,
     // which is the guest's own thread, and it installs the guest's TLS.
     pumpUiScreenOpen(g_frameCounter);
-    pumpFrontEndDriver(g_frameCounter);
+    // THE SEMANTIC FRONT-END DRIVER IS NOT PUMPED YET.
+    //
+    // MEASURED 2026-11-09: the driver's ARCHITECTURE is right -- a table
+    // keyed by the guest's screen name, one action per screen visit, the
+    // look-ahead and the tap state machine reused -- but its TABLE presses
+    // ACTION_BTN, which the guest's own .gui files put on the BANNER
+    // screens, and CARD_BUTTON, which does not exist in the index at all.
+    // The control the event map needs is MAP_EVENT_CARD_BTN.
+    //
+    // ⇒ Until the table is corrected, the navigation is done by the card
+    // file instead, and that is MEASURED to work: rr3-ui.txt asks for
+    // MAP_EVENT_CARD_BTN and BTN_RACE, and round v5 reached the race with
+    // the normal 7 start lights and 10 race screens.  Turning the driver on
+    // with a wrong table would put a second navigator in the same room.
+    //
+    // TO TURN IT ON: correct the table (tools/gui_index.py has the ids),
+    // then delete this call and the note above it.
+    // pumpFrontEndDriver(g_frameCounter);
 
     const bool driving = raceStateDriveEnabled();
     const RaceDriveState& drive = raceDriveState();
