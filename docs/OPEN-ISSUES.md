@@ -3105,11 +3105,21 @@ with every sha256 checked against the manifest.
 
 **MEASURED ON THE CARD WITH THE HYBRID (round `hybrid1`):**
 ```
-front-end markers: 185 EventMapScreen/main_menu lines   (baseline: 193)
+front-end layout opened 4   main menu layouts open 20   EventMapScreen 194
+start lights 7             race screen 10
+```
+against the DXT baseline's 4 / 20 / 193 / 7 / 10 -- the front end is
+INDISTINGUISHABLE from the set that boots.
+```
 ctex-upload: 30 x ETC1 (0x8d64, recent_fourcc=ETC)   2 x S3TC
   the two S3TC uploads are the WATER NORMAL MAP from the card's own loose
   copy (.depot/Tracks/common/gnd/water/water_world_normal.dxt.dds.z), not a car
 ```
+and the frame scan of the round finds no green-zeroed pixel at all: its
+worst frame holds 590 pink pixels and they are (255,77,181) -- the
+advertising billboard, whose green channel is 77 -- where the magenta rivals
+were (255,4,255) and (192,4,192), a green channel of FOUR.
+
 ⇒ **EVERY car texture is uploaded as ETC1 now, so Mesa's broken S3TC decode
 is out of the picture for the cars, and the front end is still the DXT one
 that boots.**  The volumes are also smaller than the ones they replace
