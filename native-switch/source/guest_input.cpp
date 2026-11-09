@@ -69,6 +69,7 @@
 
 #include "rr3/elf_preflight.hpp"
 #include "rr3/gamepad.hpp"
+#include "rr3/raw_hid.hpp"
 #include "rr3/guest_action.hpp"
 #include "rr3/guest_input_doors.hpp"
 #include "rr3/guest_touch.hpp"
@@ -463,6 +464,9 @@ bool prepareGuestControllerInput() {
     // touchscreen -- and it stands down on its own while the file control
     // owns the guest's touch path.
     prepareGuestTouchHardware();
+    // Initialize the raw HID subsystem so non-Npad controllers (e.g. Xbox Elite,
+    // DualShock 4, DualSense on PC emulators) can be enumerated and read.
+    rr3::raw_hid::initRawHid();
     return g_ready;
 }
 
@@ -673,6 +677,35 @@ void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
     physical.lt = triggerValue(pad, held, HidNpadButton_ZL, 0);
     physical.rt = triggerValue(pad, held, HidNpadButton_ZR, 1);
 
+    const uint64_t kPhysicalButtons =
+        HidNpadButton_A | HidNpadButton_B | HidNpadButton_X | HidNpadButton_Y |
+        HidNpadButton_L | HidNpadButton_R | HidNpadButton_ZL |
+        HidNpadButton_ZR | HidNpadButton_Minus | HidNpadButton_Plus |
+        HidNpadButton_Left | HidNpadButton_Right | HidNpadButton_Up |
+        HidNpadButton_Down | HidNpadButton_StickL | HidNpadButton_StickR;
+    const bool npadInUse =
+        (held & kPhysicalButtons) != 0 ||
+        physical.lx != 0.0f || physical.ly != 0.0f ||
+        physical.rx != 0.0f || physical.ry != 0.0f ||
+        physical.lt > 0.0f || physical.rt > 0.0f;
+
+    // NON-NPAD CONTROLLER FALLBACK (RAW-HID)
+    //
+    // On a PC under an emulator, non-Switch controllers (Xbox 360/One/Elite,
+    // DualShock 4, DualSense, generic USB pads) are not reported as Npads.
+    // When the Npad reports no active buttons or sticks, poll raw HID devices.
+    // If a recognized raw HID device provides input, it populates `physical`
+    // with the exact same rr3::gamepad::NpadState shape.
+    rr3::raw_hid::RawHidDevice rawDev{};
+    rr3::gamepad::NpadState rawPhysical{};
+    bool rawActive = false;
+    if (!npadInUse) {
+        rawActive = rr3::raw_hid::pollRawHidInput(&rawPhysical, &rawDev);
+        if (rawActive) {
+            physical = rawPhysical;
+        }
+    }
+
     // THE SCRIPT YIELDS TO THE HUMAN.
     //
     // THE DEFECT THIS FIXES, MEASURED 2026-11-04: the script path was "the
@@ -693,14 +726,12 @@ void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
     // plugged in and left on the table must not steal the input from the
     // experiment, and a pad that is being rested on must not steal it from
     // the script either.
-    const uint64_t kPhysicalButtons =
-        HidNpadButton_A | HidNpadButton_B | HidNpadButton_X | HidNpadButton_Y |
-        HidNpadButton_L | HidNpadButton_R | HidNpadButton_ZL |
-        HidNpadButton_ZR | HidNpadButton_Minus | HidNpadButton_Plus |
-        HidNpadButton_Left | HidNpadButton_Right | HidNpadButton_Up |
-        HidNpadButton_Down | HidNpadButton_StickL | HidNpadButton_StickR;
     const bool physicalActive =
-        (held & kPhysicalButtons) != 0 ||
+        npadInUse || rawActive ||
+        physical.a || physical.b || physical.x || physical.y ||
+        physical.l || physical.r || physical.zl || physical.zr ||
+        physical.minus || physical.plus || physical.left || physical.right ||
+        physical.up || physical.down || physical.stickL || physical.stickR ||
         physical.lx != 0.0f || physical.ly != 0.0f ||
         physical.rx != 0.0f || physical.ry != 0.0f ||
         physical.lt > 0.0f || physical.rt > 0.0f;
@@ -896,6 +927,7 @@ void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
              kAxisRTrigger, &g_lastRt);
     logGamepadState(g_frameCounter, canonical, guest, driving, mode);
     logTriggerState(g_frameCounter, pad, held);
+    rr3::raw_hid::logRawHidState(g_frameCounter, rawActive ? &rawDev : nullptr, &physical);
     }
 
     ++g_frameCounter;

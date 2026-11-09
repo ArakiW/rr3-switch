@@ -94,6 +94,7 @@ void guestViewTracedGlShaderSource(GLuint shader, GLsizei count,
                                    const GLchar* const* strings, const GLint* lengths);
 void guestViewTracedGlCompileShader(GLuint shader);
 void guestViewTracedGlLinkProgram(GLuint program);
+void guestViewTracedGlAttachShader(GLuint program, GLuint shader);
 void guestViewTracedGlShaderBinary(GLsizei count, const GLuint* shaders,
                                    GLenum binaryformat, const void* binary,
                                    GLsizei length);
@@ -177,6 +178,15 @@ struct GuestViewGlStats {
     // provably alive and drawing.  A blit that is only allowed to run when
     // the target really holds this frame's picture cannot do that.
     uint32_t drawsIntoOffscreenTarget{};
+    // Failure diagnostics for guest shaders and texture uploads.
+    // Counted unconditionally so shader or texture faults during the race
+    // are observable without paying per-call log costs.
+    uint32_t shaderCompileFails{};
+    uint32_t programLinkFails{};
+    uint32_t texUploadFails{};
+    uint32_t lastFailedShader{};
+    uint32_t lastFailedProgram{};
+    uint32_t lastTexUploadError{};
 };
 GuestViewGlStats guestViewGlStats();
 void resetGuestViewGlStats();
@@ -192,6 +202,12 @@ void guestViewTracedGlCompressedTexImage2D(GLenum target, GLint level,
                                            GLenum internalformat, GLsizei width,
                                            GLsizei height, GLint border,
                                            GLsizei imageSize, const void* data);
+void guestViewTracedGlTexSubImage2D(GLenum target, GLint level, GLint xoffset,
+                                    GLint yoffset, GLsizei width, GLsizei height,
+                                    GLenum format, GLenum type, const void* pixels);
+void guestViewTracedGlCopyTexSubImage2D(GLenum target, GLint level, GLint xoffset,
+                                        GLint yoffset, GLint x, GLint y,
+                                        GLsizei width, GLsizei height);
 void guestViewTracedGlBindFramebuffer(GLenum target, GLuint framebuffer);
 void guestViewTracedGlGenFramebuffers(GLsizei n, GLuint* framebuffers);
 void guestViewTracedGlFramebufferTexture2D(GLenum target, GLenum attachment,

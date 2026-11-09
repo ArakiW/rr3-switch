@@ -482,6 +482,79 @@ void hostDrawMagentaQuad() {
 bool g_glStatsEnabled = false;
 GuestViewGlStats g_glStats{};
 
+// ---------------------------------------------------------------------------
+// GL Failure Budget and Diagnostics.
+//
+// MEASURED: Per-call logging in the render loop severely penalizes frame rate.
+// The failure diagnostics for guest shaders and texture uploads are therefore:
+//   1. COMPLETELY SILENT on success (no log line for successful compiles or uploads).
+//   2. Logged ONLY on failure (non-zero compile/link error, glGetError != NO_ERROR).
+//   3. Strictly rate-limited to a per-process budget of 32 lines. Once the budget
+//      is exhausted, a single warning line is emitted and no further disk I/O occurs.
+// ---------------------------------------------------------------------------
+constexpr uint32_t kGlFailureLogBudget = 32;
+static std::atomic<uint32_t> g_glFailureLogCount{0};
+static std::atomic<bool> g_glFailureBudgetSpent{false};
+
+static void reportGlFailure(const char* tag, unsigned long long ordinal,
+                            unsigned long long target, const char* details) {
+    uint32_t count = g_glFailureLogCount.fetch_add(1, std::memory_order_relaxed);
+    if (count < kGlFailureLogBudget) {
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            tag, ordinal, target, details);
+        if (count + 1 == kGlFailureLogBudget) {
+            g_glFailureBudgetSpent.store(true, std::memory_order_relaxed);
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                "gl-fail-budget", kGlFailureLogBudget, 0,
+                                "maximum GL failure log budget reached; suppressing further lines");
+        }
+    }
+}
+
+struct TrackedShaderEntry {
+    GLuint shader;
+    GLuint program;
+    GLenum type;
+};
+constexpr size_t kMaxTrackedShaders = 256;
+static TrackedShaderEntry g_trackedShaders[kMaxTrackedShaders]{};
+static size_t g_trackedShaderCount = 0;
+
+static void recordShaderCreated(GLuint shader, GLenum type) {
+    if (shader == 0) return;
+    for (size_t i = 0; i < g_trackedShaderCount; ++i) {
+        if (g_trackedShaders[i].shader == shader) {
+            g_trackedShaders[i].type = type;
+            return;
+        }
+    }
+    if (g_trackedShaderCount < kMaxTrackedShaders) {
+        g_trackedShaders[g_trackedShaderCount++] = {shader, 0, type};
+    }
+}
+
+static void recordShaderAttached(GLuint program, GLuint shader) {
+    if (shader == 0) return;
+    for (size_t i = 0; i < g_trackedShaderCount; ++i) {
+        if (g_trackedShaders[i].shader == shader) {
+            g_trackedShaders[i].program = program;
+            return;
+        }
+    }
+    if (g_trackedShaderCount < kMaxTrackedShaders) {
+        g_trackedShaders[g_trackedShaderCount++] = {shader, program, 0};
+    }
+}
+
+static GLuint findProgramForShader(GLuint shader) {
+    for (size_t i = 0; i < g_trackedShaderCount; ++i) {
+        if (g_trackedShaders[i].shader == shader) {
+            return g_trackedShaders[i].program;
+        }
+    }
+    return 0;
+}
+
 // THE PORT'S OWN BINDS.  Set while the port binds a framebuffer for its own
 // reasons (the blit into the window), so the tracer does not redirect them.
 static bool g_hostBinding = false;
@@ -851,12 +924,15 @@ GLuint guestViewTracedGlCreateShader(GLenum type) {
     noteGlCallWithoutContext("glCreateShader",
                               reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     if (!g_enabled || g_checkpointInProgress) {
-        return ::glCreateShader(type);
+        const GLuint shader = ::glCreateShader(type);
+        recordShaderCreated(shader, type);
+        return shader;
     }
     g_glCaller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
     g_glObject = 0;
     checkpointPhase("view-gl-create-shader-enter", 38, type);
     const GLuint shader = ::glCreateShader(type);
+    recordShaderCreated(shader, type);
     g_glObject = shader;
     appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                         "glCreateShader",
@@ -902,50 +978,111 @@ void guestViewTracedGlShaderSource(GLuint shader, GLsizei count,
     checkpointPhase("view-gl-shader-source-return", 41, shader);
 }
 
+void guestViewTracedGlAttachShader(GLuint program, GLuint shader) {
+    noteGlCallWithoutContext("glAttachShader",
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
+    recordShaderAttached(program, shader);
+    ::glAttachShader(program, shader);
+}
+
 void guestViewTracedGlCompileShader(GLuint shader) {
     // BEFORE the early-out: see the observer's comment.  A shader compiled on
     // a thread with no context is the single most suspicious thing a guest
     // can do to an NVN driver.
     noteGlCallWithoutContext("glCompileShader",
                               reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
-    if (!g_enabled || g_checkpointInProgress) {
-        ::glCompileShader(shader);
-        return;
+    const bool probeTrace = g_enabled && !g_checkpointInProgress;
+    if (probeTrace) {
+        g_glCaller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+        g_glObject = shader;
+        checkpointPhase("view-gl-compile-shader-enter", 42, shader);
     }
-    g_glCaller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
-    g_glObject = shader;
-    checkpointPhase("view-gl-compile-shader-enter", 42, shader);
     ::glCompileShader(shader);
     GLint compiled = 0;
     ::glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
     if (compiled == 0) {
-        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
-                            "shader-compile-fail",
-                            static_cast<unsigned long long>(shader), 0);
+        ++g_glStats.shaderCompileFails;
+        g_glStats.lastFailedShader = shader;
+
+        GLint logLen = 0;
+        ::glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &logLen);
+        char infoLog[512] = {0};
+        if (logLen > 0) {
+            GLsizei actual = 0;
+            ::glGetShaderInfoLog(shader, sizeof(infoLog) - 1, &actual, infoLog);
+            for (GLsizei i = 0; i < actual; ++i) {
+                if (infoLog[i] == '\r' || infoLog[i] == '\n') {
+                    infoLog[i] = ' ';
+                }
+            }
+        }
+
+        const GLuint prog = findProgramForShader(shader);
+        char details[640];
+        std::snprintf(details, sizeof(details),
+                      "shader=%u program=%u status=%d log=\"%s\"",
+                      static_cast<unsigned>(shader), static_cast<unsigned>(prog),
+                      static_cast<int>(compiled), infoLog[0] ? infoLog : "none");
+        reportGlFailure("shader-compile-fail", shader, prog, details);
     }
-    checkpointPhase("view-gl-compile-shader-return", 43, shader);
+    if (probeTrace) {
+        checkpointPhase("view-gl-compile-shader-return", 43, shader);
+    }
 }
 
 void guestViewTracedGlLinkProgram(GLuint program) {
     // BEFORE the early-out: see the observer's comment.
     noteGlCallWithoutContext("glLinkProgram",
                               reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
-    if (!g_enabled || g_checkpointInProgress) {
-        ::glLinkProgram(program);
-        return;
+    const bool probeTrace = g_enabled && !g_checkpointInProgress;
+    if (probeTrace) {
+        g_glCaller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+        g_glObject = program;
+        checkpointPhase("view-gl-link-program-enter", 44, program);
     }
-    g_glCaller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
-    g_glObject = program;
-    checkpointPhase("view-gl-link-program-enter", 44, program);
     ::glLinkProgram(program);
     GLint linked = 0;
     ::glGetProgramiv(program, GL_LINK_STATUS, &linked);
     if (linked == 0) {
-        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
-                            "gl-link-fail",
-                            static_cast<unsigned long long>(program), 0);
+        ++g_glStats.programLinkFails;
+        g_glStats.lastFailedProgram = program;
+
+        GLint logLen = 0;
+        ::glGetProgramiv(program, GL_INFO_LOG_LENGTH, &logLen);
+        char infoLog[512] = {0};
+        if (logLen > 0) {
+            GLsizei actual = 0;
+            ::glGetProgramInfoLog(program, sizeof(infoLog) - 1, &actual, infoLog);
+            for (GLsizei i = 0; i < actual; ++i) {
+                if (infoLog[i] == '\r' || infoLog[i] == '\n') {
+                    infoLog[i] = ' ';
+                }
+            }
+        }
+
+        GLint attachedCount = 0;
+        GLuint attached[8] = {0};
+        ::glGetAttachedShaders(program, 8, &attachedCount, attached);
+        char attachedStr[64] = {0};
+        if (attachedCount > 0) {
+            int off = 0;
+            for (GLint i = 0; i < attachedCount && off < static_cast<int>(sizeof(attachedStr)) - 12; ++i) {
+                off += std::snprintf(attachedStr + off, sizeof(attachedStr) - off, "%s%u", i > 0 ? "," : "", attached[i]);
+            }
+        } else {
+            std::snprintf(attachedStr, sizeof(attachedStr), "none");
+        }
+
+        char details[640];
+        std::snprintf(details, sizeof(details),
+                      "program=%u shaders=[%s] status=%d log=\"%s\"",
+                      static_cast<unsigned>(program), attachedStr,
+                      static_cast<int>(linked), infoLog[0] ? infoLog : "none");
+        reportGlFailure("gl-link-fail", program, 0, details);
     }
-    checkpointPhase("view-gl-link-program-return", 45, program);
+    if (probeTrace) {
+        checkpointPhase("view-gl-link-program-return", 45, program);
+    }
 }
 
 void guestViewTracedGlShaderBinary(GLsizei count, const GLuint* shaders,
@@ -1186,8 +1323,26 @@ void guestViewTracedGlTexImage2D(GLenum target, GLint level, GLint internalforma
                              pixels != nullptr ? "pixels" : "null");
         }
     }
+    // Drain any prior error so it is not misattributed to this texture upload
+    while (::glGetError() != GL_NO_ERROR) {}
+
     ::glTexImage2D(target, level, internalformat, width, height, border,
                    format, type, pixels);
+
+    const GLenum err = ::glGetError();
+    if (err != GL_NO_ERROR) {
+        ++g_glStats.texUploadFails;
+        g_glStats.lastTexUploadError = err;
+        char details[256];
+        std::snprintf(details, sizeof(details),
+                      "op=glTexImage2D target=0x%x level=%d internal=0x%x w=%d h=%d fmt=0x%x type=0x%x err=0x%x",
+                      static_cast<unsigned>(target), static_cast<int>(level),
+                      static_cast<unsigned>(internalformat),
+                      static_cast<int>(width), static_cast<int>(height),
+                      static_cast<unsigned>(format), static_cast<unsigned>(type),
+                      static_cast<unsigned>(err));
+        reportGlFailure("gl-tex-upload-fail", g_glStats.lastBoundTexture, err, details);
+    }
 }
 
 void guestViewTracedGlCompressedTexImage2D(GLenum target, GLint level,
@@ -1212,8 +1367,76 @@ void guestViewTracedGlCompressedTexImage2D(GLenum target, GLint level,
                              data != nullptr ? "data" : "null");
         }
     }
+
+    while (::glGetError() != GL_NO_ERROR) {}
+
     ::glCompressedTexImage2D(target, level, internalformat, width, height,
                              border, imageSize, data);
+
+    const GLenum err = ::glGetError();
+    if (err != GL_NO_ERROR) {
+        ++g_glStats.texUploadFails;
+        g_glStats.lastTexUploadError = err;
+        char details[256];
+        std::snprintf(details, sizeof(details),
+                      "op=glCompressedTexImage2D target=0x%x level=%d internal=0x%x w=%d h=%d size=%d err=0x%x",
+                      static_cast<unsigned>(target), static_cast<int>(level),
+                      static_cast<unsigned>(internalformat),
+                      static_cast<int>(width), static_cast<int>(height),
+                      static_cast<int>(imageSize),
+                      static_cast<unsigned>(err));
+        reportGlFailure("gl-tex-upload-fail", g_glStats.lastBoundTexture, err, details);
+    }
+}
+
+void guestViewTracedGlTexSubImage2D(GLenum target, GLint level, GLint xoffset,
+                                    GLint yoffset, GLsizei width, GLsizei height,
+                                    GLenum format, GLenum type, const void* pixels) {
+    noteGlCallWithoutContext("glTexSubImage2D",
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
+    while (::glGetError() != GL_NO_ERROR) {}
+
+    ::glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixels);
+
+    const GLenum err = ::glGetError();
+    if (err != GL_NO_ERROR) {
+        ++g_glStats.texUploadFails;
+        g_glStats.lastTexUploadError = err;
+        char details[256];
+        std::snprintf(details, sizeof(details),
+                      "op=glTexSubImage2D target=0x%x level=%d xoff=%d yoff=%d w=%d h=%d fmt=0x%x type=0x%x err=0x%x",
+                      static_cast<unsigned>(target), static_cast<int>(level),
+                      static_cast<int>(xoffset), static_cast<int>(yoffset),
+                      static_cast<int>(width), static_cast<int>(height),
+                      static_cast<unsigned>(format), static_cast<unsigned>(type),
+                      static_cast<unsigned>(err));
+        reportGlFailure("gl-tex-upload-fail", g_glStats.lastBoundTexture, err, details);
+    }
+}
+
+void guestViewTracedGlCopyTexSubImage2D(GLenum target, GLint level, GLint xoffset,
+                                        GLint yoffset, GLint x, GLint y,
+                                        GLsizei width, GLsizei height) {
+    noteGlCallWithoutContext("glCopyTexSubImage2D",
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
+    while (::glGetError() != GL_NO_ERROR) {}
+
+    ::glCopyTexSubImage2D(target, level, xoffset, yoffset, x, y, width, height);
+
+    const GLenum err = ::glGetError();
+    if (err != GL_NO_ERROR) {
+        ++g_glStats.texUploadFails;
+        g_glStats.lastTexUploadError = err;
+        char details[256];
+        std::snprintf(details, sizeof(details),
+                      "op=glCopyTexSubImage2D target=0x%x level=%d xoff=%d yoff=%d x=%d y=%d w=%d h=%d err=0x%x",
+                      static_cast<unsigned>(target), static_cast<int>(level),
+                      static_cast<int>(xoffset), static_cast<int>(yoffset),
+                      static_cast<int>(x), static_cast<int>(y),
+                      static_cast<int>(width), static_cast<int>(height),
+                      static_cast<unsigned>(err));
+        reportGlFailure("gl-tex-upload-fail", g_glStats.lastBoundTexture, err, details);
+    }
 }
 
 void guestViewTracedGlBindFramebuffer(GLenum target, GLuint framebuffer) {

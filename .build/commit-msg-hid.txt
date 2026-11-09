@@ -1,0 +1,79 @@
+THE PORT READS A CONTROLLER THAT IS NOT AN NPAD, AND THE FAILURE OF A TEXTURE IS NOW VISIBLE
+
+Two of the user's standing complaints, implemented and verified by the gate.
+
+1. A CONTROLLER THAT IS NOT AN NPAD WAS NEVER READ AT ALL.
+
+   The port read the controller only through libnx's Npad API, so a device
+   the HID service does not report as an Npad was invisible to it.  On a
+   console hidretro / dinput_redux translate a DS4, an Xbox pad or a generic
+   pad into an Npad, which is why the console path works and why the PC
+   path does not: an Xbox Elite under an emulator arrives as a raw HID
+   device and the port saw nothing.
+
+   native-switch/source/raw_hid.cpp (+ include/rr3/raw_hid.hpp) adds the raw
+   HID path: the devices are enumerated, their reports are read, their
+   layout is identified, and their state is translated into the SAME
+   rr3::gamepad::NpadState shape the rest of the port already uses.  So
+   rr3-gamepad.txt stays the one place that says what a button means, and
+   no layout's button numbers are hard-coded into the driver.
+
+   Two properties were checked by reading the diff rather than trusting it:
+
+     * THE CONSOLE PATH IS UNTOUCHED.  The raw poll only runs when the
+       Npad reports no activity at all (`if (!npadInUse)`), so a Pro
+       Controller behaves exactly as before.
+     * THE RAW DEVICE IS A FALLBACK, NOT A RIVAL.  It fills the same
+       NpadState, so everything downstream -- the mapping file, the guest's
+       SetButtonValueJNI calls, the autopilot -- is unchanged.
+
+   AND THE COST WAS FIXED, because the first version of this polled the
+   HID service's device list EVERY FRAME while the Npad was idle, which on
+   a real console is always: every console controller is an Npad.  The
+   device list is now cached and refreshed every 15 frames (a quarter of a
+   second at 60 fps, so plugging a pad in is still noticed at once), and
+   the REPORTS are still read every frame, so a controller in use is never
+   throttled.  With no raw device connected -- the console's normal case --
+   the whole poll costs one comparison a frame.
+
+   The host harness (native-switch/tests/host/gamepad_selftest.cpp) gained
+   the coverage, and test_gamepad_contract.py compiles and runs it, so it
+   is part of the 39 the gate runs.
+
+2. THE TEXTURE FAILURE IS NOW VISIBLE IN THE LOG.
+
+   The magenta car and the grey-white HUD widget were diagnosed only from
+   the log, and the port read NO status value from GL: it counts the calls
+   to glCompileShader, glLinkProgram and the texture uploads, and never
+   reads GL_COMPILE_STATUS, GL_LINK_STATUS or glGetError().  So "the
+   guest's shader failed to link" and "the shaders are fine" were the same
+   observation, and so were "the upload was rejected" and "the upload
+   worked".
+
+   guest_view_trace.cpp now reads the status after every guest shader
+   compile and link and after every guest texture upload, and reports ONLY
+   failures, with a per-process budget of 32 lines and one line saying the
+   budget was spent.  Silent on success, because the port's own log volume
+   has been measured as a real cost to the frame rate.
+
+WHAT THE MEASUREMENT SAID, AND WHAT IT DID NOT SAY
+
+   The magenta car REPRODUCES IN THIS PROJECT'S OWN ARCHIVE, and it is
+   EVENT-SPECIFIC rather than a regression: m1 and m9 are the SAME Nov-4
+   binary, and m1 has zero magenta frames while m9 has 24 of them.  m9's
+   frame is the NASCAR oval, with the same magenta AI opponents as the
+   user's screenshot.  It is NOT the port's own diagnostic checkerboard --
+   the "texImage2D-fixup" branch, which substitutes a magenta/black
+   checkerboard for a 0-size guest upload, fired zero times in every
+   round.  And the asset serving is identical between the magenta round
+   and the clean one (243 asset-invariant lines each, same paths, same
+   sources, agree=1 found=1), so it is not which file the port picks.
+
+   ⇒ What is left is what happens to the bytes on the GPU, and that is
+   exactly what the port could not see.  The instrument is now in place to
+   name it, and the next round will.
+
+   The Antigenravity CLI produced the code for both parts; its report was
+   lost when the process was killed, so everything above was checked by
+   reading the diff and by the gate, and the per-frame enumeration cost was
+   found and fixed here.
