@@ -157,4 +157,18 @@ int guestLink(const char* oldPath, const char* newPath);
 int guestSymlink(const char* target, const char* linkPath);
 int guestBionicStatfs(const char* path, void* output);
 
+// Texture service tracking for Defect B:
+// Links glCompressedTexImage2D uploads to the texture file that was served.
+struct ServedTextureRecord {
+    char path[224];
+    char fourcc[8];
+    uint32_t width;
+    uint32_t height;
+    uint32_t mips;
+    uint32_t fileBytes;
+};
+
+void rememberServedTexture(const char* guestPath, const char* localPath);
+bool getRecentServedTexture(size_t indexFromLatest, ServedTextureRecord* outRecord);
+
 } // namespace rr3

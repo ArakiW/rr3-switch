@@ -2788,3 +2788,166 @@ the 2x2 (the cells were not comparable), the flip hypothesis (killed by its
 own experiment), and this one (the counter read a field and ignored the rest
 of the line).  **⇒ PRINT THE WHOLE LINE, NOT A FIELD OF IT, AND GREP FOR
 WHAT THE LINE SAYS, NOT FOR A SUBSTRING OF IT.**
+
+### 9.17 The magenta rival cars: block layout corruption vs format advertising and delivery
+
+**THE MEASUREMENT PIXEL BY PIXEL (NOT A MISSING TEXTURE):**
+In frame 2000 of the m9 run (`.build/eden-runs/20261109-202239-eden-rr3-m9-nov4-binary-todays-card/frames/frame-002000.png`)
+and its 4x crop (`frame-002000.magenta-crop.png`), rival DTM cars (BMW M4 DTM,
+Mercedes C63 DTM) render magenta with dark purple windows.
+Measuring pixel values proves this is NOT a missing-texture colour:
+zero pixels in the frame are exactly (255, 0, 255).
+What actually appears on the car bodies:
+  (255,4,255) x40, (192,4,192) x17, (221,4,229) x7, (187,7,204) x5, (255,7,255) x4, (190,29,220) x3
+This represents a normal grey/white car livery where the green channel is zeroed
+(white 255,255,255 -> 255,4,255; grey 192,192,192 -> 192,4,192), and window glass
+becomes dark purple (60,60,60 -> 60,0,60). The texture is decoded, but decoded
+with the wrong block layout.
+
+**THE ASSET DATA AND DELIVERY ARE VERIFIED GOOD:**
+- Source pack member `files/.depot/vehicles/2017_bmw_m4_dtm/livery/2017_bmw_m4_dtm_ext.dxt.dds.z`
+  (266,228 bytes on disk) has 4-byte LE size 699,192 + zlib payload.
+  It inflates to a valid 1024x1024 DDS with 11 mip levels and FourCC 'DXT1'
+  (8 bytes per 4x4 block).
+  CPU decode via Pillow and via `rr3/dxt_decode.hpp` produces a normal grey car
+  (mean RGB 125, 122, 126) with ZERO green-zeroed pixels.
+- The delivery log in m9 (`guest-view.log`) proves the guest received exactly these
+  266,228 bytes (`phase=map-app`, `phase=stat-layout size=266228`, `phase=open-ok`).
+
+**LOG CAP EXPLANATION FOR THE DXT5 TRACE ARTIFACT:**
+Earlier logs in m9/m10 showed:
+  `phase=ctexImage2D ordinal=16777472 target=00000000000083f3 data`
+  `... (8 mip levels from 256x256 down to 2x2) ...`
+Internal format 0x83F3 is `GL_COMPRESSED_RGBA_S3TC_DXT5_EXT` (16 bytes per block).
+The reason only 0x83F3 was logged is that `guestViewTracedGlCompressedTexImage2D`
+had a hard cutoff `if (g_glStats.compressedTexImage2D <= 8)`. Those 8 calls belonged
+to `vehicles/common/car_rotor_glow.dxt.dds.z`, which is genuinely 256x256 DXT5 on disk.
+All subsequent texture uploads (including car liveries) were suppressed by the budget.
+
+**THE THREE DISCRIMINATED HYPOTHESES:**
+- H1: The candidate chain served a format-specific request with bytes of another format.
+- H2: The port's asset list rewrite and the guest's format decision disagreed.
+- H3: Mesa 20.1.0-rc3 on this target cannot decode S3TC or decodes DXT1 with green masked.
+
+**THE DIAGNOSTIC INSTRUMENTS INTRODUCED:**
+1. `graphics_probe.cpp` pixel readback:
+   Stage 9 now performs `glReadPixels(640, 360, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE)`
+   and compares the GPU pixel against reference CPU decode of the exact same DDS block
+   via `decodeDxt1Block` / `decodeDxt5Block`.
+   Probes both GUI atlas (`sprites_0.dxt.dds.z`) and vehicle livery
+   (`2017_bmw_m4_dtm_ext.dxt.dds.z`), logging:
+   `phase=probe-dxt1 asset=... fourcc=... w=... h=... internal=... err=... got=(r,g,b) want=(r,g,b) match=0/1`
+2. Linked compressed texture upload tracking:
+   A ring buffer in `guest_filesystem.cpp` records served DDS assets with parsed FourCC,
+   dimensions, and mip counts. `guestViewTracedGlCompressedTexImage2D` reports the
+   recent served file alongside `internalformat` and `glGetError()` with a 32-line budget.
+3. Software DXT fallback:
+   `__wrap_glCompressedTexImage2D` in `gfx_gles.cpp` now supports translating S3TC uploads
+   to RGBA8 on CPU via `decodeDxtImage` and `__real_glTexImage2D` when `RR3_SW_DXT=1` is set.
+4. Defect A Npad heartbeat:
+   Added `npad-heartbeat` diagnostic (every 5s and on slot/button/analog change) reporting
+   `state=npad-none|npad-idle|npad-active`, connection type, buttons (hex), sticks, and
+   autopilot injection. Raw HID fallback is silenced during Npad activity and polled at
+   15-frame cadence.
+
+**WHAT REMAINS UNVERIFIED:**
+- The first Eden run with the new diagnostics will report whether Mesa's `probe-dxt1`
+  returns `match=1` or `match=0` (confirming or ruling out H3).
+- The `ctex-upload` log lines will report whether the guest passed 0x83F1 (DXT1) or
+  0x83F3 (DXT5) when uploading vehicle liveries.
+
+### 9.18 The magenta rivals, continued: the guest's format ORDER, and what the GPU does with the bytes
+
+**THE FORMAT ORDER THE GUEST ASKS FOR (measured from the `path-req` lines):**
+The guest asks for a texture by SPELLING, and it walks the list:
+`..._sprites_0.rgb.pvr.z` -> `..._sprites_0.etc.dds.z` -> `..._sprites_0.dxt.dds.z`
+-> `..._sprites_0.atc.dds.z`.  PVR first, then ETC1, then DXT, then ATC.  It
+takes the first one that EXISTS.
+
+**WHERE EACH SPELLING EXISTS ON THIS CARD:**
+- The card's loose `.depot` (the original Android app's own files) carries the
+  PVR and ETC1 spellings -- for example
+  `.depot/assets_2048x1536/common/sprites_0.rgb.pvr.z` (1,021,253 B) and
+  `.depot/vehicles/<model>/livery/<model>_ext_<colour>.etc.dds.z`.
+- The SEVEN EXTERNAL VOLUMES were built from the DXT data pack (the pack whose
+  name and sha256 are recorded as `source_archive` / `source_sha256` in
+  `data/rr3-data-manifest.json`; the archive itself is a ~6.6 GB zip whose file
+  name carries CJK characters and is therefore not quoted here), and they
+  carry ONLY the DXT spelling: of the
+  11,155 `*.dds.z` entries in `tracks` + `vehicles-mid`, every single one is
+  `.dxt.dds.z`.
+
+⇒ **So a car whose assets are in the loose `.depot` gets its PVR/ETC spelling
+and renders correctly; a car that exists ONLY in the volumes falls through to
+the DXT spelling.**  That is exactly the split the symptom shows: the 82 cars
+the card has are fine, and the DTM rivals -- which the card does not have --
+are magenta.
+
+**THE GUEST'S OWN FORMAT DECISION IS CORRECT (measured, `ctex-upload` lines):**
+```
+phase=ctex-upload ordinal=1 ... internal=0x83f3(DXT5_RGBA) err=0x0 recent_file=".../vehicles/common/car_rotor_glow.dxt.dds.z" recent_fourcc=DXT5 recent_dim=256x256
+phase=ctex-upload ordinal=10 ... internal=0x83f1(DXT1_RGBA) err=0x0 recent_file=".../vehicles/common/arms_norm.dxt.dds.z" recent_fourcc=DXT1 recent_dim=512x512
+```
+The guest uploads each texture with the internal format that matches the
+FourCC inside the file it was given (DXT5 file -> 0x83F3, DXT1 file -> 0x83F1),
+and every upload reports `err=0x0`.  ⇒ **H1 (the alias chain answered a
+format-specific request with another format's bytes) and H2 (the asset-list
+rewrite and the guest's format decision disagreed) are DEAD.**
+
+⇒ **WHAT IS LEFT IS THE GPU'S OWN DECODE.**  The bytes are good (the CPU
+decodes them into a normal grey car, mean RGB 125,122,126, zero green-zeroed
+pixels) and the guest hands them over in the right format with no GL error --
+and the result on screen is the same texture with its GREEN CHANNEL ZEROED.
+
+**THE FIX (a conf key, because an NRO on a console has no environment):**
+`swdxt=1` in `sdmc:/switch/rr3-gfx.conf` makes the port decode DXT1/DXT5 on
+the CPU (`include/rr3/dxt_decode.hpp`) and upload the pixels as plain RGBA,
+which takes Mesa out of the S3TC decode entirely.  The decoder is proved by
+`native-switch/tests/test_dxt_decode_contract.py` (27 checks, and the gate
+runs it).
+
+**THE INSTRUMENT, AND TWO WAYS IT WAS WRONG FIRST:**
+`phase=dxt-readback` prints what the GPU returned for a texel next to what the
+CPU decoded for the same texel.
+1. It first reported `match=0` (the GPU disagrees) when the truth was "nothing
+   was measured": this Mesa build answers `GL_FRAMEBUFFER_UNSUPPORTED`
+   (0x8CD6) when a COMPRESSED texture is attached to a framebuffer, so the
+   pixel came back (0,0,0).  The verdict is now THREE-VALUED: `1` agrees,
+   `0` disagrees, `-1` NOT MEASURED, with the status and the GL error on the
+   line.  **"NOT MEASURED" IS NOT "MEASURED AND WRONG".**
+2. It then read the texture back the moment level 0 arrived, and a texture
+   whose mip chain is incomplete SAMPLES BLACK.  The measurement is now
+   DEFERRED until the next texture starts, at which point the previous one has
+   its whole chain.
+
+**THE CONTROLLER, MEASURED THE SAME WAY (Defect A):**`phase=npad-heartbeat ... state=npad-idle type=FullKey seen_press=0
+buttons=0x0 autopilot_injected=0` -- the emulator DOES hand the guest a
+Nintendo Pro Controller (a FullKey one), and it never changes because no host
+pad is bound to it.  Eden's own configuration says the same thing:
+`player_0_button_a="engine:keyboard,code:67"` and the same for every other
+button of every player, and `enable_all_controllers=false`.  The pad itself is
+fine: XInput slot 0 is CONNECTED.  So on the PC the work is in EDEN's
+controller configuration, and the port's job is only to make the difference
+visible in one log line -- see `docs/CONTROLLER-ON-PC.md`.
+
+**THE A/B, RUN AGAINST THE SAME SAVED STATE (rounds `dxtab0` and `dxtab1`):**
+Both rounds start from the SAME restored guest state (`.build/guest-state.ps1
+-Restore -Tag dxtab0`), the same build, and differ in ONE thing: the `swdxt`
+key.
+
+- `dxtab0` (swdxt off, the GPU decodes the S3TC blocks): the texture arrives
+  on screen with its green channel zeroed -- the m9 frame above, measured pixel
+  by pixel.
+- `dxtab1` (swdxt on, the port decodes the blocks and uploads RGBA): the
+  read-back returns the CPU's own pixels, unchanged:
+  ```
+  phase=dxt-readback ordinal=2 ... internal=0x83f1(DXT1) w=512 h=512 status=0x8cd5 err=0x0 got=(129,255,129) want=(129,255,129) match=1 sw=1
+  phase=dxt-readback ordinal=3 ... internal=0x83f1(DXT1) w=1024 h=1024 status=0x8cd5 err=0x0 got=(127,127,255) want=(127,127,255) match=1 sw=1
+  ```
+  `status=0x8CD5` is GL_FRAMEBUFFER_COMPLETE -- the texture is plain RGBA8
+  here, which a framebuffer DOES accept, so this is a real verdict and not a
+  "not measured" one.
+
+⇒ **Same bytes, same game, same shader, one switch: the GPU's S3TC decode is
+what turned a grey car into a magenta one.**
+

@@ -217,6 +217,32 @@ struct ConfState {
     // from the data packs, where on real hardware the game would create it
     // itself and succeed. Default 0: plain POSIX mkdir, EEXIST and all.
     bool mkdirIdempotent = false;
+    // "swdxt=1" -- the port decodes DXT1/DXT5 textures on the CPU and uploads
+    // them as uncompressed RGBA, instead of handing S3TC blocks to the GPU.
+    //
+    // WHY IT EXISTS.  The rival cars in a race render magenta.  Measured pixel
+    // by pixel, that is not the missing-texture colour: no pixel in the frame
+    // is exactly (255,0,255).  What is there is (255,4,255), (192,4,192),
+    // (221,4,229) -- a normal grey/white car with the GREEN CHANNEL ZEROED,
+    // and the window glass comes out dark purple.  So the texture is decoded,
+    // but decoded with the wrong layout.
+    //
+    // The bytes are good.  The pack member
+    //   files/.depot/vehicles/2017_bmw_m4_dtm/livery/2017_bmw_m4_dtm_ext.dxt.dds.z
+    // (266,228 B on disk) inflates to a valid 1024x1024 DDS, 11 mip levels,
+    // FourCC 'DXT1', and decoding it on the CPU gives a normal grey car
+    // (mean RGB 125,122,126, no green-zeroed pixels).  So the corruption is
+    // in the decode/upload path, and this key is the way to take the GPU out
+    // of it: the port already knows how to decode DXT1 and DXT5
+    // (include/rr3/dxt_decode.hpp), and the host test that proves it is
+    // native-switch/tests/test_dxt_decode_contract.py.
+    //
+    // It is a CONF key and not an environment variable because the port runs
+    // as an NRO on a console, where there is no environment to set.  Off by
+    // default until the read-back probe has measured which side is wrong:
+    // native-switch/source/graphics_probe.cpp draws a real texture and
+    // compares the GPU's pixels with the CPU's.
+    bool softwareDxt = false;
     // "ccloginok=1" -- the Cloudcell account manager answers LoginCompleteCallback
     // with SUCCESS rather than with an honest failure.
     //
@@ -730,6 +756,11 @@ void readConf() {
                  std::strcmp(key, "mkdirx") == 0) {
             s_conf.mkdirIdempotent = parseSwitch(value);
         }
+        else if (std::strcmp(key, "swdxt") == 0 ||
+                 std::strcmp(key, "software-dxt") == 0 ||
+                 std::strcmp(key, "dxt-cpu") == 0) {
+            s_conf.softwareDxt = parseSwitch(value);
+        }
         else if (std::strcmp(key, "ccloginok") == 0 ||
                  std::strcmp(key, "cc-login-ok") == 0 ||
                  std::strcmp(key, "loginsuccess") == 0) {
@@ -1003,6 +1034,12 @@ bool gfxObjectIdentity() {
 bool gfxMkdirIdempotent() {
     ensureResolved();
     return s_conf.mkdirIdempotent;
+}
+
+// "swdxt=1": S3TC uploads are decoded on the CPU and uploaded as RGBA.
+bool gfxSoftwareDxt() {
+    ensureResolved();
+    return s_conf.softwareDxt;
 }
 
 // "ccloginok=1": the Cloudcell account manager reports a successful login.

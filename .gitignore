@@ -62,6 +62,26 @@ reference/
 #   .build/metrics-summary.py        did the pursuit run at all, per round
 #   .build/run-pursuit-ab.ps1        the pursuit's four-cell A/B, one binary
 #   .build/run-regression-matrix.ps1 the code-vs-census 2x2, one variable each
+#   .build/extract-failed-assets.ps1 the assets the GUEST ITSELF reported as
+#                                     unresolvable, and the diff between two
+#                                     rounds (the controlled diff that named
+#                                     the one asset the magenta round lost)
+#   .build/magenta-sample.py         the pixel measurement: the EXACT colours
+#                                     and a crop, because counting pink pixels
+#                                     cannot tell a missing texture from a
+#                                     pink billboard
+#   .build/probe-xinput.ps1          does the host see the controller at all
+#   .build/romfs-extract.py          pull one member out of a data volume
+#   .build/pack-compare.py           one member across the three source packs
+#   .build/pack-fourcc.py            what FourCC the pack's textures really carry
+#   .build/dds-from-pack.py          decode a pack member's DDS and report it
+#   .build/dds-stats.py              per-channel statistics of a DDS
+#   .build/dxt-crosscheck.cpp        the port's DXT decoder against an
+#                                     independent one, on a real texture
+#   .build/agy-brief-textures-and-pad-v2.txt  the brief that produced the
+#                                     read-back instrument and the heartbeat
+#   .build/agy-report-textures-and-pad.md    what came back, and what is
+#                                     still unverified
 #
 # WHY THEY HAVE TO BE TRACKED: the archive packer silently reused a STALE
 # archive on 2026-11-03 and shipped one 1480 bytes off the package.  A fix to
@@ -74,6 +94,12 @@ reference/
 # with the same reasoning: the pursuit's A/B had never been runnable, because
 # the script that sets the configuration and the script that reads the result
 # were not in the repository at all.
+#
+# The texture ones were added on 2026-11-10 for the same reason again: the
+# magenta rivals were chased with hypotheses for a week, and every one of them
+# was tested against the WRONG lines.  The instruments that finally settled it
+# -- the pixel sampler, the guest's own failure list, the pack comparison --
+# have to be recoverable, or the next texture fault starts from zero again.
 native-switch/build/
 native-switch/*.nro
 native-switch/*.elf

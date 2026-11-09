@@ -1126,5 +1126,90 @@ inline bool parseMappingText(const char* text, Mapping* out, int* errorLine) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// NPAD HEARTBEAT & STATE CLASSIFICATION
+// ---------------------------------------------------------------------------
+//
+// WHY THIS EXISTS:
+// In emulators (Eden) or hardware, the port needs to distinguish three cases:
+//   (a) no Npad slot connected              -> npad-none
+//   (b) a slot is connected but never moves -> npad-idle
+//   (c) the guest's input changes           -> npad-active
+// On PC emulators like Eden, if qt-config.ini binds controls to keyboard and
+// no gamepad is mapped, or Eden does not forward HID devices to the guest,
+// the state is npad-none (or npad-idle if Eden presents a dummy Npad with zero movement).
+// Without explicit state tagging, "Eden never forwarded the controller" and
+// "the port read the controller and did nothing" look identical in the log.
+//
+// PURE DECISION FUNCTION:
+// Takes the slot snapshot(s) and returns the state word.
+
+struct NpadSlotSnapshot {
+    int slot{-1};                  // 0 = Player 1, 1 = Player 2, etc.
+    bool connected{false};         // true if a controller is connected to this slot
+    uint32_t styleSet{0};          // HidNpadStyleTag bitmask or connection type
+    uint64_t buttons{0};           // current button bitmask
+    float lx{0.0f}, ly{0.0f};      // left stick (-1..1)
+    float rx{0.0f}, ry{0.0f};      // right stick (-1..1)
+    float lt{0.0f}, rt{0.0f};      // triggers (0..1)
+    bool everPressed{false};       // true if any button/stick movement ever observed on this slot
+    bool autopilotInjected{false}; // true if port's autopilot injected steering/throttle/brake
+};
+
+inline const char* npadStyleName(uint32_t styleSet) {
+    if (styleSet == 0) return "none";
+    if (styleSet & (1u << 0)) return "FullKey";       // Pro Controller
+    if (styleSet & (1u << 1)) return "Handheld";      // Handheld Joy-Cons
+    if (styleSet & (1u << 2)) return "JoyDual";       // Dual Joy-Con pair
+    if (styleSet & (1u << 3)) return "JoyLeft";       // Joy-Con (L)
+    if (styleSet & (1u << 4)) return "JoyRight";      // Joy-Con (R)
+    if (styleSet & (1u << 5)) return "GameCube";      // GameCube
+    if (styleSet & (1u << 6)) return "Palma";         // Poke Ball Plus
+    if (styleSet & (1u << 7)) return "Lark";          // NES controller
+    if (styleSet & (1u << 8)) return "HandheldLark";
+    return "other";
+}
+
+inline bool isNpadSlotActive(const NpadSlotSnapshot& slot, float deadzone = 0.05f) {
+    if (!slot.connected) {
+        return false;
+    }
+    if (slot.buttons != 0) {
+        return true;
+    }
+    const float absLx = slot.lx < 0.0f ? -slot.lx : slot.lx;
+    const float absLy = slot.ly < 0.0f ? -slot.ly : slot.ly;
+    const float absRx = slot.rx < 0.0f ? -slot.rx : slot.rx;
+    const float absRy = slot.ry < 0.0f ? -slot.ry : slot.ry;
+    const float absLt = slot.lt < 0.0f ? -slot.lt : slot.lt;
+    const float absRt = slot.rt < 0.0f ? -slot.rt : slot.rt;
+    return absLx > deadzone || absLy > deadzone ||
+           absRx > deadzone || absRy > deadzone ||
+           absLt > deadzone || absRt > deadzone;
+}
+
+inline const char* npadStateWord(const NpadSlotSnapshot* slots, size_t slotCount) {
+    if (slots == nullptr || slotCount == 0) {
+        return "npad-none";
+    }
+    bool anyConnected = false;
+    for (size_t i = 0; i < slotCount; ++i) {
+        if (slots[i].connected) {
+            anyConnected = true;
+            if (isNpadSlotActive(slots[i])) {
+                return "npad-active";
+            }
+        }
+    }
+    if (!anyConnected) {
+        return "npad-none";
+    }
+    return "npad-idle";
+}
+
+inline const char* npadSlotStateWord(const NpadSlotSnapshot& slot) {
+    return npadStateWord(&slot, 1);
+}
+
 }  // namespace gamepad
 }  // namespace rr3

@@ -417,6 +417,79 @@ void logTriggerState(unsigned long long frame, const PadState* pad,
         detail);
 }
 
+// Npad heartbeat diagnostic.
+// Reports connection type, seen press, buttons (hex), stick values, and autopilot injection.
+// Emitted every 300 frames (5s) and on significant slot/button/analog/autopilot state change.
+// Hard line budget of 128 lines with budget exhausted message.
+void logNpadHeartbeat(unsigned long long frame, const rr3::gamepad::NpadSlotSnapshot& slot) {
+    static unsigned s_heartbeatBudget = 0;
+    constexpr unsigned kMaxHeartbeatBudget = 128;
+    if (s_heartbeatBudget >= kMaxHeartbeatBudget) {
+        return;
+    }
+
+    static rr3::gamepad::NpadSlotSnapshot s_lastLoggedSlot{};
+    static unsigned long long s_lastLoggedFrame = 0;
+    static bool s_firstLogged = false;
+
+    const bool periodic = !s_firstLogged || (frame >= s_lastLoggedFrame + 300ULL);
+
+    // Check significant change (gated to at least 15 frames between change-driven lines)
+    bool changed = false;
+    if (s_firstLogged && (frame >= s_lastLoggedFrame + 15ULL)) {
+        if (slot.connected != s_lastLoggedSlot.connected ||
+            slot.styleSet != s_lastLoggedSlot.styleSet ||
+            slot.buttons != s_lastLoggedSlot.buttons ||
+            slot.autopilotInjected != s_lastLoggedSlot.autopilotInjected) {
+            changed = true;
+        } else {
+            auto delta = [](float a, float b) { const float d = a - b; return d < 0 ? -d : d; };
+            if (delta(slot.lx, s_lastLoggedSlot.lx) >= 0.05f ||
+                delta(slot.ly, s_lastLoggedSlot.ly) >= 0.05f ||
+                delta(slot.rx, s_lastLoggedSlot.rx) >= 0.05f ||
+                delta(slot.ry, s_lastLoggedSlot.ry) >= 0.05f ||
+                delta(slot.lt, s_lastLoggedSlot.lt) >= 0.05f ||
+                delta(slot.rt, s_lastLoggedSlot.rt) >= 0.05f) {
+                changed = true;
+            }
+        }
+    }
+
+    if (!periodic && !changed) {
+        return;
+    }
+
+    s_firstLogged = true;
+    s_lastLoggedFrame = frame;
+    s_lastLoggedSlot = slot;
+    ++s_heartbeatBudget;
+
+    const char* stateWord = rr3::gamepad::npadSlotStateWord(slot);
+    const char* typeName = rr3::gamepad::npadStyleName(slot.styleSet);
+
+    char detail[320];
+    std::snprintf(detail, sizeof(detail),
+                  "f=%llu state=%s type=%s seen_press=%d buttons=0x%016llx "
+                  "lx=%.2f ly=%.2f rx=%.2f ry=%.2f lt=%.2f rt=%.2f "
+                  "autopilot_injected=%d trigger=%s",
+                  frame, stateWord, typeName, slot.everPressed ? 1 : 0,
+                  static_cast<unsigned long long>(slot.buttons),
+                  static_cast<double>(slot.lx), static_cast<double>(slot.ly),
+                  static_cast<double>(slot.rx), static_cast<double>(slot.ry),
+                  static_cast<double>(slot.lt), static_cast<double>(slot.rt),
+                  slot.autopilotInjected ? 1 : 0,
+                  periodic ? "periodic" : "change");
+
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                        "npad-heartbeat", static_cast<unsigned>(s_heartbeatBudget),
+                        static_cast<unsigned long long>(slot.buttons), detail);
+
+    if (s_heartbeatBudget == kMaxHeartbeatBudget) {
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "npad-heartbeat", 0, 0, "budget exhausted (128 lines)");
+    }
+}
+
 } // namespace
 
 bool prepareGuestControllerInput() {
@@ -689,21 +762,31 @@ void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
         physical.rx != 0.0f || physical.ry != 0.0f ||
         physical.lt > 0.0f || physical.rt > 0.0f;
 
+    static bool s_npadEverPressed = false;
+    if (npadInUse) {
+        s_npadEverPressed = true;
+    }
+
     // NON-NPAD CONTROLLER FALLBACK (RAW-HID)
     //
     // On a PC under an emulator, non-Switch controllers (Xbox 360/One/Elite,
     // DualShock 4, DualSense, generic USB pads) are not reported as Npads.
     // When the Npad reports no active buttons or sticks, poll raw HID devices.
-    // If a recognized raw HID device provides input, it populates `physical`
-    // with the exact same rr3::gamepad::NpadState shape.
+    // Keep raw HID fallback silent during Npad activity and at 15-frame cadence.
     rr3::raw_hid::RawHidDevice rawDev{};
     rr3::gamepad::NpadState rawPhysical{};
+    static bool s_lastRawActive = false;
     bool rawActive = false;
     if (!npadInUse) {
-        rawActive = rr3::raw_hid::pollRawHidInput(&rawPhysical, &rawDev);
-        if (rawActive) {
-            physical = rawPhysical;
+        if (s_lastRawActive || (g_frameCounter % 15 == 0)) {
+            rawActive = rr3::raw_hid::pollRawHidInput(&rawPhysical, &rawDev);
+            s_lastRawActive = rawActive;
+            if (rawActive) {
+                physical = rawPhysical;
+            }
         }
+    } else {
+        s_lastRawActive = false;
     }
 
     // THE SCRIPT YIELDS TO THE HUMAN.
@@ -754,7 +837,9 @@ void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
     //   auto    the loop owns the throttle, the brake and the steering axis
     //   assist  the human wins on every control they are actively using
     //   manual  the port does not touch the car at all
+    bool autopilotInjected = false;
     if (driving && mode != rr3::gamepad::kAutopilotManual) {
+        autopilotInjected = true;
         if (mode == rr3::gamepad::kAutopilotAssist) {
             // ON THE SCRIPTED PATH THE HUMAN IS THE SCRIPT, so "actively
             // using" means "the script moved it".
@@ -889,6 +974,7 @@ void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
             loopOwnsBrake = true;
         }
     }
+    autopilotInjected = (loopOwnsSteer || loopOwnsThrottle || loopOwnsBrake);
     if (loopOwnsSteer) {
         guest.axes[kAxisLThumbX] = drive.steer;
     }
@@ -927,14 +1013,35 @@ void pumpGuestControllerInput(void* jniEnvironment, void* activityObject,
              kAxisRTrigger, &g_lastRt);
     logGamepadState(g_frameCounter, canonical, guest, driving, mode);
     logTriggerState(g_frameCounter, pad, held);
-    rr3::raw_hid::logRawHidState(g_frameCounter, rawActive ? &rawDev : nullptr, &physical);
-    // THE DEVICE INVENTORY, EVERY 300 FRAMES, UNCONDITIONALLY.
-    //
-    // It is deliberately NOT next to the other loggers: the question it
-    // answers -- "does the port see my controller at all?" -- has to be
-    // answerable on a round where nobody touched anything, and that is
-    // exactly the round where the state line says nothing.
-    rr3::raw_hid::logRawHidInventory(g_frameCounter);
+    if (!npadInUse) {
+        rr3::raw_hid::logRawHidState(g_frameCounter, rawActive ? &rawDev : nullptr, &physical);
+        // THE DEVICE INVENTORY, EVERY 300 FRAMES, UNCONDITIONALLY WHEN RAW HID CAN BE USED.
+        //
+        // It is deliberately NOT next to the other loggers: the question it
+        // answers -- "does the port see my controller at all?" -- has to be
+        // answerable on a round where nobody touched anything, and that is
+        // exactly the round where the state line says nothing.
+        rr3::raw_hid::logRawHidInventory(g_frameCounter);
+    }
+    }
+
+    // Npad heartbeat diagnostic: reports connection, seen press, buttons, sticks, autopilot
+    {
+        rr3::gamepad::NpadSlotSnapshot slotSnapshot{};
+        slotSnapshot.slot = 0;
+        const u32 npadStyle = padGetStyleSet(pad);
+        slotSnapshot.connected = (npadStyle != 0);
+        slotSnapshot.styleSet = npadStyle;
+        slotSnapshot.buttons = held;
+        slotSnapshot.lx = physical.lx;
+        slotSnapshot.ly = physical.ly;
+        slotSnapshot.rx = physical.rx;
+        slotSnapshot.ry = physical.ry;
+        slotSnapshot.lt = physical.lt;
+        slotSnapshot.rt = physical.rt;
+        slotSnapshot.everPressed = s_npadEverPressed;
+        slotSnapshot.autopilotInjected = autopilotInjected;
+        logNpadHeartbeat(g_frameCounter, slotSnapshot);
     }
 
     ++g_frameCounter;

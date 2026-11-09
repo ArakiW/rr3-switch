@@ -140,6 +140,20 @@ bool gfxObjectIdentity();
 // reason still returns its error.
 bool gfxMkdirIdempotent();
 
+// "swdxt=1": the port decodes DXT1/DXT5 on the CPU and uploads the texture as
+// uncompressed RGBA, instead of handing S3TC blocks to the GPU.
+//
+// WHY: the rival cars render magenta, and the pixels say the green channel is
+// zeroed -- a normal grey/white car with its green channel gone -- so the
+// texture is decoded with the wrong layout. The bytes are good (the pack
+// member inflates to a valid 1024x1024 DXT1 DDS that the CPU decoder turns
+// into a normal grey car), which puts the fault in the decode/upload path.
+//
+// Off by default until the read-back probe has measured which side is wrong:
+// native-switch/source/graphics_probe.cpp draws a real texture and compares
+// the GPU's pixels against the CPU's.
+bool gfxSoftwareDxt();
+
 // "ccloginok=1": the Cloudcell account manager answers LoginCompleteCallback
 // with success instead of an honest failure.
 //

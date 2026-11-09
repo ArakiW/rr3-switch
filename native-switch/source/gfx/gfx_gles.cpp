@@ -10,13 +10,20 @@
 
 #include "rr3/gfx_backend.hpp"
 #include "rr3/gfx_text_probe.hpp"
+#include "rr3/dxt_decode.hpp"
+// appendGuestBootLine: the one line the read-back writes. It keeps its own
+// handle open and only flushes, and it is what every other diagnostic in the
+// port uses, so the read-back line lands in the same file as the rest.
+#include "rr3/recovery_guard.hpp"
 
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 namespace rr3 {
 namespace {
@@ -178,6 +185,14 @@ RR3_REAL_GLES_DECL(void, glGenTextures, (GLsizei n, GLuint *textures))
 RR3_REAL_GLES_DECL(void, glGenBuffers, (GLsizei n, GLuint *buffers))
 RR3_REAL_GLES_DECL(void, glGenFramebuffers, (GLsizei n, GLuint *framebuffers))
 RR3_REAL_GLES_DECL(void, glGenRenderbuffers, (GLsizei n, GLuint *renderbuffers))
+// The read-back needs to attach a texture to a framebuffer of its own and
+// put that framebuffer back exactly as it was.  The ES2 headers do not
+// declare these two, so they are declared here the same way as every other
+// real entry point above.
+RR3_REAL_GLES_DECL(void, glBindFramebuffer, (GLenum target, GLuint framebuffer))
+RR3_REAL_GLES_DECL(void, glFramebufferTexture2D, (GLenum target, GLenum attachment,
+                                                    GLenum textarget, GLuint texture,
+                                                    GLint level))
 RR3_REAL_GLES_DECL(GLuint, glCreateShader, (GLenum type))
 RR3_REAL_GLES_DECL(GLuint, glCreateProgram, (void))
 RR3_REAL_GLES_DECL(void, glGetShaderiv, (GLuint shader, GLenum pname, GLint *params))
@@ -861,6 +876,198 @@ extern "C" void __wrap_glTexImage2D(GLenum target, GLint level, GLint internalfo
                         type, pixels);
 }
 
+// THE READ-BACK: WHAT THE GPU SAYS, NEXT TO WHAT THE BYTES SAY.
+//
+// WHY: the rival cars render magenta, and the pixels say the green channel is
+// zeroed -- a normal grey/white car with its green channel gone.  The bytes
+// are good (the pack member inflates to a valid 1024x1024 DXT1 DDS that the
+// CPU decodes into a normal grey car) and the guest uploads each texture with
+// the format that matches the file's FourCC, so the only thing left between
+// the bytes and the screen is the GPU's own decode.
+//
+// THIS IS THE MEASUREMENT.  After each compressed upload the texture is
+// attached to a framebuffer of its own and one texel is read back; the CPU
+// decodes the very same block and the two answers are printed side by side.
+// match=1 means the GPU decoded the block the way the bytes say it must be
+// decoded.  match=0 means the GPU's decode is wrong -- which is what turns
+// "the rivals are magenta" into a line in the log.
+//
+// IT RUNS ON BOTH PATHS, so it also proves the fix: with "swdxt=1" the port
+// uploads the CPU-decoded pixels, and the same line then reports match=1
+// against the same bytes.
+//
+// THE STATE IT TOUCHES IS PUT BACK.  The framebuffer binding, the read
+// framebuffer and the texture binding are saved and restored, so the guest's
+// own rendering cannot see this.  The read-back only runs when the GL error
+// state is CLEAN beforehand, so it can never swallow an error the guest
+// caused; and it is budgeted, because it is a diagnostic.
+#ifndef GL_FRAMEBUFFER
+#define GL_FRAMEBUFFER 0x8D40
+#endif
+#ifndef GL_COLOR_ATTACHMENT0
+#define GL_COLOR_ATTACHMENT0 0x8CE0
+#endif
+#ifndef GL_READ_FRAMEBUFFER_BINDING
+#define GL_READ_FRAMEBUFFER_BINDING 0x8CAA
+#endif
+#ifndef GL_READ_FRAMEBUFFER
+#define GL_READ_FRAMEBUFFER 0x8CAA
+#endif
+
+namespace {
+
+constexpr unsigned kDxtReadbackBudget = 8;
+unsigned g_dxtReadbackLines = 0;
+GLuint g_dxtReadbackFbo = 0;
+
+// The comparison the log line reports.
+int dxtChannelDiff(unsigned a, unsigned b) {
+    return static_cast<int>(a) > static_cast<int>(b)
+               ? static_cast<int>(a) - static_cast<int>(b)
+               : static_cast<int>(b) - static_cast<int>(a);
+}
+
+// ONE TEXTURE, WAITING TO BE MEASURED.
+//
+// WHY IT IS DEFERRED: the guest uploads a texture level by level, and a
+// texture whose mip chain is incomplete SAMPLES BLACK.  Reading it back the
+// moment level 0 arrives would therefore report "the GPU says (0,0,0)" for a
+// texture that is not broken -- it is simply not finished yet.  So the
+// measurement waits until the NEXT texture starts: at that moment the
+// previous one has its whole chain and is sampleable.
+struct PendingDxtTexture {
+    bool valid = false;
+    GLuint texture = 0;
+    int width = 0;
+    int height = 0;
+    bool dxt5 = false;
+    uint8_t want[4] = {0, 0, 0, 0};
+};
+PendingDxtTexture g_pendingDxt;
+
+// READ THE PENDING TEXTURE BACK AND REPORT WHAT THE GPU SAYS NEXT TO WHAT
+// THE BYTES SAY.
+void dxtFlushReadback() {
+    if (!g_pendingDxt.valid) {
+        return;
+    }
+    const PendingDxtTexture pending = g_pendingDxt;
+    g_pendingDxt.valid = false;
+
+    if (g_dxtReadbackLines >= kDxtReadbackBudget) {
+        return;
+    }
+    // Only measure when the error state is clean, so that no error of the
+    // guest's own is ever swallowed by the drain at the end.
+    if (__real_glGetError() != GL_NO_ERROR) {
+        return;
+    }
+    ++g_dxtReadbackLines;
+
+    GLint framebuffer = 0;
+    GLint readFramebuffer = 0;
+    __real_glGetIntegerv(GL_FRAMEBUFFER_BINDING, &framebuffer);
+    __real_glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFramebuffer);
+
+    if (g_dxtReadbackFbo == 0) {
+        __real_glGenFramebuffers(1, &g_dxtReadbackFbo);
+    }
+    __real_glBindFramebuffer(GL_FRAMEBUFFER, g_dxtReadbackFbo);
+    __real_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                                  pending.texture, 0);
+    const GLenum status = __real_glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    uint8_t got[4] = {0, 0, 0, 0};
+    GLenum readError = GL_NO_ERROR;
+    if (status == GL_FRAMEBUFFER_COMPLETE) {
+        __real_glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, got);
+        readError = __real_glGetError();
+    }
+
+    // Put everything back exactly as it was.
+    __real_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+    __real_glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(framebuffer));
+    __real_glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(readFramebuffer));
+    while (__real_glGetError() != GL_NO_ERROR) {
+    }
+
+    // "NOT MEASURED" IS NOT "MEASURED AND WRONG".
+    //
+    // MEASURED 2026-11-10: this Mesa build answers GL_FRAMEBUFFER_UNSUPPORTED
+    // (0x8CD6) when a COMPRESSED texture is attached to a framebuffer, so the
+    // read-back of a DXT texture cannot happen at all -- the pixel comes back
+    // as (0,0,0) and a naive comparison would report "the GPU disagrees with
+    // the bytes" when the truth is "nothing was measured".  So the verdict is
+    // three-valued: 1 = the GPU agrees with the bytes, 0 = the GPU disagrees,
+    // -1 = NOT MEASURED, and the reason (status, error) is on the line.
+    //
+    // The software path ("swdxt=1") uploads plain RGBA8, which a framebuffer
+    // DOES accept, so on that path the same line is a real verdict.
+    int match = -1;
+    if (status == GL_FRAMEBUFFER_COMPLETE && readError == GL_NO_ERROR) {
+        match = (dxtChannelDiff(got[0], pending.want[0]) <= 4 &&
+                 dxtChannelDiff(got[1], pending.want[1]) <= 4 &&
+                 dxtChannelDiff(got[2], pending.want[2]) <= 4)
+                    ? 1
+                    : 0;
+    }
+
+    char details[320];
+    std::snprintf(details, sizeof(details),
+                  "internal=0x%x(%s) w=%d h=%d status=0x%x err=0x%x "
+                  "got=(%u,%u,%u) want=(%u,%u,%u) match=%d sw=%d",
+                  static_cast<unsigned>(pending.dxt5 ? 0x83f3 : 0x83f1),
+                  pending.dxt5 ? "DXT5" : "DXT1", pending.width, pending.height,
+                  static_cast<unsigned>(status), static_cast<unsigned>(readError),
+                  got[0], got[1], got[2], pending.want[0], pending.want[1],
+                  pending.want[2], match, gfxSoftwareDxt() ? 1 : 0);
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log", "dxt-readback",
+                        g_dxtReadbackLines, 0, details);
+    if (g_dxtReadbackLines == kDxtReadbackBudget) {
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "dxt-readback", 0, 0, "budget exhausted (8 lines)");
+    }
+}
+
+// Remember a texture that has just been uploaded, level 0, so it can be
+// measured once it is complete.
+void dxtRememberUploadedTexel(GLenum target, GLint level, GLenum internalformat,
+                               GLsizei width, GLsizei height, const void* data) {
+    if (target != GL_TEXTURE_2D || level != 0 || data == nullptr || width <= 0 ||
+        height <= 0) {
+        return;
+    }
+    const bool dxt5 = (internalformat == 0x83F3);
+    const bool dxt1 = (internalformat == 0x83F0 || internalformat == 0x83F1);
+    if (!dxt1 && !dxt5) {
+        return;
+    }
+    // The previous texture is finished now, so measure it.
+    dxtFlushReadback();
+
+    GLint texture = 0;
+    __real_glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+    if (texture == 0) {
+        return;
+    }
+    // The CPU's answer for the very same bytes: the texel at (0,0).
+    uint8_t block[64] = {0};
+    if (dxt5) {
+        rr3::decodeDxt5Block(static_cast<const uint8_t*>(data), block);
+    } else {
+        rr3::decodeDxt1Block(static_cast<const uint8_t*>(data), block);
+    }
+    g_pendingDxt.valid = true;
+    g_pendingDxt.texture = static_cast<GLuint>(texture);
+    g_pendingDxt.width = static_cast<int>(width);
+    g_pendingDxt.height = static_cast<int>(height);
+    g_pendingDxt.dxt5 = dxt5;
+    g_pendingDxt.want[0] = block[0];
+    g_pendingDxt.want[1] = block[1];
+    g_pendingDxt.want[2] = block[2];
+}
+
+}  // namespace
+
 extern "C" void __wrap_glCompressedTexImage2D(GLenum target, GLint level,
                                               GLenum internalformat, GLsizei width,
                                               GLsizei height, GLint border,
@@ -872,8 +1079,57 @@ extern "C" void __wrap_glCompressedTexImage2D(GLenum target, GLint level,
                              static_cast<uint64_t>(imageSize > 0 ? imageSize : 0));
         return;
     }
+
+    // Software DXT decoding translation hook.
+    //
+    // The switch is the card's rr3-gfx.conf key "swdxt=1", NOT an environment
+    // variable: the port runs as an NRO on a console, where there is no
+    // environment to set, so an env-var switch would be a switch nobody can
+    // reach.  See gfxSoftwareDxt() in gfx_backend.cpp for why it exists and
+    // what it is for.
+    //
+    // WHY DECODE AT ALL: the rival cars render magenta, and the pixels say the
+    // green channel is zeroed.  The bytes are good -- the pack member inflates
+    // to a valid 1024x1024 DXT1 DDS whose CPU decode is a normal grey car --
+    // so the corruption is in the decode/upload path.  Taking the GPU out of
+    // it means decoding here (include/rr3/dxt_decode.hpp, proved by
+    // native-switch/tests/test_dxt_decode_contract.py) and uploading the
+    // pixels as plain RGBA.
+    //
+    // The decoded size is checked against the image size the guest asked for,
+    // so a block size that does not match the format (DXT1 is 8 bytes per
+    // 4x4 group, DXT5 is 16) is NOT decoded with the wrong one: the hook
+    // falls through to the GPU in that case and the read-back probe reports
+    // the mismatch.
+    const bool isS3tc = (internalformat == 0x83F0 /* GL_COMPRESSED_RGB_S3TC_DXT1_EXT */ ||
+                         internalformat == 0x83F1 /* GL_COMPRESSED_RGBA_S3TC_DXT1_EXT */ ||
+                         internalformat == 0x83F3 /* GL_COMPRESSED_RGBA_S3TC_DXT5_EXT */);
+    if (rr3::gfxSoftwareDxt() && isS3tc && data != nullptr && width > 0 && height > 0) {
+        const bool isDxt5 = (internalformat == 0x83F3);
+        const size_t expected =
+            isDxt5 ? rr3::dxt5MipBytes(static_cast<uint32_t>(width), static_cast<uint32_t>(height))
+                   : rr3::dxt1MipBytes(static_cast<uint32_t>(width), static_cast<uint32_t>(height));
+        if (static_cast<size_t>(imageSize) == expected) {
+            const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height);
+            std::vector<uint8_t> rgba(pixelCount * 4u);
+            if (rr3::decodeDxtImage(static_cast<const uint8_t*>(data),
+                                    static_cast<size_t>(imageSize),
+                                    static_cast<uint32_t>(width),
+                                    static_cast<uint32_t>(height), isDxt5, rgba.data())) {
+                __real_glTexImage2D(target, level, GL_RGBA, width, height, border,
+                                    GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+                // The read-back runs on this path too, so the same log line
+                // proves the fix: with swdxt=1 it must report match=1 against
+                // the very same bytes that the GPU path got wrong.
+                dxtRememberUploadedTexel(target, level, internalformat, width, height, data);
+                return;
+            }
+        }
+    }
+
     __real_glCompressedTexImage2D(target, level, internalformat, width, height, border,
                                   imageSize, data);
+    dxtRememberUploadedTexel(target, level, internalformat, width, height, data);
 }
 
 extern "C" void __wrap_glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height,

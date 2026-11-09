@@ -1,0 +1,118 @@
+You are working inside E:\AI\RealRacing3-switch (EA Real Racing 3 Android guest re-hosted on Nintendo Switch Horizon OS, libnx + Mesa 20.1.0-rc3). Work ONLY in this repository.
+
+TWO defects. Both need a MEASUREMENT before a fix, and every diagnostic line must have a HARD BUDGET measured in LINES (a budget on an intermediate data structure is a bug: an earlier instrument capped a record array at 32 entries but still printed one line per wait and wrote 186 MB).
+
+READ FIRST:
+- native-switch/source/guest_filesystem.cpp — the path resolver / asset router. Pay attention to: contentDevice() (~line 571), mapAppRootToContent() (~1372), resolvePathImpl() (~2021), the format-alias rules (~4660-4760, "compression, not the format, so .dxt.dds.z and .dxt.dds are one format"), the candidate chain withWithReadFallback() (~3600-3760), and the FOURTH CANDIDATE "THE LIVERY-ONLY CAR'S BODY" (~3709).
+- native-switch/include/rr3_asset_candidates.hpp — the candidate rules.
+- native-switch/source/gfx/gfx_gles.cpp:109-115 and native-switch/source/gfx/gfx_egl.cpp:55-56 — the HARD-CODED GL extension string.
+- native-switch/source/guest_view_trace.cpp:1348-1390 — the traced glCompressedTexImage2D (note it only prints on FAILURE) and reportGlFailure() (~the GL failure budget).
+- native-switch/source/graphics_probe.cpp — the startup probe. Stage 9 already uploads a real ".dds.z" sprite with glCompressedTexImage2D and draws it, but it never READS THE PIXELS BACK.
+- native-switch/source/guest_input.cpp and native-switch/source/raw_hid.cpp — the input plumbing.
+- native-switch/tests/ — host tests, run by the gate.
+
+HARD RULES (the project has been burned by each of these before):
+- The gate is .build\gate.ps1 (39 tests). tools\Build-NativeSwitch.ps1 builds. NEVER add a pipe or a redirect to either; run them as
+    cmd /c "powershell -ExecutionPolicy Bypass -File E:\AI\RealRacing3-switch\tools\Build-NativeSwitch.ps1 > E:\AI\RealRacing3-switch\.build\build-agy.log 2>&1"
+  and the same for .build\gate.ps1.
+- Comments must explain WHY and cite the measured numbers. English only in code comments and docs. docs\OPEN-ISSUES.md is English only (CJK count must stay 0).
+- Line endings are mixed: guest_filesystem.cpp and guest_view_trace.cpp are CRLF; race_line.cpp and race_state_probe.cpp are LF. Preserve each file's endings.
+- Do not touch the pursuit / autopilot driving logic in this task.
+- Do not delete or rewrite existing diagnostics; add next to them.
+- Never claim a measurement you did not take. Mark inferences as inferences.
+
+===============================================================================
+DEFECT B -- rival cars render magenta; HUD parts render as grey-white blocks
+===============================================================================
+THE SYMPTOM, MEASURED PIXEL BY PIXEL (not a missing texture):
+- The magenta is NOT the classic missing-texture colour. ZERO pixels in the frame are exactly (255,0,255). What is there:
+    (255,4,255) x40, (192,4,192) x17, (221,4,229) x7, (187,7,204) x5, (255,7,255) x4, (190,29,220) x3 ...
+  That is a NORMAL grey/white car with the GREEN CHANNEL ZEROED (grey 192,192,192 -> 192,4,192; white 255,255,255 -> 255,4,255), and the window glass comes out dark purple (60,60,60 -> 60,0,60). So the texture is DECODED, but decoded with the wrong block layout.
+- Archive with the reproduction frame:
+  .build\eden-runs\20261109-202239-eden-rr3-m9-nov4-binary-todays-card\frames\frame-002000.png
+  and a 4x crop next to it: frame-002000.magenta-crop.png (the rival cars are clearly magenta with darker magenta windows; the player's own car renders correctly).
+- The affected cars are the DTM ones (BMW M4 DTM, Mercedes C63 DTM) at Hockenheim. The player's own car is fine.
+- Only ONE guest asset failed in the magenta round that did not fail in the clean rounds (controlled diff of the guest's own "LoadReadOnlyMappedFile failed getting full path:" lines, .build\extract-failed-assets.ps1):
+    sdmc:/switch/rr3-native-rehost/.depot/vehicles/2017_bmw_m4_dtm/livery/2017_bmw_m4_dtm_ext.dxt.dds.z
+  (that request later succeeded too, so it is a symptom, not the cause).
+
+THE DATA IS GOOD. Measured on the source packs that sit in the repository root
+(DXT_960x640+2048x1536数据包-260530-7723.zip, 6.6 GB; and ETC_... / ATC_...):
+- DXT pack member files/.depot/vehicles/2017_bmw_m4_dtm/livery/2017_bmw_m4_dtm_ext.dxt.dds.z
+    266,228 B on disk = uint32 LE size (699,192) + zlib -> a VALID DDS:
+    1024x1024, mips=11, FourCC 'DXT1'. Pillow decodes it to a normal grey car
+    (mean RGB 125,122,126) with ZERO green-zeroed pixels.
+- ETC pack member .../2017_bmw_m4_dtm_ext.etc.dds.z: 268,723 B, same DDS size,
+  FourCC 'ETC ' (ETC1). ATC pack has the .atc variant.
+- The external volumes on the card were built from the DXT pack (data/rr3-data-manifest.json says source_archive = the DXT zip, sha256 82FD54DE...).
+
+THE DELIVERY IS GOOD TOO:
+- m9 guest-view.log shows
+    phase=map-app rr3veh1:/files/.depot/vehicles/2017_bmw_m4_dtm/livery/2017_bmw_m4_dtm_ext.dxt.dds.z
+    phase=stat-layout ... size=266228 ... (266,228 == the volume entry size)
+    phase=open-ok ...
+  so the bytes handed to the guest are the bytes in the volume.
+
+WHAT THE PORT'S OWN TRACE SAYS ABOUT COMPRESSED UPLOADS (both m9 and m10 archives):
+    phase=ctexImage2D ordinal=16777472 target=00000000000083f3 data
+    phase=ctexImage2D ordinal=8388736  target=00000000000083f3 data
+    phase=ctexImage2D ordinal=4194368  target=00000000000083f3 data
+    phase=ctexImage2D ordinal=2097184  target=00000000000083f3 data
+    phase=ctexImage2D ordinal=1048592  target=00000000000083f3 data
+    phase=ctexImage2D ordinal=524296   target=00000000000083f3 data
+    phase=ctexImage2D ordinal=262148   target=00000000000083f3 data
+    phase=ctexImage2D ordinal=131074   target=00000000000083f3 data
+  ordinal packs (width << 16) | height, so those are the mip chain 256,128,64,32,16,8x8,4x4,2x2 of ONE texture, and internalformat 0x83F3 = GL_COMPRESSED_RGBA_S3TC_DXT5_EXT, i.e. 16 BYTES PER BLOCK. The DTM car texture on disk is DXT1 = 8 BYTES PER BLOCK. Reading DXT1 bytes as DXT5 takes the colour block from the wrong offset, which is exactly the kind of corruption that can come out as "green channel zeroed".
+
+THE PORT ADVERTISES S3TC WITHOUT ASKING MESA:
+- native-switch/source/gfx/gfx_gles.cpp:109-115 and gfx/gfx_egl.cpp:55-56 hard-code
+    "GL_EXT_texture_format_s3tc " "GL_EXT_texture_compression_s3tc " "GL_OES_compressed_ETC1_RGB8_texture "
+  The comment says "Only extensions whose entry points are actually answered above" -- it never checks that the Mesa context can actually DECODE S3TC.
+- The guest is an ANDROID guest: on a real Android device it would pick the ETC1 variant. Because we advertise S3TC, the guest picks the DXT variant instead. The guest's own asset list publishes all three variants with their own md5 and size (m9 guest-view.log: manifest-asset lines for .atc.dds.z / .dxt.dds.z / .etc.dds.z of the same atlas), so the guest chooses by advertised capability.
+
+THREE HYPOTHESES TO DISCRIMINATE (do not pick one by reasoning; instrument them):
+H1. The port answers a request for one texture FORMAT with the bytes of another format (the format-alias chain in guest_filesystem.cpp ~4660-4760 and rr3_asset_candidates.hpp), so the guest decodes DXT1 bytes with its DXT5/ETC1 decoder.
+H2. The port's asset-list rewrite publishes the md5/size of whatever it serves while the guest's format decision comes from somewhere else (the device profile -- see maybeSubstituteDeviceProfile() in guest_filesystem.cpp -- or a texture manifest), so the guest and the port disagree about the format.
+H3. Mesa 20.1.0-rc3 on this target cannot decode S3TC at all (no decompressor), so the upload produces undefined colours even though the bytes are right.
+
+REQUIRED WORK:
+1. MEASURE, DO NOT GUESS.
+   a. Extend native-switch/source/graphics_probe.cpp: after it uploads the real ".dds.z" sprite with glCompressedTexImage2D, draw it and READ THE PIXELS BACK (glReadPixels from the FBO it renders into), and report the colour next to the colour the SAME DDS decodes to on the CPU (decode the DXT1 blocks in the probe, or compare against a known reference colour). One budgeted line, e.g.
+        phase=probe-dxt1 ... fourcc=DXT1 w=1024 h=1024 internal=0x83f3 err=0x0 got=(r,g,b) want=(r,g,b) match=0/1
+      Also probe a VEHICLE texture (the DTM livery in vehicles-mid) so the measurement covers the real case, not only a GUI atlas.
+   b. Link every compressed upload to the file it came from: when the port serves a texture to the guest, remember (path, FourCC parsed from the inflated DDS) in a small ring buffer; in guest_view_trace.cpp's traced glCompressedTexImage2D, report the most recent served textures next to the internalformat used. Budgeted (e.g. 32 lines, then one "budget exhausted" line). The point: "the guest uploaded DXT5" must never again have to be guessed from a screenshot.
+   c. Report glGetError() after the compressed upload even when it succeeds, for the first N uploads only.
+2. FIX, chosen by the measurement:
+   - If H3 (Mesa cannot decode S3TC): implement DXT1/DXT5 block decoding in the port and translate the guest's glCompressedTexImage2D(S3TC) into glTexImage2D(RGBA) inside gfx_gles.cpp's wrapper (gfx_gles.cpp:200 and :864 are the existing hooks). Report the measured before/after.
+   - If H1 (alias chain): make the candidate chain answer a format-specific request only with bytes of that format, or re-encode. Show the line that was wrong.
+   - If H2: fix the rewrite or the profile substitution so the guest's format decision and the served bytes agree.
+   - If the measurement says the bytes are right and Mesa decodes them right, say so and instrument further; do not invent a fix.
+3. MAKE THE GUEST PICK THE RIGHT VARIANT if that is part of the fix: the ETC pack exists in the repository root, and the card's loose .depot already carries .etc copies for 82 cars. Say exactly which source each served texture should come from, and whether the volumes have to be rebuilt.
+4. WRITE THE FINDING into docs\OPEN-ISSUES.md as a new numbered subsection (English only), with the measured numbers above, the conclusion, and what remains unverified.
+5. The reproduction recipe, for whoever verifies this: the magenta shows up in a DTM race (Hockenheim). The pixel scanner has a NOISE FLOOR of 10-11 px (a pink advertising billboard), so "reproduced" means clearly more than 11 px, as in the 54 px of m9. .build\scan-magenta.py <round-tag> prints the per-frame counts.
+
+===============================================================================
+DEFECT A -- the port cannot tell "Eden never forwarded the controller" from
+              "the port read the controller and did nothing"
+===============================================================================
+MEASURED FACTS (established, do not re-litigate):
+- The host PC has an Xbox Elite Controller and Windows sees it: XInput slot 0 = CONNECTED (.build\probe-xinput.ps1).
+- Eden (the emulator) is at E:\Eden-rr3. Its global config E:\Eden-rr3\user\config\qt-config.ini binds EVERY player to the keyboard: player_0_button_a = "engine:keyboard,code:67" ... player_9_*, player_0_lstick, player_0_rstick, debug_pad_*. No host gamepad is bound to any player. qt-config.ini also has enable_all_controllers=false.
+- Inside Eden the guest sees ZERO raw HID devices: our own inventory instrument (logRawHidInventory() in raw_hid.cpp) printed no device at all. Eden does not expose the host's HID stack to the guest, so the raw-HID path cannot work on the PC (it exists for a real Switch with a non-Npad pad).
+- Consequence: on the PC the guest can only receive a Nintendo Pro Controller (Npad), and only if Eden is bound to it. That is a user-configuration step we document separately; the PORT side must make it verifiable.
+
+WHAT TO IMPLEMENT:
+1. A Npad HEARTBEAT diagnostic: every 5 seconds, and whenever the connected slot set or the button/analog state CHANGES, emit ONE line per Npad slot naming: connection type, whether the port has ever seen a press on it, the current button mask (hex), the stick values, and whether the port's autopilot injected input.
+2. The line must state the state word explicitly, so these three cases stop looking alike in the log:
+     (a) no Npad slot connected            -> npad-none
+     (b) a slot is connected but never moves -> npad-idle
+     (c) the guest's input changes           -> npad-active
+3. Keep the raw HID fallback as it is today: silent whenever any Npad activity exists, and keep its 15-frame device rescan cadence (never enumerate every frame).
+4. Put the state decision in a pure function that takes the slot states and returns the state word, and unit-test THAT in the existing host-test pattern (native-switch\tests\test_gamepad_contract.py really compiles and runs native-switch\tests\host\gamepad_selftest.cpp). The gate runs the host tests, so a new test must be picked up by the existing runner.
+
+DELIVERABLE:
+- The code changes, with comments citing the measurements above.
+- A report file .build\agy-report-textures-and-pad.md (English): what you measured, what you concluded, what you changed, what you could NOT verify.
+- A build and a gate run, both green, with the exact tail of both logs in your answer:
+    cmd /c "powershell -ExecutionPolicy Bypass -File E:\AI\RealRacing3-switch\tools\Build-NativeSwitch.ps1 > E:\AI\RealRacing3-switch\.build\build-agy.log 2>&1"
+    cmd /c "powershell -ExecutionPolicy Bypass -File E:\AI\RealRacing3-switch\.build\gate.ps1 > E:\AI\RealRacing3-switch\.build\gate-agy.log 2>&1"

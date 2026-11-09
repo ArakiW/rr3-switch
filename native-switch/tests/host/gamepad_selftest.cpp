@@ -794,6 +794,62 @@ static void testRawHid() {
     }
 }
 
+static void testNpadStateDecision() {
+    // 1. Style naming
+    check(std::strcmp(gp::npadStyleName(0), "none") == 0, "Style 0 is none");
+    check(std::strcmp(gp::npadStyleName(1u << 0), "FullKey") == 0, "Style 1 is FullKey");
+    check(std::strcmp(gp::npadStyleName(1u << 1), "Handheld") == 0, "Style 2 is Handheld");
+    check(std::strcmp(gp::npadStyleName(1u << 2), "JoyDual") == 0, "Style 4 is JoyDual");
+    check(std::strcmp(gp::npadStyleName(1u << 15), "other") == 0, "Unknown style is other");
+
+    // 2. Disconnected slot -> npad-none
+    gp::NpadSlotSnapshot slotNone{};
+    slotNone.slot = 0;
+    slotNone.connected = false;
+    check(std::strcmp(gp::npadSlotStateWord(slotNone), "npad-none") == 0,
+          "Disconnected slot is npad-none");
+
+    // 3. Connected but zero input -> npad-idle
+    gp::NpadSlotSnapshot slotIdle{};
+    slotIdle.slot = 0;
+    slotIdle.connected = true;
+    slotIdle.styleSet = 1u << 0;
+    check(std::strcmp(gp::npadSlotStateWord(slotIdle), "npad-idle") == 0,
+          "Connected slot with zero inputs is npad-idle");
+
+    // 4. Connected with button -> npad-active
+    gp::NpadSlotSnapshot slotBtn = slotIdle;
+    slotBtn.buttons = 0x01;
+    check(std::strcmp(gp::npadSlotStateWord(slotBtn), "npad-active") == 0,
+          "Connected slot with button pressed is npad-active");
+
+    // 5. Connected with stick deflection -> npad-active
+    gp::NpadSlotSnapshot slotStick = slotIdle;
+    slotStick.lx = 0.5f;
+    check(std::strcmp(gp::npadSlotStateWord(slotStick), "npad-active") == 0,
+          "Connected slot with stick deflection is npad-active");
+
+    // 6. Connected with small stick noise within deadzone (<= 0.05) -> npad-idle
+    gp::NpadSlotSnapshot slotNoise = slotIdle;
+    slotNoise.lx = 0.02f;
+    check(std::strcmp(gp::npadSlotStateWord(slotNoise), "npad-idle") == 0,
+          "Connected slot with deadzone noise is npad-idle");
+
+    // 7. Multi-slot aggregation
+    gp::NpadSlotSnapshot slots[2] = {slotNone, slotIdle};
+    check(std::strcmp(gp::npadStateWord(slots, 2), "npad-idle") == 0,
+          "Aggregated slots with one idle returns npad-idle");
+
+    slots[1] = slotBtn;
+    check(std::strcmp(gp::npadStateWord(slots, 2), "npad-active") == 0,
+          "Aggregated slots with one active returns npad-active");
+
+    slots[0] = slotNone;
+    slots[1] = slotNone;
+    check(std::strcmp(gp::npadStateWord(slots, 2), "npad-none") == 0,
+          "Aggregated slots with all disconnected returns npad-none");
+}
+
 int main(int argc, char** argv) {
     testNames();
     testCanonical();
@@ -803,6 +859,7 @@ int main(int argc, char** argv) {
     testSony();
     testXbox();
     testRawHid();
+    testNpadStateDecision();
     testCardFile(argc > 1 ? argv[1] : nullptr);
 
     if (g_failures == 0) {

@@ -1,6 +1,8 @@
 #include "rr3/graphics_probe.hpp"
 
+#include "rr3/dxt_decode.hpp"
 #include "rr3/guest_filesystem.hpp"
+#include "rr3/recovery_guard.hpp"
 
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
@@ -432,13 +434,191 @@ GraphicsProbe runWindowGraphicsProbe(NWindow* window) {
                                               4 * sizeof(float), kAssetVerts + 2);
                         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
                         probe.realAssetDrawCompleted = glGetError() == GL_NO_ERROR;
+                        glFinish();
+                        uint8_t pixelGot[4] = {0};
+                        glReadPixels(640, 360, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixelGot);
+                        GLenum readErr = glGetError();
                         glDisableVertexAttribArray(0);
                         glDisableVertexAttribArray(1);
                         glUseProgram(0);
+
+                        size_t bx = (probe.assetWidth / 2) / 4;
+                        size_t by = (probe.assetHeight / 2) / 4;
+                        size_t blocksWide = (probe.assetWidth + 3) / 4;
+                        const uint8_t* blk = (dds.data() + 128) + (by * blocksWide + bx) * blockBytes;
+                        uint8_t blkPixels[64]{};
+                        if (std::memcmp(probe.assetFourcc, "DXT1", 4) == 0) {
+                            rr3::decodeDxt1Block(blk, blkPixels);
+                        } else {
+                            rr3::decodeDxt5Block(blk, blkPixels);
+                        }
+                        int subx = (probe.assetWidth / 2) % 4;
+                        int suby = (probe.assetHeight / 2) % 4;
+                        int pIdx = suby * 4 + subx;
+                        uint8_t wantR = blkPixels[pIdx * 4 + 0];
+                        uint8_t wantG = blkPixels[pIdx * 4 + 1];
+                        uint8_t wantB = blkPixels[pIdx * 4 + 2];
+
+                        auto diff = [](uint8_t a, uint8_t b) { return a > b ? a - b : b - a; };
+                        bool match = (diff(pixelGot[0], wantR) <= 4) &&
+                                     (diff(pixelGot[1], wantG) <= 4) &&
+                                     (diff(pixelGot[2], wantB) <= 4);
+
+                        char diag[320];
+                        std::snprintf(diag, sizeof(diag),
+                                      "asset=gui fourcc=%.4s w=%u h=%u internal=0x%x err=0x%x "
+                                      "got=(%u,%u,%u) want=(%u,%u,%u) match=%d path=%s",
+                                      probe.assetFourcc, probe.assetWidth, probe.assetHeight,
+                                      glFormat, static_cast<unsigned>(readErr),
+                                      pixelGot[0], pixelGot[1], pixelGot[2],
+                                      wantR, wantG, wantB, match ? 1 : 0, assetPath);
+                        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                            "probe-dxt1", 0, 0, diag);
                     }
 
                     if (assetTex != 0) {
                         glDeleteTextures(1, &assetTex);
+                    }
+
+                    // VEHICLE TEXTURE PROBE (DTM livery)
+                    if (probe.s3tcSupported && realProgram != 0) {
+                        static const char* const kVehCandidates[] = {
+                            "files/.depot/vehicles/2017_bmw_m4_dtm/livery/2017_bmw_m4_dtm_ext.dxt.dds.z",
+                            ".depot/vehicles/2017_bmw_m4_dtm/livery/2017_bmw_m4_dtm_ext.dxt.dds.z",
+                            "vehicles/2017_bmw_m4_dtm/livery/2017_bmw_m4_dtm_ext.dxt.dds.z",
+                        };
+                        char vehPath[0x300] = {0};
+                        std::FILE* vf = nullptr;
+                        for (const char* cand : kVehCandidates) {
+                            vf = rr3::guestFopen(cand, "rb");
+                            if (vf != nullptr) {
+                                std::snprintf(vehPath, sizeof(vehPath), "%s", cand);
+                                break;
+                            }
+                        }
+                        if (vf != nullptr) {
+                            std::fseek(vf, 0, SEEK_END);
+                            long vSize = std::ftell(vf);
+                            std::fseek(vf, 0, SEEK_SET);
+                            std::vector<unsigned char> vRawa(vSize > 0 ? static_cast<size_t>(vSize) : 0);
+                            size_t vGot = vRawa.empty() ? 0 : std::fread(vRawa.data(), 1, vRawa.size(), vf);
+                            std::fclose(vf);
+
+                            std::vector<unsigned char> vDds;
+                            if (vGot == vRawa.size() && vRawa.size() > 6 && vRawa[4] == 0x78) {
+                                uint32_t vDecl = 0;
+                                std::memcpy(&vDecl, vRawa.data(), 4);
+                                vDds.resize(vDecl);
+                                uLongf vDest = vDecl;
+                                if (uncompress(vDds.data(), &vDest, vRawa.data() + 4,
+                                               static_cast<uLong>(vRawa.size() - 4)) == Z_OK &&
+                                    vDest == vDecl) {
+                                    // inflated
+                                }
+                            }
+
+                            uint32_t vWidth = 0, vHeight = 0;
+                            char vFourcc[5] = {0};
+                            GLenum vGlFormat = 0;
+                            GLsizei vBlockBytes = 0;
+                            if (vDds.size() >= 128 && std::memcmp(vDds.data(), "DDS ", 4) == 0) {
+                                std::memcpy(&vHeight, vDds.data() + 12, 4);
+                                std::memcpy(&vWidth, vDds.data() + 16, 4);
+                                std::memcpy(vFourcc, vDds.data() + 84, 4);
+                                if (std::memcmp(vFourcc, "DXT1", 4) == 0) {
+                                    vGlFormat = GL_COMPRESSED_RGBA_S3TC_DXT1_EXT;
+                                    vBlockBytes = 8;
+                                } else if (std::memcmp(vFourcc, "DXT5", 4) == 0) {
+                                    vGlFormat = GL_COMPRESSED_RGBA_S3TC_DXT5_EXT;
+                                    vBlockBytes = 16;
+                                }
+                            }
+
+                            if (vGlFormat != 0) {
+                                GLsizei vImgSize = ((static_cast<GLsizei>(vWidth) + 3) / 4) *
+                                                   ((static_cast<GLsizei>(vHeight) + 3) / 4) *
+                                                   vBlockBytes;
+                                if (128 + static_cast<size_t>(vImgSize) <= vDds.size()) {
+                                    GLuint vehTex = 0;
+                                    glGenTextures(1, &vehTex);
+                                    glBindTexture(GL_TEXTURE_2D, vehTex);
+                                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                                    glCompressedTexImage2D(GL_TEXTURE_2D, 0, vGlFormat,
+                                                           static_cast<GLsizei>(vWidth),
+                                                           static_cast<GLsizei>(vHeight), 0,
+                                                           vImgSize, vDds.data() + 128);
+                                    GLenum upErr = glGetError();
+                                    if (upErr == GL_NO_ERROR) {
+                                        static const float kIdentityVeh[16] = {
+                                            1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
+                                            0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+                                        };
+                                        static const float kAssetVertsVeh[] = {
+                                            -0.5f, -0.5f, 0.0f, 0.0f,  0.5f, -0.5f, 1.0f, 0.0f,
+                                            -0.5f,  0.5f, 0.0f, 1.0f,  0.5f,  0.5f, 1.0f, 1.0f,
+                                        };
+                                        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+                                        glClear(GL_COLOR_BUFFER_BIT);
+                                        glUseProgram(realProgram);
+                                        glUniformMatrix4fv(glGetUniformLocation(realProgram, "uMVP"), 1, GL_FALSE, kIdentityVeh);
+                                        glActiveTexture(GL_TEXTURE0);
+                                        glBindTexture(GL_TEXTURE_2D, vehTex);
+                                        glUniform1i(glGetUniformLocation(realProgram, "uTex"), 0);
+                                        glUniform4f(glGetUniformLocation(realProgram, "uTint"), 1.0f, 1.0f, 1.0f, 1.0f);
+                                        glEnableVertexAttribArray(0);
+                                        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), kAssetVertsVeh);
+                                        glEnableVertexAttribArray(1);
+                                        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), kAssetVertsVeh + 2);
+                                        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+                                        glFinish();
+                                        glDisableVertexAttribArray(0);
+                                        glDisableVertexAttribArray(1);
+                                        glUseProgram(0);
+
+                                        uint8_t vehPixelGot[4] = {0};
+                                        glReadPixels(640, 360, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, vehPixelGot);
+                                        GLenum vReadErr = glGetError();
+
+                                        size_t vbx = (vWidth / 2) / 4;
+                                        size_t vby = (vHeight / 2) / 4;
+                                        size_t vBlocksWide = (vWidth + 3) / 4;
+                                        const uint8_t* vBlk = (vDds.data() + 128) + (vby * vBlocksWide + vbx) * vBlockBytes;
+                                        uint8_t vBlockPixels[64]{};
+                                        if (std::memcmp(vFourcc, "DXT1", 4) == 0) {
+                                            rr3::decodeDxt1Block(vBlk, vBlockPixels);
+                                        } else {
+                                            rr3::decodeDxt5Block(vBlk, vBlockPixels);
+                                        }
+                                        int vsubx = (vWidth / 2) % 4;
+                                        int vsuby = (vHeight / 2) % 4;
+                                        int vpIdx = vsuby * 4 + vsubx;
+                                        uint8_t vWantR = vBlockPixels[vpIdx * 4 + 0];
+                                        uint8_t vWantG = vBlockPixels[vpIdx * 4 + 1];
+                                        uint8_t vWantB = vBlockPixels[vpIdx * 4 + 2];
+
+                                        auto vdiff = [](uint8_t a, uint8_t b) { return a > b ? a - b : b - a; };
+                                        bool vMatch = (vdiff(vehPixelGot[0], vWantR) <= 4) &&
+                                                      (vdiff(vehPixelGot[1], vWantG) <= 4) &&
+                                                      (vdiff(vehPixelGot[2], vWantB) <= 4);
+
+                                        char vdiag[320];
+                                        std::snprintf(vdiag, sizeof(vdiag),
+                                                      "asset=veh fourcc=%.4s w=%u h=%u internal=0x%x err=0x%x "
+                                                      "got=(%u,%u,%u) want=(%u,%u,%u) match=%d path=%s",
+                                                      vFourcc, vWidth, vHeight,
+                                                      vGlFormat, static_cast<unsigned>(vReadErr),
+                                                      vehPixelGot[0], vehPixelGot[1], vehPixelGot[2],
+                                                      vWantR, vWantG, vWantB, vMatch ? 1 : 0, vehPath);
+                                        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                                            "probe-dxt1", 0, 0, vdiag);
+                                    }
+                                    glDeleteTextures(1, &vehTex);
+                                }
+                            }
+                        }
                     }
                     if (probe.realAssetDrawCompleted) {
                         probe.stage = 10;

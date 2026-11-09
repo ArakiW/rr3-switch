@@ -1,6 +1,7 @@
 #include "rr3/guest_view_trace.hpp"
 
 #include "rr3/gfx_text_probe.hpp"
+#include "rr3/guest_filesystem.hpp"
 #include "rr3/guest_frame_probe.hpp"
 #include "rr3/guest_teardown_repair.hpp"
 #include "rr3/recovery_guard.hpp"
@@ -1374,6 +1375,46 @@ void guestViewTracedGlCompressedTexImage2D(GLenum target, GLint level,
                              border, imageSize, data);
 
     const GLenum err = ::glGetError();
+
+    // Defect B diagnostic: link every compressed upload to recent served texture
+    // and report glGetError() even on success, with a hard budget of 32 lines.
+    static unsigned s_ctexDiagLines = 0;
+    constexpr unsigned kMaxCtexDiagLines = 32;
+    if (s_ctexDiagLines < kMaxCtexDiagLines) {
+        ++s_ctexDiagLines;
+        ServedTextureRecord recent{};
+        const bool hasRecent = getRecentServedTexture(0, &recent);
+        const char* internalStr = "unknown";
+        if (internalformat == 0x83f0) internalStr = "DXT1_RGB";
+        else if (internalformat == 0x83f1) internalStr = "DXT1_RGBA";
+        else if (internalformat == 0x83f2) internalStr = "DXT3_RGBA";
+        else if (internalformat == 0x83f3) internalStr = "DXT5_RGBA";
+        else if (internalformat == 0x8d64) internalStr = "ETC1_RGB8";
+
+        char detail[320];
+        std::snprintf(detail, sizeof(detail),
+                      "call=%u level=%d w=%d h=%d size=%d internal=0x%x(%s) err=0x%x "
+                      "recent_file=\"%s\" recent_fourcc=%.4s recent_dim=%ux%u recent_mips=%u",
+                      static_cast<unsigned>(g_glStats.compressedTexImage2D),
+                      static_cast<int>(level),
+                      static_cast<int>(width), static_cast<int>(height),
+                      static_cast<int>(imageSize),
+                      static_cast<unsigned>(internalformat), internalStr,
+                      static_cast<unsigned>(err),
+                      hasRecent ? recent.path : "-",
+                      hasRecent ? recent.fourcc : "-",
+                      hasRecent ? recent.width : 0,
+                      hasRecent ? recent.height : 0,
+                      hasRecent ? recent.mips : 0);
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "ctex-upload", s_ctexDiagLines,
+                            g_glStats.lastBoundTexture, detail);
+        if (s_ctexDiagLines == kMaxCtexDiagLines) {
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                "ctex-upload", 0, 0, "budget exhausted (32 lines)");
+        }
+    }
+
     if (err != GL_NO_ERROR) {
         ++g_glStats.texUploadFails;
         g_glStats.lastTexUploadError = err;

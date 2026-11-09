@@ -24,6 +24,7 @@
 #include <unistd.h>
 #include <utility>
 #include <vector>
+#include <zlib.h>
 
 namespace rr3 {
 // THE PATH-RESOLUTION LOG, DEDUPED.
@@ -8713,6 +8714,88 @@ uint64_t guestFilesystemSelfTest() {
     return bits;
 }
 
+constexpr size_t kServedTextureRingSize = 16;
+static ServedTextureRecord s_servedTextureRing[kServedTextureRingSize]{};
+static size_t s_servedTextureCount = 0;
+
+void rememberServedTexture(const char* guestPath, const char* localPath) {
+    if (localPath == nullptr && guestPath == nullptr) {
+        return;
+    }
+    const char* fileToProbe = localPath != nullptr ? localPath : guestPath;
+
+    ServedTextureRecord rec{};
+    std::snprintf(rec.path, sizeof(rec.path), "%s", guestPath ? guestPath : localPath);
+
+    std::FILE* f = std::fopen(fileToProbe, "rb");
+    if (f != nullptr) {
+        std::fseek(f, 0, SEEK_END);
+        long sz = std::ftell(f);
+        rec.fileBytes = sz > 0 ? static_cast<uint32_t>(sz) : 0;
+        std::fseek(f, 0, SEEK_SET);
+
+        uint8_t headerBuf[256]{};
+        size_t nRead = std::fread(headerBuf, 1, sizeof(headerBuf), f);
+        std::fclose(f);
+
+        if (nRead > 6 && headerBuf[4] == 0x78) {
+            z_stream strm{};
+            if (inflateInit(&strm) == Z_OK) {
+                uint8_t ddsHdr[128]{};
+                strm.next_in = headerBuf + 4;
+                strm.avail_in = static_cast<uInt>(nRead - 4);
+                strm.next_out = ddsHdr;
+                strm.avail_out = sizeof(ddsHdr);
+                int ret = inflate(&strm, Z_SYNC_FLUSH);
+                inflateEnd(&strm);
+                if ((ret == Z_OK || ret == Z_STREAM_END) && strm.total_out >= 128 &&
+                    std::memcmp(ddsHdr, "DDS ", 4) == 0) {
+                    std::memcpy(&rec.height, ddsHdr + 12, 4);
+                    std::memcpy(&rec.width, ddsHdr + 16, 4);
+                    std::memcpy(&rec.mips, ddsHdr + 28, 4);
+                    std::memcpy(rec.fourcc, ddsHdr + 84, 4);
+                    rec.fourcc[4] = '\0';
+                }
+            }
+        } else if (nRead >= 128 && std::memcmp(headerBuf, "DDS ", 4) == 0) {
+            std::memcpy(&rec.height, headerBuf + 12, 4);
+            std::memcpy(&rec.width, headerBuf + 16, 4);
+            std::memcpy(&rec.mips, headerBuf + 28, 4);
+            std::memcpy(rec.fourcc, headerBuf + 84, 4);
+            rec.fourcc[4] = '\0';
+        }
+    }
+
+    if (rec.fourcc[0] == '\0') {
+        if (std::strstr(rec.path, ".dxt.dds") != nullptr) {
+            std::strcpy(rec.fourcc, "DXT?");
+        } else if (std::strstr(rec.path, ".etc.dds") != nullptr) {
+            std::strcpy(rec.fourcc, "ETC1");
+        } else if (std::strstr(rec.path, ".atc.dds") != nullptr) {
+            std::strcpy(rec.fourcc, "ATC ");
+        } else if (std::strstr(rec.path, ".rgb.pvr") != nullptr) {
+            std::strcpy(rec.fourcc, "PVR ");
+        } else {
+            std::strcpy(rec.fourcc, "UNK ");
+        }
+    }
+
+    const size_t slot = (s_servedTextureCount++) % kServedTextureRingSize;
+    s_servedTextureRing[slot] = rec;
+}
+
+bool getRecentServedTexture(size_t indexFromLatest, ServedTextureRecord* outRecord) {
+    if (s_servedTextureCount == 0 || indexFromLatest >= kServedTextureRingSize ||
+        indexFromLatest >= s_servedTextureCount) {
+        return false;
+    }
+    const size_t latestIdx = (s_servedTextureCount - 1 - indexFromLatest) % kServedTextureRingSize;
+    if (outRecord != nullptr) {
+        *outRecord = s_servedTextureRing[latestIdx];
+    }
+    return true;
+}
+
 // Defined further down, next to kStatBionicMode where the A/B switch and the
 // stub list live. Declared here because the path-taking entry points that
 // consult it are all above that point in the file.
@@ -8856,6 +8939,11 @@ std::FILE* guestFopen(const char* path, const char* mode) {
                                     "served-digest", 0, 0, details);
             }
         }
+        if (file != nullptr && served != nullptr) {
+            if (std::strstr(served, ".dds") != nullptr || (path != nullptr && std::strstr(path, ".dds") != nullptr)) {
+                rememberServedTexture(path != nullptr ? path : served, served);
+            }
+        }
     }
     // THE GUI-ASSET CENSUS. The open is what the guest actually CONSUMED: a
     // key with a stat hit and no open hit is a file the guest found and
@@ -8996,6 +9084,7 @@ int guestOpen(const char* path, int flags, ...) {
         // now reporting "Failed opening file". Same run also proved the .z
         // retry itself works -- mtResourceCache failures went 71 -> 0 and the
         // pixel readback turned from 000000ff to 00ffffff.
+        const char* servedPointer = nullptr;
         const int rc = withReadFallback(resolution, path, [&fd, flags, mode, path](const char* candidate) {
             // THE TRACK'S RACING LINE, on the POSIX open() path as well.
             //
@@ -9011,9 +9100,14 @@ int guestOpen(const char* path, int flags, ...) {
                 ? ::open(candidate, flags, mode)
                 : ::open(candidate, flags);
             return fd < 0 ? -1 : 0;
-        });
+        }, &servedPointer);
         if (rc != 0) {
             fd = -1;
+        }
+        if (fd >= 0 && servedPointer != nullptr) {
+            if (std::strstr(servedPointer, ".dds") != nullptr || (path != nullptr && std::strstr(path, ".dds") != nullptr)) {
+                rememberServedTexture(path != nullptr ? path : servedPointer, servedPointer);
+            }
         }
     }
     // THE GUI-ASSET CENSUS, the open side. The guest reads its texture
