@@ -3140,7 +3140,87 @@ alternative spelling of it in the pack.
    The same thing happened with the HUD stand-in (9.20): the per-series
    `LocalStyles.gui` was put on the card as the top-level one, and the guest
    stopped reaching the race.  It was taken back off.  **AN EXPERIMENT ON THE
-   CARD HAS TO BE REVERTED UNLESS IT IS VERIFIED IN THE GAME IT CHANGES.**
+   CARD HAS TO BE REVERTED UNLESS IT IS VERIFIED IN THE GAME IT CHANGES.
+
+### 9.22 The pursuit gave up on the racing line exactly when the car needed it
+
+**THE MEASUREMENT (round `hybrid1`, 223 race-state samples, read out by the
+port's own `.build/pursuit-trace.py`):**
+```
+    frame   total    perr  pur  steer   mag  dir flips stalls thr brk   la  ctdist
+      630       0   0.000   0  0.000  0.00   0     0      0   1   0   0.0 13076.48
+     1530   67927  -1.295   1  1.000  0.29   1     1      2   0   1  20.0    7.04
+     3330   58576   0.000   0 -0.410  0.41   1     4      4   1   0   0.0 12031.40
+     5430   87803   0.000   0  0.530  0.53   1     7      6   1   0   0.0 47014.71
+    pursuit on 153/223 samples; flips=9 stalls=7; final total=89623 (3.0 %)
+```
+against the reference round's 186,921 (10.35 %).
+
+**THE MECHANISM, IN THREE STEPS:**
+1. `raceLineTargetAdaptive()` refused the racing line whenever the car was
+   more than **25 m** from it.  That was the guard's job: a car far from the
+   line is not on this track's line, and aiming at it would be aiming at
+   noise.
+2. But when the line was refused, THE SAMPLE KEPT THE GUEST'S OWN AIM
+   TARGET, and that target is garbage when the car is off the racing line --
+   the measured distances are 13,076 m, 12,031 m, 19,059 m and 47,014 m.  The
+   port's own plausibility test then refused it too (`targetPlausible`), so
+   the pursuit switched itself OFF (`pur=0`) and the recovery took the wheel
+   with a full lock.
+3. The recovery is a full-lock manoeuvre that ends in a spin or a stall
+   (flips=9, stalls=7), and the car never came back: the pursuit could not
+   come back either, because the line was still refused.
+
+⇒ **THE 25 m GUARD WAS THE ONLY THING THAT COULD HAVE STEERED THE CAR BACK
+ONTO THE TRACK, AND IT WAS THE THING THAT PREVENTED IT.**
+
+**THE FIX:** the line keeps the car.  Between "on the line" (25 m) and "not on
+this track's line at all" (250 m) the TARGET IS THE NEAREST POINT ON THE LINE
+-- a look-ahead of zero -- so the car is pointed back onto the track instead
+of at a point further along it that it cannot see from there.  The hard limit
+is still there, so a car that is nowhere near this track's line is still
+refused.
+
+The host test has teeth: the old law answered "no target" for the car below,
+and the new law answers with the nearest point on the line.
+```
+  a car 100 m off the line still gets a target               ok
+  100 m off the line : target 99.91 m away, 62.59 m from the centre
+  the look-ahead is zero for a car that is off the line      ok
+  the target is about 100 m away -- the nearest point on the line ok
+  the target lies ON the line                                ok
+  a car 500 m off the line gets no target at all             ok
+```
+
+**THE RULE:** a guard that exists to keep the controller from steering on
+noise must not be the same guard that stops it steering at all.  When the
+"right" input goes bad, the fallback has to be the port's OWN model of the
+track, not the guest's.
+
+**WHAT THE FIRST ROUND OF THE FIX DID AND DID NOT SHOW (round `pursuit1`):**
+It did not settle the question, and the log says why:
+- the round ENDED at frame 2,162 (the reference rounds race to about 6,600),
+  so the absolute progress (76,368) is not comparable with the 89,623 of the
+  round before it;
+- the last sample has `la=0.00`, which is the NEW branch (a car off the line
+  gets a look-ahead of zero), and `ctdist=13215.19` -- so the FITTED LINE was
+  itself 13 km from the car in that sample.  The port refused to aim at it
+  (the hard limit is 250 m) and kept the guest's own target, which is why the
+  pursuit was still off (`pur=0`).
+
+⇒ **So the change cannot make things worse** -- a line that is 13 km away is
+refused, not aimed at -- **but the layer UNDER it is the real one: the fitted
+chunk does not follow the car.**  The line is fitted once, on the chunk that
+was current then; when the car is on another part of the track the nearest
+point of that line is kilometres away, and the port is left with nothing.
+
+⇒ **THE NEXT PIECE OF WORK IS THE CHUNK, NOT THE GUARD:** the fitted chunk
+has to follow the car -- the guest's own `snode` says which node the car is
+on, and the chunk boundaries are in the spline -- so that "the nearest point
+of the line" is always metres away and not kilometres.  Until that is done,
+the fallback only covers the case where the car is a hundred metres off the
+line it was fitted on, which is the spin-into-the-runoff case and not the
+wrong-chunk case.**
 
 ⇒ **AND THE PORT-SIDE EXPERIMENT IS KEPT, OFF BY DEFAULT:** `swdxt=1` still
 decodes DXT on the CPU (9.19 proved the mechanism and proved that the port

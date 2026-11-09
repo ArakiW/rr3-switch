@@ -355,6 +355,76 @@ int main() {
         }
     }
 
+    // ---------------------------------------------------------------------
+    // 5. A CAR FAR OFF THE LINE STILL GETS A TARGET, AND THE TARGET IS THE
+    //    NEAREST POINT ON THE LINE.
+    //
+    //    MEASURED 2026-11-10 (round hybrid1, 223 race-state samples): the
+    //    port used to refuse the line whenever the car was more than 25 m
+    //    from it.  The guest's own aim target then stayed in the sample, and
+    //    that target is garbage when the car is off the racing line -- 13,076
+    //    m, 19,059 m and 47,014 m were measured -- so the pursuit switched
+    //    itself off and the recovery took the wheel with a full lock.  The
+    //    car spun and stalled instead of coming back (flips=9, stalls=7) and
+    //    the lap progress fell to 3.0 % against the reference round's
+    //    10.35 %.
+    //
+    //    So the line has to KEEP the car, and the target has to be the way
+    //    back onto it.  This test has teeth: the old law answered "no
+    //    target" for the car below.
+    // ---------------------------------------------------------------------
+    {
+        double centreX = 0.0;
+        double centreY = 0.0;
+        toWorld(2000, -3000, &centreX, &centreY);
+        double nodeX = 0.0;
+        double nodeY = 0.0;
+        toWorld(file.chunks[0].nodes[0].x, file.chunks[0].nodes[0].y, &nodeX, &nodeY);
+        const double radiusX = nodeX - centreX;
+        const double radiusY = nodeY - centreY;
+        const double radiusLength = std::sqrt(radiusX * radiusX + radiusY * radiusY);
+        const double circleRadiusMetres = kRadius * kScale / 256.0;
+        const double outward = 100.0 * 256.0;   // the port's units per metre
+        const double carOutX =
+            centreX + radiusX * (1.0 + outward / radiusLength);
+        const double carOutY =
+            centreY + radiusY * (1.0 + outward / radiusLength);
+
+        int direction = 0;
+        double tx = 0.0;
+        double ty = 0.0;
+        double lookAhead = -1.0;
+        const bool got = rr3::raceLineTargetAdaptive(line, file, carOutX, carOutY,
+                                                      hx, hy, &direction, &tx, &ty,
+                                                      &lookAhead, true, 20.0);
+        check(got, "a car 100 m off the line still gets a target");
+        if (got) {
+            const double toTarget =
+                std::sqrt((tx - carOutX) * (tx - carOutX) +
+                          (ty - carOutY) * (ty - carOutY)) / 256.0;
+            const double targetToCentre =
+                std::sqrt((tx - centreX) * (tx - centreX) +
+                          (ty - centreY) * (ty - centreY)) / 256.0;
+            std::printf("  100 m off the line : target %.2f m away, %.2f m from the centre\n",
+                        toTarget, targetToCentre);
+            check(lookAhead < 0.001,
+                  "the look-ahead is zero for a car that is off the line");
+            check(toTarget > 90.0 && toTarget < 110.0,
+                  "the target is about 100 m away -- the nearest point on the line");
+            check(std::fabs(targetToCentre - circleRadiusMetres) < 1.5,
+                  "the target lies ON the line");
+        }
+
+        // And a car that is not on this track's line AT ALL gets no target.
+        int farDirection = 0;
+        double fx = 0.0;
+        double fy = 0.0;
+        const bool gotFar = rr3::raceLineTargetAdaptive(
+            line, file, carOutX + 400.0 * 256.0, carOutY, hx, hy, &farDirection,
+            &fx, &fy, nullptr, true, 20.0);
+        check(!gotFar, "a car 500 m off the line gets no target at all");
+    }
+
     std::printf("%s\n", failures == 0 ? "race_line selftest: OK" : "race_line selftest: FAILED");
     return failures == 0 ? 0 : 1;
 }

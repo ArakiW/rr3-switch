@@ -497,6 +497,24 @@ constexpr double kCornerHeadingThresholdRad = 0.35;  // ~20 degrees
 constexpr double kMinLookAheadMetres = 4.0;
 constexpr double kMaxLookAheadMetres = 20.0;
 
+// HOW FAR OFF THE LINE A CAR MAY BE AND STILL BE AIMED AT.
+//
+// THE TWO NUMBERS MEAN DIFFERENT THINGS:
+//   kOnLineDistanceMetres     below this the car is ON the line and the
+//                              look-ahead is the normal one (curvature or
+//                              constant).
+//   kFarFromLineLimitMetres   above this the car is not on this track's line
+//                              at all, and the line is not used.
+//
+// BETWEEN THEM the car is off the line but still on the track: it is aimed at
+// the NEAREST POINT of the line, so it drives back onto the track.  MEASURED
+// 2026-11-10 (round hybrid1): refusing the line there cost the pursuit
+// 10.35 % -> 3.0 % of a lap, because the guest's own target is garbage when
+// the car is off the line (13,076 m and 47,014 m measured) and the pursuit
+// switched itself off.
+constexpr double kOnLineDistanceMetres = 25.0;
+constexpr double kFarFromLineLimitMetres = 250.0;
+
 // The heading of the segment from `from` to `to`, in radians.
 double segmentHeading(const Point& from, const Point& to) {
     return std::atan2(to.y - from.y, to.x - from.x);
@@ -634,7 +652,29 @@ bool raceLineTargetAdaptive(const RaceLine& line, const SplineFile& spline,
         }
     }
     const double distanceMetres = std::sqrt(nearestDistance) / 256.0;
-    if (distanceMetres > 25.0) {
+    // A CAR FAR OFF THE LINE IS NOT A CAR ON ANOTHER TRACK -- IT IS A CAR
+    // THAT HAS TO COME BACK.
+    //
+    // MEASURED 2026-11-10 (round hybrid1, 223 race-state samples): with the
+    // old 25 m guard the port gave up on the line exactly when the car needed
+    // it most.  The guest's own aim target then stayed in the sample, and the
+    // guest's target is garbage when the car is off the racing line -- the
+    // measured distances were 13,076 m, 19,059 m and 47,014 m -- so the
+    // pursuit switched itself OFF (pur=0) and the recovery took the wheel with
+    // a full lock.  The car spun and stalled instead of coming back: flips=9,
+    // stalls=7, and the lap progress stopped at 89,623 units (3.0 %) against
+    // the 186,921 (10.35 %) of the reference round.
+    //
+    // So: the line is still used, and when the car is far off it the TARGET
+    // IS THE NEAREST POINT ON THE LINE (a look-ahead of zero), which is the
+    // direction back onto the track.  Aiming at a point further along the line
+    // would be aiming at a place the car cannot see from there.
+    //
+    // The hard limit is still there, and it is much larger: a car that is more
+    // than kFarFromLineLimitMetres from the line is not on this track's line
+    // at all, and aiming at it would be aiming at noise.
+    const bool farFromLine = distanceMetres > kOnLineDistanceMetres;
+    if (farFromLine && distanceMetres > kFarFromLineLimitMetres) {
         return false;
     }
 
@@ -664,9 +704,15 @@ bool raceLineTargetAdaptive(const RaceLine& line, const SplineFile& spline,
     //
     // The fixed branch is EXACTLY what raceLineTarget() did, so the "fixed"
     // mode is the old behaviour and not an approximation of it.
-    const double lookAhead = adaptiveLookAhead
-        ? curvatureLookAheadMetres(poly, nearest, step)
-        : fixedLookAheadMetres;
+    //
+    // AND FOR A CAR THAT IS FAR OFF THE LINE THE LOOK-AHEAD IS ZERO, so the
+    // target IS THE NEAREST POINT ON THE LINE: the car is pointed back onto
+    // the track instead of at a point further along it that it cannot see.
+    const double lookAhead = farFromLine
+                                 ? 0.0
+                                 : (adaptiveLookAhead
+                                        ? curvatureLookAheadMetres(poly, nearest, step)
+                                        : fixedLookAheadMetres);
     if (lookAheadMetres != nullptr) {
         *lookAheadMetres = lookAhead;
     }
