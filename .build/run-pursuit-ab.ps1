@@ -82,7 +82,7 @@ foreach ($combo in $combos) {
     # its own state, so a cell that starts from a different state is
     # measuring that state and not the variable it was given.
     & (Join-Path $root '.build\guest-state.ps1') -Restore
-    & (Join-Path $root '.build\set-pursuit-conf.py') $combo.raceline $combo.lookahead
+    python (Join-Path $root '.build\set-pursuit-conf.py') $combo.raceline $combo.lookahead
     if ($LASTEXITCODE -ne 0) {
         throw ("could not set the pursuit configuration for {0}" -f $combo.name)
     }
@@ -95,7 +95,7 @@ foreach ($combo in $combos) {
     }
     Write-Host ''
     Write-Host ("--- {0} ---" -f $combo.name)
-    & (Join-Path $root '.build\pursuit-report.py') $tag
+    python (Join-Path $root '.build\pursuit-report.py') $tag
 }
 
 Write-Host ''

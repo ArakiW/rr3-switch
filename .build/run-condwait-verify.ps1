@@ -62,7 +62,7 @@ foreach ($r in $rounds) {
         & (Join-Path $root '.build\run-pinned-round.ps1') -Tag $r.tag -Seconds $Seconds -Nro $nro
     }
     Write-Host ('--- {0} ---' -f $r.tag)
-    & (Join-Path $root '.build\metrics-summary.py') $r.tag
+    python (Join-Path $root '.build\metrics-summary.py') $r.tag
 }
 
 Write-Host ''
