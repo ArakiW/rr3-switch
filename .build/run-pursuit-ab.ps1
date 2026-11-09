@@ -60,8 +60,16 @@ Write-Host ("=== the NRO every cell runs: {0} ===" -f $nroHash.Substring(0, 16))
 
 # THE AUTOPILOT, NOT THE MANUAL SCRIPT: this measures the port's own closed
 # loop, which is the thing that has to complete a lap.
-Write-Host '=== input mode: autopilot ==='
-& (Join-Path $root '.build\deploy-input-mode.ps1') -Mode autopilot
+#
+# THE PULSE.  MEASURED 2026-11-09: with the plain script, which HOLDS the
+# guest's BTN_A down for the whole round, the guest never sees a
+# button-down TRANSITION, so a modal dialog (the "you received 50 gold"
+# popup, which the guest PERSISTS between rounds) waits for a press that
+# never comes and the guest sits in the front end forever.  Three rounds
+# drew EXACTLY 10,394 things in 400 s and stopped in the same place.  With
+# the pulse, the same build and the same card reached the race.
+Write-Host '=== input mode: autopilot (pulsing confirm) ==='
+& (Join-Path $root '.build\deploy-input-mode.ps1') -Mode autopilot-pulse
 
 foreach ($combo in $combos) {
     if ($Only -ne '' -and $combo.name -ne $Only) {
@@ -70,6 +78,10 @@ foreach ($combo in $combos) {
     Write-Host ''
     Write-Host ("=== {0}: raceline={1} lookahead={2} ===" -f
         $combo.name, $combo.raceline, $combo.lookahead)
+    # THE SAME GUEST STATE AT THE START OF EVERY CELL.  The guest persists
+    # its own state, so a cell that starts from a different state is
+    # measuring that state and not the variable it was given.
+    & (Join-Path $root '.build\guest-state.ps1') -Restore
     & (Join-Path $root '.build\set-pursuit-conf.py') $combo.raceline $combo.lookahead
     if ($LASTEXITCODE -ne 0) {
         throw ("could not set the pursuit configuration for {0}" -f $combo.name)
@@ -88,3 +100,9 @@ foreach ($combo in $combos) {
 
 Write-Host ''
 Write-Host ("A/B DONE, all cells on NRO {0}" -f $nroHash.Substring(0, 16))
+
+# THE BASELINE FOR THE NEXT A/B.  Taken after the last round, so that the
+# next A/B starts every cell from the state this one ended in -- and not
+# from a state one of its own cells produced.
+Write-Host '=== snapshot the guest state for the next A/B ==='
+& (Join-Path $root '.build\guest-state.ps1') -Snapshot

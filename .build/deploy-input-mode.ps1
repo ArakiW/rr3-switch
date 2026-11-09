@@ -25,7 +25,7 @@
 #
 # Usage: powershell -File .build\deploy-input-mode.ps1 -Mode manual
 param(
-    [ValidateSet('manual', 'autopilot', 'none')]
+    [ValidateSet('manual', 'autopilot', 'autopilot-pulse', 'none')]
     [string]$Mode = 'manual'
 )
 
@@ -49,6 +49,19 @@ switch ($Mode) {
         $autopilot = '1'
         $script = Join-Path $root 'native-switch\card\rr3-pad-autopilot.txt'
     }
+    'autopilot-pulse' {
+        # THE PULSE.  The plain script HOLDS the guest's BTN_A down from
+        # frame 600 to the end of the round, so the guest's UI never sees a
+        # button-down TRANSITION and a modal dialog that waits for a press
+        # waits forever.  MEASURED 2026-11-09 (rounds m2, m3, v1): the guest
+        # froze on a modal "you received 50 gold" popup -- which the guest
+        # PERSISTS, so every later round started stuck on it -- and never
+        # reached the race.  With the pulse, the same build and the same
+        # card reached the race and the metrics went live (round v3:
+        # metrics=1 at frame 1830).
+        $autopilot = '1'
+        $script = Join-Path $root 'native-switch\card\rr3-pad-autopilot-pulse.txt'
+    }
     'none' {
         $autopilot = '0'
         $script = Join-Path $root 'native-switch\card\rr3-pad.txt'
@@ -69,5 +82,6 @@ Write-Host ("pad     : {0}  ({1} bytes, from {2})" -f $pad, (Get-Item $pad).Leng
 switch ($Mode) {
     'manual' { Write-Host 'the port will NOT touch the car: the script owns the throttle and the steering.' }
     'autopilot' { Write-Host 'the port''s own closed loop owns the car.' }
+    'autopilot-pulse' { Write-Host 'the port''s own closed loop owns the car, and the confirm button is pulsed so that a modal dialog cannot wedge the guest.' }
     'none' { Write-Host 'the port will NOT touch the car, and there is no script: only a controller drives.' }
 }

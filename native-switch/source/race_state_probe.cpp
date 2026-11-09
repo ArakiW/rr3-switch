@@ -2428,6 +2428,40 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
     if (rate < -0.0001 && !g_drive.brake &&
         frame >= g_lastFlipFrame + 600ULL) {
         g_drive.sign = -g_drive.sign;
+        // AND THE DIRECTION LOCK GOES WITH IT.
+        //
+        // MEASURED 2026-11-09 (round v3, archive
+        // 20261109-161237-eden-rr3-v3-pulse-census-off): the lock was decided
+        // at frame 2610 with dir=1, and at frame 2670 the motion vector
+        // flipped to mot=-1.000 -- the car had turned round and was driving
+        // BACKWARDS down the track (total 58712 -> 51160, snode 261 -> 259).
+        // From there the pursuit steered at full lock in both directions
+        // (steer=-1.000 at frame 2730, steer=1.000 at frame 2760) and never
+        // settled.
+        //
+        // WHY: the flip above only changes the STEERING SIGN.  The
+        // look-ahead point is placed by the DIRECTION LOCK, which was never
+        // touched, so it stayed on the side the car had left -- that is,
+        // BEHIND the car.  The controller was chasing a point behind it, and
+        // the sign flip only made it swing the other way round the same
+        // wrong point.  A car that is going the wrong way round the track
+        // means the track's direction is the other way, so the lock has to
+        // go with the sign.
+        //
+        // THIS IS NOT "RE-DECIDING IT EVERY FRAME".  The hysteresis above is
+        // 600 frames, the condition is a sustained negative rate, and the
+        // recovery's own reversing is excluded -- which is exactly the
+        // guard q142 asked for.  MEASURED 2026-11-04 (q142): re-deciding
+        // the direction EVERY frame moved the look-ahead point to the other
+        // side of the car whenever the car was nudged, the controller saw
+        // the sum of two flips, and the car drove 6,581 units backwards.
+        //
+        // And the lock is only flipped when it has been decided at all: an
+        // undecided lock (0) is not a decision, and inverting it would make
+        // it -1, which the pursuit would read as a decision it never made.
+        if (gRaceLine.direction != 0) {
+            gRaceLine.direction = -gRaceLine.direction;
+        }
         g_lastFlipFrame = frame;
         ++g_drive.flips;
         g_drive.bestRate = 0.0f;

@@ -2270,3 +2270,71 @@ condvar was signalled ONCE for FOUR waiters; in m2 it was signalled ZERO
 times.  Both are the same underlying thing: the host condvar has no
 memory, so the bridge has to keep the signal itself, and until it does,
 the guest's wake-ups are a matter of luck.
+
+### 9.7 The pulse, and the first round that measured the pursuit
+
+THE EXPERIMENT.  One variable: the pad script's confirm button is released
+for a few frames every cycle instead of being held down for the whole
+round.  Same build, same card, same census setting as the round that
+failed.
+
+    v3   the fixed build, census OFF, PULSE   metrics live at frame 1830
+                                              6120 frames in 406 s
+                                              start lights 7, race screen 10
+
+**⇒ CONFIRMED: the held confirm button was what wedged the guest, and the
+popup was what the confirm button could not dismiss.**
+
+And v3 is the FIRST round that measured the pursuit with the new
+instruments:
+
+    lookahead (lam)   : {'adaptive': 205}     the configuration was in force
+    la                : min 0.00  median 8.71  max 20.00
+    progress          : last 7367
+    raceline          : {'centre_spline': 145}
+
+**⇒ THE ADAPTIVE LOOK-AHEAD IS MEASURING FOR THE FIRST TIME, AND IT IS
+VARYING.**  The corrected law gives 20 m on a straight and shortens towards
+the corner; the median of 8.71 m over the round is what that looks like.
+The old law would have printed 4.00 m for every single sample.
+
+### 9.8 The pursuit drove the car backwards, and the log now says why
+
+v3's `dir=` and `mot=` fields (added in this same round, because a decision
+that is made once and never revisited is invisible in a per-frame line
+unless the line carries it) read:
+
+    f=2010 .. 2580   dir=0   la=0.00   mot=0.000,0.000
+    f=2610           dir=1   la=20.00  mot=0.807,-0.590
+    f=2670           dir=1   la=20.00  mot=-1.000,0.015   total 58712 -> 51160
+    f=2730           dir=1   la=4.00   steer=-1.000
+    f=2760           dir=1   la=9.31   steer=1.000
+
+Three things, and the third is the bug:
+
+  1. **FOR 570 FRAMES THE PORT HAD NO TARGET AT ALL.**  `la=0.00` means
+     `raceLineTargetAdaptive()` returned false: the car was more than 25 m
+     from the fitted centre line, so the port was steering a car it could
+     not see the line for.  `dir=0` for the same period: the direction
+     lock is decided inside that same call, so it had not been decided
+     either.  The lock was therefore decided at frame 2610 -- 780 frames
+     after the race started.
+  2. **THE CAR TURNED ROUND AT FRAME 2670**, and `total` (the car's signed
+     position along the track) fell from 58712 to 51160 while `snode` went
+     261 -> 259.
+  3. **THE FLIP RECOVERY DID NOT CORRECT THE LOCK.**  The recovery at
+     `race_state_probe.cpp:2428` flips `g_drive.sign` -- the steering sign
+     -- when the rate stays negative.  It did not touch
+     `gRaceLine.direction`, which is what places the look-ahead point.  So
+     the target stayed on the side the car had LEFT, that is behind it, and
+     the controller chased a point behind the car at full lock in both
+     directions.
+
+**⇒ THE FIX: the flip recovery now inverts the direction lock as well.**
+
+This is NOT "re-deciding the direction every frame", which is what q142
+measured and rejected: the flip carries a 600 frame hysteresis, fires only
+on a sustained negative rate, and is excluded while the recovery is
+deliberately reversing the car.  A car that is going the wrong way round
+the track means the track's direction is the other way, so the lock has to
+go with the sign.
