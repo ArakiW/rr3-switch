@@ -749,3 +749,50 @@ phase=npad-heartbeat ... state=npad-active ... seen_press=1
 ```
 
 `npad-active` 就说明宿主手柄真的进了客机。详细说明见 `docs/CONTROLLER-ON-PC.md`。
+
+## 10.8 洋红色 AI 对手：用 ETC 数据包重建 7 个数据卷（真机必做）
+
+**现象：** 比赛里的 AI 对手车是洋红色。**根因不是端口的 bug，是卡上放了错的数据包。**
+
+客机按**拼写**要贴图，顺序是 `pvr -> etc -> dxt -> atc`，取**第一个存在的**。
+- 卡上松散的 `.depot` 里有那 82 辆车的 pvr/etc 版本 ⇒ 它们正常。
+- 七个数据卷如果是用 **DXT 数据包**建的，就**只有 dxt 这一种拼写**。
+  ⇒ 卡上没有的车，客机一路退到 dxt ⇒ 而 Mesa 的 S3TC 解码会把贴图的**绿通道清零**
+  （实测：帧里 0 个像素是 (255,0,255)，而是 (255,4,255)/(192,4,192)，
+  也就是「灰白车被抠掉绿色」）。
+
+**⇒ 修法：用 ETC 数据包重建这 7 个卷。** ETC 那条路早就在用（卡上那 82 辆车一直是它），
+是能正常渲染的。
+
+**在真机上做（两行命令，卷用你自己的数据包在本机生成，不进任何发布包）：**
+
+```
+python tools\prepare_rr3_external_data.py "<你的 ETC 数据包>.zip" --output dist\rr3-native-rehost-complete-etc
+powershell -ExecutionPolicy Bypass -File tools\Deploy-RR3Volumes.ps1 ^
+  -SourceRoot "<仓库>\dist\rr3-native-rehost-complete-etc\switch\rr3-native-rehost\data" ^
+  -CardDataDir "F:\switch\rr3-native-rehost\data" -CardSwitchDir "F:\switch" -Apply
+```
+
+`Deploy-RR3Volumes.ps1` 默认是**干跑**：先打印计划、字节账和容量闸门的结果，什么都不改；
+确认没问题再加 `-Apply`。它会逐个卷写临时名、在原地校验 sha256、再改名盖上去。
+
+**重建前先比覆盖面**（少一个包就等于用一个故障换另一个）：
+
+```
+DXT: 50,608 个成员  gui=2,825  gui_assets=12,653  tracks=12,229  vehicles=17,732
+ETC: 50,168 个成员  gui=2,825  gui_assets=12,305  tracks=12,233  vehicles=17,679
+```
+
+两种拼写 ETC 包都有（单数 `livery/<车>_ext.etc.dds.z` 给 DTM 那种新车，
+分色 `livery/<车>_ext_<颜色>.etc.dds.z` 给老车），共 2,746 个车漆文件。
+
+**装完怎么确认：** 跑一轮，日志里应该有
+
+```
+phase=ctex-upload ... internal=0x8d64(ETC1_RGB8) err=0x0 recent_fourcc=ETC
+```
+
+而且**一条 S3TC（0x83f1/0x83f3）上传都不该再有** —— 那条路就是洋红的来路。
+
+> ETC / DXT / ATC 三个数据包都是 EA 的素材，按 `NOTICE.md` 不进任何发布包，
+> 只能由你用自己的包在本机生成。
