@@ -1,0 +1,36 @@
+THE RACE-STATE LINE PRINTED FOUR FIELDS FROM THE WRONG ARGUMENTS
+
+MEASURED 2026-11-10 (round chunk1): the commit that added the `cchunk` field
+put the new argument BEFORE `dir`/`mot`, while the format string puts
+`cchunk=%.2f` AFTER `mot=%.3f,%.3f`.
+
+The number of specifiers and the number of arguments stayed EQUAL, so the
+mistake was a POSITION error and not a count error: only the four fields
+BETWEEN the two insertion points were printed from the wrong arguments --
+`dir`, `mot.x`, `mot.y` and `cchunk`.  Everything from `perr` onwards was
+aligned, and the log proves it: `dir` printed -328052707 and 2102253012 (the
+low words of a double read as an int), `mot` printed a 120-digit number (an
+int read as a double), and `cchunk` printed -0.42 (the motion vector's Y).
+
+The compiler had said so all along and nobody read it:
+
+    race_state_probe.cpp:2810:73: warning: format '%d' expects argument of
+      type 'int', but argument 79 has type 'double' [-Wformat=]
+    race_state_probe.cpp:2810:82: warning: format '%f' expects argument of
+      type 'double', but argument 80 has type 'int' [-Wformat=]
+
+CONSEQUENCE: chunk1's reading of `cchunk` -- the field the round existed to
+measure -- was meaningless, and so was `dir`.  Its reading of `pur` (the
+pursuit was on in 150 of 193 samples), `flips` (9 -> 6), `stalls` (7) and
+`total` (94,034) was sound, because those fields were aligned.
+
+THE FIX: the argument moves to the position the format string asks for.  The
+build is now warning-free for this file, and the round `chunk2` measured
+`cchunk` at 2.5 to 9.3 m -- the chunk picker works -- and `dir` at 1.
+
+THE LESSON, WHICH IS THE GENERAL ONE: a field that is ADDED to a log line is
+a new contract, and the contract is "the argument list has to be in the same
+order as the format string".  A count error breaks the build; a position
+error does not, and it silently corrupts exactly the fields between the two
+positions.  The compiler warns about it, and the warning is in the build log
+like everything else.

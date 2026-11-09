@@ -1,0 +1,195 @@
+You are working in the repository E:\AI\RealRacing3-switch (a native Nintendo Switch port of an Android racing game, libnx + Mesa). The working tree is a git repository; the branch is master.
+
+# THE PROBLEM TO FIX
+
+The port has an autopilot ('the pursuit') that steers the car by aiming at a point on the track's racing line. In the most recent measured round (tag chunk1, 2026-11-10) the pursuit is saturating the steering at full lock while its steering error swings between +1.16 and -2.66 radians, and the car goes BACKWARDS:
+
+    perr= 1.1621  steer=-1.000  total=100657
+    perr=-1.6103  steer= 1.000  total=100565
+    perr= 2.6651  steer=-1.000  total= 98711
+    perr=-0.2034  steer= 0.407  total= 95994
+    perr=-2.4641  steer= 1.000  total= 94034
+
+perr is the signed angle from the car's heading to the direction of the aim point. An error of 2.4 rad (137 degrees) means the aim point is BEHIND the car. The controller then applies full lock, the car spins, and the guest's own progress along the track falls.
+
+Three root causes, all in the pursuit path. Fix all three.
+
+# WHERE THE CODE IS
+
+- E:\AI\RealRacing3-switch\native-switch\source\race_line.cpp
+  - raceLineTargetAdaptive() (around line 626): builds the aim point.
+  - raceLineTarget() (around line 355): the older, non-adaptive variant.
+  - nearestOnPolyline() (around line 91): helper that finds the closest point on a polyline.
+  - buildChunkPolyline() (around line 52), curvatureLookAheadMetres() (around line 567).
+  - Constants near line 496: kCornerHeadingThresholdRad, kMinLookAheadMetres, kMaxLookAheadMetres,
+    kOnLineDistanceMetres (25), kFarFromLineLimitMetres (250).
+- E:\AI\RealRacing3-switch\native-switch\include\rr3\race_line.hpp : the public API.
+- E:\AI\RealRacing3-switch\native-switch\source\race_state_probe.cpp
+  - The call site of raceLineTargetAdaptive() (around line 1408), which passes
+    gRaceLine.motionX / gRaceLine.motionY as the heading and &gRaceLine.direction as the direction lock.
+  - The pursuit error computation (around line 2584-2672): steerError = atan2(cross, dot).
+  - The stuck / pinned test (around line 2410-2442): kPinnedDistance = 256, kPinnedFrames = 1200,
+    it watches the car's WORLD position.
+  - The flip test (around line 2465-2511): if (rate < -0.0001 && !g_drive.brake && frame >= g_lastFlipFrame + 600ULL).
+    Right below it the direction-lock inversion is DISABLED by `if (false && gRaceLine.direction != 0)`.
+  - Constants near line 900: kDriveMagnitudeFloor, kDriveRecoveryMagnitude, kDriveRecoveryFrames = 240.
+- E:\AI\RealRacing3-switch\native-switch\tests\host\race_line_selftest.cpp : the host self-test.
+  There is also E:\AI\RealRacing3-switch\native-switch\tests\test_dxt_decode_contract.py for reference on how
+  a test is wired into the gate.
+
+READ these files before you change anything. The existing comments explain WHY each thing is the way it is,
+and they contain the measurements that justify the current design. Your changes must keep that style: every
+non-obvious constant needs the measurement that justifies it.
+
+# FIX A - THE AIM POINT MUST COME FROM THE PROJECTION, AND ITS LOOK-AHEAD MUST NEVER BE ZERO
+
+Today raceLineTargetAdaptive() finds the nearest NODE of the polyline, then walks `lookAhead` metres along
+the locked direction. When the car is more than kOnLineDistanceMetres (25 m) from the line, the look-ahead is
+forced to 0.0, so the aim point IS that node. The nodes are about 8 m apart, so that node can be up to about
+4 m BEHIND the car along the track, and at a look-ahead of zero the vector from the car to the aim point is
+decided by which side the node happened to fall on. That is the geometry that produced the 2.4 rad error.
+
+Required:
+
+A1. Compute the car's PROJECTION onto the polyline: the nearest point on the nearest SEGMENT (not the nearest
+    node), plus the ARC-LENGTH COORDINATE of that projection, measured in metres along the polyline in NODE
+    ORDER, starting at node 0, wrapping at the loop length. The coordinate is a property of the LINE, so it
+    does not change when the travel direction flips; the caller compares two coordinates and must be
+    wrap-around aware.
+
+A2. The aim point is the point at (projection arc coordinate + lookAhead) along the locked direction. When the
+    car is far from the line, the look-ahead is a fixed moderate value (a point on the line ahead of the car),
+    NOT zero. Keep kFarFromLineLimitMetres as the hard limit and keep kOnLineDistanceMetres as the on-line
+    threshold, and keep the curvature-following look-ahead for a car that is on the line.
+
+A3. Expose the projection and the arc-length coordinate through the public API so the caller can use the same
+    number for FIX B and FIX C. Add it to E:\AI\RealRacing3-switch\native-switch\include\rr3\race_line.hpp.
+
+A4. A car that is ON the line and driving FORWARD must get an aim point ahead of it, so the error stays small.
+    A car that is ON the line and driving BACKWARD must still get an aim point that is AHEAD ALONG THE TRACK
+    (that is the honest report of 'you are going the wrong way round'), and the caller sees a large error.
+
+# FIX B - THE FLIP CRITERION MUST NOT BE A SIGNAL THE RECOVERY CAN FAKE
+
+Today the flip fires on `rate`, a 120 frame smoothed rate, and the direction-lock inversion right below it is
+dead code (`if (false && ...)`). The reason it is dead is written in the comment: the recovery deliberately
+REVERSES the car, so the recovery's own reverse drives the rate negative, and since the recovery lasts 240
+frames (kDriveRecoveryFrames) while the rate window is 120 frames, the flip fires on the recovery's signal.
+The comment there already states the requirement:
+
+    TO RESTORE IT, the criterion has to be the car's own progress along the track (the guest's signed total),
+    not a smoothed rate that the recovery can poison.
+
+Required:
+
+B1. Compute the flip criterion from the ALONG-TRACK COORDINATE from FIX A1, compared over a window LONGER than
+    kDriveRecoveryFrames, so the recovery's own 240 frame reverse cannot dominate the window. The window must be
+    a named constant with the reasoning in a comment. The comparison must be wrap-around aware (the coordinate
+    wraps at the loop length).
+
+B2. Keep the steering-sign flip: it is what stops the controller driving the wrong way. Base it on the windowed
+    along-track comparison instead of the smoothed rate, and keep the existing 600 frame hysteresis between
+    flips.
+
+B3. RESTORE the direction-lock inversion, driven by the SAME along-track criterion, not by the instantaneous
+    rate. The lock is the port's one-off decision about which way round the track is; it has to be invertible
+    when the measurement proves the car is going the other way. Removing the `if (false && ...)` is part of the
+    job.
+
+B4. The recovery itself must not be able to trigger the flip. Keep the existing `!g_drive.brake` guard, and
+    make sure the window length and the hysteresis are consistent with kDriveRecoveryFrames.
+
+# FIX C - THE STUCK TEST MUST MEASURE PROGRESS ALONG THE TRACK, NOT THE WORLD POSITION
+
+Today the pinned test watches the car's world position and resets its timer whenever the car has moved
+kPinnedDistance (256 port units = 1 m) from the last recorded position, and declares the car pinned when
+1200 frames pass with no such movement. A car grinding along a barrier moves 1 m every few frames and so is
+never declared pinned, while the recovery, which reverses the car, moves the world position a lot and hides the
+pin.
+
+Required:
+
+C1. The stuck test must be based on the ALONG-TRACK COORDINATE from FIX A1: a car whose along-track coordinate
+    has not advanced by a meaningful distance over a window is stuck. A car that is crawling along a barrier
+    advances along the track and is not stuck; a car pressed against it does not advance and is.
+
+C2. Keep the existing exemption for a car that has never moved: the guest's start sequence holds the car at the
+    grid, and a car that has never moved is being HELD, not stuck. The existing `g_sawProgress` guard does
+    that; do not remove it.
+
+C3. The recovery reverses the car on purpose, so it moves the along-track coordinate backwards for its duration.
+    The stuck window must be long enough that the recovery cannot be mistaken for a stuck car, or the stuck test
+    must ignore the frames the recovery is active. Say which one you did and why.
+
+# FIX D - INSTRUMENTATION
+
+D1. The race-state log line in race_state_probe.cpp must keep every argument in the order the format string
+    asks for. A previous commit put a new argument in the wrong place and the compiler said so in a
+    -Wformat= warning that nobody read; the four fields dir, mot and cchunk were printed from the wrong
+    arguments for a whole round. The build must stay free of -Wformat= warnings. Verify by reading the build
+    log.
+
+D2. Add fields for the new quantities: the along-track coordinate (name it `along`), the projection distance in
+    metres (name it `pdist`), and the windowed along-track delta that the flip criterion uses (name it
+    `fdelta`). Keep the existing fields and their names.
+
+D3. Every new diagnostic line must have a HARD BUDGET counted in LINES, and must print one 'budget exhausted'
+    line when the budget runs out. Follow the pattern that is already in guest_view_trace.cpp.
+
+# FIX E - HOST SELF-TEST
+
+Add cases to E:\AI\RealRacing3-switch\native-switch\tests\host\race_line_selftest.cpp. The cases must have
+teeth, i.e. they must FAIL on the old behaviour. At least:
+
+E1. A car on the line driving FORWARD gets an aim point ahead of it, and the angle between the car's heading and
+    the vector to the aim point is under about 0.3 rad.
+
+E2. A car on the line driving BACKWARD gets an aim point whose arc coordinate is AHEAD along the track, and the
+    geometry reports a large error - the geometry reports the wrong way round instead of silently aiming behind.
+
+E3. A car 30 m off the line still gets a target, and the target is NOT the car's own position: the distance from
+    the car to the target is at least the look-ahead.
+
+E4. The along-track coordinate increases when the car moves forward along the line and decreases when the car
+    moves backwards along it. This is the criterion FIX B and FIX C use.
+
+E5. All the existing self-test cases must still pass.
+
+# FIX F - BUILD AND GATE
+
+Run these EXACTLY as written, with no pipe and no extra redirection around them:
+
+    cmd /c "powershell -ExecutionPolicy Bypass -File E:\AI\RealRacing3-switch\tools\Build-NativeSwitch.ps1 > E:\AI\RealRacing3-switch\.build\build-pursuit-v3.log 2>&1"
+
+    cmd /c "powershell -ExecutionPolicy Bypass -File E:\AI\RealRacing3-switch\.build\gate.ps1 > E:\AI\RealRacing3-switch\.build\gate-pursuit-v3.log 2>&1"
+
+The gate must end with GATE OK and zero failures, and the build log must have no -Wformat= warning for
+race_state_probe.cpp and no new warning at all. If the gate fails, fix the cause and run it again.
+
+# FIX G - WHAT NOT TO DO
+
+G1. Do not touch anything under E:\AI\RealRacing3-switch\.build\ except reading it and writing your report.
+G2. Do not commit, and do not run git push. Leave the changes in the working tree.
+G3. Do not add game assets, and do not copy anything out of the .depot folders: the repository is public and the
+    assets belong to the publisher.
+G4. Do not change the existing line endings of a file. race_line.cpp, race_state_probe.cpp and
+    race_line_selftest.cpp use LF endings; guest_filesystem.cpp and guest_view_trace.cpp use CRLF.
+G5. Do not weaken the existing guards: kFarFromLineLimitMetres, the never-moved exemption and the 600 frame
+    flip hysteresis stay.
+G6. Do not touch the graphics, the controller, the HUD or the filesystem code. This task is the pursuit only.
+G7. Do not weaken or delete an existing test to make it pass.
+G8. Do not claim a measurement you did not make. If you cannot verify something, say so.
+
+# DELIVERABLE
+
+The edits in the working tree, plus a report in ENGLISH at
+E:\AI\RealRacing3-switch\.build\agy-report-pursuit-v3.md with these sections:
+
+1. What changed and why, one subsection per fix A, B, C, D, E.
+2. Every new constant, with the measurement or the argument that justifies its value.
+3. The self-test cases you added, and what the old code would have done on each of them.
+4. The build and gate results, quoted from the logs (the last lines of each).
+5. Anything you could not verify, and anything you think the next round on real hardware must measure.
+
+Write the report in plain English. The repository's own documents are English and are checked by a script that
+fails on any CJK character; your report is a scratch file but keep it English too.

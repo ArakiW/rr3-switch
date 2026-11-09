@@ -1,0 +1,137 @@
+You are working in the repository E:\AI\RealRacing3-switch (a native Nintendo Switch port of an Android racing game, libnx + Mesa).
+
+# CONTEXT: WHAT WAS ALREADY FOUND
+
+A previous pass in this same working tree was given the following task, and its
+instrument was fixed first so that the measurement could be trusted:
+
+  The race-state log line had four fields printed from the wrong arguments
+  (`dir`, `mot`, `cchunk`), because a new argument was put in the wrong place
+  relative to the format string.  The compiler had warned (-Wformat=) and nobody
+  read it.  That is fixed and committed.
+
+With the instrument fixed, a fresh round (tag chunk2) produced the numbers below.
+They are READ FROM THE LOG, not inferred.
+
+# THE NEW MEASUREMENT (round chunk2, the instrument fixed)
+
+From the live log of the round, the pursuit phase, sampled every 30 frames:
+
+    f=3870  dir=1  mot=-1.000,-0.007  cchunk=4.80  perr= 1.5175  pur=1  total= 71949  ctdist=17.92  flips=2  stalls=5  steer=-1.000  mag=0.530  sign=-1  thr=0  brk=1
+    f=3900  dir=1  mot=-1.000,-0.017  cchunk=5.14  perr= 1.5228  pur=1  total= 72387  ctdist=19.61  flips=2  stalls=5  steer=-1.000  mag=0.530  sign=-1  thr=0  brk=1
+    f=3930  dir=1  mot=-1.000, 0.009  cchunk=2.51  perr= 1.6406  pur=1  total= 72850  ctdist=16.92  flips=2  stalls=5  steer=-1.000  mag=0.530  sign=-1  thr=0  brk=1
+    f=3960  dir=1  mot=-0.997, 0.076  cchunk=2.88  perr= 1.6346  pur=1  total= 73309  ctdist=18.71  flips=2  stalls=5  steer=-1.000  mag=0.530  sign=-1  thr=0  brk=1
+
+WHAT THE NUMBERS SAY:
+
+1. `cchunk` is 2.5 to 9.3 m: the chunk picker works, the aim point comes from a
+   chunk the car is actually on.  That part of the port is DONE.
+2. `dir` is 1 and `mot` is (-1.000, ~0.000): the direction lock is decided and
+   the car's own 20 m displacement vector is consistent.
+3. `ctdist` is 16.9 to 19.6 m, which is the 20 m look-ahead: the aim point is
+   where the port thinks it is.
+4. `perr` sits at 87 to 94 degrees and STAYS THERE, while `steer` is -1.000, i.e.
+   FULL LOCK, for at least 90 frames, and `brk` is 1: the RECOVERY IS BRAKING.
+   A steady 90 degree error with the aim point at the car's tangent is the
+   signature of a car driving in a CIRCLE around the aim point.
+5. The car is barely moving along the track: `total` grew by 1,360 units in 90
+   frames, against the reference round's 23.88 units per frame (so 2,149 units
+   in 90 frames).  The car is creeping, in a circle, at full lock, with the
+   brake on.
+
+# THE ROOT CAUSE THIS POINTS AT
+
+The recovery is supposed to back the car off a barrier and point it down the
+track again.  Its code says so:
+
+    // WHILE REVERSING, HOLD A DECISIVE ANGLE THE OTHER WAY.  The car has
+    // to come off the barrier pointing back down the track ...
+    // BUT THE PURSUIT WINS.  MEASURED 2026-11-02 (q114): the pursuit was ON
+    // in 0 of 228 samples, so every steering value in that round was this
+    // recovery's full lock -- the pursuit never got a say.
+
+So the pursuit overrides the recovery's steering.  That was right when the
+pursuit never engaged (q114).  It is wrong now: the pursuit IS engaged (pur=1),
+it holds the error at 90 degrees, it commands FULL LOCK, and the recovery is
+BRAKING AT THE SAME TIME.  A brake plus a full lock is a SPIN.  The recovery's
+reversing angle never gets a say, the car never comes off the barrier, the
+stall counter runs up (stalls=5), and the round ends with the car creeping in
+circles.
+
+# WHAT TO IMPLEMENT
+
+Work in E:\AI\RealRacing3-switch\native-switch\source\race_state_probe.cpp
+(the pursuit and the recovery are both in there: `updateDrive()` around line
+2314, the stall/pinned test around line 2410, the flip test around line 2465,
+the pursuit error around line 2584, and the steering assembly around line
+2672-2700).  Read the file first; the comments there carry the measurements
+that justify the current design, and they are the style to follow.
+
+H1. The pursuit and the recovery must not both be at full lock.  While the
+    recovery is active (`g_drive.brake`), the pursuit's steering must not be
+    able to hold the car at full lock with the brake on.  Either the recovery's
+    decisive angle wins while it is active, or the pursuit's magnitude is
+    scaled down while it is active.  Pick ONE, and write down why, with the
+    measurement above as the reason.
+
+H2. The pursuit must not be able to sit at a steady 90 degree error forever.
+    A pure pursuit at a large error is a limit cycle: the car turns at full
+    lock around the aim point and the error never falls.  If the car is not
+    making progress along the track, the pursuit has to give way to the
+    recovery.  The along-track progress signal is the same one the stall test
+    uses.
+
+H3. The recovery must be able to finish its job: it brakes, the guest reverses
+    the car, and the steering has to point the car back down the track.  If the
+    pursuit overrides it, the recovery cannot work, and the stall counter runs
+    up (stalls=5 measured) with no effect.  Make sure that after the recovery's
+    brake window ends, the car is pointed the right way.
+
+H4. Instrument it.  The race-state line must gain a field that says whether the
+    pursuit or the recovery owned the steering in that sample (the pursuit
+    already has `pur`, the recovery has `brk`; add a field that names the
+    owner, e.g. `owner=pursuit|recovery`).  The field's position in the format
+    string and in the argument list must match EXACTLY: a previous commit put a
+    new argument in the wrong place, the compiler warned, nobody read the
+    warning, and four fields were printed from the wrong arguments for a whole
+    round.  The build must come out with no -Wformat= warning.
+
+H5. Every new diagnostic line must have a HARD BUDGET counted in LINES and must
+    print one 'budget exhausted' line when the budget runs out.
+
+# RULES
+
+R1. Do not commit and do not run git push.  Leave the changes in the working tree.
+R2. Do not touch anything under E:\AI\RealRacing3-switch\.build\ except reading it
+    and writing your report.
+R3. Do not add game assets and do not copy anything out of the .depot folders.
+R4. Do not change the existing line endings of a file: race_state_probe.cpp uses LF.
+R5. Do not weaken the existing guards, do not weaken or delete an existing test,
+    and do not change the graphics, controller, HUD or filesystem code.
+R6. Do not claim a measurement you did not make.  If you cannot verify something,
+    say so in the report.
+R7. Keep every new constant justified by a measurement or an argument, in a
+    comment, in the style of the file.
+
+# BUILD AND GATE
+
+Run these EXACTLY as written, with no pipe and no extra redirection around them:
+
+    cmd /c "powershell -ExecutionPolicy Bypass -File E:\AI\RealRacing3-switch\tools\Build-NativeSwitch.ps1 > E:\AI\RealRacing3-switch\.build\build-pursuit-v4.log 2>&1"
+
+    cmd /c "powershell -ExecutionPolicy Bypass -File E:\AI\RealRacing3-switch\.build\gate.ps1 > E:\AI\RealRacing3-switch\.build\gate-pursuit-v4.log 2>&1"
+
+The gate must end with GATE OK and zero failures, and the build log must have no
+-Wformat= warning.
+
+# DELIVERABLE
+
+The edits in the working tree, plus a report in ENGLISH at
+E:\AI\RealRacing3-switch\.build\agy-report-pursuit-v4.md with these sections:
+
+1. What changed and why, one subsection per item H1..H5.
+2. Every new constant, with the measurement or the argument that justifies it.
+3. What the next round on the emulator must measure to prove or disprove the fix,
+   with the exact field names to read.
+4. The build and gate results, quoted from the logs (the last lines of each).
+5. Anything you could not verify.

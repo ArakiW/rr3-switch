@@ -90,6 +90,19 @@ reference/
 #   .build/put-hud-styles.ps1       the HUD experiment: the per-series
 #                                     LocalStyles as a stand-in
 #   .build/remove-hud-styles.ps1    taking it back off (the experiment failed)
+#   .build/tail-fields.py           the race-state line's TAIL fields, and the
+#                                     split between the fields an argument-order
+#                                     bug corrupted and the ones it did not
+#   .build/line-fields.py           the race-state line's HEAD and MIDDLE
+#                                     fields: the ones that were always aligned
+#   .build/magenta-scan.py          the batch magenta scan over a whole round's
+#                                     frames, on the GREEN channel, because a
+#                                     pink billboard is not a fault
+#   .build/append-9-24.py           append the instrument-and-root-cause section
+#   .build/append-9-27.py           append the human-path measurement section
+#   .build/agy-prompt-pursuit-v3.txt  the brief for the pursuit's control law
+#   .build/agy-prompt-pursuit-v4.txt  and the second brief, with the chunk2
+#                                     measurement that named the root cause
 #
 # WHY THEY HAVE TO BE TRACKED: the archive packer silently reused a STALE
 # archive on 2026-11-03 and shipped one 1480 bytes off the package.  A fix to
