@@ -82,6 +82,14 @@ reference/
 #                                     read-back instrument and the heartbeat
 #   .build/agy-report-textures-and-pad.md    what came back, and what is
 #                                     still unverified
+#   .build/deploy-volumes.ps1       put a prepared set of data volumes on the
+#                                     card, one at a time, sha256 verified
+#   .build/merge-hybrid-volumes.ps1 the HYBRID set: the front end from the
+#                                     DXT pack, the vehicle textures from the
+#                                     ETC pack (the magenta fix)
+#   .build/put-hud-styles.ps1       the HUD experiment: the per-series
+#                                     LocalStyles as a stand-in
+#   .build/remove-hud-styles.ps1    taking it back off (the experiment failed)
 #
 # WHY THEY HAVE TO BE TRACKED: the archive packer silently reused a STALE
 # archive on 2026-11-03 and shipped one 1480 bytes off the package.  A fix to

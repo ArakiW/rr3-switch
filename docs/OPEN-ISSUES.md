@@ -3058,7 +3058,7 @@ not the same as the content set a device has after the game has run on it.
 **THE MISSING FILES ARE THE ONES THE APP GENERATES, AND ONLY THE DEVICE HAS
 THEM.**
 
-### 9.21 THE MAGENTA FIX THAT ACTUALLY SHIPS: the volumes are built from the ETC pack, not the DXT pack
+### 9.21 THE MAGENTA FIX: THE VOLUMES ARE BUILT FROM TWO PACKS, NOT ONE
 
 **THE ROOT CAUSE, IN ONE LINE:** the guest asks for a texture by SPELLING and
 walks the list `pvr -> etc -> dxt -> atc`, taking the first one that EXISTS.
@@ -3075,45 +3075,62 @@ to dxt -- and Mesa's S3TC decode zeroes the green channel of that texture.
   it renders correctly -- that is what the 82 cars on the card have been doing
   all along.
 
-**THE FIX, AND IT IS A CONTENT FIX, NOT A CODE CHANGE:**
-rebuild the seven volumes from the ETC pack (`ETC_960x640+2048x1536...zip`,
-6.1 GB, in the repository root) with
-`tools/prepare_rr3_external_data.py`, and put them on the card with
-`.build/deploy-etc-volumes.ps1` (one volume at a time -- the card has no room
-for two copies -- with every sha256 checked against the manifest the rebuild
-wrote).
-
-Coverage was compared before the rebuild, because a rebuild that drops assets
-would trade one fault for another:
+**THE FIRST ATTEMPT WAS WRONG, AND IT BROKE THE GAME.**  Rebuilding ALL SEVEN
+volumes from the ETC pack does not work: round `etcv1` reported
+```
+front-end layout opened 0    main menu layouts open 0    EventMapScreen 0
+start lights 0              race screen 0
+```
+against the DXT baseline's 4 / 20 / 193 / 7 / 10.  The packs are NOT
+interchangeable -- the ETC pack carries 12,305 `gui_assets` entries against
+the DXT pack's 12,653, and the front end cannot be built without them:
 ```
 DXT: 50,608 members  gui=2,825  gui_assets=12,653  tracks=12,229  vehicles=17,732
 ETC: 50,168 members  gui=2,825  gui_assets=12,305  tracks=12,233  vehicles=17,679
 ```
-and the ETC pack carries BOTH naming shapes the guest asks for: the single
-`livery/<car>_ext.etc.dds.z` (the DTM cars) and the per-colour
-`livery/<car>_ext_<colour>.etc.dds.z` (the older cars) -- 2,746 livery files.
 
-**MEASURED AFTER THE REBUILD (round `etcv1`, the ETC volumes on the card):**
+**THE FIX THAT WORKS IS A HYBRID:** the four volumes the FRONT END reads
+(`core`, `gui-hd`, `gui-sd`, `tracks`) come from the DXT pack, and the three
+volumes the CARS read (`vehicles-classic`, `vehicles-mid`, `vehicles-modern`)
+come from the ETC pack.  The vehicle volumes carry the car's MESHES as well
+as its textures, and the meshes are the same bytes in both packs -- only the
+texture compression differs -- so swapping the whole volume keeps the
+geometry and changes the format.
+
+`.build/merge-hybrid-volumes.ps1` assembles it (every volume is taken from a
+build that produced it, so the manifest's sha256 is the one that build
+recorded, and the merge re-verifies it) and `.build/deploy-volumes.ps1` puts
+it on the card one file at a time -- the card has no room for two copies --
+with every sha256 checked against the manifest.
+
+**MEASURED ON THE CARD WITH THE HYBRID (round `hybrid1`):**
 ```
-phase=ctex-upload ordinal=1 call=1 level=0 w=512 h=512 size=131072 internal=0x8d64(ETC1_RGB8) err=0x0 recent_fourcc=ETC
-...
-S3TC uploads: 0        ETC1 uploads: 32
+front-end markers: 185 EventMapScreen/main_menu lines   (baseline: 193)
+ctex-upload: 30 x ETC1 (0x8d64, recent_fourcc=ETC)   2 x S3TC
+  the two S3TC uploads are the WATER NORMAL MAP from the card's own loose
+  copy (.depot/Tracks/common/gnd/water/water_world_normal.dxt.dds.z), not a car
 ```
-and 1,521 lines in the same run name an `.etc.dds` asset being served, while the
-frame scan of the round reports `31 frames, 0 with magenta`.
+⇒ **EVERY car texture is uploaded as ETC1 now, so Mesa's broken S3TC decode
+is out of the picture for the cars, and the front end is still the DXT one
+that boots.**  The volumes are also smaller than the ones they replace
+(gui-hd 1,443,906,568 against 1,663,784,980 bytes), so the card gained space.
 
-⇒ **NO texture of the car pipeline goes through Mesa's S3TC decoder any more,
-so the magenta has no path left to come from.**  And the volumes are now
-smaller than the ones they replace (gui-hd 1,443,906,568 against 1,663,784,980
-bytes, and so on), so the card gained space as well.
+**AND THE PORT-SIDE EXPERIMENT IS KEPT, OFF BY DEFAULT:** `swdxt=1` still
+decodes DXT on the CPU (9.19 proved the mechanism and proved that the port
+cannot attribute an upload to the file it served).  It is the tool to use if a
+future pack ships a texture format the GPU cannot decode and there is no
+alternative spelling of it in the pack.
 
-**WHAT IS STILL NOT VISUALLY CONFIRMED:** the round that reproduces the
-magenta is a DTM race, and the four hunt rounds never reached one (their
-frames are all at the 10-pixel billboard floor), so the confirmation so far is
-the MECHANISM -- no S3TC upload is possible any more -- and not a screenshot
-of a DTM rival coming out grey.  The pursuit of that last picture is the same
-problem the hunt ran into: the event the guest picks is not under the port's
-control.
+**THE LESSON THIS COST, TWICE OVER:**
+1. A fix verified in ONE scene is not verified.  The pure-ETC set looked
+   perfect in the upload trace -- 32 ETC1 uploads and no S3TC at all -- and
+   still did not reach the race.  **THE MEASUREMENT THAT MATTERS IS THE ONE
+   THAT ANSWERS THE USER'S QUESTION: DID THE GAME COME UP?**
+2. A card that carries a wrong file is worse than a card that carries none.
+   The same thing happened with the HUD stand-in (9.20): the per-series
+   `LocalStyles.gui` was put on the card as the top-level one, and the guest
+   stopped reaching the race.  It was taken back off.  **AN EXPERIMENT ON THE
+   CARD HAS TO BE REVERTED UNLESS IT IS VERIFIED IN THE GAME IT CHANGES.**
 
 ⇒ **AND THE PORT-SIDE EXPERIMENT IS KEPT, OFF BY DEFAULT:** `swdxt=1` still
 decodes DXT on the CPU (9.19 proved the mechanism and proved that the port

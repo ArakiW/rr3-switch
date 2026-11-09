@@ -1,26 +1,28 @@
-# Put the ETC-built data volumes on the card, one file at a time.
+# Put a prepared set of data volumes on the card, one file at a time.
 #
 # WHY ONE AT A TIME: the card has about 675 MB free and the volumes are 12 GB
 # in total, so the new file cannot exist next to the old one.  Each volume is
 # therefore deleted and then replaced, and the peak usage stays where it was.
-# The old volumes are not backed up: they are reproducible from the DXT pack
-# with tools/prepare_rr3_external_data.py, and keeping a second copy of 12 GB
-# on a card that cannot hold it is not an option.
+# The old volumes are not backed up: they are reproducible from the source
+# packs with tools/prepare_rr3_external_data.py, and keeping a second copy of
+# 12 GB on a card that cannot hold it is not an option.
 #
-# WHY ETC: the guest asks for a texture by SPELLING and walks the list
-# pvr -> etc -> dxt -> atc, taking the first one that exists.  The card's loose
-# .depot has the pvr/etc spellings for the 82 cars it carries, and the
-# volumes were built from the DXT pack, which carries ONLY the dxt spelling.
-# A car the card does not have therefore fell through to dxt, and Mesa's S3TC
-# decode zeroes the green channel of that texture -- which is the magenta
-# (docs/OPEN-ISSUES.md 9.18 and 9.19).  The ETC pack carries the etc spelling
-# for the whole roster, and the etc path is already proven to render correctly
-# (the 82 cars on the card).
+# WHAT THE VOLUMES HAVE TO CONTAIN (measured, see docs/OPEN-ISSUES.md 9.21 and
+# 9.22):
+#   * the volumes the FRONT END reads must come from the DXT pack -- the ETC
+#     pack carries 12,305 gui_assets entries against the DXT pack's 12,653 and
+#     with the ETC pack alone the guest never reaches the race (round etcv1:
+#     EventMapScreen 0, race screen 0, against the DXT baseline's 193 and 10);
+#   * the volumes the CARS read should come from the ETC pack -- the guest
+#     asks for a texture by SPELLING and walks pvr -> etc -> dxt -> atc, so a
+#     car the card does not have falls through to dxt, and Mesa's S3TC decode
+#     zeroes the green channel of that texture, which is the magenta.
+# The hybrid set is assembled by .build/merge-hybrid-volumes.ps1.
 #
 # EVERY FILE IS VERIFIED: the sha256 of each volume is compared with the
-# manifest that the rebuild wrote.
+# manifest that the build wrote.
 param(
-    [string]$Package = 'E:\AI\RealRacing3-switch\dist\rr3-native-rehost-complete-etc',
+    [string]$Package = 'E:\AI\RealRacing3-switch\dist\rr3-native-rehost-complete-hybrid',
     [string]$Card = 'E:\Eden-rr3\user\sdmc\switch\rr3-native-rehost'
 )
 
