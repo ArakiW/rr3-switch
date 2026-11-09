@@ -54,7 +54,15 @@ def main():
                     continue
                 m = re.search(r"\btotal=(\d+)", line)
                 if m:
+                    # `total` is SIGNED.  The guest publishes the car's
+                    # position along the track and it goes NEGATIVE when the
+                    # car drives backwards, so the raw uint32 wraps.  Taking
+                    # the max of the UNSIGNED value makes a wrapped negative
+                    # look like the best result of the round, which is the
+                    # instrument lying for the third time.
                     v = int(m.group(1))
+                    if v >= 0x80000000:
+                        v -= 0x100000000
                     if v > best:
                         best = v
                         f = re.search(r"\bf=(\d+)", line)
