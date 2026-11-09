@@ -1,0 +1,74 @@
+THE PURSUIT GETS THE GEOMETRY RIGHT, AND THE RECOVERY GETS THE WHEEL
+
+MEASURED 2026-11-10 (round chunk2), the causal chain, every link read out of
+the log:
+
+    cchunk = 2.5 to 9.3 m   the chunk picker works
+    dir    = 1, mot = (-1.000, -0.007)
+    perr   = 1.5 to 2.9 rad (86 to 166 degrees), and it STAYS there
+    ctdist = 17 to 25 m     the aim point is the 20 m look-ahead away
+    total  = 71,949 -> 58,507 -> 30,865   the car drives BACKWARDS
+    brk    = 1, steer = -1.000   the recovery brakes AT FULL LOCK
+
+An error of 180 degrees with the target 20 m away is not geometry: the aim
+point is BEHIND the car.  And the port could not escape it:
+
+  * the pursuit OVERRIDES the recovery's steering ("BUT THE PURSUIT WINS"),
+    so the recovery's brake plus the pursuit's full lock is a spin;
+  * the steering-sign flip is INERT while the pursuit is on, because `steer`
+    is `steersign * perr / steergain` and `g_drive.sign` never reaches the
+    wheel -- the `flips` counter counted events that did nothing;
+  * the one mechanism that could invert an aim point that is behind the car
+    was disabled in the source (`if (false && ...)`), and the criterion that
+    used to drive it -- a 120 frame smoothed rate -- is exactly the signal
+    the recovery poisons, because the recovery reverses the car on purpose.
+
+THE FIVE CHANGES, all in the pursuit's own path:
+
+A. THE AIM POINT COMES FROM THE PROJECTION, NOT THE NEAREST NODE, AND ITS
+   LOOK-AHEAD IS NEVER ZERO.  The polyline's nodes are ~8 m apart, so the
+   nearest node can be ~4 m BEHIND the car, and the old code forced the
+   look-ahead to 0 when the car was more than 25 m off the line -- which
+   aimed at the car's own feet.  Now the aim point is the projection on the
+   nearest SEGMENT, plus the look-ahead along the locked direction, and the
+   off-line look-ahead is a real 10 m.
+
+B. THE FLIP CRITERION IS THE CAR'S OWN PROGRESS ALONG THE TRACK, over a
+   window LONGER than the recovery (360 frames against 240), so the
+   recovery's own reverse cannot fake a wrong-way reading.  The direction-lock
+   inversion is RESTORED on that criterion.
+
+C. THE STUCK TEST MEASURES PROGRESS ALONG THE TRACK, not the car's world
+   position, and it ignores the frames the recovery is active.  The old test
+   reset its timer on any 1 m of world movement, so a car grinding along a
+   barrier never read as stuck and the recovery's reverse hid the pin.
+
+D. INSTRUMENTATION: the race-state line gains `along` (the arc-length
+   coordinate), `pdist` (the distance to the line) and `fdelta` (the windowed
+   along-track delta the flip uses), and two event lines, `race-flip` and
+   `race-stuck`, each with a hard budget of 16 lines and a "budget exhausted"
+   line.  The argument order matches the format string: the previous commit
+   put a new argument in the wrong place, the compiler warned, nobody read
+   the warning, and four fields were printed from the wrong arguments for a
+   whole round.
+
+H. THE PURSUIT YIELDS TO THE RECOVERY.  While the recovery is active it owns
+   the wheel, so a brake and a full lock can no longer happen at the same
+   time; and a pursuit that sits at a steady 80+ degree error without
+   advancing along the track is declared a limit cycle and handed to the
+   recovery.  The steering's owner is in the log: `owner=pursuit|recovery|
+   sweep`.
+
+THE HOST SELF-TEST GAINS FOUR CASES WITH TEETH: a car on the line driving
+forward gets an aim point ahead of it and an error under 0.3 rad; a car
+driving backwards gets an aim point ahead ALONG THE TRACK and a large error
+(the geometry reports the wrong way round instead of aiming behind); a car
+30 m off the line gets a non-zero look-ahead and a target at least that far
+away; and the along-track coordinate increases forward and decreases
+backward.
+
+GATE: 40 run, 0 failed, GATE OK.  Build clean, no -Wformat= warning.
+
+NOTE THE FRAME RATE: the port's measured frame time is 30.35 ms, not 60 fps,
+so the 360-frame window is 10.9 s and the 600-frame stuck window is 18.2 s.
+The comments now say so.

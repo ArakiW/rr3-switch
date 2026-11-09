@@ -916,6 +916,117 @@ constexpr unsigned long long kDriveRecoveryFrames = 240ULL;
 // moved again.
 constexpr double kPinnedDistance = 256.0;
 constexpr unsigned long long kPinnedFrames = 1200ULL;
+// FIX B1: Flip criterion along-track window.
+// Must be longer than kDriveRecoveryFrames (240 frames) so the recovery's own 240-frame
+// reverse maneuver cannot dominate the window and fake a wrong-way reading.
+//
+// THE FRAME RATE IS THE PORT'S MEASURED ONE, NOT 60 fps: the comment above
+// kDriveRecoveryFrames measures 30.35 ms a frame, so 360 frames is 10.9 s, not
+// 6.0 s.  That is 1.5x the recovery's 240 frames, leaving at least 120 frames
+// of forward driving in the window during a full recovery.  It is also well
+// inside the 600-frame hysteresis between flips.
+constexpr unsigned long long kFlipWindowFrames = 360ULL;
+
+// FIX B1/B2: Along-track delta threshold for flipping direction.
+// A car driving the wrong way at 10 km/h covers ~30 m backwards in 10.9 s, and
+// one crawling backwards at 2 km/h covers ~6 m.  -5.0 m therefore discriminates
+// genuine backwards travel from barrier grinding jitter (+/- 1-2 m).
+constexpr double kFlipDeltaThresholdMetres = -5.0;
+
+// FIX C1: Pinned/stuck along-track distance and window.
+// A car crawling along a barrier advances along the track; a car pressed against it does not.
+// 2.0 metres is well above barrier jitter while small enough that even slow crawling (0.2 m/s = 0.7 km/h)
+// covers 2 m well inside the window.
+constexpr double kStuckAlongDistanceMetres = 2.0;
+
+// 600 frames = 18.2 s at the port's measured frame time (30.35 ms a frame).
+// If a car with throttle applied cannot advance 2.0 metres along the track in
+// that time, it is stuck against a barrier.
+constexpr unsigned long long kStuckAlongFrames = 600ULL;
+
+struct AlongSample {
+    unsigned long long frame = 0;
+    double along = 0.0;
+    bool valid = false;
+};
+constexpr size_t kAlongRingSize = 512;
+static AlongSample s_alongRing[kAlongRingSize];
+
+static void clearAlongRing() {
+    for (size_t i = 0; i < kAlongRingSize; ++i) {
+        s_alongRing[i].valid = false;
+    }
+}
+
+// FIX D3: Every new diagnostic line must have a HARD BUDGET counted in LINES,
+// and must print one 'budget exhausted' line when the budget runs out.
+static void logFlipEvent(unsigned long long frame, double fdelta, int oldDir, int newDir, int oldSign, int newSign) {
+    constexpr unsigned kMaxFlipDiagLines = 16;
+    static unsigned s_flipDiagLines = 0;
+    if (s_flipDiagLines < kMaxFlipDiagLines) {
+        ++s_flipDiagLines;
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "f=%llu fdelta=%.2f dir=%d->%d sign=%d->%d",
+                      frame, fdelta, oldDir, newDir, oldSign, newSign);
+        appendGuestBootLine(kGuestViewLogPath, "race-flip", 0, 0, buf);
+        if (s_flipDiagLines == kMaxFlipDiagLines) {
+            appendGuestBootLine(kGuestViewLogPath, "race-flip", 0, 0, "budget exhausted (16 lines)");
+        }
+    }
+}
+
+static void logStuckEvent(unsigned long long frame, double along, double delta) {
+    constexpr unsigned kMaxStuckDiagLines = 16;
+    static unsigned s_stuckDiagLines = 0;
+    if (s_stuckDiagLines < kMaxStuckDiagLines) {
+        ++s_stuckDiagLines;
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "f=%llu along=%.2f delta=%.2f note=car_stuck_recovery_triggered",
+                      frame, along, delta);
+        appendGuestBootLine(kGuestViewLogPath, "race-stuck", 0, 0, buf);
+        if (s_stuckDiagLines == kMaxStuckDiagLines) {
+            appendGuestBootLine(kGuestViewLogPath, "race-stuck", 0, 0, "budget exhausted (16 lines)");
+        }
+    }
+}
+
+// FIX H2: Pursuit limit-cycle detection constants.
+//
+// MEASURED 2026-11-10 (round chunk2): the pursuit error sat at 1.5175..1.6406 rad
+// (87 to 94 degrees) while steering was locked at -1.000 for at least 90 frames,
+// orbiting the 18 m look-ahead point without advancing down the track.
+// 1.40 rad (~80.2 degrees) detects when the car is pointed roughly perpendicular
+// to the look-ahead point, far beyond normal line-tracking errors (< 0.5 rad = 28.6 deg).
+constexpr double kLimitCycleErrorRad = 1.40;
+
+// Window of stalled along-track progress before limit cycle gives way to recovery:
+// 240 frames (~7.3 s at 30.35 ms/frame), matching kDriveRecoveryFrames and the progress stall window.
+// If pursuit error remains above 1.40 rad for 240 frames without advancing
+// kStuckAlongDistanceMetres (2.0 m) along the track, pursuit yields to recovery.
+constexpr unsigned long long kLimitCycleFrames = 240ULL;
+
+static double s_lastAlong = 0.0;
+static unsigned long long s_alongMoveFrame = 0;
+static bool s_haveAlong = false;
+static double s_headingX = 0.0;
+static double s_headingY = 0.0;
+static bool s_haveHeading = false;
+
+// FIX H5: Limit-cycle diagnostic line with a hard budget counted in lines.
+static void logLimitCycleEvent(unsigned long long frame, double perr, double along) {
+    constexpr unsigned kMaxLimitCycleDiagLines = 16;
+    static unsigned s_limitCycleDiagLines = 0;
+    if (s_limitCycleDiagLines < kMaxLimitCycleDiagLines) {
+        ++s_limitCycleDiagLines;
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "f=%llu perr=%.4f along=%.2f note=pursuit_limit_cycle_recovery_triggered",
+                      frame, perr, along);
+        appendGuestBootLine(kGuestViewLogPath, "race-limitcycle", 0, 0, buf);
+        if (s_limitCycleDiagLines == kMaxLimitCycleDiagLines) {
+            appendGuestBootLine(kGuestViewLogPath, "race-limitcycle", 0, 0, "budget exhausted (16 lines)");
+        }
+    }
+}
 uint32_t g_lastTotalLaps = 0xFFFFFFFFu;
 unsigned long long g_brakeUntilFrame = 0;
 unsigned long long g_lastFlipFrame = 0;
@@ -1143,6 +1254,10 @@ struct RaceLineState {
     uint32_t generation = 0;
     uint64_t lastFitFrame = 0;
     bool fitted = false;
+    double loopLength = 0.0;
+    double alongTrack = 0.0;
+    double projDistance = 0.0;
+    bool haveProjection = false;
     rr3::RaceLine line{};
 };
 
@@ -1405,6 +1520,9 @@ void fillCarState(RaceMetricsSample* out) {
                     out->chunkForTarget = haveCurrent ? currentMetres : -1.0f;
                 }
             }
+            double alongTrack = 0.0;
+            double projDistance = 0.0;
+            double loopLength = 0.0;
             if (rr3::raceLineTargetAdaptive(lineForTarget, *spline,
                                     static_cast<double>(out->carX),
                                     static_cast<double>(out->carY),
@@ -1424,13 +1542,21 @@ void fillCarState(RaceMetricsSample* out) {
                                     &gRaceLine.direction,
                                     &targetX, &targetY, &lookAheadUsed,
                                     raceLineLookAheadAdaptive(),
-                                    kRaceLineLookAheadMetres)) {
+                                    kRaceLineLookAheadMetres,
+                                    nullptr, nullptr,
+                                    &alongTrack, &projDistance, &loopLength)) {
                 out->carTargetX = static_cast<int32_t>(targetX);
                 out->carTargetY = static_cast<int32_t>(targetY);
                 out->carTargetZ = out->carZ;
                 out->targetFromLine = true;
                 out->lineResidual = gRaceLine.line.residual;
                 out->lookAheadMetres = static_cast<float>(lookAheadUsed);
+                out->alongTrack = alongTrack;
+                out->projDistance = projDistance;
+                gRaceLine.alongTrack = alongTrack;
+                gRaceLine.projDistance = projDistance;
+                gRaceLine.loopLength = loopLength;
+                gRaceLine.haveProjection = true;
                 // THE CAR'S DISTANCE FROM THE RACING LINE.
                 //
                 // The port follows the CENTRE line, and the track's own racing
@@ -2324,12 +2450,14 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
         g_drive.steer = 0.0f;
         g_drive.brake = false;
         g_drive.throttle = true;
+        g_drive.owner = "disabled";
         return;
     }
     if (sample.activeIndex < 0) {
         g_drive.steer = 0.0f;
         g_drive.brake = false;
         g_drive.throttle = true;
+        g_drive.owner = "disabled";
         return;
     }
     const RaceMetricsSample& m = sample.metrics[sample.activeIndex];
@@ -2407,107 +2535,112 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
     // change either, because the guest holds the car at the grid.  So the
     // pinned test also requires that the car has ALREADY made progress in
     // this race: a car that has never moved is being HELD, not stuck.
+    // FIX B1: Continuous windowed along-track delta over kFlipWindowFrames (360).
+    double fdelta = 0.0;
+    if (m.targetFromLine && gRaceLine.loopLength > 0.0) {
+        s_alongRing[frame % kAlongRingSize] = { frame, m.alongTrack, true };
+        const size_t oldIdx = (frame >= kFlipWindowFrames) ? ((frame - kFlipWindowFrames) % kAlongRingSize) : 0;
+        const AlongSample& old = s_alongRing[oldIdx];
+        if (old.valid && frame >= old.frame + kFlipWindowFrames && frame <= old.frame + kFlipWindowFrames + 60ULL) {
+            const double rawDelta = rr3::raceLineArcDelta(m.alongTrack, old.along, gRaceLine.loopLength);
+            fdelta = rawDelta * (gRaceLine.direction < 0 ? -1.0 : 1.0);
+        }
+    }
+    g_drive.flipDelta = static_cast<float>(fdelta);
+
+    // FIX C1: Pinned/stuck discriminator based on progress along the track (m.alongTrack),
+    // not world position. A car crawling along a barrier advances along the track; a car
+    // pressed against it does not.
     bool pinned = false;
     {
-        static double s_posX = 0.0;
-        static double s_posY = 0.0;
-        static unsigned long long s_posMoveFrame = 0;
-        static bool s_havePos = false;
-        const double px = static_cast<double>(m.carX);
-        const double py = static_cast<double>(m.carY);
-        if (!s_havePos) {
-            s_posX = px;
-            s_posY = py;
-            s_posMoveFrame = frame;
-            s_havePos = true;
+        if (g_drive.brake) {
+            // FIX C3: Ignore recovery frames. The recovery reverses the car on purpose,
+            // moving the along-track coordinate backwards. Reset the anchor frame during
+            // recovery so recovery reversals cannot trigger or hide a pin, giving a clean
+            // kStuckAlongFrames window after recovery finishes.
+            s_alongMoveFrame = frame;
+            if (m.targetFromLine) {
+                s_lastAlong = m.alongTrack;
+            }
+        } else if (m.targetFromLine && gRaceLine.loopLength > 0.0) {
+            if (!s_haveAlong) {
+                s_lastAlong = m.alongTrack;
+                s_alongMoveFrame = frame;
+                s_haveAlong = true;
+            } else {
+                const double delta = rr3::raceLineArcDelta(m.alongTrack, s_lastAlong, gRaceLine.loopLength) *
+                                     (gRaceLine.direction < 0 ? -1.0 : 1.0);
+                if (delta >= kStuckAlongDistanceMetres) {
+                    s_lastAlong = m.alongTrack;
+                    s_alongMoveFrame = frame;
+                }
+            }
+            // FIX C2: Preserve g_sawProgress: a car held at grid by start sequence is not stuck.
+            pinned = g_sawProgress && (frame - s_alongMoveFrame > kStuckAlongFrames);
+            if (pinned) {
+                logStuckEvent(frame, m.alongTrack, m.alongTrack - s_lastAlong);
+            }
         } else {
-            const double dx = px - s_posX;
-            const double dy = py - s_posY;
-            if (dx * dx + dy * dy >= kPinnedDistance * kPinnedDistance) {
+            // Fallback before racing line is fitted: world position check
+            static double s_posX = 0.0;
+            static double s_posY = 0.0;
+            static unsigned long long s_posMoveFrame = 0;
+            static bool s_havePos = false;
+            const double px = static_cast<double>(m.carX);
+            const double py = static_cast<double>(m.carY);
+            if (!s_havePos) {
                 s_posX = px;
                 s_posY = py;
                 s_posMoveFrame = frame;
+                s_havePos = true;
+            } else {
+                const double dx = px - s_posX;
+                const double dy = py - s_posY;
+                if (dx * dx + dy * dy >= kPinnedDistance * kPinnedDistance) {
+                    s_posX = px;
+                    s_posY = py;
+                    s_posMoveFrame = frame;
+                }
             }
+            pinned = g_sawProgress && frame - s_posMoveFrame > kPinnedFrames;
         }
-        pinned = g_sawProgress && frame - s_posMoveFrame > kPinnedFrames;
     }
     const bool onLine = m.targetFromLine && m.lineResidual > 0.0f &&
                         m.lineResidual < 3.0f;
-    if (g_lastProgressFrame != 0 && (!onLine || pinned) &&
-        frame - g_lastProgressFrame > 240ULL) {
+    const bool progressStall = (g_lastProgressFrame != 0 && !onLine &&
+                                frame - g_lastProgressFrame > 240ULL);
+    const bool pinnedStall = pinned;
+    if (progressStall || pinnedStall) {
         ++g_drive.stalls;
         g_drive.bestRate = 0.0f;
         g_lastProgressFrame = frame;
+        s_alongMoveFrame = frame;
         g_brakeUntilFrame = frame + kDriveRecoveryFrames;
     }
     g_drive.brake = (g_brakeUntilFrame != 0 && frame <= g_brakeUntilFrame);
     g_drive.throttle = !g_drive.brake;
 
-    // A negative rate means the wrong way round: flip. The rate is a
-    // 120-frame window, so the flip needs a HYSTERESIS: without one the
-    // loop would flip on every window and oscillate.
-    //
-    // A TINY NEGATIVE RATE IS NOT "THE WRONG WAY ROUND".  A car grinding
-    // against a barrier jitters the telemetry by a unit or two, and the
-    // threshold here was -0.0001, so the port read that jitter as "the car
-    // is going backwards" and flipped the direction AROUND THE TRACK.
-    // Measured 2026-10-28: 24 sign flips in one race, while the car sat
-    // still -- the autopilot was steering a car that was not moving, in
-    // both directions in turn.
-    //
-    // AND THE RECOVERY IS NOT "GOING THE WRONG WAY" EITHER.  The recovery
-    // reverses the car ON PURPOSE, so the distance falls and the rate goes
-    // negative -- that is the recovery working.  Measured 2026-10-28: the
-    // recovery reversed the car 30 m back down the track, that negative rate
-    // flipped the sign, and the controller then drove the wrong way round
-    // the circuit for the rest of the race (the distance fell from 125,357
-    // to 103,119 and the stall counter ran to 8).
-    if (rate < -0.0001 && !g_drive.brake &&
+    // FIX B1/B2/B3/B4: Base flip criterion on windowed along-track delta (fdelta)
+    // instead of the smoothed rate.
+    // Window length kFlipWindowFrames (360) is longer than kDriveRecoveryFrames (240).
+    // The !g_drive.brake guard and 600-frame hysteresis are preserved.
+    // The direction-lock inversion is RESTORED (FIX B3).
+    if (fdelta < kFlipDeltaThresholdMetres && !g_drive.brake &&
         frame >= g_lastFlipFrame + 600ULL) {
+        const int oldDir = gRaceLine.direction;
+        const int oldSign = g_drive.sign;
         g_drive.sign = -g_drive.sign;
-        // THE EXPERIMENT (2026-11-09, after the four-cell A/B): the lock
-        // inversion is DISABLED, because the A/B says it is the regression.
-        //
-        // MEASURED 2026-11-09, the four cells of the pursuit A/B, all on the
-        // same build and the same card:
-        //
-        //     fixed + centre line   69,367 units = 3.84 % of a lap
-        //     adaptive + centre     58,110 units = 3.22 %
-        //     fixed + racing line   57,091 units = 3.16 %
-        //     adaptive + racing line 74,016 units = 4.10 %
-        //     q145 (2026-11-04)    186,921 units = 10.35 %
-        //
-        // The first cell has the SAME configuration as q145 -- centre line,
-        // constant 20 m -- and the only differences between the two rounds
-        // are the changes made on 2026-11-09.  It is 2.7 times WORSE, and
-        // the car's progress rate at the end of it is 2.76 units a frame
-        // against q145's 23.88, with the steering pinned at FULL LOCK
-        // (steer=1.000) for the last samples.  A pursuit that is saturated
-        // at full lock is not tracking the line.
-        //
-        // ⇒ THE FLIP'S OWN CRITERION IS STALE.  The rate is a 120 frame
-        // window, and the RECOVERY REVERSES THE CAR ON PURPOSE -- the
-        // comment above says so -- so the recovery's own reverse drives the
-        // rate negative.  The flip can therefore fire on the recovery's
-        // signal, and inverting the LOCK on that signal puts the look-ahead
-        // point on the wrong side of the car, which is the one thing the
-        // lock exists to prevent.
-        //
-        // ⇒ SO THE INVERSION IS OFF until the criterion is measured
-        // properly, and the flip keeps doing what it always did: flip the
-        // steering sign.  The pursuit's distance is the thing to protect;
-        // the lock is a hypothesis about which way round the track is.
-        //
-        // TO RESTORE IT, the criterion has to be the car's own progress
-        // along the track (the guest's signed `total`), not a smoothed rate
-        // that the recovery can poison.
-        if (false && gRaceLine.direction != 0) {
+        // FIX B3: RESTORE the direction-lock inversion, driven by the SAME along-track criterion.
+        if (gRaceLine.direction != 0) {
             gRaceLine.direction = -gRaceLine.direction;
         }
         g_lastFlipFrame = frame;
         ++g_drive.flips;
         g_drive.bestRate = 0.0f;
         g_smoothedRate = 0.0;
+        clearAlongRing();
+        s_haveAlong = false;
+        logFlipEvent(frame, fdelta, oldDir, gRaceLine.direction, oldSign, g_drive.sign);
     }
 
     // THE MAGNITUDE SWEEP.
@@ -2606,9 +2739,6 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
         //
         // So the last heading is KEPT: a car that is stopped has not changed
         // its heading, and the pursuit can steer it off the spot.
-        static double s_headingX = 0.0;
-        static double s_headingY = 0.0;
-        static bool s_haveHeading = false;
         const double px = static_cast<double>(m.carX) / 256.0;
         const double py = static_cast<double>(m.carY) / 256.0;
         const double tx = static_cast<double>(m.carTargetX) / 256.0;
@@ -2629,30 +2759,21 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
             // is a steering command derived from noise.  With the gate the
             // pursuit stays OFF (pur=0) instead of turning the car at
             // random.
-            if (hLen > 0.05 && !g_drive.brake) {
-                // THE HEADING IS NOT UPDATED WHILE THE CAR IS REVERSING.
-                //
-                // The heading is the direction of TRAVEL, and the recovery
-                // deliberately drives the car BACKWARDS -- so a heading taken
-                // from a reversing car points behind the car, the target is
-                // ahead of it, and the pursuit's error becomes about 180
-                // degrees.  The port then steers at FULL LOCK in the wrong
-                // direction and the car reverses further, and the loop never
-                // ends.
-                //
-                // MEASURED 2026-11-02 (q116): the pursuit was ON in 93 of 164
-                // samples for the first time, and the error it computed was
-                // 2.2562 rad -- 129 degrees -- while the car was 1.38 m from
-                // the fitted line and the look-ahead point was 4.4 m ahead of
-                // it.  A car 1.38 m off the line does not need 129 degrees of
-                // correction; it needs a heading that is not pointing
-                // backwards.
-                //
-                // So the last FORWARD heading is kept while the recovery
-                // reverses the car, and the pursuit can steer it back.
-                s_headingX = hx / hLen;
-                s_headingY = hy / hLen;
-                s_haveHeading = true;
+            if (g_drive.brake) {
+                // H1 & H3: While the recovery reverses off the barrier, invalidate the heading.
+                // The car's physical heading rotates as it reverses with the recovery angle.
+                // Keeping the pre-recovery heading causes pursuit to resume at 90-degree error,
+                // which cuts throttle via |steerError| > 1.5 and deadlocks the car.
+                s_haveHeading = false;
+            } else if (hLen > 0.05 && dLen > 0.05) {
+                // Ensure the motion has a forward component toward the lookahead target,
+                // preventing any backwards slide or coast from corrupting the forward heading.
+                const double fwdDot = (hx * dx + hy * dy) / (hLen * dLen);
+                if (fwdDot > 0.0) {
+                    s_headingX = hx / hLen;
+                    s_headingY = hy / hLen;
+                    s_haveHeading = true;
+                }
             }
             if (s_haveHeading && dLen > 0.05 && m.targetPlausible) {
                 const double ax = s_headingX;
@@ -2672,34 +2793,44 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
     g_drive.steerError = static_cast<float>(steerError);
     g_drive.pursuit = pursuit;
 
-    g_drive.steer = static_cast<float>(g_drive.sign) * g_drive.magnitude;
-    // WHILE REVERSING, HOLD A DECISIVE ANGLE THE OTHER WAY.  The car has
-    // to come off the barrier pointing back down the track, and the swept
-    // magnitude the servo is still hunting for is not a recovery angle.
-    //
-    // BUT THE PURSUIT WINS.  MEASURED 2026-11-02 (q114): the pursuit was ON
-    // in 0 of 228 samples, so every steering value in that round was this
-    // recovery's full lock -- the pursuit never got a say.  Now that the
-    // heading is kept while the car is standing still, the pursuit CAN steer
-    // a stuck car, and its target is on the racing line, so its direction is
-    // the right one.  The recovery keeps the BRAKE (the guest reverses) and
-    // the pursuit keeps the WHEEL.
-    if (pursuit) {
-        // THE AXIS SIGN.  `steersign` is the pursuit's axis sign -- "a
-        // POSITIVE axis steers RIGHT" (MEASURED: lx=+0.6 at the launch
-        // ended up on the right runoff, .build/rr3-pad-mirror.txt) -- and
-        // the port's world frame has its Y NEGATED (the guest's converter at
-        // 0xf05600), so the handedness of the pursuit's error is NOT the
-        // handedness of the guest's steering axis.  The key existed and was
-        // never applied, because the pursuit had never run: the guest's own
-        // aim target was garbage, so the pursuit was always OFF.
-        //
-        // `sign` is a DIFFERENT key: it is the SWEEP's starting direction,
-        // not the pursuit's axis sign.
+    // H2: The pursuit must not be able to sit at a steady 90 degree error forever.
+    // A pure pursuit at a large error is a limit cycle: the car turns at full lock
+    // around the aim point and the error never falls. If the car is not making progress
+    // along the track, the pursuit has to give way to the recovery.
+    // The along-track progress signal is the same one the stall test uses.
+    const bool limitCycle = g_sawProgress && m.targetFromLine && pursuit && !g_drive.brake &&
+                            (std::fabs(steerError) > kLimitCycleErrorRad) &&
+                            (s_haveAlong && frame >= s_alongMoveFrame + kLimitCycleFrames);
+    if (limitCycle) {
+        ++g_drive.stalls;
+        g_drive.bestRate = 0.0f;
+        g_lastProgressFrame = frame;
+        s_alongMoveFrame = frame;
+        g_brakeUntilFrame = frame + kDriveRecoveryFrames;
+        g_drive.brake = true;
+        g_drive.throttle = false;
+        s_haveHeading = false;
+        logLimitCycleEvent(frame, steerError, m.alongTrack);
+    }
+
+    // H1 & H3: The pursuit and the recovery must not both be at full lock.
+    // While the recovery is active (g_drive.brake), the recovery's decisive angle wins:
+    // the pursuit's steering must not be able to hold the car at full lock with the brake on.
+    // MEASURED 2026-11-10 (round chunk2): pursuit commanded full lock (steer=-1.000)
+    // while recovery braked (brk=1), producing a spin and limit cycle (stalls=5).
+    // In reverse, pure pursuit aiming 20 m ahead down the track is topologically invalid.
+    // The recovery holds the decisive angle the other way (-sign * kDriveRecoveryMagnitude)
+    // so reversing backs the car off the barrier and points it down the track.
+    if (g_drive.brake) {
+        g_drive.steer = -static_cast<float>(g_drive.sign) * kDriveRecoveryMagnitude;
+        g_drive.owner = "recovery";
+    } else if (pursuit) {
         g_drive.steer = static_cast<float>(g_driveConfig.steerSign) *
                         static_cast<float>(steerError / g_driveConfig.steerGain);
-    } else if (g_drive.brake) {
-        g_drive.steer = -static_cast<float>(g_drive.sign) * kDriveRecoveryMagnitude;
+        g_drive.owner = "pursuit";
+    } else {
+        g_drive.steer = static_cast<float>(g_drive.sign) * g_drive.magnitude;
+        g_drive.owner = "sweep";
     }
     if (g_drive.steer > 1.0f) {
         g_drive.steer = 1.0f;
@@ -2728,7 +2859,7 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
     // brake stays off: the guest reverses only when the brake is held AND
     // the throttle is let go, and a car that reverses here is the loop this
     // whole thing is about.
-    if (pursuit && std::fabs(steerError) > 1.5) {
+    if (pursuit && !g_drive.brake && std::fabs(steerError) > 1.5) {
         g_drive.throttle = false;
     }
 }
@@ -2766,7 +2897,7 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             "gm_base=%d gm_cand=%d cand=%s metrics=%d "
             "active=-1 nodes=%d keyoff=%d heap=0x%llx+0x%llx "
             "rej=%s rejm=0x%x rejlapd=%u "
-            "drive=%d cfg=%d rl=%s lam=%s dir=%d",
+            "drive=%d cfg=%d rl=%s lam=%s dir=%d owner=%s",
             frame, static_cast<unsigned long long>(g_cglobal),
             static_cast<unsigned long long>(sample.gameMode),
             sample.gameModeFound ? 1 : 0,
@@ -2789,7 +2920,8 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             // to carry it, or the measurement cannot be attributed.
             raceLineChunk(),
             raceLineLookAheadMode(),
-            gRaceLine.direction);
+            gRaceLine.direction,
+            g_drive.owner != nullptr ? g_drive.owner : "none");
     } else {
         const RaceMetricsSample& m = sample.metrics[active];
         std::snprintf(
@@ -2808,10 +2940,10 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             "car=0x%llx cnum=%u cnode=%u cprev=%u cpos=%d,%d,%d ctgt=%d,%d,%d "
             "snode=%u sdist=%u tsok=%d posok=%d ctok=%d ctdist=%.2f "
             "line=%d lres=%.2f rres=%.2f la=%.2f lachunk=%s lam=%s dir=%d mot=%.3f,%.3f "
-            "cchunk=%.2f "
+            "cchunk=%.2f along=%.2f pdist=%.2f fdelta=%.2f "
             "perr=%.4f pur=%d ident=0x%llx "
             "drive=%d steer=%.3f mag=%.3f sign=%d best=%.6f flips=%d stalls=%d "
-            "thr=%d brk=%d",
+            "thr=%d brk=%d owner=%s",
             frame, static_cast<unsigned long long>(g_cglobal),
             static_cast<unsigned long long>(sample.gameMode),
             sample.gameModeFound ? 1 : 0,
@@ -2889,12 +3021,16 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             // (13,215 m measured on 2026-11-10), and it is what the chunk
             // picker has to keep small.
             static_cast<double>(m.chunkForTarget),
+            static_cast<double>(m.alongTrack),
+            static_cast<double>(m.projDistance),
+            static_cast<double>(g_drive.flipDelta),
             static_cast<double>(g_drive.steerError), g_drive.pursuit ? 1 : 0,
             static_cast<unsigned long long>(m.membersIdentified),
             g_drive.enabled ? 1 : 0, static_cast<double>(g_drive.steer),
             static_cast<double>(g_drive.magnitude), g_drive.sign,
             static_cast<double>(g_drive.bestRate), g_drive.flips, g_drive.stalls,
-            g_drive.throttle ? 1 : 0, g_drive.brake ? 1 : 0);
+            g_drive.throttle ? 1 : 0, g_drive.brake ? 1 : 0,
+            g_drive.owner != nullptr ? g_drive.owner : "none");
     }
     appendGuestBootLine(kGuestViewLogPath, "race-state", 100, 0, detail);
     logGameModeSlots(frame);

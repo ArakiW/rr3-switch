@@ -2,6 +2,7 @@
 // evidence and the guard are in include/rr3/race_line.hpp.
 #include "rr3/race_line.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -612,24 +613,132 @@ double curvatureLookAheadMetres(const std::vector<Point>& poly, size_t nearest,
     return kMaxLookAheadMetres;
 }
 
+struct PolylineInfo {
+    std::vector<Point> poly;
+    std::vector<double> segLen;  // metres
+    std::vector<double> cumLen;  // metres, size = poly.size() + 1
+    double loopLength = 0.0;     // metres
+};
+
+void buildPolylineInfo(const RaceLine& line, const SplineChunk& chunk,
+                       PolylineInfo* info) {
+    buildChunkPolyline(line, chunk, &info->poly);
+    const size_t count = info->poly.size();
+    info->segLen.resize(count, 0.0);
+    info->cumLen.resize(count + 1, 0.0);
+    double total = 0.0;
+    for (size_t i = 0; i < count; ++i) {
+        const Point& a = info->poly[i];
+        const Point& b = info->poly[(i + 1) % count];
+        const double dx = b.x - a.x;
+        const double dy = b.y - a.y;
+        const double len = std::sqrt(dx * dx + dy * dy) / 256.0;
+        info->segLen[i] = len;
+        total += len;
+        info->cumLen[i + 1] = total;
+    }
+    info->loopLength = total;
+}
+
+double projectOntoPolyline(const PolylineInfo& info, double carX, double carY,
+                           double* projX, double* projY,
+                           double* arcMetres, size_t* nearestNode) {
+    const size_t count = info.poly.size();
+    if (count == 0) return 1e30;
+
+    double bestDist2 = 1e30;
+    size_t bestSeg = 0;
+    double bestT = 0.0;
+    double bestQx = 0.0;
+    double bestQy = 0.0;
+
+    for (size_t i = 0; i < count; ++i) {
+        const Point& a = info.poly[i];
+        const Point& b = info.poly[(i + 1) % count];
+        const double dx = b.x - a.x;
+        const double dy = b.y - a.y;
+        const double len2 = dx * dx + dy * dy;
+        if (len2 <= 0.0) continue;
+
+        double t = ((carX - a.x) * dx + (carY - a.y) * dy) / len2;
+        if (t < 0.0) t = 0.0;
+        if (t > 1.0) t = 1.0;
+
+        const double qx = a.x + t * dx;
+        const double qy = a.y + t * dy;
+        const double d2 = (carX - qx) * (carX - qx) + (carY - qy) * (carY - qy);
+        if (d2 < bestDist2) {
+            bestDist2 = d2;
+            bestSeg = i;
+            bestT = t;
+            bestQx = qx;
+            bestQy = qy;
+        }
+    }
+
+    if (projX != nullptr) *projX = bestQx;
+    if (projY != nullptr) *projY = bestQy;
+    if (arcMetres != nullptr) {
+        double arc = info.cumLen[bestSeg] + bestT * info.segLen[bestSeg];
+        if (info.loopLength > 0.0) {
+            while (arc >= info.loopLength) arc -= info.loopLength;
+            while (arc < 0.0) arc += info.loopLength;
+        }
+        *arcMetres = arc;
+    }
+    if (nearestNode != nullptr) {
+        *nearestNode = (bestT <= 0.5) ? bestSeg : ((bestSeg + 1) % count);
+    }
+    return std::sqrt(bestDist2) / 256.0;
+}
+
+void pointAtArcLength(const PolylineInfo& info, double targetArc,
+                      double* targetX, double* targetY) {
+    const size_t count = info.poly.size();
+    if (count == 0 || targetX == nullptr || targetY == nullptr) return;
+
+    if (info.loopLength > 0.0) {
+        while (targetArc >= info.loopLength) targetArc -= info.loopLength;
+        while (targetArc < 0.0) targetArc += info.loopLength;
+    }
+
+    auto it = std::upper_bound(info.cumLen.begin() + 1, info.cumLen.end(), targetArc);
+    size_t seg = 0;
+    if (it != info.cumLen.end()) {
+        seg = static_cast<size_t>(std::distance(info.cumLen.begin(), it) - 1);
+        if (seg >= count) seg = count - 1;
+    } else {
+        seg = count - 1;
+    }
+
+    const double segL = info.segLen[seg];
+    const double rem = targetArc - info.cumLen[seg];
+    double t = (segL > 0.0) ? (rem / segL) : 0.0;
+    if (t < 0.0) t = 0.0;
+    if (t > 1.0) t = 1.0;
+
+    const Point& a = info.poly[seg];
+    const Point& b = info.poly[(seg + 1) % count];
+    *targetX = a.x + t * (b.x - a.x);
+    *targetY = a.y + t * (b.y - a.y);
+}
+
 // THE TARGET, WITH A CURVATURE-ADAPTIVE LOOK-AHEAD.
 //
-// This is raceLineTarget() with one difference: the look-ahead distance is
-// not a constant but is computed from the curvature of the road AHEAD.  The
-// direction lock, the nearest-node search and the 25 m "the car has to be
-// ON the line" guard are all exactly as they were -- they are the parts
-// that were MEASURED to be right, and they are not being touched.
-//
-// The curvature is computed on the SAME polyline and in the SAME direction
-// as the target, so the two cannot disagree about which way the car is
-// going.
+// FIX A: The aim point comes from the car's projection onto the nearest
+// segment, not the nearest node, and its look-ahead is never zero.
 bool raceLineTargetAdaptive(const RaceLine& line, const SplineFile& spline,
                             double carX, double carY, double headingX, double headingY,
                             int* direction,
                             double* targetX, double* targetY,
                             double* lookAheadMetres,
                             bool adaptiveLookAhead,
-                            double fixedLookAheadMetres) {
+                            double fixedLookAheadMetres,
+                            double* projX,
+                            double* projY,
+                            double* arcMetres,
+                            double* distanceMetres,
+                            double* loopLengthMetres) {
     if (!line.valid || targetX == nullptr || targetY == nullptr) {
         return false;
     }
@@ -637,59 +746,38 @@ bool raceLineTargetAdaptive(const RaceLine& line, const SplineFile& spline,
     if (chunk == nullptr || chunk->nodes.size() < 8) {
         return false;
     }
-    std::vector<Point> poly;
-    buildChunkPolyline(line, *chunk, &poly);
-
-    size_t nearest = 0;
-    double nearestDistance = 1e30;
-    for (size_t i = 0; i < poly.size(); ++i) {
-        const double dx = poly[i].x - carX;
-        const double dy = poly[i].y - carY;
-        const double d = dx * dx + dy * dy;
-        if (d < nearestDistance) {
-            nearestDistance = d;
-            nearest = i;
-        }
-    }
-    const double distanceMetres = std::sqrt(nearestDistance) / 256.0;
-    // A CAR FAR OFF THE LINE IS NOT A CAR ON ANOTHER TRACK -- IT IS A CAR
-    // THAT HAS TO COME BACK.
-    //
-    // MEASURED 2026-11-10 (round hybrid1, 223 race-state samples): with the
-    // old 25 m guard the port gave up on the line exactly when the car needed
-    // it most.  The guest's own aim target then stayed in the sample, and the
-    // guest's target is garbage when the car is off the racing line -- the
-    // measured distances were 13,076 m, 19,059 m and 47,014 m -- so the
-    // pursuit switched itself OFF (pur=0) and the recovery took the wheel with
-    // a full lock.  The car spun and stalled instead of coming back: flips=9,
-    // stalls=7, and the lap progress stopped at 89,623 units (3.0 %) against
-    // the 186,921 (10.35 %) of the reference round.
-    //
-    // So: the line is still used, and when the car is far off it the TARGET
-    // IS THE NEAREST POINT ON THE LINE (a look-ahead of zero), which is the
-    // direction back onto the track.  Aiming at a point further along the line
-    // would be aiming at a place the car cannot see from there.
-    //
-    // The hard limit is still there, and it is much larger: a car that is more
-    // than kFarFromLineLimitMetres from the line is not on this track's line
-    // at all, and aiming at it would be aiming at noise.
-    const bool farFromLine = distanceMetres > kOnLineDistanceMetres;
-    if (farFromLine && distanceMetres > kFarFromLineLimitMetres) {
+    PolylineInfo info;
+    buildPolylineInfo(line, *chunk, &info);
+    if (info.poly.size() < 8 || info.loopLength <= 0.0) {
         return false;
     }
 
-    // THE DIRECTION, LOCKED ONCE -- unchanged from raceLineTarget().
+    // FIX A1: Projection onto the nearest segment, and arc-length coordinate in node order.
+    double px = 0.0;
+    double py = 0.0;
+    double arc = 0.0;
+    size_t nearestNode = 0;
+    const double pdist = projectOntoPolyline(info, carX, carY, &px, &py, &arc, &nearestNode);
+
+    // Hard limit: above kFarFromLineLimitMetres (250 m), line is refused.
+    if (pdist > kFarFromLineLimitMetres) {
+        return false;
+    }
+
+    const bool farFromLine = (pdist > kOnLineDistanceMetres);
+
+    // THE DIRECTION, LOCKED ONCE.
     int step = 1;
     if (direction != nullptr && *direction != 0) {
         step = (*direction > 0) ? 1 : -1;
     } else if (headingX != 0.0 || headingY != 0.0) {
-        const size_t count = poly.size();
-        const size_t next = (nearest + 1) % count;
-        const size_t prev = (nearest + count - 1) % count;
-        const double fx = poly[next].x - poly[nearest].x;
-        const double fy = poly[next].y - poly[nearest].y;
-        const double bx = poly[prev].x - poly[nearest].x;
-        const double by = poly[prev].y - poly[nearest].y;
+        const size_t count = info.poly.size();
+        const size_t next = (nearestNode + 1) % count;
+        const size_t prev = (nearestNode + count - 1) % count;
+        const double fx = info.poly[next].x - info.poly[nearestNode].x;
+        const double fy = info.poly[next].y - info.poly[nearestNode].y;
+        const double bx = info.poly[prev].x - info.poly[nearestNode].x;
+        const double by = info.poly[prev].y - info.poly[nearestNode].y;
         const double forward = fx * headingX + fy * headingY;
         const double backward = bx * headingX + by * headingY;
         if (backward > forward) {
@@ -700,43 +788,93 @@ bool raceLineTargetAdaptive(const RaceLine& line, const SplineFile& spline,
         }
     }
 
-    // THE LOOK-AHEAD: from the curvature ahead, or the constant.
-    //
-    // The fixed branch is EXACTLY what raceLineTarget() did, so the "fixed"
-    // mode is the old behaviour and not an approximation of it.
-    //
-    // AND FOR A CAR THAT IS FAR OFF THE LINE THE LOOK-AHEAD IS ZERO, so the
-    // target IS THE NEAREST POINT ON THE LINE: the car is pointed back onto
-    // the track instead of at a point further along it that it cannot see.
+    // FIX A2: The look-ahead is a fixed moderate value when far from line, NOT zero.
     const double lookAhead = farFromLine
-                                 ? 0.0
+                                 ? kFarLookAheadMetres
                                  : (adaptiveLookAhead
-                                        ? curvatureLookAheadMetres(poly, nearest, step)
+                                        ? curvatureLookAheadMetres(info.poly, nearestNode, step)
                                         : fixedLookAheadMetres);
     if (lookAheadMetres != nullptr) {
         *lookAheadMetres = lookAhead;
     }
 
-    double travelled = 0.0;
-    size_t index = nearest;
-    const size_t count = poly.size();
-    for (size_t guard = 0; guard < count; ++guard) {
-        const size_t next = (step > 0) ? ((index + 1) % count)
-                                       : ((index + count - 1) % count);
-        const double dx = poly[next].x - poly[index].x;
-        const double dy = poly[next].y - poly[index].y;
-        const double segment = std::sqrt(dx * dx + dy * dy) / 256.0;
-        if (travelled + segment >= lookAhead) {
-            const double remaining = lookAhead - travelled;
-            const double t = segment > 0.0 ? remaining / segment : 0.0;
-            *targetX = poly[index].x + (poly[next].x - poly[index].x) * t;
-            *targetY = poly[index].y + (poly[next].y - poly[index].y) * t;
-            return true;
-        }
-        travelled += segment;
-        index = next;
+    // FIX A2: Aim point at (projection arc coordinate + lookAhead) along locked direction.
+    const double targetArc = (step > 0) ? (arc + lookAhead) : (arc - lookAhead);
+    pointAtArcLength(info, targetArc, targetX, targetY);
+
+    // FIX A3: Expose projection, arc coordinate, distance and loop length through API.
+    if (projX != nullptr) *projX = px;
+    if (projY != nullptr) *projY = py;
+    if (arcMetres != nullptr) *arcMetres = arc;
+    if (distanceMetres != nullptr) *distanceMetres = pdist;
+    if (loopLengthMetres != nullptr) *loopLengthMetres = info.loopLength;
+
+    return true;
+}
+
+bool raceLineProject(const RaceLine& line, const SplineFile& spline,
+                     double carX, double carY,
+                     double* projX, double* projY,
+                     double* arcMetres,
+                     double* distanceMetres,
+                     double* loopLengthMetres,
+                     const char* chunkName) {
+    if (!line.valid) {
+        return false;
     }
-    return false;
+    const char* name = (chunkName != nullptr && chunkName[0] != '\0')
+                           ? chunkName
+                           : (line.chunk[0] != '\0' ? line.chunk : "centre_spline");
+    const SplineChunk* chunk = spline.chunk(name);
+    if (chunk == nullptr || chunk->nodes.size() < 8) {
+        return false;
+    }
+    PolylineInfo info;
+    buildPolylineInfo(line, *chunk, &info);
+    if (info.poly.size() < 8 || info.loopLength <= 0.0) {
+        return false;
+    }
+    double px = 0.0;
+    double py = 0.0;
+    double arc = 0.0;
+    const double d = projectOntoPolyline(info, carX, carY, &px, &py, &arc, nullptr);
+    if (projX != nullptr) *projX = px;
+    if (projY != nullptr) *projY = py;
+    if (arcMetres != nullptr) *arcMetres = arc;
+    if (distanceMetres != nullptr) *distanceMetres = d;
+    if (loopLengthMetres != nullptr) *loopLengthMetres = info.loopLength;
+    return true;
+}
+
+double raceLineArcDelta(double toArc, double fromArc, double loopLength) {
+    if (loopLength <= 0.0) {
+        return 0.0;
+    }
+    double d = toArc - fromArc;
+    while (d > loopLength * 0.5) {
+        d -= loopLength;
+    }
+    while (d < -loopLength * 0.5) {
+        d += loopLength;
+    }
+    return d;
+}
+
+double raceLineLoopLength(const RaceLine& line, const SplineFile& spline,
+                          const char* chunkName) {
+    if (!line.valid) {
+        return 0.0;
+    }
+    const char* name = (chunkName != nullptr && chunkName[0] != '\0')
+                           ? chunkName
+                           : (line.chunk[0] != '\0' ? line.chunk : "centre_spline");
+    const SplineChunk* chunk = spline.chunk(name);
+    if (chunk == nullptr || chunk->nodes.size() < 8) {
+        return 0.0;
+    }
+    PolylineInfo info;
+    buildPolylineInfo(line, *chunk, &info);
+    return info.loopLength;
 }
 
 // THE CAR'S DISTANCE FROM A CHUNK, IN METRES.

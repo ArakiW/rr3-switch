@@ -209,6 +209,11 @@ struct RaceMetricsSample {
     // car is on (the transform is a property of the track, so no re-fit is
     // needed), and this number says how far the car is from THAT chunk.
     double chunkForTarget{-1.0};
+    // The along-track arc-length coordinate of the car's projection onto the line,
+    // in metres in node order from node 0.
+    double alongTrack{0.0};
+    // The projection distance from the car to the polyline segment, in metres.
+    double projDistance{0.0};
     // THE LOOK-AHEAD DISTANCE THE PURSUIT USED, IN METRES.
     //
     // WHY IT IS REPORTED: the look-ahead is the single number that decides
@@ -316,8 +321,12 @@ struct RaceDriveState {
     // charge at all.
     float steerError{};
     bool pursuit{};
+    // Which controller owned steering in this sample: "pursuit", "recovery", "sweep", or "disabled".
+    const char* owner{"none"};
     int flips{};
     int stalls{};
+    // The windowed along-track delta that the flip criterion uses, in metres.
+    float flipDelta{};
     unsigned long long frames{};
     unsigned long long sinceProgress{};
 };

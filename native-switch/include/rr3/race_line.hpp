@@ -144,13 +144,45 @@ bool raceLineTarget(const RaceLine& line, const SplineFile& spline,
 // the parts that were MEASURED to be right.
 // `adaptiveLookAhead` picks between the curvature-following distance and
 // the constant one, so that there is ONE call site for both.
+// Look-ahead distance applied when the car is off the racing line
+// (between kOnLineDistanceMetres and kFarFromLineLimitMetres).
+constexpr double kFarLookAheadMetres = 10.0;
+
 bool raceLineTargetAdaptive(const RaceLine& line, const SplineFile& spline,
                             double carX, double carY, double headingX, double headingY,
                             int* direction,
                             double* targetX, double* targetY,
                             double* lookAheadMetres,
                             bool adaptiveLookAhead,
-                            double fixedLookAheadMetres);
+                            double fixedLookAheadMetres,
+                            double* projX = nullptr,
+                            double* projY = nullptr,
+                            double* arcMetres = nullptr,
+                            double* distanceMetres = nullptr,
+                            double* loopLengthMetres = nullptr);
+
+// Projects a point in the port's world frame onto the line.
+//
+// Computes the nearest point on the nearest SEGMENT of the polyline (in port units),
+// its distance from the query point in metres, and the ARC-LENGTH COORDINATE
+// in metres measured along the polyline in NODE ORDER, starting at node 0,
+// wrapping at the loop length.
+// Optionally returns the total loop length in metres.
+bool raceLineProject(const RaceLine& line, const SplineFile& spline,
+                     double carX, double carY,
+                     double* projX, double* projY,
+                     double* arcMetres,
+                     double* distanceMetres = nullptr,
+                     double* loopLengthMetres = nullptr,
+                     const char* chunkName = nullptr);
+
+// Signed shortest distance along the loop from fromArc to toArc in metres.
+// Positive means in increasing node order (+step).
+double raceLineArcDelta(double toArc, double fromArc, double loopLength);
+
+// Returns the total loop length of the chunk in metres.
+double raceLineLoopLength(const RaceLine& line, const SplineFile& spline,
+                          const char* chunkName = nullptr);
 
 // The car's distance from another chunk of the SAME spline, in metres.
 //

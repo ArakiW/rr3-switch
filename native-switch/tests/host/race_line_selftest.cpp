@@ -407,8 +407,8 @@ int main() {
                           (ty - centreY) * (ty - centreY)) / 256.0;
             std::printf("  100 m off the line : target %.2f m away, %.2f m from the centre\n",
                         toTarget, targetToCentre);
-            check(lookAhead < 0.001,
-                  "the look-ahead is zero for a car that is off the line");
+            check(std::fabs(lookAhead - rr3::kFarLookAheadMetres) < 0.001,
+                  "the look-ahead is a fixed moderate value for a car that is off the line");
             check(toTarget > 90.0 && toTarget < 110.0,
                   "the target is about 100 m away -- the nearest point on the line");
             check(std::fabs(targetToCentre - circleRadiusMetres) < 1.5,
@@ -473,6 +473,166 @@ int main() {
                                                     chunk2, sizeof(chunk2), nullptr);
         check(got2 && std::strcmp(chunk2, "centre_spline") == 0,
               "the car on the first chunk picks the first chunk");
+    }
+
+    // ---------------------------------------------------------------------
+    // 7. FIX E1: A CAR ON THE LINE DRIVING FORWARD GETS AN AIM POINT AHEAD,
+    //    AND THE PURSUIT ANGLE ERROR IS UNDER ABOUT 0.3 RAD.
+    // ---------------------------------------------------------------------
+    {
+        double px = 0.0, py = 0.0;
+        toWorld(file.chunks[0].nodes[0].x, file.chunks[0].nodes[0].y, &px, &py);
+        double nx = 0.0, ny = 0.0;
+        toWorld(file.chunks[0].nodes[1].x, file.chunks[0].nodes[1].y, &nx, &ny);
+        double hx = nx - px;
+        double hy = ny - py;
+        const double hlen = std::hypot(hx, hy);
+        if (hlen > 0.0) {
+            hx /= hlen;
+            hy /= hlen;
+        }
+
+        int dir = 1;
+        double tx = 0.0, ty = 0.0;
+        double lookAhead = 0.0;
+        const bool got = rr3::raceLineTargetAdaptive(line, file, px, py, hx, hy, &dir,
+                                                      &tx, &ty, &lookAhead, false, 20.0);
+        check(got, "E1: forward car on the line produces target");
+        if (got) {
+            const double dx = (tx - px) / 256.0;
+            const double dy = (ty - py) / 256.0;
+            const double dlen = std::hypot(dx, dy);
+            const double cross = hx * (dy / dlen) - hy * (dx / dlen);
+            const double dot = hx * (dx / dlen) + hy * (dy / dlen);
+            const double err = std::atan2(cross, dot);
+            std::printf("  E1 forward: error=%.4f rad (< 0.3 rad required)\n", err);
+            check(std::fabs(err) < 0.3, "E1: forward car heading-to-target angle is under 0.3 rad");
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 8. FIX E2: A CAR ON THE LINE DRIVING BACKWARD GETS AN AIM POINT WHOSE
+    //    ARC COORDINATE IS AHEAD ALONG THE TRACK, AND THE GEOMETRY REPORTS
+    //    A LARGE ERROR (> 2.5 RAD) -- NOT SILENTLY AIMING BEHIND.
+    // ---------------------------------------------------------------------
+    {
+        double px = 0.0, py = 0.0;
+        toWorld(file.chunks[0].nodes[0].x, file.chunks[0].nodes[0].y, &px, &py);
+        double nx = 0.0, ny = 0.0;
+        toWorld(file.chunks[0].nodes[1].x, file.chunks[0].nodes[1].y, &nx, &ny);
+        double hx = nx - px;
+        double hy = ny - py;
+        const double hlen = std::hypot(hx, hy);
+        if (hlen > 0.0) {
+            hx /= hlen;
+            hy /= hlen;
+        }
+
+        // Backward heading: opposite to forward
+        const double bhx = -hx;
+        const double bhy = -hy;
+
+        int lockedDir = 1; // Locked forward round the track
+        double tx = 0.0, ty = 0.0;
+        double lookAhead = 0.0;
+        double carArc = 0.0;
+        double targetArc = 0.0;
+        double loopLen = 0.0;
+
+        rr3::raceLineProject(line, file, px, py, nullptr, nullptr, &carArc, nullptr, &loopLen);
+        const bool got = rr3::raceLineTargetAdaptive(line, file, px, py, bhx, bhy, &lockedDir,
+                                                      &tx, &ty, &lookAhead, false, 20.0);
+        check(got, "E2: backward car produces target");
+        if (got) {
+            rr3::raceLineProject(line, file, tx, ty, nullptr, nullptr, &targetArc, nullptr, nullptr);
+            const double arcDiff = rr3::raceLineArcDelta(targetArc, carArc, loopLen);
+            std::printf("  E2 backward: arcDiff=%.2f m (lookAhead=%.2f m)\n", arcDiff, lookAhead);
+            check(arcDiff > 15.0 && arcDiff < 25.0,
+                  "E2: target arc coordinate is AHEAD along the track");
+
+            const double dx = (tx - px) / 256.0;
+            const double dy = (ty - py) / 256.0;
+            const double dlen = std::hypot(dx, dy);
+            const double cross = bhx * (dy / dlen) - bhy * (dx / dlen);
+            const double dot = bhx * (dx / dlen) + bhy * (dy / dlen);
+            const double err = std::atan2(cross, dot);
+            std::printf("  E2 backward: error=%.4f rad (> 2.5 rad required)\n", err);
+            check(std::fabs(err) > 2.5,
+                  "E2: geometry reports large error (> 2.5 rad) indicating wrong way");
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 9. FIX E3: A CAR 30 M OFF THE LINE STILL GETS A TARGET, AND THE TARGET
+    //    IS NOT THE CAR'S OWN POSITION: DISTANCE IS AT LEAST LOOK-AHEAD.
+    // ---------------------------------------------------------------------
+    {
+        double centreX = 0.0, centreY = 0.0;
+        toWorld(2000, -3000, &centreX, &centreY);
+        double nodeX = 0.0, nodeY = 0.0;
+        toWorld(file.chunks[0].nodes[0].x, file.chunks[0].nodes[0].y, &nodeX, &nodeY);
+        const double radiusX = nodeX - centreX;
+        const double radiusY = nodeY - centreY;
+        const double radiusLength = std::hypot(radiusX, radiusY);
+        const double outward30 = 30.0 * 256.0; // 30 m off the line
+        const double carOut30X = centreX + radiusX * (1.0 + outward30 / radiusLength);
+        const double carOut30Y = centreY + radiusY * (1.0 + outward30 / radiusLength);
+
+        int dir = 1;
+        double tx = 0.0, ty = 0.0;
+        double lookAhead = -1.0;
+        const bool got = rr3::raceLineTargetAdaptive(line, file, carOut30X, carOut30Y,
+                                                      hx, hy, &dir, &tx, &ty,
+                                                      &lookAhead, true, 20.0);
+        check(got, "E3: car 30 m off the line gets a target");
+        if (got) {
+            const double dist = std::hypot(tx - carOut30X, ty - carOut30Y) / 256.0;
+            std::printf("  E3: 30 m off line: lookAhead=%.2f m, distToTarget=%.2f m\n",
+                        lookAhead, dist);
+            check(lookAhead > 0.001, "E3: look-ahead is NOT zero for car 30 m off line");
+            check(dist >= lookAhead, "E3: distance to target is at least look-ahead");
+            check(dist >= 30.0, "E3: distance to target is at least the offset distance");
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 10. FIX E4: THE ALONG-TRACK COORDINATE INCREASES WHEN MOVING FORWARD
+    //     ALONG THE LINE AND DECREASES WHEN MOVING BACKWARDS.
+    // ---------------------------------------------------------------------
+    {
+        double loopLen = 0.0;
+        double along0 = 0.0;
+        double alongFwd = 0.0;
+        double alongBwd = 0.0;
+
+        // Position at node 0
+        double p0x = 0.0, p0y = 0.0;
+        toWorld(file.chunks[0].nodes[0].x, file.chunks[0].nodes[0].y, &p0x, &p0y);
+        // Position at node 1 (forward along node order)
+        double p1x = 0.0, p1y = 0.0;
+        toWorld(file.chunks[0].nodes[1].x, file.chunks[0].nodes[1].y, &p1x, &p1y);
+        // Midpoint 0->1
+        const double fwdX = 0.5 * (p0x + p1x);
+        const double fwdY = 0.5 * (p0y + p1y);
+
+        // Position at node N-1 (backward along node order)
+        double pLastX = 0.0, pLastY = 0.0;
+        toWorld(file.chunks[0].nodes[kNodes - 1].x, file.chunks[0].nodes[kNodes - 1].y, &pLastX, &pLastY);
+        // Midpoint (N-1)->0
+        const double bwdX = 0.5 * (p0x + pLastX);
+        const double bwdY = 0.5 * (p0y + pLastY);
+
+        rr3::raceLineProject(line, file, p0x, p0y, nullptr, nullptr, &along0, nullptr, &loopLen);
+        rr3::raceLineProject(line, file, fwdX, fwdY, nullptr, nullptr, &alongFwd, nullptr, nullptr);
+        rr3::raceLineProject(line, file, bwdX, bwdY, nullptr, nullptr, &alongBwd, nullptr, nullptr);
+
+        const double deltaFwd = rr3::raceLineArcDelta(alongFwd, along0, loopLen);
+        const double deltaBwd = rr3::raceLineArcDelta(alongBwd, along0, loopLen);
+
+        std::printf("  E4: loopLen=%.2f m deltaFwd=%.2f m deltaBwd=%.2f m\n",
+                    loopLen, deltaFwd, deltaBwd);
+        check(deltaFwd > 0.0, "E4: along-track coordinate increases when moving forward");
+        check(deltaBwd < 0.0, "E4: along-track coordinate decreases when moving backward");
     }
 
     std::printf("%s\n", failures == 0 ? "race_line selftest: OK" : "race_line selftest: FAILED");

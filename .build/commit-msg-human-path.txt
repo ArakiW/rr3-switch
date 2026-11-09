@@ -1,0 +1,70 @@
+THE HUMAN PATH MEASURED, THE MAGENTA CONFIRMED BY EYE, AND THE PURSUIT'S
+ROOT CAUSE NAMED
+
+THREE MEASUREMENTS, ONE ROUND EACH, ALL ON THE CURRENT BUILD.
+
+1. THE INSTRUMENT WAS RIGHT, AND WHAT IT SHOWS.
+
+   Round chunk2, with the race-state line's argument order fixed (the
+   compiler had been warning about it and nobody read the warning):
+
+       cchunk = 2.5 to 9.3 m   the chunk picker works; the aim point comes
+                               from a chunk the car is on, where before it
+                               came from one 13,215 m away
+       dir    = 1              the direction lock is decided
+       mot    = (-1.000, -0.007)  the car's own 20 m displacement vector
+       perr   = 1.5 to 2.9 rad (86 to 166 degrees), and it STAYS there
+       ctdist = 17 to 25 m     the aim point is the 20 m look-ahead away
+       total  = 71,949 -> 58,507 -> 30,865   the car drives BACKWARDS
+       brk    = 1, steer = -1.000   the recovery brakes AT FULL LOCK
+
+   => THE AIM POINT IS BEHIND THE CAR.  An error of 180 degrees with the
+   target 20 m away is not geometry; it is the direction lock pointing the
+   wrong way round the track.
+
+   => AND THE PORT CANNOT ESCAPE IT.  The pursuit overrides the recovery's
+   steering ("BUT THE PURSUIT WINS"), so the recovery's brake plus the
+   pursuit's full lock is a spin; the steering-sign flip is inert while the
+   pursuit is on (`steer` is `steersign * perr / steergain`, so `g_drive.sign`
+   never reaches the wheel); and the one mechanism that could invert an
+   aim point that is behind the car is disabled in the source
+   (`if (false && ...)`), with the criterion that used to drive it being
+   exactly the signal the recovery poisons.
+
+   => AND THE STALL TEST'S EXEMPTION IS NOT LIVE: `lineResidual` holds the
+   FIT's residual, a constant, so "the car is on the line" is a constant
+   boolean for the whole race instead of the current distance to the line.
+
+2. THE MAGENTA IS GONE, AND THE PICTURES SAY SO.
+
+   Round chunk2, 122 archived frames, 112,435,200 pixels scanned:
+
+       EXACT (255,0,255)   : 0
+       green<=12, r,b>=128 : 0  (0.00000%)
+
+   And by eye: the front end renders (Chinese UI, the Porsche 911 RSR promo
+   car, the track thumbnail), the race start at Hockenheim renders (the
+   player's Mercedes with its wheels and decals, the pit building, the
+   sponsor boards, the start lights, and an ORANGE rival car).  The in-race
+   HUD is EMPTY -- which is the `LocalStyles.gui` gap, now visible in a
+   picture and not only in a file listing.
+
+3. THE HUMAN PATH IS MEASURED END TO END, AND IT WORKS.
+
+   Round manual1, the card at `autopilot = 0`, the weave script holding the
+   accelerator and alternating the steering axis:
+
+       lx_script == lx_guest in 24 of 24 samples, loop_steered = 0
+       autopilot_injected = 0 in all 25 heartbeats
+       total 0 -> 55,062, rate up to 181.23 units a frame (about 84 km/h)
+
+   => THE INPUT REACHES THE CAR, THE THROTTLE REACHES THE CAR, AND THE CAR
+   DRIVES.  What is broken is the AUTOPILOT -- the port's own measurement
+   harness and its attract mode -- not the game's playability.  That is a
+   different defect from the one the previous rounds were measuring, and it
+   is the difference between "the pursuit drives badly" and "the port cannot
+   play".
+
+DOCS/OPEN-ISSUES.md gains 9.24 (the instrument, and the causal chain),
+9.25 (the magenta, confirmed by eye), 9.26 (what "playable" means here, with
+the state of every acceptance line) and 9.27 (the human path).
