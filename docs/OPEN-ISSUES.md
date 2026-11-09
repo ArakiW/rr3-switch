@@ -2725,3 +2725,66 @@ SAME FRAME AS q145:** the same blind navigation with the census ON.  If the
 distance comes back, the census is the variable -- and that would be the
 third time the census has been blamed and the second time it has been
 wrong, so it will be worth a repeat round before it is believed.
+
+### 9.16 A CORRECTION: the magenta car is NOT a path-resolution bug
+
+**THIS CORRECTS SECTION 9.4's LAST PARAGRAPH, WHICH WAS WRONG.**
+
+The earlier reading claimed that 45 asset-list entries could not be resolved
+locally, so the manifest kept the server's digest for them, and that the
+port therefore served the guest a digest for a file it did not have.  **That
+count was a misreading of the log**: the counter grepped only the PATH field
+of the "assetlist-entry" lines and ignored the rest of the line.  Those 45
+lines are REWRITES THAT SUCCEEDED.
+
+WHAT THE SAME LOG ACTUALLY SAYS:
+
+    phase=assetlist-entry path=/assets_2048x1536/common/sprites.android.atlas
+      md5=2ab3d810...->72bcfd205a917770eebb8a1a9e3dcbd0 size=39460
+      source=rr3gui0:/files/.depot/gui_assets/2048x1536/common/sprites.android.atlas
+    phase=asset-invariant path=... published=72bcfd20... served=72bcfd20...
+      agree=1 found=1 src=rr3gui0:/files/.depot/gui_assets/2048x1536/common/...
+    phase=cc-asset-req path=... want_md5=72bcfd20... digest_field=wire candidates=13
+      tried=.depot/assets_2048x1536/common/sprites.android.atlas|files/.depot/...
+
+and for the magenta car itself:
+
+    phase=repair-candidate path=assets_2048x1536/events/map/featured/
+      weekly_events/lexus_is_f350_catalunya/sprites.android.atlas
+      resolved=1 digest=debbef8a79a15e0b2aeb475039e2beab
+      card=.../.depot/gui_assets/2048x1536/.../sprites.android.atlas present=0
+      source=.../.depot/assets_2048x1536/.../sprites.android.atlas
+
+**⇒ THE FILE IS FOUND, THE DIGEST IS PUBLISHED, THE SERVED DIGEST MATCHES
+THE PUBLISHED ONE (agree=1, found=1), AND THE GUEST ASKS FOR EXACTLY THAT
+DIGEST.**  And no texture failed to LOAD: every "unable to load file" line
+in the round was counted by extension and there is not one texture among
+them.
+
+**⇒ SO THE TEXTURE IS CORRECTLY SERVED AND THE FAULT IS DOWNSTREAM OF
+THAT.**  What is left is the part the port cannot currently see:
+
+  (a) THE TEXTURE UPLOAD IS REJECTED BY THE DRIVER.  The guest's atlases
+      are "sprites_0.rgb.pvr.z" -- a COMPRESSED PVR texture.  The port
+      serves the bytes; if the host driver cannot decode that format the
+      upload fails and the material samples an incomplete texture.  The
+      port traces the upload calls and COUNTS them; it never reads
+      glGetError() afterwards.
+  (b) THE SHADER NEVER BECOMES USABLE.  The port traces glCompileShader
+      and glLinkProgram and counts the calls; it never reads
+      GL_COMPILE_STATUS or GL_LINK_STATUS, and never reads the driver's
+      info log.
+
+**⇒ (a) AND (b) ARE THE TWO THINGS THE PORT CANNOT CURRENTLY TELL APART,
+and that is the whole problem: the instrument does not exist.**  So the
+work is an instrument first -- read the shader status and the upload error
+after every guest call that can fail, and report only failures, with a
+budget -- and a fix second, if the fault is findable from the source.
+
+**⇒ AND THE LESSON, WHICH IS THE THIRD TIME THIS PROJECT HAS PAID IT IN
+ONE WEEK: a count taken from a log is only as good as the fields that were
+actually read.**  Three readings of the same rounds were wrong in a row --
+the 2x2 (the cells were not comparable), the flip hypothesis (killed by its
+own experiment), and this one (the counter read a field and ignored the rest
+of the line).  **⇒ PRINT THE WHOLE LINE, NOT A FIELD OF IT, AND GREP FOR
+WHAT THE LINE SAYS, NOT FOR A SUBSTRING OF IT.**

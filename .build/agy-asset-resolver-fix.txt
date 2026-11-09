@@ -1,133 +1,119 @@
-You are fixing a PORT BUG that has been causing a visible texture fault for
-weeks and has also been costing the port half of its driving distance.
+You are implementing ONE fix for a Nintendo Switch port of an Android game
+(Real Racing 3 guest, libnx + Mesa): a VISIBLE TEXTURE FAULT that has been
+there for weeks.
 
 Files live under E:\AI\RealRacing3-switch\native-switch\.
 
 =============================================================================
-THE MEASUREMENT (do not re-litigate it; it is measured)
+THE SYMPTOM
 =============================================================================
 
-THE SYMPTOM the user sees: in the race, one car renders MAGENTA (the
-renderer's fallback colour) while the other is textured correctly, and a HUD
-widget renders as a flat GREY-WHITE blob.
-
-WHAT WAS MEASURED:
-
- 1. IT IS NOT A MISSING-FILE PROBLEM.  Every "unable to load file" line in
-    the guest-view log of the latest round was counted by extension:
-        16 x .decomp   (audio)
-         6 x .gui
-         1 x .evt
-         0 x texture formats
-    Nothing failed to LOAD.  It is a RENDER failure.
-
- 2. THE PORT KEEPS THE SERVER'S DIGEST FOR 45 ENTRIES IT CANNOT RESOLVE.
-    From the log of the same round:
-
-      phase=assetlist-entry path=/assets_2048x1536/events/map/featured/
-        weekly_events/lexus_is_f350_catalunya/sprites.android.atlas
-        md5=<the server's> kept=SERVER size=- source=none
-      phase=assetlist-entry path=/assets_2048x1536/events/map/featured/
-        weekly_events/lexus_is_f350_catalunya/sprites_0.rgb.pvr.z
-        md5=<the server's> kept=SERVER size=- source=none
-
-    45 such entries, and they are THE TEXTURE ATLASES:
-        /assets_{2048x1536,960x640,480x320}/common/sprites.android.atlas
-        /assets_{2048x1536,960x640,480x320}/common/sprites_0.rgb.pvr.z
-        /assets_{2048x1536,960x640,480x320}/events/map/featured/weekly_events/
-            lexus_is_f350_catalunya/sprites.android.atlas
-        /assets_{2048x1536,960x640,480x320}/events/map/featured/weekly_events/
-            lexus_is_f350_catalunya/sprites_0.rgb.pvr.z
-        /MenuBannerData.xml, /crew.bin, /economy.bin, /events.dat,
-        /eds/iPad2,1.plist ... and so on
-
-    The magenta car IS the featured weekly event's car: the guest asks for
-    "lexus_is_f350_catalunya" sprites and the port answers with the SERVER's
-    digest for a file the port cannot resolve.  The port's own code says so,
-    in native-switch/source/cc_http_request.cpp around line 645:
-
-      "the guest asked for e198be78... (the 2048x1536 weekly-event atlas),
-       which is the digest the SERVER's own list publishes -- the port's
-       manifest rewrite kept the server's value because it could not resolve
-       a local file to compute one from ('kept=SERVER size=- source=none').
-       So the guest did its lookup and had a digest; the digest described a
-       file the port does not have."
-
- 3. THE FILES ARE ON THE CARD.  A search of the emulator's card found:
-
-      .depot/assets_2048x1536/events/map/featured/weekly_events/
-          lexus_is_f350_catalunya/sprites_0.rgb.pvr.z      216,935 bytes
-      .depot/assets_2048x1536/events/map/featured/weekly_events/
-          lexus_is_f350_catalunya/sprites.android.atlas         267 bytes
-      .depot/assets_2048x1536/common/sprites_0.rgb.pvr.z  1,021,253 bytes
-      .depot/assets_2048x1536/common/sprites.android.atlas   39,460 bytes
-      .depot/assets_480x320/..., .depot/assets_960x640/... (same shape)
-      .depot/economy.bin, .depot/events.dat, ...
-
-    **⇒ THIS IS NOT MISSING DATA.  THIS IS A PATH-RESOLUTION BUG.**
-
- 4. THE SAME RESOLVER FEEDS THE RACE SETUP.  The port's driving distance on
-    the emulator is 3.16-4.16 % of a lap today against 10.35 % on 2026-11-04
-    (measured, same card, same configuration, same harness), and the
-    Nov-4 BINARY on today's card gives 6.61 %.  So the code costs about 40 %
-    and the card about 36 %, and the card's half is the asset side.
+In the race, one car renders MAGENTA -- the renderer's fallback colour --
+while the other car is textured correctly, and a HUD widget renders as a flat
+GREY-WHITE blob.  The magenta car is the featured weekly event's car (the
+guest asks for "lexus_is_f350_catalunya" sprites).
 
 =============================================================================
-THE CODE
+WHAT WAS MEASURED -- AND WHAT WAS MEASURED WRONG
 =============================================================================
 
-native-switch/source/guest_filesystem.cpp
+A FIRST READING OF THIS TASK WAS WRONG, and it is recorded here so that you
+do not repeat it.  An earlier count claimed "45 asset-list entries the port
+could not resolve, so the manifest kept the server's digest for them".  That
+count was a MISREADING of the log: the counter grepped only the PATH field
+of the "assetlist-entry" lines and ignored the rest of the line.  Those 45
+lines are REWRITES THAT SUCCEEDED.
 
-  resolveAssetLocalFile(path, source, sizeof(source), digest, &size)
-      THE FUNCTION THAT FAILS.  It takes the asset list's path (which starts
-      with '/', e.g. "/assets_2048x1536/common/sprites.android.atlas") and
-      has to find the file on the SD card.  It resolves thousands of other
-      entries, so the candidate list it tries is nearly right -- and it fails
-      for exactly the paths whose files sit under .depot/.
+WHAT THE LOG ACTUALLY SAYS (the same round, verbatim):
 
-  The rewrite site is around line 5889-5934 (the "asset_list_updates.txt"
-  pass) and there are equivalent passes for the other lists (the log shows
-  "assetlist-rewrite-all-begin lists=1235 overrides=8649").
+    phase=assetlist-entry path=/assets_2048x1536/common/sprites.android.atlas
+      md5=2ab3d810182c1b4baf275e5d11ab4981->72bcfd205a917770eebb8a1a9e3dcbd0
+      size=39460 source=rr3gui0:/files/.depot/gui_assets/2048x1536/common/
+      sprites.android.atlas
+    phase=asset-invariant path=/assets_2048x1536/common/sprites.android.atlas
+      published=72bcfd205a917770eebb8a1a9e3dcbd0
+      served=72bcfd205a917770eebb8a1a9e3dcbd0 agree=1 found=1
+      src=rr3gui0:/files/.depot/gui_assets/2048x1536/common/sprites.android.atlas
+    phase=cc-asset-req path=/assets_2048x1536/common/sprites.android.atlas
+      want_md5=72bcfd205a917770eebb8a1a9e3dcbd0 digest_field=wire candidates=13
+      tried=.depot/assets_2048x1536/common/sprites.android.atlas|files/.depot/...
 
-  There is ALSO a separate OVERRIDE SET of 8,649 known paths with their
-  digests.  Work out whether the 45 failures are (a) resolveAssetLocalFile
-  not trying the right prefix, or (b) entries that are not in the override
-  set, or (c) both -- and say which, with the code.
+and for the magenta car:
+
+    phase=repair-candidate path=assets_2048x1536/events/map/featured/
+      weekly_events/lexus_is_f350_catalunya/sprites.android.atlas
+      resolved=1 digest=debbef8a79a15e0b2aeb475039e2beab
+      card=sdmc:/switch/rr3-native-rehost/.depot/gui_assets/2048x1536/events/
+      map/featured/weekly_events/lexus_is_f350_catalunya/sprites.android.atlas
+      present=0
+      source=sdmc:/switch/rr3-native-rehost/.depot/assets_2048x1536/events/...
+
+  => THE FILE IS FOUND, THE DIGEST IS PUBLISHED, THE SERVED DIGEST MATCHES
+     THE PUBLISHED ONE (agree=1, found=1), AND THE GUEST ASKS FOR EXACTLY
+     THAT DIGEST (want_md5=72bcfd2...).
+
+  => ALSO: no texture failed to LOAD.  Every "unable to load file" line in
+     the round was counted by extension: 16 .decomp (audio), 6 .gui, 1 .evt,
+     and NOT ONE texture.
+
+**⇒ SO THE TEXTURE IS CORRECTLY SERVED AND THE FAULT IS DOWNSTREAM OF
+THAT.**  The bytes arrive and the digest is right; the surface still renders
+in the fallback colour.  The possibilities are:
+
+  (a) THE TEXTURE UPLOAD IS REJECTED BY THE DRIVER.  The guest's atlases are
+      "sprites_0.rgb.pvr.z" -- a COMPRESSED PVR texture.  The port serves
+      the bytes; if the host driver cannot decode that format, the upload
+      fails and the material samples an incomplete texture.  **The port
+      never checks.**  It traces glTexImage2D / glCompressedTexImage2D /
+      glCopyTexSubImage2D and COUNTS the calls; it never reads glGetError()
+      afterwards.
+  (b) THE SHADER NEVER BECOMES USABLE.  The port traces glCompileShader and
+      glLinkProgram and counts the calls; it never reads
+      glGetShaderiv(GL_COMPILE_STATUS) or glGetProgramiv(GL_LINK_STATUS),
+      and never reads the driver's info log.  A failed link and a good link
+      are the SAME OBSERVATION in the log.
+  (c) THE GUEST'S ATLAS AND THE SERVED ATLAS DISAGREE about the region the
+      surface samples, which the port cannot see either way.
+
+**⇒ (a) AND (b) ARE THE TWO THE PORT CANNOT CURRENTLY TELL APART.  THAT
+IS WHY THIS TASK IS AN INSTRUMENT FIRST AND A FIX SECOND.**
 
 =============================================================================
 YOUR JOB
 =============================================================================
 
-  1. FIND WHY resolveAssetLocalFile() fails for those 45 paths, and fix it.
-     Do not guess: the fix must be justified by the candidate list you read
-     in the source, and by the paths the log prints.
+  1. MAKE THE FAILURE VISIBLE.  In the GL tracer
+     (native-switch/source/guest_view_trace.cpp, which already hooks 23 GL
+     entry points):
 
-  2. MAKE "UNRESOLVED" IMPOSSIBLE TO MISS.  Right now the port can keep
-     the server's digest for an arbitrary number of entries and the only
-     evidence is up to 80 per-list lines.  The port must report, per list
-     AND in total, how many entries it could not resolve -- and it must
-     report the TOTAL, not a sample, so a reader can tell "2 entries" from
-     "2,000 entries" without counting lines.  A magenta car in a race must
-     be traceable to this number.
+       a. after every guest glCompileShader / glLinkProgram, read
+          glGetShaderiv(GL_COMPILE_STATUS) and glGetProgramiv(GL_LINK_STATUS)
+          and the driver's info log, and report a FAILURE -- one line per
+          failure, naming the program id and the driver's words;
+       b. after every guest texture upload (glTexImage2D,
+          glCompressedTexImage2D, glTexSubImage2D, glCopyTexSubImage2D),
+          read glGetError() and report the ones that are not GL_NO_ERROR,
+          with the level, the internal format, the format/type and the
+          width/height, and with the asset path if the tracer can know it.
 
-  3. DO NOT SILENTLY SERVE A WRONG FILE.  If the resolver cannot find the
-     asset, keeping the server's digest is arguably correct (the guest then
-     asks the server) -- but then the port must say so loudly, and it must
-     NOT be possible for a path that IS on the card to be reported as
-     unresolved.
+     THE PORT'S OWN LOG VOLUME IS A MEASURED COST, so: NO line for a
+     successful call (there are tens of thousands), a TOTAL budget on the
+     failure lines per process, and one line saying the budget was spent.
+     Do not regress the frame rate.
 
-  4. CHECK THE OTHER HALF.  The same resolution decides which assets the
-     guest gets for a RACE (the car, the track, the event).  Say whether
-     the fix also covers the race setup, and if it does not, say what
-     else is in the way.
+  2. THEN FIX WHAT THE INSTRUMENT FINDS, if it is findable from the source.
+     If the fault is in the ASSET PATH -- a texture the port serves in a
+     format the driver rejects, or an atlas the port serves from the wrong
+     tree -- say so and fix it.  If the fault is not findable from the
+     source, say so plainly and make the instrument good enough that the
+     next round on the console names it.  **An honest "the instrument now
+     tells us which of (a) and (b) it is" is a complete answer.**
 
-  5. Add a TEST that fails with the current code and passes with the fix.
-     The project's host tests live in native-switch/tests/ and are driven by
-     native-switch/tests/test_*.py; the gate runs them.  A test that
-     proves the resolver finds "/assets_2048x1536/common/sprites.android.atlas"
-     on a card laid out the way the emulator's card is (a .depot directory
-     with assets_2048x1536/common/sprites.android.atlas in it) is what this
-     needs.  Follow the existing tests' style.
+  3. ADD A TEST for whatever you fixed, in the project's style
+     (native-switch/tests/, driven by native-switch/tests/test_*.py, run by
+     the gate).  If the fix is the instrument alone, the test is that the
+     instrument reports a failure for a deliberately broken shader and stays
+     silent for a good one.
 
 =============================================================================
 RULES
@@ -146,11 +132,11 @@ RULES
 DELIVERABLE
 =============================================================================
 
-  1. One paragraph: the actual cause, in plain words.
+  1. One paragraph: what now happens that did not before.
   2. The complete contents of every new file, and for every EXISTING file
      you touch, the exact hunks to apply (with enough surrounding context
      that they can be applied unambiguously).
-  3. The test you added, and how it fails with the current code.
+  3. The test you added, and how it fails without the fix.
   4. Your own review: for each change, the way it can go wrong, and the ONE
      measurement that would show it.
   5. The single most likely way this is still wrong, and the one
