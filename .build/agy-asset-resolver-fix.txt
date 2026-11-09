@@ -1,0 +1,157 @@
+You are fixing a PORT BUG that has been causing a visible texture fault for
+weeks and has also been costing the port half of its driving distance.
+
+Files live under E:\AI\RealRacing3-switch\native-switch\.
+
+=============================================================================
+THE MEASUREMENT (do not re-litigate it; it is measured)
+=============================================================================
+
+THE SYMPTOM the user sees: in the race, one car renders MAGENTA (the
+renderer's fallback colour) while the other is textured correctly, and a HUD
+widget renders as a flat GREY-WHITE blob.
+
+WHAT WAS MEASURED:
+
+ 1. IT IS NOT A MISSING-FILE PROBLEM.  Every "unable to load file" line in
+    the guest-view log of the latest round was counted by extension:
+        16 x .decomp   (audio)
+         6 x .gui
+         1 x .evt
+         0 x texture formats
+    Nothing failed to LOAD.  It is a RENDER failure.
+
+ 2. THE PORT KEEPS THE SERVER'S DIGEST FOR 45 ENTRIES IT CANNOT RESOLVE.
+    From the log of the same round:
+
+      phase=assetlist-entry path=/assets_2048x1536/events/map/featured/
+        weekly_events/lexus_is_f350_catalunya/sprites.android.atlas
+        md5=<the server's> kept=SERVER size=- source=none
+      phase=assetlist-entry path=/assets_2048x1536/events/map/featured/
+        weekly_events/lexus_is_f350_catalunya/sprites_0.rgb.pvr.z
+        md5=<the server's> kept=SERVER size=- source=none
+
+    45 such entries, and they are THE TEXTURE ATLASES:
+        /assets_{2048x1536,960x640,480x320}/common/sprites.android.atlas
+        /assets_{2048x1536,960x640,480x320}/common/sprites_0.rgb.pvr.z
+        /assets_{2048x1536,960x640,480x320}/events/map/featured/weekly_events/
+            lexus_is_f350_catalunya/sprites.android.atlas
+        /assets_{2048x1536,960x640,480x320}/events/map/featured/weekly_events/
+            lexus_is_f350_catalunya/sprites_0.rgb.pvr.z
+        /MenuBannerData.xml, /crew.bin, /economy.bin, /events.dat,
+        /eds/iPad2,1.plist ... and so on
+
+    The magenta car IS the featured weekly event's car: the guest asks for
+    "lexus_is_f350_catalunya" sprites and the port answers with the SERVER's
+    digest for a file the port cannot resolve.  The port's own code says so,
+    in native-switch/source/cc_http_request.cpp around line 645:
+
+      "the guest asked for e198be78... (the 2048x1536 weekly-event atlas),
+       which is the digest the SERVER's own list publishes -- the port's
+       manifest rewrite kept the server's value because it could not resolve
+       a local file to compute one from ('kept=SERVER size=- source=none').
+       So the guest did its lookup and had a digest; the digest described a
+       file the port does not have."
+
+ 3. THE FILES ARE ON THE CARD.  A search of the emulator's card found:
+
+      .depot/assets_2048x1536/events/map/featured/weekly_events/
+          lexus_is_f350_catalunya/sprites_0.rgb.pvr.z      216,935 bytes
+      .depot/assets_2048x1536/events/map/featured/weekly_events/
+          lexus_is_f350_catalunya/sprites.android.atlas         267 bytes
+      .depot/assets_2048x1536/common/sprites_0.rgb.pvr.z  1,021,253 bytes
+      .depot/assets_2048x1536/common/sprites.android.atlas   39,460 bytes
+      .depot/assets_480x320/..., .depot/assets_960x640/... (same shape)
+      .depot/economy.bin, .depot/events.dat, ...
+
+    **⇒ THIS IS NOT MISSING DATA.  THIS IS A PATH-RESOLUTION BUG.**
+
+ 4. THE SAME RESOLVER FEEDS THE RACE SETUP.  The port's driving distance on
+    the emulator is 3.16-4.16 % of a lap today against 10.35 % on 2026-11-04
+    (measured, same card, same configuration, same harness), and the
+    Nov-4 BINARY on today's card gives 6.61 %.  So the code costs about 40 %
+    and the card about 36 %, and the card's half is the asset side.
+
+=============================================================================
+THE CODE
+=============================================================================
+
+native-switch/source/guest_filesystem.cpp
+
+  resolveAssetLocalFile(path, source, sizeof(source), digest, &size)
+      THE FUNCTION THAT FAILS.  It takes the asset list's path (which starts
+      with '/', e.g. "/assets_2048x1536/common/sprites.android.atlas") and
+      has to find the file on the SD card.  It resolves thousands of other
+      entries, so the candidate list it tries is nearly right -- and it fails
+      for exactly the paths whose files sit under .depot/.
+
+  The rewrite site is around line 5889-5934 (the "asset_list_updates.txt"
+  pass) and there are equivalent passes for the other lists (the log shows
+  "assetlist-rewrite-all-begin lists=1235 overrides=8649").
+
+  There is ALSO a separate OVERRIDE SET of 8,649 known paths with their
+  digests.  Work out whether the 45 failures are (a) resolveAssetLocalFile
+  not trying the right prefix, or (b) entries that are not in the override
+  set, or (c) both -- and say which, with the code.
+
+=============================================================================
+YOUR JOB
+=============================================================================
+
+  1. FIND WHY resolveAssetLocalFile() fails for those 45 paths, and fix it.
+     Do not guess: the fix must be justified by the candidate list you read
+     in the source, and by the paths the log prints.
+
+  2. MAKE "UNRESOLVED" IMPOSSIBLE TO MISS.  Right now the port can keep
+     the server's digest for an arbitrary number of entries and the only
+     evidence is up to 80 per-list lines.  The port must report, per list
+     AND in total, how many entries it could not resolve -- and it must
+     report the TOTAL, not a sample, so a reader can tell "2 entries" from
+     "2,000 entries" without counting lines.  A magenta car in a race must
+     be traceable to this number.
+
+  3. DO NOT SILENTLY SERVE A WRONG FILE.  If the resolver cannot find the
+     asset, keeping the server's digest is arguably correct (the guest then
+     asks the server) -- but then the port must say so loudly, and it must
+     NOT be possible for a path that IS on the card to be reported as
+     unresolved.
+
+  4. CHECK THE OTHER HALF.  The same resolution decides which assets the
+     guest gets for a RACE (the car, the track, the event).  Say whether
+     the fix also covers the race setup, and if it does not, say what
+     else is in the way.
+
+  5. Add a TEST that fails with the current code and passes with the fix.
+     The project's host tests live in native-switch/tests/ and are driven by
+     native-switch/tests/test_*.py; the gate runs them.  A test that
+     proves the resolver finds "/assets_2048x1536/common/sprites.android.atlas"
+     on a card laid out the way the emulator's card is (a .depot directory
+     with assets_2048x1536/common/sprites.android.atlas in it) is what this
+     needs.  Follow the existing tests' style.
+
+=============================================================================
+RULES
+=============================================================================
+
+  - C++17, no GNU extensions, M_PI is not available.
+  - The existing comment style: every non-obvious block explains WHY and
+    cites a measurement where there is one.  That is the house style and
+    it is the documentation.
+  - Do NOT touch the pursuit, the race-state probe, the cond-wait code or
+    the input code.  They are under active measurement or under separate
+    work.
+  - Do not run the emulator and do not build.  Output the code.
+
+=============================================================================
+DELIVERABLE
+=============================================================================
+
+  1. One paragraph: the actual cause, in plain words.
+  2. The complete contents of every new file, and for every EXISTING file
+     you touch, the exact hunks to apply (with enough surrounding context
+     that they can be applied unambiguously).
+  3. The test you added, and how it fails with the current code.
+  4. Your own review: for each change, the way it can go wrong, and the ONE
+     measurement that would show it.
+  5. The single most likely way this is still wrong, and the one
+     measurement that would show it.
