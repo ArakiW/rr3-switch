@@ -1,0 +1,169 @@
+You are implementing TWO fixes for a Nintendo Switch port of an Android game
+(Real Racing 3 guest, libnx + Mesa).  Both were diagnosed by measurement; your
+job is the implementation and the instrumentation that makes the next
+occurrence explainable.
+
+Files live under E:\AI\RealRacing3-switch\native-switch\.
+Use `git -C E:\AI\RealRacing3-switch diff` and `git log` freely to read history.
+
+=============================================================================
+PART A: THE GUEST'S SHADERS AND TEXTURES ARE NEVER CHECKED
+=============================================================================
+
+THE SYMPTOM (the user attached a screenshot): one car in the race renders
+MAGENTA -- the renderer-fallback colour -- while the other car is textured
+correctly.  A second artifact in the same frame is a HUD widget drawn as a
+flat GREY-WHITE blob (a UI atlas / glyph-region problem, a different fault).
+
+WHAT WAS MEASURED, so do not re-litigate it:
+
+  * It is NOT a missing-file problem.  Every "unable to load file" line in
+    the guest-view log of the latest round was counted by extension:
+        16 x .decomp   (audio)
+         6 x .gui      (the guest's own encrypted screen definitions)
+         1 x .evt
+         0 x texture formats at all
+    So no texture failed to LOAD.  The magenta is a RENDER failure: a
+    material or a shader chain that never became usable.
+
+  * The port's GL tracer (native-switch/source/guest_view_trace.cpp) hooks
+    23 GL entry points and COUNTS the calls, including glCompileShader,
+    glLinkProgram, glUseProgram, glTexImage2D, glCompressedTexImage2D,
+    glGenTextures, glBindTexture and the texture-upload family.  **IT NEVER
+    READS A SINGLE STATUS VALUE.**  So "the guest's shader failed to link"
+    and "the guest's shaders are fine" are the SAME OBSERVATION in the log,
+    which is exactly the situation this project keeps paying for.
+
+  * Roughly sixty OTHER guest GL imports are bound straight to libGLESv2
+    with RR3_BIND in symbol_resolver.cpp and are not observed at all
+    (glUniform*, glEnable, glFinish, glBufferData, ...).
+
+YOUR JOB, PART A:
+
+  A1. MAKE THE SHADER STATUS VISIBLE.  After every guest glCompileShader
+      and glLinkProgram, read glGetShaderiv(GL_COMPILE_STATUS) and
+      glGetShaderiv(GL_INFO_LOG_LENGTH) / glGetShaderInfoLog, and
+      glGetProgramiv(GL_LINK_STATUS) / glGetProgramInfoLog, and write ONE
+      log line per failure (not per call -- a failure is rare and the log
+      budget matters) saying: the shader or program id, the status, and
+      the driver's info log text.  The line must name the program so the
+      guest's own shader source can be looked up.
+
+  A2. MAKE THE TEXTURE UPLOAD VISIBLE.  After every guest texture upload
+      (glTexImage2D, glCompressedTexImage2D, glTexSubImage2D,
+      glCopyTexSubImage2D) record the level, the internal format, the
+      format/type and the width/height, and report the ones that FAIL --
+      i.e. where glGetError() is not GL_NO_ERROR afterwards, or where the
+      driver rejects the format.  The port serves the guest's textures out
+      of the card's volumes and the guest's assets are PVR/ETC/DXT; if the
+      host driver cannot decode a format the port serves, that is a
+      texture error and it is currently invisible.
+
+  A3. THE INSTRUMENT MUST BE CHEAP.  The port's own logging is already
+      known to cost frame rate, and the project's own A/Bs have twice
+      excluded the probes from being the cause.  So: no per-call log line
+      for a SUCCESSFUL upload (there are tens of thousands), only failures;
+      and a TOTAL budget on the failure lines per process, with one line
+      saying the budget was spent.  Do not regress the frame rate.
+
+  A4. STATE THE EXPECTED SHAPE OF THE FIX in your answer: if the magenta
+      turns out to be a shader that fails to link because the port serves a
+      texture in a format the driver rejects, then the fix is in the
+      asset-serving path, not in the shader path -- so the instrument has
+      to be able to tell those two apart, and that is what A1 and A2 are
+      for.
+
+=============================================================================
+PART B: A CONTROLLER THAT IS NOT AN NPAD IS NOT READ AT ALL
+=============================================================================
+
+THE SYMPTOM (the user): "I plugged an Xbox Elite controller into the PC and
+it does not control the game."
+
+THE PORT'S INPUT PATH, AS IT STANDS:
+
+  native-switch/source/guest_input.cpp reads the controller ONLY through
+  libnx's Npad API:
+      padUpdate / padGetState / padGetStickPos / padGetGcTriggerPos
+      and the HID style set is declared with
+      padConfigureInput(1, kNpadStyleSet) where kNpadStyleSet is
+      HidNpadStyleSet_NpadStandard | HidNpadStyleTag_NpadGc.
+
+  **⇒ A CONTROLLER THAT THE HID SERVICE DOES NOT REPORT AS AN NPAD IS
+  NEVER READ.**  On a hacked console, hidretro / dinput_redux translate a
+  DS4, an Xbox pad or a generic pad into an Npad, so the port works
+  there.  On a PC under an emulator, nothing does that translation, so an
+  Xbox Elite arrives as a raw HID device and the port sees nothing at
+  all.
+
+  The port's own documentation (native-switch/card/rr3-gamepad.txt) says
+  exactly this, and it is TRUE only for the console.
+
+YOUR JOB, PART B:
+
+  B1. ADD A RAW-HID DEVICE PATH, so that the port reads a NON-Npad
+      controller and presents it to the rest of the port in the SAME shape
+      it already uses.  The rest of the port (the mapping file
+      rr3-gamepad.txt, the guest's SetButtonValueJNI / SetAxisValueJNI
+      calls, the autopilot) must not have to know which device it came
+      from.
+
+      Concretely: enumerate the HID devices, skip the ones the Npad API
+      already reports, read the others with hidRead, and translate the
+      layouts you can identify into the port's existing NpadState shape:
+        - Xbox 360 / One / Elite (the XInput layout: 2 sticks, 2 triggers,
+          D-pad, ABXY, shoulders, menu buttons)
+        - DualShock 4 / DualSense
+        - Switch Pro Controller
+        - a generic 8-button + 2-stick layout
+      For a device whose layout cannot be identified, LOG IT BY NAME AND
+      ITS REPORT LENGTH and do not guess: an unrecognised device that is
+      reported is a finding, and a silently ignored device is the bug the
+      user is reporting.
+
+  B2. KEEP THE MAPPING FILE AS THE ONE PLACE THAT SAYS WHAT A BUTTON
+      MEANS.  The guest's ordinals (A/B/X/Y/L1/L2/R1/R2/D-pad/START/
+      SELECT/sticks/triggers) must be reached THROUGH rr3-gamepad.txt, not
+      by hard-coding a layout's button numbers in the driver.  A layout
+      translation produces a "Npad-shaped" state, and the mapping file
+      then says what that state means to the guest.
+
+  B3. DO NOT BREAK THE CONSOLE PATH.  The Npad path must keep working
+      exactly as it does, including the GameCube analogue trigger
+      handling, because on a real console that is the path that matters.
+
+  B4. MAKE IT OBSERVABLE.  The port already logs a "pad-trigger" line with
+      the controller's style set and the analogue trigger values.  Add a
+      line that says what devices are present, which one the port is
+      reading, and what it mapped -- so "my pad does nothing" becomes
+      answerable from the log instead of from a guess.  Keep it to a low
+      rate (the port's own log volume has been measured as a real cost).
+
+=============================================================================
+RULES
+=============================================================================
+
+  - C++17, no GNU extensions, M_PI is not available.
+  - Read the existing comment style: every non-obvious block explains WHY
+    and cites a measurement where there is one.  That is the house style
+    and it is the documentation.
+  - The guest speaks UTF-8 and the port's own strings are English.
+  - Do NOT change the pursuit, the race-state probe or the cond-wait code.
+    They are under active measurement.
+  - Do not run the emulator and do not build.  Output the code.
+
+=============================================================================
+DELIVERABLE
+=============================================================================
+
+  1. One paragraph per part, in plain words: what now happens that did not
+     before.
+  2. The complete contents of every new file, and for every EXISTING file
+     you touch, the exact hunks to apply (with enough surrounding context
+     that they can be applied unambiguously).
+  3. For Part B, the list of HID layouts you can identify, how you
+     identify each one, and what happens for one you cannot.
+  4. Your own review: for each of your changes, the way it can go wrong,
+     and the ONE measurement that would show it.
+  5. The single most likely way each part is still wrong, and the one
+     measurement that would show it.
