@@ -463,6 +463,236 @@ bool raceLineTarget(const RaceLine& line, const SplineFile& spline,
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// THE LOOK-AHEAD DISTANCE, AND WHY IT HAS TO FOLLOW THE CURVATURE.
+//
+// MEASURED 2026-11-04 (q147): the port was moved onto the track's own racing
+// line (ai_spline) instead of the centre line, and the car's distance from
+// the CENTRE line dropped from 2.92-8.25 m to 0.32 m -- the car was finally
+// on the right line.  And the lap progress got WORSE: 10.35 % -> 5.14 %.
+//
+// The reason was the look-ahead.  It was a CONSTANT 20 m, and on the racing
+// line's sharp corners 20 m ahead is a long way round a corner the car is
+// still entering: the measured pursuit error on those corners was 0.7 rad
+// (40 degrees).  The controller steers by AIMING AT A POINT, so a point
+// 40 degrees off is a steering command 40 degrees wrong, and the car drove
+// off the road at the first real corner.
+//
+// The fix is the ordinary one: a look-ahead that SHORTENS as the corner
+// tightens.  A long look-ahead is right on a straight (it damps the
+// steering and keeps the car on the line); a short one is right in a corner
+// (it aims at the part of the line the car is actually about to drive).
+//
+// The measure is deliberately simple and is stated here so that it can be
+// argued with: the line is walked forward from the car's nearest node, and
+// the ARC LENGTH at which the accumulated heading change first exceeds the
+// threshold is the corner's scale.  A straight never reaches the threshold,
+// so the walk reaches the maximum look-ahead; a hairpin reaches it in a
+// couple of metres.
+//
+// The curve is measured over the arc AHEAD, in the direction the car is
+// travelling, so the answer is the same whichever way round the track goes.
+// ---------------------------------------------------------------------------
+constexpr double kCornerHeadingThresholdRad = 0.35;  // ~20 degrees
+constexpr double kMinLookAheadMetres = 4.0;
+constexpr double kMaxLookAheadMetres = 20.0;
+
+// The heading of the segment from `from` to `to`, in radians.
+double segmentHeading(const Point& from, const Point& to) {
+    return std::atan2(to.y - from.y, to.x - from.x);
+}
+
+// The smallest non-zero angle between two headings, in radians.
+//
+// M_PI IS NOT USED: it is not in the C++ standard, and the host self-test
+// compiles this file with -std=c++17 and no GNU extensions, where M_PI is
+// only there if <cmath> happens to define it.
+constexpr double kPi = 3.14159265358979323846;
+
+double headingDifference(double a, double b) {
+    double d = std::fabs(a - b);
+    while (d > kPi) {
+        d -= 2.0 * kPi;
+    }
+    while (d < 0.0) {
+        d += 2.0 * kPi;
+    }
+    return d;
+}
+
+// The look-ahead distance for the car at `nearest` on `poly`, walking in
+// `step`.  Returns kMaxLookAheadMetres when the road ahead is straight.
+//
+// THE ARC LENGTH, NOT THE ANGLE.
+//
+// The comment above says what this returns: "the ARC LENGTH at which the
+// accumulated heading change first exceeds the threshold is the corner's
+// scale".  The implementation used to walk the same path and return
+// `accumulated * 8.0` -- the ANGLE, scaled by a magic number.  That is not
+// the same thing, and it is wrong in the direction that matters:
+//
+//   * on a straight, the walk runs a long way before the turn reaches the
+//     threshold, and the angle is still only just over 0.35 rad, so the
+//     answer was ~2.8 m -- clamped to the 4 m minimum.  The straight got the
+//     SHORTEST look-ahead of anywhere on the track, which is exactly where
+//     the steering noise lives;
+//   * in a tight corner the threshold is crossed inside one segment, so the
+//     angle overshoots further and the answer got LONGER -- the opposite of
+//     the intent, and the same failure q147 measured (a long look-ahead into
+//     a corner is a steering command tens of degrees wrong).
+//
+// ⇒ The arc length walked is what bounds the pursuit error: aiming at a
+// point L metres ahead along the road gives an error of about the road's
+// turn over that arc, so the distance at which the turn reaches the
+// threshold IS the look-ahead that keeps the error under the threshold.
+// That is the law the comment states, and it is now the law the code obeys.
+double curvatureLookAheadMetres(const std::vector<Point>& poly, size_t nearest,
+                                int step) {
+    if (poly.size() < 8) {
+        return kMaxLookAheadMetres;
+    }
+    const size_t count = poly.size();
+    const size_t first = (step > 0) ? ((nearest + 1) % count)
+                                     : ((nearest + count - 1) % count);
+    double previousHeading = segmentHeading(poly[nearest], poly[first]);
+    double accumulatedTurn = 0.0;
+    double walkedMetres = 0.0;
+    size_t index = first;
+    // The walk is bounded: it looks at most a third of the lap ahead, which
+    // is far more than any corner needs and keeps the cost constant.
+    const size_t maxSteps = count / 3 + 4;
+    for (size_t step_i = 0; step_i < maxSteps; ++step_i) {
+        const size_t next = (step > 0) ? ((index + 1) % count)
+                                       : ((index + count - 1) % count);
+        const double dx = poly[next].x - poly[index].x;
+        const double dy = poly[next].y - poly[index].y;
+        const double segment = std::sqrt(dx * dx + dy * dy) / 256.0;
+        if (segment <= 0.0) {
+            break;
+        }
+        walkedMetres += segment;
+        const double heading = segmentHeading(poly[index], poly[next]);
+        accumulatedTurn += headingDifference(heading, previousHeading);
+        previousHeading = heading;
+        if (accumulatedTurn >= kCornerHeadingThresholdRad) {
+            // The corner's scale: the distance at which the road ahead has
+            // turned by the threshold.  Aim there, so the target is still
+            // within the threshold of the car's heading.
+            if (walkedMetres < kMinLookAheadMetres) {
+                return kMinLookAheadMetres;
+            }
+            if (walkedMetres > kMaxLookAheadMetres) {
+                return kMaxLookAheadMetres;
+            }
+            return walkedMetres;
+        }
+        index = next;
+        if (index == nearest) {
+            break;  // wrapped the whole loop without a corner
+        }
+    }
+    return kMaxLookAheadMetres;
+}
+
+// THE TARGET, WITH A CURVATURE-ADAPTIVE LOOK-AHEAD.
+//
+// This is raceLineTarget() with one difference: the look-ahead distance is
+// not a constant but is computed from the curvature of the road AHEAD.  The
+// direction lock, the nearest-node search and the 25 m "the car has to be
+// ON the line" guard are all exactly as they were -- they are the parts
+// that were MEASURED to be right, and they are not being touched.
+//
+// The curvature is computed on the SAME polyline and in the SAME direction
+// as the target, so the two cannot disagree about which way the car is
+// going.
+bool raceLineTargetAdaptive(const RaceLine& line, const SplineFile& spline,
+                            double carX, double carY, double headingX, double headingY,
+                            int* direction,
+                            double* targetX, double* targetY,
+                            double* lookAheadMetres,
+                            bool adaptiveLookAhead,
+                            double fixedLookAheadMetres) {
+    if (!line.valid || targetX == nullptr || targetY == nullptr) {
+        return false;
+    }
+    const SplineChunk* chunk = spline.chunk(line.chunk);
+    if (chunk == nullptr || chunk->nodes.size() < 8) {
+        return false;
+    }
+    std::vector<Point> poly;
+    buildChunkPolyline(line, *chunk, &poly);
+
+    size_t nearest = 0;
+    double nearestDistance = 1e30;
+    for (size_t i = 0; i < poly.size(); ++i) {
+        const double dx = poly[i].x - carX;
+        const double dy = poly[i].y - carY;
+        const double d = dx * dx + dy * dy;
+        if (d < nearestDistance) {
+            nearestDistance = d;
+            nearest = i;
+        }
+    }
+    const double distanceMetres = std::sqrt(nearestDistance) / 256.0;
+    if (distanceMetres > 25.0) {
+        return false;
+    }
+
+    // THE DIRECTION, LOCKED ONCE -- unchanged from raceLineTarget().
+    int step = 1;
+    if (direction != nullptr && *direction != 0) {
+        step = (*direction > 0) ? 1 : -1;
+    } else if (headingX != 0.0 || headingY != 0.0) {
+        const size_t count = poly.size();
+        const size_t next = (nearest + 1) % count;
+        const size_t prev = (nearest + count - 1) % count;
+        const double fx = poly[next].x - poly[nearest].x;
+        const double fy = poly[next].y - poly[nearest].y;
+        const double bx = poly[prev].x - poly[nearest].x;
+        const double by = poly[prev].y - poly[nearest].y;
+        const double forward = fx * headingX + fy * headingY;
+        const double backward = bx * headingX + by * headingY;
+        if (backward > forward) {
+            step = -1;
+        }
+        if (direction != nullptr) {
+            *direction = step;
+        }
+    }
+
+    // THE LOOK-AHEAD: from the curvature ahead, or the constant.
+    //
+    // The fixed branch is EXACTLY what raceLineTarget() did, so the "fixed"
+    // mode is the old behaviour and not an approximation of it.
+    const double lookAhead = adaptiveLookAhead
+        ? curvatureLookAheadMetres(poly, nearest, step)
+        : fixedLookAheadMetres;
+    if (lookAheadMetres != nullptr) {
+        *lookAheadMetres = lookAhead;
+    }
+
+    double travelled = 0.0;
+    size_t index = nearest;
+    const size_t count = poly.size();
+    for (size_t guard = 0; guard < count; ++guard) {
+        const size_t next = (step > 0) ? ((index + 1) % count)
+                                       : ((index + count - 1) % count);
+        const double dx = poly[next].x - poly[index].x;
+        const double dy = poly[next].y - poly[index].y;
+        const double segment = std::sqrt(dx * dx + dy * dy) / 256.0;
+        if (travelled + segment >= lookAhead) {
+            const double remaining = lookAhead - travelled;
+            const double t = segment > 0.0 ? remaining / segment : 0.0;
+            *targetX = poly[index].x + (poly[next].x - poly[index].x) * t;
+            *targetY = poly[index].y + (poly[next].y - poly[index].y) * t;
+            return true;
+        }
+        travelled += segment;
+        index = next;
+    }
+    return false;
+}
+
 // THE CAR'S DISTANCE FROM A CHUNK, IN METRES.
 //
 // WHY IT IS HERE: the port follows the CENTRE line, and the track's own

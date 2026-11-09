@@ -120,6 +120,38 @@ bool raceLineTarget(const RaceLine& line, const SplineFile& spline,
                     int* direction,
                     double lookAheadMetres, double* targetX, double* targetY);
 
+// The look-ahead point on the line, with a LOOK-AHEAD THAT FOLLOWS THE
+// CURVATURE.
+//
+// Same as raceLineTarget() except for the look-ahead distance, which is
+// computed from how sharply the road bends AHEAD of the car instead of
+// being a constant.
+//
+// WHY.  MEASURED 2026-11-04 (q147): on the track's own racing line the car
+// sat 0.32 m from it -- the right line at last -- and the lap progress got
+// WORSE (10.35 % -> 5.14 %), because the look-ahead was a constant 20 m and
+// 20 m ahead on a sharp corner is a point 0.7 rad (40 degrees) off the
+// car's actual path.  The controller steers by AIMING AT A POINT, so that
+// is a steering command 40 degrees wrong.
+//
+// The distance now SHORTENS as the corner tightens: long on a straight (it
+// damps the steering), short in a corner (it aims at the part of the line
+// the car is about to drive).  `lookAheadMetres`, when given, receives the
+// distance that was used.
+//
+// The direction lock, the nearest-node search and the "the car has to be ON
+// the line" guard are identical to raceLineTarget()'s, because those are
+// the parts that were MEASURED to be right.
+// `adaptiveLookAhead` picks between the curvature-following distance and
+// the constant one, so that there is ONE call site for both.
+bool raceLineTargetAdaptive(const RaceLine& line, const SplineFile& spline,
+                            double carX, double carY, double headingX, double headingY,
+                            int* direction,
+                            double* targetX, double* targetY,
+                            double* lookAheadMetres,
+                            bool adaptiveLookAhead,
+                            double fixedLookAheadMetres);
+
 // The car's distance from another chunk of the SAME spline, in metres.
 //
 // WHY: the fit's transform was established on ONE chunk (the centre line),

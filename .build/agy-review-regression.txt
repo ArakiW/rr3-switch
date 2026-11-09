@@ -1,0 +1,142 @@
+You are reviewing a Nintendo Switch port of an Android game (Real Racing 3 guest,
+libnx + Mesa) for a REGRESSION that appeared between two dates. Be adversarial.
+Do not assume the author is right. Do not praise. Find the mechanism or say
+plainly that you cannot.
+
+THE SYMPTOM (measured, not guessed)
+
+Round q145/q147, built 2026-11-04, source commit b2e15180 or later:
+  - guest rendered 6240 frames in 407 s (15.3 fps)
+  - the guest's RuleSet_RaceMetrics object was found ALIVE at frame 540
+    (the log line says "metrics=1 ... lapd=1806336 lapdF=1806336.000")
+  - the port's own closed loop then took over the car and drove it
+  - the guest's race ran normally
+
+Round q163 and every other 2026-11-09 round, source commit b9f006df:
+  - guest rendered 2040 frames in 407 s (5.0 fps) -- 3x SLOWER
+  - the race-metrics object was found but NEVER judged live:
+    "metrics=0 ... rej=the-members-are-not-live rejm=0x3f rejlapd=4294967295"
+    (4294967295 as uint32 is -1.0f, the guest's own "no lap yet" value)
+  - the guest re-entered the race screens repeatedly: 25 StartLightsScreen
+    loads and 37 InGameScreen loads in one round, versus 7 and 10 in the good
+    round.  The race never actually started.
+  - the throttle DID reach the guest: the input-door line shows
+    "ax=[0.000,0.000,0.000,0.000,0.000,1.000] btn=[1,0,0,...]" (RT=1.0, A held)
+    for the whole run, and the pad script log confirms it.
+  - the port's closed loop never engaged, because it refuses to drive a
+    not-live metrics object.  So the missing lap distance is the cause, and
+    the missing lap distance is a GUEST-side symptom.
+  - NEW log lines that did not exist in the Nov-4 rounds:
+      phase=cond-wait-ledger obj=0x2110000660 known=1 waited_ms=1000 waits=1
+        signals=1 deficit_at_entry=0 epoch=1 wait_caller=0x2109423a30
+        budget_ms=120000 outcome=still-waiting
+      ... repeated at 30000/60000/90000/120000 ms, then:
+      phase=cond-wait-ledger ... outcome=GIVING-UP
+      phase=cond-wait-abandoned reason=no-signal-within-budget
+        returned=0_like_a_spurious_wakeup
+    and the same object is waited on AGAIN (waits=2, deficit_at_entry=1), again,
+    and again (waits=3, waits=4).  signals stays at 1 and epoch stays at 1.
+    So: several guest threads wait on ONE guest condition variable, it is
+    signalled exactly ONCE, and the waiters are never released.
+
+WHAT CHANGED IN THE PORT BETWEEN THE TWO DATES
+
+  456f43c3  2026-11-09  THE CONSOLE FROZE, AND THE LOG COULD NOT SAY WHY
+  4a8cd99d  2026-11-09  THE WAIT MUST NOT HAND THE GUEST A NON-ZERO RETURN,
+                        AND A SIGNAL MUST NOT BE LOST
+  4dfe4694  2026-11-09  the no-context GL observer
+  7a13ef1b  2026-11-09  fixes to that observer
+  b8151e47  2026-11-09  THE CLEAN LOADER HUNG (asset path fallback chain in
+                        native_ui.cpp + console release in main.cpp)
+
+The relevant files are under E:\AI\RealRacing3-switch\native-switch\source\:
+  pthread_bridge.cpp    (guestPthreadCondWait, noteCondSignal, noteCondWait,
+                         guestPthreadCondSignal, guestPthreadCondBroadcast)
+  guest_view_trace.cpp  (noteGlCallWithoutContext, checkpointPhase)
+  native_ui.cpp         (portPath, openFaceOrBootstrap, nativeUiInit/Exit)
+  main.cpp              (releaseDiagnosticConsole, loaderPaths)
+  race_state_probe.cpp  (race-state probe; the "race-state" log line)
+
+Use git to see the diffs.  For example:
+  git -C E:\AI\RealRacing3-switch diff b2e15180 HEAD -- native-switch/source/pthread_bridge.cpp
+  git -C E:\AI\RealRacing3-switch diff b2e15180 HEAD -- native-switch/source/guest_view_trace.cpp
+  git -C E:\AI\RealRacing3-switch diff b2e15180 HEAD -- native-switch/source/native_ui.cpp native-switch/source/main.cpp
+
+YOUR QUESTIONS, in priority order
+
+  Q1. In guestPthreadCondWait, the OLD code (see the diff) was a loop that
+      called pthread_cond_timedwait with a ~1 second deadline and looped
+      forever on ETIMEDOUT.  The NEW code adds: a per-pass ledger read, a
+      signal-epoch check, and a 120 s budget after which it returns 0.
+      Read both versions CAREFULLY and answer precisely:
+        (a) In the OLD code, what happened to a guest thread that called
+            pthread_cond_wait on a condition variable that was signalled only
+            ONCE while several threads were waiting?  Did those threads ever
+            return to the guest's own predicate loop?
+        (b) In the NEW code, what happens to them?
+        (c) Is there any way the NEW code returns EARLIER or LATER than the
+            OLD code from the guest's point of view?  In particular: the old
+            code, on a successful signal, returned 0 from the wait; the new
+            code's epoch check can ALSO return 0 without ever having been
+            signalled.  Can the new code turn a "waited and was woken"
+            into a "returned immediately without waiting", or vice versa?
+        (d) The new code updates lastSeenEpoch = ledger.signalEpoch on EVERY
+            pass through the loop, including the pass right before it blocks.
+            Is that correct with respect to "a signal that arrived while
+            nobody was blocked"?  Consider: thread A waits and is signalled
+            (epoch 0 -> 1).  Later thread B calls cond_wait for the first
+            time.  What does B see, and does B return immediately?  Is that
+            right or wrong for a guest that uses while(!predicate) wait()?
+
+  Q2. noteGlCallWithoutContext() is called BEFORE every ::gl* call in 23
+      guest_view_trace.cpp tracers.  Read it and its callers.
+        (a) What does it cost per call, and how many guest GL calls happen
+            per frame?  The Nov-9 run logged "phase=gl-no-context-summary
+            calls=0 recorded=0" -- explain what that says about whether the
+            observer is even wired in.
+        (b) Can calling eglGetCurrentContext() before a guest GL call change
+            what the guest observes or how it renders?
+        (c) Is the observer wired into the SAME tracer functions the guest
+            actually goes through, or only into tracers the guest does not
+            use?  Prove it from the source (list the tracer entry points and
+            say how you know they are on the guest's path).
+
+  Q3. native_ui.cpp and main.cpp: can the asset-fallback chain
+      (resolvePortAssetPath) or releaseDiagnosticConsole() change the ORDER in
+      which the guest's threads first run, or change whether the guest's
+      renderer thread starts before the guest's worker threads?  The clean
+      loader releases the deko3d console before creating the EGL surface.
+
+  Q4. Does "census=off" (sdmc:/switch/rr3-census.conf) gate anything OTHER
+      than diagnostics?  Read censusArm() and censusDisabled() and everything
+      they guard.  In particular, could turning the census off change the
+      GUEST's behaviour (thread scheduling, memory pressure, timing) rather
+      than only the port's logging?  The census SAMPLES the guest by pausing
+      its threads.
+
+  Q5. Your own judgement: what is the most likely mechanism by which the
+      Nov-9 build causes "the guest's race never starts" and "3x slower"?
+      Rank at least three candidate mechanisms, and for each say what
+      measurement would confirm or kill it.
+
+RULES
+
+  - Answer from the SOURCE, with file:line citations.  Quote the code you
+    rely on.  If you are inferring, label it as inference.
+  - Separate what is CONFIRMED from the code, what is PROBABLE, and what is
+    SPECULATION.  The author cares about that distinction more than about
+    reassurance.
+  - If the evidence does not support a conclusion, say so.  A wrong answer
+    costs more than no answer.
+  - Do NOT modify any file.  Read-only review.
+  - Do not run the emulator or any build.
+
+FORMAT
+
+  Start with a one-paragraph BOTTOM LINE: the single most likely mechanism, or
+  "I could not find one" plus the strongest reason.
+  Then answer Q1..Q5 in order, each with a short verdict line and the
+    file:line evidence.
+  Finish with the TOP 3 MEASUREMENTS that would most cheaply separate the
+    remaining candidate mechanisms, each one line, each naming the log field
+    or file to read and the value that would confirm or kill it.

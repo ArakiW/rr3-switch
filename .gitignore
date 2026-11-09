@@ -57,6 +57,11 @@ reference/
 #   .build/run-pinned-round.ps1      one round with a named census setting
 #   .build/gate-and-round.ps1        the gate and then one round, in that order
 #   .build/retry-push.ps1            retry the push until GitHub answers again
+#   .build/set-pursuit-conf.py       set the pursuit's two configuration keys
+#   .build/pursuit-report.py         what the pursuit actually did, per round
+#   .build/metrics-summary.py        did the pursuit run at all, per round
+#   .build/run-pursuit-ab.ps1        the pursuit's four-cell A/B, one binary
+#   .build/run-regression-matrix.ps1 the code-vs-census 2x2, one variable each
 #
 # WHY THEY HAVE TO BE TRACKED: the archive packer silently reused a STALE
 # archive on 2026-11-03 and shipped one 1480 bytes off the package.  A fix to
@@ -64,6 +69,11 @@ reference/
 # The same is true of the EXPERIMENT scripts: a measurement nobody can repeat
 # is a measurement nobody can check, and the census A/B is the measurement the
 # frame-rate question now rests on.
+#
+# The pursuit's four scripts were added on 2026-11-09 for the same reason and
+# with the same reasoning: the pursuit's A/B had never been runnable, because
+# the script that sets the configuration and the script that reads the result
+# were not in the repository at all.
 native-switch/build/
 native-switch/*.nro
 native-switch/*.elf

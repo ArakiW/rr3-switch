@@ -974,6 +974,129 @@ unsigned long long g_lastFlipFrame = 0;
 // WHY THE FIT IS DONE ONCE PER TRACK: the track's geometry does not change
 // while the car drives on it, so refitting every frame would be a lot of
 // arithmetic for the same answer.
+// ---------------------------------------------------------------------------
+// THE PURSUIT'S CONFIGURATION.
+//
+// Read from rr3-screen.txt, the file the port already reads for the view
+// size.  Two keys:
+//
+//   raceline=centre_spline|ai_spline
+//       Which line of the track's spline the port follows.
+//
+//       MEASURED 2026-11-04 (q147): the centre line is 7016.9 m a lap and
+//       the racing line (ai_spline) is 6949.8 m -- 67.0 m shorter, because
+//       it cuts the corners -- and the two are 2.92 m (median) to 8.25 m
+//       (worst) apart.  A car that hits the barriers ten times a race while
+//       sitting within 2 m of the centre line is on the WRONG line, and the
+//       number that says so is the car's distance from the racing line (the
+//       "rres" field).
+//
+//   lookahead=adaptive|fixed
+//       Whether the look-ahead distance follows the curvature of the road
+//       AHEAD (adaptive) or stays constant (fixed).
+//
+//       MEASURED 2026-11-04 (q147): on the racing line a constant 20 m
+//       look-ahead gave a pursuit error of 0.7 rad on the corners, and the
+//       controller steers by AIMING AT A POINT -- so that is a steering
+//       command 40 degrees wrong, and the car left the road at the first
+//       real corner.
+//
+// The defaults are the ones that were MEASURED to work: the centre line
+// (the only one the port has ever completed a lap on) with the adaptive
+// look-ahead.  The other combinations are one key away, so a round can
+// measure them instead of arguing about them.
+// ---------------------------------------------------------------------------
+struct RaceLineConf {
+    char chunk[32] = "centre_spline";
+    bool adaptiveLookAhead = true;
+    bool resolved = false;
+};
+
+const RaceLineConf& raceLineConf() {
+    static RaceLineConf conf;
+    if (conf.resolved) {
+        return conf;
+    }
+    conf.resolved = true;
+    std::FILE* file = std::fopen("sdmc:/switch/rr3-native-rehost/rr3-screen.txt", "rb");
+    if (file == nullptr) {
+        return conf;
+    }
+    char line[256];
+    while (std::fgets(line, sizeof(line), file) != nullptr) {
+        char* eq = std::strchr(line, '=');
+        if (eq == nullptr) {
+            continue;
+        }
+        *eq = '\0';
+        char* key = line;
+        char* value = eq + 1;
+        while (*key == ' ' || *key == '\t') ++key;
+        while (*value == ' ' || *value == '\t') ++value;
+        // Trim the ends.
+        char* keyEnd = key + std::strlen(key);
+        while (keyEnd > key && (keyEnd[-1] == '\n' || keyEnd[-1] == '\r' ||
+                                keyEnd[-1] == ' ' || keyEnd[-1] == '\t')) {
+            --keyEnd;
+        }
+        *keyEnd = '\0';
+        char* valueEnd = value + std::strlen(value);
+        while (valueEnd > value && (valueEnd[-1] == '\n' || valueEnd[-1] == '\r' ||
+                                    valueEnd[-1] == ' ' || valueEnd[-1] == '\t')) {
+            --valueEnd;
+        }
+        *valueEnd = '\0';
+        if (std::strcmp(key, "raceline") == 0) {
+            if (value[0] != '\0' && std::strlen(value) < sizeof(conf.chunk)) {
+                std::snprintf(conf.chunk, sizeof(conf.chunk), "%s", value);
+            }
+        } else if (std::strcmp(key, "lookahead") == 0) {
+            conf.adaptiveLookAhead = (std::strcmp(value, "fixed") != 0);
+        }
+    }
+    std::fclose(file);
+    return conf;
+}
+
+// The chunk of the spline the port follows.
+const char* raceLineChunk() {
+    return raceLineConf().chunk;
+}
+
+// Whether the look-ahead follows the curvature of the road ahead.
+bool raceLineLookAheadAdaptive() {
+    return raceLineConf().adaptiveLookAhead;
+}
+
+// The look-ahead mode, as a word, so the log line says WHICH pursuit
+// configuration the round measured.
+//
+// WHY THE LOG HAS TO SAY IT.  The pursuit's configuration is read from the
+// card ONCE, at startup, and it is changed by editing a file between rounds.
+// A log line that does not name the configuration leaves the archive unable
+// to say what it measured -- and the measurement is worthless without it.
+const char* raceLineLookAheadMode() {
+    return raceLineLookAheadAdaptive() ? "adaptive" : "fixed";
+}
+
+// THE LOOK-AHEAD, AND THE LINE IT FOLLOWS.
+//
+// Both are CONFIGURATION, not constants, because the two halves of the
+// pursuit have to be measured TOGETHER.
+//
+// MEASURED 2026-11-04 (q147): the track's own racing line (ai_spline) is
+// 67.0 m shorter a lap than the centre line and 2.92-8.25 m away from it,
+// and a car 0.32 m from the racing line is on the RIGHT line.  But the same
+// round's lap progress got WORSE on the racing line (10.35 % -> 5.14 %)
+// because the look-ahead was a constant 20 m: on the racing line's corners
+// 20 m ahead is 0.7 rad (40 degrees) off the car's path, and the
+// controller steers by AIMING AT A POINT.
+//
+// So: the chunk is chosen ("raceline=centre_spline" | "ai_spline"), and the
+// look-ahead either follows the curvature ("lookahead=adaptive", the
+// default) or stays constant ("lookahead=fixed").  The defaults are the
+// ones that were MEASURED to work; the others are one file edit away, so a
+// round can measure them.
 constexpr double kRaceLineLookAheadMetres = 20.0;
 constexpr size_t kRaceLineSamples = 48;
 constexpr size_t kRaceLineMinSamples = 12;
@@ -1052,7 +1175,7 @@ bool refreshRaceLine(unsigned long long frame) {
         ++n;
     }
     rr3::RaceLine line;
-    if (!rr3::raceLineFit(*spline, "centre_spline", xs, ys, n, &line)) {
+    if (!rr3::raceLineFit(*spline, raceLineChunk(), xs, ys, n, &line)) {
         return false;
     }
     // THE RESIDUAL IS THE DISCRIMINATOR.  With the right scale the residual
@@ -1240,7 +1363,12 @@ void fillCarState(RaceMetricsSample* out) {
         if (spline != nullptr && refreshRaceLine(gRaceLineFrame)) {
             double targetX = 0.0;
             double targetY = 0.0;
-            if (rr3::raceLineTarget(gRaceLine.line, *spline,
+            // THE LOOK-AHEAD IS COMPUTED BY raceLineTargetAdaptive(), which
+            // follows the curvature when the mode says so and uses the
+            // constant otherwise.  ONE call site, so there is one way to be
+            // wrong instead of two.
+            double lookAheadUsed = 0.0;
+            if (rr3::raceLineTargetAdaptive(gRaceLine.line, *spline,
                                     static_cast<double>(out->carX),
                                     static_cast<double>(out->carY),
                                     // THE WINDOWED MOTION VECTOR, not the
@@ -1257,13 +1385,15 @@ void fillCarState(RaceMetricsSample* out) {
                                     gRaceLine.haveMotion ? gRaceLine.motionX : 0.0,
                                     gRaceLine.haveMotion ? gRaceLine.motionY : 0.0,
                                     &gRaceLine.direction,
-                                    kRaceLineLookAheadMetres, &targetX,
-                                    &targetY)) {
+                                    &targetX, &targetY, &lookAheadUsed,
+                                    raceLineLookAheadAdaptive(),
+                                    kRaceLineLookAheadMetres)) {
                 out->carTargetX = static_cast<int32_t>(targetX);
                 out->carTargetY = static_cast<int32_t>(targetY);
                 out->carTargetZ = out->carZ;
                 out->targetFromLine = true;
                 out->lineResidual = gRaceLine.line.residual;
+                out->lookAheadMetres = static_cast<float>(lookAheadUsed);
                 // THE CAR'S DISTANCE FROM THE RACING LINE.
                 //
                 // The port follows the CENTRE line, and the track's own racing
@@ -2560,7 +2690,7 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             "gm_base=%d gm_cand=%d cand=%s metrics=%d "
             "active=-1 nodes=%d keyoff=%d heap=0x%llx+0x%llx "
             "rej=%s rejm=0x%x rejlapd=%u "
-            "drive=%d cfg=%d",
+            "drive=%d cfg=%d rl=%s lam=%s dir=%d",
             frame, static_cast<unsigned long long>(g_cglobal),
             static_cast<unsigned long long>(sample.gameMode),
             sample.gameModeFound ? 1 : 0,
@@ -2576,7 +2706,14 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             g_metricsRejectionMask,
             g_metricsRejectionLapd,
             g_drive.enabled ? 1 : 0,
-            g_driveConfig.present ? 1 : 0);
+            g_driveConfig.present ? 1 : 0,
+            // WHICH PURSUIT CONFIGURATION THIS ROUND MEASURED.  The
+            // configuration is read from the card once, at startup, and it is
+            // changed by editing a file between rounds -- so the archive has
+            // to carry it, or the measurement cannot be attributed.
+            raceLineChunk(),
+            raceLineLookAheadMode(),
+            gRaceLine.direction);
     } else {
         const RaceMetricsSample& m = sample.metrics[active];
         std::snprintf(
@@ -2594,7 +2731,7 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             "rate=%.6f prog=%.3f from_total=%d sawprog=%d "
             "car=0x%llx cnum=%u cnode=%u cprev=%u cpos=%d,%d,%d ctgt=%d,%d,%d "
             "snode=%u sdist=%u tsok=%d posok=%d ctok=%d ctdist=%.2f "
-            "line=%d lres=%.2f rres=%.2f "
+            "line=%d lres=%.2f rres=%.2f la=%.2f lachunk=%s lam=%s dir=%d mot=%.3f,%.3f "
             "perr=%.4f pur=%d ident=0x%llx "
             "drive=%d steer=%.3f mag=%.3f sign=%d best=%.6f flips=%d stalls=%d "
             "thr=%d brk=%d",
@@ -2654,6 +2791,22 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             m.trackStateAddress != 0 ? 1 : 0,
             m.targetPlausible ? 1 : 0, m.targetDistance,
             m.targetFromLine ? 1 : 0, m.lineResidual, m.racingResidual,
+            static_cast<double>(m.lookAheadMetres), raceLineChunk(),
+            raceLineLookAheadMode(),
+            // THE DIRECTION LOCK, AND THE MOTION VECTOR IT CAME FROM.
+            //
+            // MEASURED 2026-11-09 (round m1): the car turned around and drove
+            // BACKWARDS down the track -- the guest's signed distance to the
+            // look-ahead point went negative and stayed there -- and the log
+            // could not say which way round the track the port had decided to
+            // follow.  The lock is the thing that decides that, and it is a
+            // ONE-OFF decision, so it is exactly the kind of state that has
+            // to be in the log: a decision that is made once and never
+            // revisited is invisible in a per-frame line unless the line
+            // carries it.
+            gRaceLine.direction,
+            gRaceLine.haveMotion ? gRaceLine.motionX : 0.0,
+            gRaceLine.haveMotion ? gRaceLine.motionY : 0.0,
             static_cast<double>(g_drive.steerError), g_drive.pursuit ? 1 : 0,
             static_cast<unsigned long long>(m.membersIdentified),
             g_drive.enabled ? 1 : 0, static_cast<double>(g_drive.steer),

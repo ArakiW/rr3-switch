@@ -76,6 +76,26 @@ struct ObjectSlot {
     //
     // Only meaningful for gConditions; the other slot types leave it zero.
     uint64_t signalEpoch{};
+    // SIGNALS THAT ARRIVED WHILE NOBODY WAS WAITING.
+    //
+    // MEASURED 2026-11-09 (round m2, the Nov-9 build): the guest's race
+    // never started, the guest's own frame loop stalled (2 draws per frame
+    // against 324 in the good round), and this condvar's ledger said
+    // `signals=0` -- the producer never signalled it at all, because the
+    // producer was blocked behind the waiter.
+    //
+    // And MEASURED 2026-11-09 on the console: the port froze with the
+    // guest's onViewChangedJNI inside pthread_cond_wait, waiting for a
+    // signal that had ALREADY been sent.  A host pthread_cond_t has no
+    // memory, so that signal was gone.
+    //
+    // ⇒ The bridge keeps the count itself.  A signal that arrives when no
+    // waiter is blocked is remembered here; the next waiter CONSUMES one
+    // and returns immediately, which is the behaviour the guest's
+    // `while (!ready) cond_wait()` loop assumes.  Exactly one waiter
+    // consumes one signal, so a broadcast is not accidentally turned into
+    // one wake-up per waiter.
+    uint64_t pendingSignals{};
     // Mutex ownership ledger. Populated only for gMutexes, and deliberately
     // kept in the HOST side table rather than read out of the guest struct:
     // the bridge never interprets guest pthread_mutex_t bytes, and it still
@@ -4678,17 +4698,44 @@ int getCondition(void* guest, pthread_cond_t** output) {
 }
 
 // Ledger taps. They only move counters; no locking beyond the registry lock.
-void noteCondWait(void* condition, const void* caller) {
+//
+// noteCondWait RECORDS THE WAIT AND CLAIMS A PENDING SIGNAL, in ONE
+// registry-lock acquisition.
+//
+// WHY IT IS ONE ACQUISITION AND NOT TWO.  The registry lock is the most
+// contended lock in the port: the census sampler holds it while it pauses
+// and resumes EVERY guest thread.  A wait that takes it twice on entry
+// doubles the chance of blocking the guest's own thread behind the census,
+// and the guest's cond-wait thread holds a guest mutex while it waits --
+// so a stall there stalls every other guest thread that needs that mutex,
+// and the producer that was going to signal never runs.
+//
+// MEASURED 2026-11-09 (round m2): exactly that.  The Nov-9 build's wait
+// took the lock once per SECOND, inside the loop, and the guest never
+// reached the race.  The Nov-4 build took it once per WAIT, on entry, and
+// the guest drove.  The rule is therefore: ONE acquisition per wait, at
+// entry, and none inside the loop.
+//
+// The return value says whether a signal that arrived while nobody was
+// waiting was claimed by THIS waiter.  A claimed signal means the guest's
+// predicate is now true, so the wait must not happen at all.
+bool noteCondWait(void* condition, const void* caller) {
     mutexLock(&gRegistryLock);
     ObjectSlot<pthread_cond_t>* slot = findSlot(gConditions, condition);
+    bool claimed = false;
     if (slot != nullptr) {
         ++slot->waits;
         slot->lastWaitReturn = caller;
         if (slot->waitersPeak == 0) {
             slot->waitersPeak = 1;
         }
+        if (slot->pendingSignals > 0) {
+            --slot->pendingSignals;
+            claimed = true;
+        }
     }
     mutexUnlock(&gRegistryLock);
+    return claimed;
 }
 
 void noteCondSignal(void* condition) {
@@ -4700,8 +4747,29 @@ void noteCondSignal(void* condition) {
         // still tell that a signal was meant for it.  See the signalEpoch
         // field on ObjectSlot.
         ++slot->signalEpoch;
+        // AND THE SIGNAL IS REMEMBERED, so that a waiter which arrives
+        // after it can still collect it.  See the pendingSignals field.
+        ++slot->pendingSignals;
     }
     mutexUnlock(&gRegistryLock);
+}
+
+// A waiter that was woken BY THE HOST condvar consumes one pending signal,
+// so the count cannot leak to a later waiter and wake it for nothing.
+//
+// This is the rare path (one acquisition per actual wake-up), and it is the
+// only place besides entry and the report points where the registry lock
+// is taken.
+bool condWaitConsumePendingSignal(void* condition) {
+    mutexLock(&gRegistryLock);
+    ObjectSlot<pthread_cond_t>* slot = findSlot(gConditions, condition);
+    bool claimed = false;
+    if (slot != nullptr && slot->pendingSignals > 0) {
+        --slot->pendingSignals;
+        claimed = true;
+    }
+    mutexUnlock(&gRegistryLock);
+    return claimed;
 }
 
 // ---------------------------------------------------------------------------
@@ -6238,68 +6306,84 @@ constexpr uint64_t kCondWaitReportEveryMs = 30000;
 int guestPthreadCondWait(void* condition, void* mutex) {
     CENSUS_IMPORT("pthread_cond_wait");
     const void* caller = __builtin_return_address(0);
-    noteCondWait(condition, caller);
+    // THE ENTRY ACQUISITION.  It records the wait AND claims a signal that
+    // arrived while nobody was waiting, in ONE registry-lock acquisition.
+    //
+    // MEASURED 2026-11-09 (round m2, the Nov-9 build): the Nov-9 version
+    // read the ledger at the TOP OF EVERY PASS of this loop, so it took the
+    // registry lock once per second, WHILE THE GUEST'S OWN HOST MUTEX WAS
+    // HELD.  The census sampler holds that same lock while it pauses and
+    // resumes every guest thread (7,071 threads per sweep), so the guest's
+    // cond-wait thread stalled for whole seconds at a time while holding a
+    // mutex that other guest threads needed.  The producer that was going to
+    // signal the condvar never ran -- m2's ledger says `signals=0` -- and
+    // the guest sat in the front end for the whole round drawing 2.1 things
+    // per frame instead of 324.
+    //
+    // The Nov-4 build took the lock once per WAIT, on entry, and the guest
+    // reached the race every time.  That is the rule this function follows
+    // now: ONE acquisition at entry, ONE on an actual wake-up, and TWO at
+    // the report points.  Never one per second.
+    const bool claimedPending = noteCondWait(condition, caller);
     pthread_cond_t* hostCondition = nullptr;
     pthread_mutex_t* hostMutex = nullptr;
     int result = getCondition(condition, &hostCondition);
     if (result == 0) result = getMutex(mutex, &hostMutex);
     if (result != 0) return result;
 
-    // THE LEDGER AND THE EPOCH BASELINE.
+    // A SIGNAL THAT WAS ALREADY HERE.  It arrived while nobody was waiting,
+    // so the host condvar threw it away.  The guest's predicate is now
+    // true, so the wait must not happen at all: returning without waiting
+    // is what a predicate wait has to do, and it is what the guest's own
+    // `while (!ready) cond_wait()` loop would have done had it looked at
+    // the predicate one more time.
     //
-    // The epoch is re-read on every pass through the loop, because a signal
-    // that arrives while this waiter is blocked has to be seen by the NEXT
-    // pass, not by the one that is already inside the wait.  The read is
-    // safe here: it takes gRegistryLock while the guest's host mutex is
-    // held, which is the SAME order the rest of this file already uses
-    // (noteCondWait on entry, mutexNoteAcquire on a successful lock), and
-    // nothing in this file takes a host mutex while holding gRegistryLock,
-    // so there is no inversion to create.
-    CondWaitLedger ledger = condWaitLedgerOf(condition);
-    uint64_t deficitAtEntry = (ledger.waits > ledger.signals)
-        ? (ledger.waits - ledger.signals) : 0;
+    // This is the case the November 9th freeze was about: the guest's
+    // onViewChangedJNI was waiting for a signal that had ALREADY been sent.
+    if (claimedPending) {
+        char details[256];
+        const CondWaitLedger ledger = condWaitLedgerOf(condition);
+        const uint64_t deficit = (ledger.waits > ledger.signals)
+            ? (ledger.waits - ledger.signals) : 0;
+        __builtin_snprintf(details, sizeof(details),
+                           "obj=%p known=%d waited_ms=0 waits=%llu "
+                           "signals=%llu deficit_at_entry=%llu epoch=%llu "
+                           "wait_caller=%p budget_ms=%llu outcome=PENDING-SIGNAL-CLAIMED",
+                           condition,
+                           ledger.known ? 1 : 0,
+                           (unsigned long long)ledger.waits,
+                           (unsigned long long)ledger.signals,
+                           (unsigned long long)deficit,
+                           (unsigned long long)ledger.signalEpoch,
+                           ledger.lastWaitReturn,
+                           (unsigned long long)kCondWaitBudgetMs);
+        condWaitLedgerLine(0, 0, details);
+        return 0;
+    }
 
-    // THE BASELINE EPOCH.  A signal that was already delivered BEFORE this
-    // waiter arrived is not this waiter's signal: the guest's predicate was
-    // false when it called wait, so a signal from before the call says
-    // nothing about it.  Without this baseline the first pass would see
-    // epoch != 0 and mistake an old signal for a fresh one, and the wait
-    // would return immediately without ever waiting.
-    uint64_t lastSeenEpoch = ledger.signalEpoch;
+    // THE LEDGER BASELINE.  Read once, for the report, and never again
+    // inside the loop.
+    CondWaitLedger ledger = condWaitLedgerOf(condition);
+    const uint64_t deficitAtEntry = (ledger.waits > ledger.signals)
+        ? (ledger.waits - ledger.signals) : 0;
 
     uint64_t waitedMs = 0;
     bool ledgerWritten = false;
     for (;;) {
-        // NOT blocked is still this waiter's signal.  The epoch is what
-        // makes that true on a host condvar, which has no memory of its own.
-        ledger = condWaitLedgerOf(condition);
-        if (ledger.signalEpoch != 0 && ledger.signalEpoch != lastSeenEpoch) {
-            // It fired while we were away: do not go back to sleep.
-            if (!ledgerWritten) {
-                char details[256];
-                __builtin_snprintf(details, sizeof(details),
-                                   "obj=%p known=1 waited_ms=%llu waits=%llu "
-                                   "signals=%llu deficit_at_entry=%llu "
-                                   "wait_caller=%p budget_ms=%llu outcome=SIGNAL-SEEN",
-                                   condition,
-                                   (unsigned long long)waitedMs,
-                                   (unsigned long long)ledger.waits,
-                                   (unsigned long long)ledger.signals,
-                                   (unsigned long long)deficitAtEntry,
-                                   ledger.lastWaitReturn,
-                                   (unsigned long long)kCondWaitBudgetMs);
-                condWaitLedgerLine(waitedMs, deficitAtEntry, details);
-            }
-            return 0;
-        }
-        lastSeenEpoch = ledger.signalEpoch;
-
+        // NO REGISTRY LOCK IN HERE.  The old code had none either, and that
+        // is exactly why the guest worked.  The ledger is read at the
+        // report points instead.
         guestViewTraceSyncBlocked("cond-wait", 53);
         struct timespec deadline{};
         clock_gettime(CLOCK_REALTIME, &deadline);
         deadline.tv_sec += 1;
         const int waitResult = ::pthread_cond_timedwait(hostCondition, hostMutex, &deadline);
-        if (waitResult == 0) return 0;
+        if (waitResult == 0) {
+            // Woken by the host condvar.  Consume the matching pending
+            // signal so that it cannot leak to a later waiter.
+            condWaitConsumePendingSignal(condition);
+            return 0;
+        }
         if (waitResult != ETIMEDOUT) return waitResult;
         waitedMs += 1000;
 
@@ -6311,6 +6395,8 @@ int guestPthreadCondWait(void* condition, void* mutex) {
                          (waitedMs % kCondWaitReportEveryMs) == 0 ||
                          waitedMs >= kCondWaitBudgetMs;
         if (due) {
+            // ONE acquisition for the read and the write together.
+            ledger = condWaitLedgerOf(condition);
             char details[256];
             __builtin_snprintf(details, sizeof(details),
                                "obj=%p known=%d waited_ms=%llu waits=%llu "
@@ -6338,11 +6424,14 @@ int guestPthreadCondWait(void* condition, void* mutex) {
             // the same answer a spurious wake-up gives, so the guest's own
             // predicate loop decides what to do next.
             //
-            // The epoch is re-read here so that a signal that arrived during
-            // the last slice is not thrown away with the wait.
+            // ONE acquisition: the last read also looks for a signal that
+            // arrived during the final slice, so that it is not thrown away
+            // with the wait.
             const CondWaitLedger fresh = condWaitLedgerOf(condition);
-            if (fresh.signalEpoch != lastSeenEpoch) {
-                ledger = fresh;
+            if (fresh.signalEpoch != ledger.signalEpoch) {
+                // It arrived during the last slice: collect it rather than
+                // pretending it never came.
+                condWaitConsumePendingSignal(condition);
                 char details[192];
                 __builtin_snprintf(details, sizeof(details),
                                    "obj=%p outcome=SIGNAL-SEEN-AT-BUDGET "

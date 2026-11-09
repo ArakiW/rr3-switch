@@ -200,6 +200,19 @@ struct RaceMetricsSample {
     // sitting within 2 m of the centre line, so this is the number that says
     // whether it is on the wrong line.
     double racingResidual{-1.0};
+    // THE LOOK-AHEAD DISTANCE THE PURSUIT USED, IN METRES.
+    //
+    // WHY IT IS REPORTED: the look-ahead is the single number that decides
+    // where the car aims, and it is either constant or derived from the
+    // curvature of the road ahead.  A run that does not say which distance
+    // it used cannot be compared with another run, so the number goes in the
+    // log with the rest of the pursuit state.
+    //
+    // MEASURED 2026-11-04 (q147): on the track's own racing line a
+    // constant 20 m look-ahead gave a pursuit error of 0.7 rad on the
+    // corners, and the controller steers by AIMING AT A POINT -- so that is
+    // a steering command 40 degrees wrong.
+    float lookAheadMetres{0.0f};
     uintptr_t trackStateAddress{};
     uint32_t splineNode{};
     uint32_t splineDistance{};

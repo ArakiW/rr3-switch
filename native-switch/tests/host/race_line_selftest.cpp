@@ -219,6 +219,142 @@ int main() {
                             &thin),
           "a fit with two samples is refused");
 
+    // ---------------------------------------------------------------------
+    // THE ADAPTIVE LOOK-AHEAD, AGAINST A TRACK WHOSE SHAPE IS KNOWN.
+    //
+    // The law under test is the one the comment in race_line.cpp states:
+    // the look-ahead is the ARC LENGTH at which the road ahead has turned by
+    // the threshold.  That has a closed-form answer on a constant-radius
+    // corner (threshold * R), so a synthetic corner is a positive control
+    // with a KNOWN number in it.
+    //
+    // WHY THE CONTROL MATTERS.  The implementation used to return the ANGLE
+    // scaled by a magic constant instead of the arc length, and that put the
+    // shortest look-ahead on the straights (where the steering noise lives)
+    // and the longest one in the corners (which is the failure q147
+    // measured).  A test that only checked "a number came back" would not
+    // have caught that, so these assertions pin the actual law.
+    // ---------------------------------------------------------------------
+    {
+        const double unit = 256.0;   // the port's units per metre
+
+        auto point = [](double xMetres, double yMetres) {
+            rr3::Point p;
+            p.x = xMetres * 256.0;
+            p.y = yMetres * 256.0;
+            return p;
+        };
+
+        // A straight of `lengthMetres`, sampled every `spacingMetres`.
+        auto straightLine = [&](double lengthMetres, double spacingMetres) {
+            std::vector<rr3::Point> poly;
+            for (double s = 0.0; s <= lengthMetres + 1e-9; s += spacingMetres) {
+                poly.push_back(point(s, 0.0));
+            }
+            return poly;
+        };
+
+        // An arc of `radiusMetres` turning `sweepRad`, leaving the origin
+        // along +x.  A constant-radius arc turns by (arc length / R), so the
+        // distance at which it has turned by THRESHOLD is THRESHOLD * R.
+        auto arcLine = [&](double radiusMetres, double sweepRad,
+                           double spacingMetres) {
+            std::vector<rr3::Point> poly;
+            poly.push_back(point(0.0, 0.0));
+            const double arcLength = radiusMetres * sweepRad;
+            for (double s = spacingMetres; s <= arcLength + 1e-9;
+                 s += spacingMetres) {
+                const double theta = s / radiusMetres;
+                poly.push_back(point(radiusMetres * std::sin(theta),
+                                     radiusMetres * (1.0 - std::cos(theta))));
+            }
+            return poly;
+        };
+
+        // The law's own threshold, read from the implementation so the test
+        // cannot drift away from it.
+        const double threshold = 0.35;
+        const double spacing = 2.0;
+
+        // 1. A STRAIGHT.  The road ahead never turns, so the walk reaches the
+        //    maximum look-ahead.  (The old law answered 4 m here.)
+        {
+            const std::vector<rr3::Point> poly = straightLine(300.0, spacing);
+            const double la =
+                rr3::curvatureLookAheadMetres(poly, 0, 1);
+            std::printf("  straight : look-ahead %.2f m\n", la);
+            check(la > 19.0 && la < 21.0,
+                  "a straight gets the maximum look-ahead");
+        }
+
+        // 2. A CORNER OF KNOWN RADIUS.  The answer is threshold * R, to
+        //    within one sample's worth of arc.
+        {
+            const double radius = 25.0;
+            const std::vector<rr3::Point> poly =
+                arcLine(radius, 1.5707963267948966, spacing);
+            const double la = rr3::curvatureLookAheadMetres(poly, 0, 1);
+            const double expected = threshold * radius;
+            std::printf("  corner R=%.0f m : look-ahead %.2f m (expected %.2f m)\n",
+                        radius, la, expected);
+            check(la > expected - spacing && la < expected + spacing,
+                  "a corner's look-ahead is the arc at which it turns by the threshold");
+        }
+
+        // 3. A TIGHTER CORNER GETS A SHORTER LOOK-AHEAD.  This is the
+        //    direction the old law got backwards.
+        {
+            const std::vector<rr3::Point> wide =
+                arcLine(50.0, 1.5707963267948966, spacing);
+            const std::vector<rr3::Point> tight =
+                arcLine(12.0, 1.5707963267948966, spacing);
+            const double wideLa = rr3::curvatureLookAheadMetres(wide, 0, 1);
+            const double tightLa = rr3::curvatureLookAheadMetres(tight, 0, 1);
+            std::printf("  R=50 m : %.2f m      R=12 m : %.2f m\n",
+                        wideLa, tightLa);
+            check(wideLa > tightLa,
+                  "a tighter corner gets a shorter look-ahead");
+        }
+
+        // 4. THE CAR APPROACHING A CORNER.  The look-ahead has to SHORTEN as
+        //    the corner comes up, and it has to be the maximum while the road
+        //    ahead is still straight.  This is the direction the old law got
+        //    backwards: it answered 4 m in both places, so the car aimed at
+        //    a point 4 m away in the middle of a corner.
+        {
+            const double radius = 25.0;
+            const double straightMetres = 20.0;
+            std::vector<rr3::Point> poly = straightLine(straightMetres, spacing);
+            const std::vector<rr3::Point> corner =
+                arcLine(radius, 1.5707963267948966, spacing);
+            // The arc's FIRST point is the straight's last point, so it is not
+            // appended: a zero-length segment would stop the walk early.
+            for (size_t i = 1; i < corner.size(); ++i) {
+                poly.push_back(point(straightMetres + corner[i].x / 256.0,
+                                     corner[i].y / 256.0));
+            }
+            // The corner's entry: the first node that is off the straight.
+            size_t entry = 0;
+            for (size_t i = 0; i < poly.size(); ++i) {
+                if (poly[i].y > 1.0) {
+                    entry = i;
+                    break;
+                }
+            }
+            const double onStraight = rr3::curvatureLookAheadMetres(poly, 0, 1);
+            const double atCorner = rr3::curvatureLookAheadMetres(poly, entry, 1);
+            std::printf("  on the straight : %.2f m   at the corner : %.2f m\n",
+                        onStraight, atCorner);
+            check(onStraight > 19.0 && onStraight < 21.0,
+                  "the straight before a corner gets the maximum look-ahead");
+            check(atCorner > threshold * radius - spacing &&
+                      atCorner < threshold * radius + spacing,
+                  "the corner's entry gets the corner's own look-ahead");
+            check(atCorner < onStraight,
+                  "the look-ahead shortens as the corner comes up");
+        }
+    }
+
     std::printf("%s\n", failures == 0 ? "race_line selftest: OK" : "race_line selftest: FAILED");
     return failures == 0 ? 0 : 1;
 }

@@ -2023,3 +2023,250 @@ path now closes each distinct pointer once.
 * **What was the guest waiting for?**  The guest's own `onViewChangedJNI` is
   doing something that expects a worker thread to make progress.  That is
   guest behaviour, and it needs the ledger to identify it.
+
+---
+
+## 9. The pursuit's A/B measured nothing, and the look-ahead it was about to measure was wrong
+
+Three separate faults, found on 2026-11-09, none of them in the pursuit's
+own maths at first sight, and all three of them between the reader and the
+number.
+
+### 9.1 q163 did not measure the pursuit at all
+
+The round the pursuit's first A/B was going to be read from produced this:
+
+    phase=race-state ... metrics=0 ... rej=the-members-are-not-live
+                               rejm=0x3f rejlapd=4294967295
+    phase=race-state ... metrics=0 ... rej=not-found
+
+`4294967295` as a uint32 is `-1.0f`, which is the guest's own "no lap yet"
+value.  The port found the guest's `RuleSet_RaceMetrics` object and refused
+it, because the object's lap distance had never become positive -- the car
+had never driven.  The port's closed loop refuses to drive a not-live
+metrics object, so the two conditions are circular:
+
+    the car must move for the metrics to be live
+    the port only drives when the metrics are live
+
+⇒ The round measured NOTHING about the pursuit.  The old report printed
+`progress: max=0.000` and stopped there, which reads like a result ("the
+adaptive look-ahead is worthless") and is in fact a report of a round that
+failed to start.  `pursuit-report.py` now answers three questions in this
+order -- did the pursuit run at all, under which configuration, and then how
+far did it get -- and exits non-zero with an explicit "THIS ROUND SAYS
+NOTHING ABOUT THE PURSUIT" when the first answer is no.
+
+The good rounds are the reference: q145 and q147 (2026-11-04) found the
+object live at frame 540 and 570 respectively.
+
+### 9.2 The harness could not run a different binary
+
+An A/B needs the two halves to differ in ONE thing.  This one needed the two
+halves to differ in the CONFIGURATION and to run the SAME binary, and the
+harness could do neither:
+
+  * `deploy-card-romfs.ps1` copies the CURRENT BUILD's NRO onto the card;
+  * `Test-OnEden.ps1` copies the current build's NRO onto the card again,
+    unless `-NoDeploy` is passed.
+
+Both copies happen AFTER the experiment's own deploy.  So a round that put
+an older NRO on the card ran the new NRO anyway, and the comparison was
+silently worthless.  This was caught by reading the archive, not by the
+harness: the archived `run-summary.txt` said the NRO was 53,694,961 bytes
+when the round had been told to run a 53,690,865-byte one.
+
+⇒ `run-pinned-round.ps1` grew a `-Nro` parameter that puts the chosen NRO on
+the card AFTER both copies, passes `-NoDeploy` to `Test-OnEden.ps1`, and
+then VERIFIES the card's sha256 against the chosen file and refuses to start
+if they differ.  The A/B script resolves one NRO and hashes it once, and
+every cell runs that file.
+
+⇒ The general rule: **an experiment that cannot say which binary it ran is
+not an experiment.**  The archive now carries the hash, the harness asserts
+it, and the report says which configuration was in force.
+
+### 9.3 The adaptive look-ahead returned the ANGLE, not the ARC
+
+`curvatureLookAheadMetres()` in `native-switch/source/race_line.cpp` is
+supposed to return the look-ahead distance.  The comment above it says what
+that distance is:
+
+    "the ARC LENGTH at which the accumulated heading change first exceeds the
+     threshold is the corner's scale.  A straight never reaches the
+     threshold, so the walk reaches the maximum look-ahead; a hairpin
+     reaches it in a couple of metres."
+
+The implementation walked the polyline and accumulated the heading change,
+but it never accumulated the DISTANCE it walked.  It returned
+`accumulated * 8.0` -- the ANGLE, scaled by a magic number.
+
+The consequence is not a small error.  The angle at the point where the
+threshold is crossed is always between 0.35 rad and roughly 0.5 rad, so
+`accumulated * 8.0` is always between 2.8 and 4.0, and the clamp is
+`[4.0, 20.0]`.  ⇒ **The old "adaptive" look-ahead was a constant 4 metres
+everywhere.**  Measured on a synthetic track:
+
+    straight, before a corner      4.00 m      (correct: 20.00 m)
+    corner of radius 25 m          4.00 m      (correct: 10.00 m)
+    corner of radius 50 m          4.00 m      (correct: 18.00 m)
+    corner of radius 12 m          4.00 m      (correct:  5.99 m)
+
+It was completely insensitive to the radius of the corner.  And it was
+backwards where it mattered: the SHORTEST look-ahead was on the straights,
+where the steering noise lives, and it did not shorten at all as a corner
+came up -- which is the failure q147 measured (a long look-ahead into a
+corner is a steering command tens of degrees wrong).
+
+⇒ The law is now the arc length: the distance at which the road ahead has
+turned by the threshold, clamped to `[4, 20]` metres.  On a constant-radius
+corner of radius R that is `0.35 * R`, which is the closed form the comment
+promised, and it is the distance that actually bounds the pursuit error.
+
+⇒ `native-switch/tests/host/race_line_selftest.cpp` now pins the law with a
+synthetic track of KNOWN shape: a straight, a corner of known radius, two
+corners of different radius, and a straight that ends in a corner.  The
+assertions are that a straight gets the maximum, that a corner gets
+`0.35 * R` to within one sample of arc, that a tighter corner gets a
+shorter look-ahead, and that the look-ahead shortens as a corner comes up.
+
+  THE TEST WAS PROVED TO HAVE TEETH: the same self-test was compiled
+  against the old law and FAILED five of the new assertions, with the
+  numbers above.  A test that has never been seen to fail is not evidence.
+
+### 9.4 The census is a variable too, and it was never controlled
+
+The good rounds (2026-11-04) ran with the census ARMED; every 2026-11-09
+round ran with `census=off` in `sdmc:/switch/rr3-census.conf`.  The census
+is not only logging: it SAMPLES the guest by pausing its threads, which is
+the part of the port that touches the guest every frame.  So "the code
+changed" and "the census was off" were confounded, and the regression matrix
+in `.build/run-regression-matrix.ps1` separates them.  All four cells, one
+variable each, the same card and the same assets:
+
+                   census ON                       census OFF
+    Nov-4 NRO     m1   WORKS                      m3   FAILS
+                   metrics live at frame 540       the guest never reaches the race
+                   6960 frames in 406 s (17.1 fps) 5160 frames
+
+    Nov-9 NRO     m2   FAILS                      q163 FAILS
+                   the guest never reaches the race  metrics live NEVER
+                   4920 frames                   2040 frames
+
+**⇒ AND THEN THE 2x2 WAS FOUND TO BE CONFOUNDED, AND THE CONCLUSION CHANGED
+AGAIN.**
+
+Read the four cells as a table and one thing stands out: `m2`, `m3` and a
+later round `v1` drew **EXACTLY 10,394 things in 400 s**.  Three different
+builds and two different census settings, the same number, to the draw.
+That is not a coincidence and it is not a race condition; it is the same
+deterministic stop.
+
+**⇒ THE GUEST PERSISTS ITS OWN STATE, AND THE ROUNDS RAN IN ORDER.**
+
+`m1` was the FIRST round of the day and it was the only one that reached
+the race.  It also ended a race, and the guest paid out a reward, and the
+"you received 50 gold" popup went into the guest's SAVE DATA.  The popup
+survives between rounds, so every round after `m1` started with the popup
+already on screen and stopped there.
+
+The archived frame is the proof, and it is one image:
+`.build/eden-runs/20261109-155529-eden-rr3-m3-nov4-census-off/frames/frame-005200.png`
+shows a modal panel with a gold coin, an empty text area and the guest's red
+glove parked at its top right corner.  The guest's own log says what the
+panel is, in the same round, in the same archive: `phase=jni-utf163 ...
+text=<the bytes of "you received 50 gold">`.  (The mojibake in that line is
+the TRACER's own decoding, not the game's: the frames render Chinese
+correctly, so the port's text pipeline is fine and only the tracer's
+UTF-16-to-text step is wrong.)
+
+**⇒ WHY A HELD BUTTON CANNOT DISMISS IT.**  The autopilot pad script is a
+state timeline, and its third line is:
+
+    [at 600] lx=0 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
+
+which holds the guest's BTN_A down from frame 600 to the end of the round.
+There is never a release, so the guest's UI never sees a BUTTON-DOWN
+TRANSITION once the popup is up, and a modal dialog that waits for a press
+waits forever.  (`m1` was unaffected because its popup appeared at the END
+of its race, when nothing more was needed from the script.)
+
+**⇒ SO THE 2x2'S CELLS WERE NOT COMPARABLE, and the FIRST TWO READINGS OF
+IT WERE BOTH WRONG.**  The first reading blamed the November 9th code; the
+third cell (m3) corrected that to "the census"; and the draw counts
+corrected it again to "the guest's persisted state, and the order the
+rounds ran in".  **A 2x2 in which the system's own persisted state is not
+reset between the cells is not a 2x2.**  The harness now snapshots the
+guest's save data and puts it back before every round
+(`.build/guest-state.ps1 -Snapshot | -Restore`).
+
+### 9.5 What the failing rounds say about the guest's condition variable
+
+m2's own log names the object and says what happened to it:
+
+    phase=cond-wait-ledger obj=0x2110251d00 known=1 waited_ms=120000
+      waits=1 signals=0 deficit_at_entry=1 epoch=0
+      wait_caller=0x2109648a30 budget_ms=120000 outcome=GIVING-UP
+    phase=cond-wait-abandoned reason=no-signal-within-budget
+      returned=0_like_a_spurious_wakeup
+    ... and then waits=2, waits=3, waits=4, with signals STILL 0.
+
+`signals=0` means the guest never signalled this object at all, and the
+waiter was released only by the port's 120 s give-up, which returns 0 --
+the same answer a spurious wake-up gives.  The guest's own `while (!ready)`
+loop then re-entered the wait, forever.
+
+Two faults in one function, and the November 9th build has both:
+
+  1. **THE REGISTRY LOCK, ONCE PER SECOND.**  The November 9th version read
+     the cond-var ledger at the top of every pass of the wait loop.  That
+     read takes `gRegistryLock`, and it takes it WHILE THE GUEST'S OWN HOST
+     MUTEX IS HELD.  The census sampler takes the same lock and holds it
+     while it pauses and resumes EVERY guest thread (7,071 threads per
+     sweep, seconds of wall clock).  So the guest's cond-wait thread
+     stalled for whole seconds at a time while holding a mutex that other
+     guest threads needed -- and the producer that was going to signal
+     never ran, which is what `signals=0` says.  The November 4th version
+     took the lock once per WAIT, on entry, and never again.  **The rule is
+     now: one acquisition at entry, one on an actual wake-up, two at the
+     report points.  Never one per second.**
+  2. **A DROPPED SIGNAL.**  A host `pthread_cond_t` has no memory: a
+     signal that arrives while nobody is blocked is gone, and the guest's
+     `while (!ready) cond_wait()` cannot recover it, because the predicate
+     was already checked.  The November 9th epoch was meant to catch that
+     and could not: its baseline was taken at entry, so a signal that
+     arrived between two one-second slices was counted by the bridge and
+     never seen by the waiter.  **The bridge now keeps a PENDING count per
+     condition variable: a signal that arrives with nobody waiting is
+     remembered, and the next waiter consumes exactly one of them and
+     returns without waiting at all.**
+
+**⇒ AND THE CENSUS WAS COVERING FOR THE BUG.**  The census pauses and
+resumes every guest thread every 500 ms, and that perturbation is enough to
+close the lost-wakeup window most of the time -- so the guest ran "by
+luck", at the price of 7,071 thread pauses per sweep.  Turning the census
+off removed the accident and exposed the fault.  **A port must not depend
+on a diagnostic instrument to accidentally fix its threading.**
+
+### 9.6 The console freeze's cond-var, named
+
+q163's new `cond-wait-ledger` line named the object the guest was waiting on,
+which is the question the console freeze left open:
+
+    phase=cond-wait-ledger obj=0x2110000660 known=1 waited_ms=120000
+      waits=4 signals=1 deficit_at_entry=3 epoch=1
+      wait_caller=0x2109423a30 budget_ms=120000 outcome=GIVING-UP
+    phase=cond-wait-abandoned reason=no-signal-within-budget
+      returned=0_like_a_spurious_wakeup
+
+Four guest threads wait on ONE guest condition variable, it is signalled
+exactly once, and the waiters are never released; the port gives up after
+120 s and returns 0, the same answer a spurious wake-up gives, so the
+guest's own predicate loop decides what to do next.  This is the shape of a
+starved worker pool, and it is consistent with the race never starting.
+
+**⇒ THIS IS THE SAME FAULT AS 9.5, IN THE OTHER DIRECTION.**  Here the
+condvar was signalled ONCE for FOUR waiters; in m2 it was signalled ZERO
+times.  Both are the same underlying thing: the host condvar has no
+memory, so the bridge has to keep the signal itself, and until it does,
+the guest's wake-ups are a matter of luck.

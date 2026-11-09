@@ -7,6 +7,27 @@
 #   ui=WxH         CCUserInterfaceManager.getScreenWidth / getScreenHeight
 #   view=WxH       the size the port tells the GUEST its view is
 #
+#   raceline=centre_spline|ai_spline
+#                  which line of the track's spline the port follows.
+#                  DEFAULT: centre_spline (the only line the port has ever
+#                  completed a lap on).
+#                  MEASURED 2026-11-04 (q147): the track's own racing line
+#                  (ai_spline) is 67.0 m shorter a lap and 2.92-8.25 m away
+#                  from the centre line, and a car 0.32 m from the racing
+#                  line is on the RIGHT line -- but the lap progress got
+#                  WORSE on it (10.35 % -> 5.14 %) because the look-ahead
+#                  was a constant 20 m, which on that line's corners is
+#                  0.7 rad (40 degrees) off the car's path.  With the
+#                  curvature-following look-ahead below, the two can be
+#                  measured together.
+#
+#   lookahead=adaptive|fixed
+#                  whether the look-ahead distance follows the curvature of
+#                  the road AHEAD (adaptive) or stays at 20 m (fixed).
+#                  DEFAULT: adaptive.
+#                  The controller steers by AIMING AT A POINT, so a point
+#                  40 degrees off is a steering command 40 degrees wrong.
+#
 # ---------------------------------------------------------------------------
 # WHY THERE IS A "view" KEY
 #
