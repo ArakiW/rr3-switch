@@ -3099,10 +3099,21 @@ phase=ctex-upload ordinal=1 call=1 level=0 w=512 h=512 size=131072 internal=0x8d
 ...
 S3TC uploads: 0        ETC1 uploads: 32
 ```
+and 1,521 lines in the same run name an `.etc.dds` asset being served, while the
+frame scan of the round reports `31 frames, 0 with magenta`.
+
 ⇒ **NO texture of the car pipeline goes through Mesa's S3TC decoder any more,
 so the magenta has no path left to come from.**  And the volumes are now
 smaller than the ones they replace (gui-hd 1,443,906,568 against 1,663,784,980
 bytes, and so on), so the card gained space as well.
+
+**WHAT IS STILL NOT VISUALLY CONFIRMED:** the round that reproduces the
+magenta is a DTM race, and the four hunt rounds never reached one (their
+frames are all at the 10-pixel billboard floor), so the confirmation so far is
+the MECHANISM -- no S3TC upload is possible any more -- and not a screenshot
+of a DTM rival coming out grey.  The pursuit of that last picture is the same
+problem the hunt ran into: the event the guest picks is not under the port's
+control.
 
 ⇒ **AND THE PORT-SIDE EXPERIMENT IS KEPT, OFF BY DEFAULT:** `swdxt=1` still
 decodes DXT on the CPU (9.19 proved the mechanism and proved that the port
