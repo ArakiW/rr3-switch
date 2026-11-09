@@ -690,3 +690,62 @@ $p = 'F:\switch\rr3-native-rehost.guest-view.log'
 > 而出货的 `rr3-pad.txt` **没有任何事件行**，所以它根本不会激活。
 > ⇒ **看到 `gamepad-state` 就说明手柄被认出来了；它上面那行 `guest_buttons`/`guest_lx`
 > 就是客机真正收到的值。**
+
+## 10.6 两个只有你的手机才有的文件（HUD 灰白块）
+
+HUD 里有一部分是灰白色块，根因是客机要的两个文件在**所有素材里都没有**：
+
+* `gui/processed/LocalStyles.gui`
+* `gui/processed/LocalStyles_480x320.gui`
+
+实测（m9 的 `guest-view.log`）：客机在 `.depot/`、`apk/res/`、`doc/` 三个位置各找了一遍，
+全是 `rc=-1 errno=2`，然后打印 `Asset::LoadFile unable to load file`。
+
+**为什么我们的素材里没有：** 这两个文件是 App **首次运行时在自己的 files 目录里生成**的
+（名字里的 "Local" 就是这个意思）。我们的素材来自 APK 和三个数据包，而：
+core.romfs 的 `gui/processed/` 里那 3,870 个文件不含它（`limited_time_series/common/LocalStyles.gui`
+倒是有），卡上 `.depot/gui/` 的 338 个原始 `.gui` 里也没有，DXT/ETC/ATC 三个数据包里
+`LocalStyles` 一个都搜不到。客机也**不会自己写**它（日志里所有 `map-write` 都不是它）。
+
+**⇒ 所以只能从安卓手机上拷。** 在跑过这个游戏的手机上找：
+
+```
+Android/data/com.ea.gp.fifteen15.fnhd/files/.depot/gui/processed/LocalStyles.gui
+Android/data/com.ea.gp.fifteen15.fnhd/files/.depot/gui/processed/LocalStyles_480x320.gui
+```
+
+拷到卡的：
+
+```
+sdmc:/switch/rr3-native-rehost/.depot/gui/processed/
+```
+
+端口的读取有「第三个候选 = 卡上同一路径」，所以放进去就会被找到，不用改任何代码。
+
+## 10.7 PC（Eden）上用 Xbox 精英控制器
+
+客机是安卓客机，**只认任天堂 Pro Controller**；Eden 是唯一把宿主手柄交给客人的那一层，
+而它默认把每个按键都绑成了键盘。
+
+实测（m9 的 `guest-view.log`）：
+
+```
+phase=npad-heartbeat ... state=npad-idle type=FullKey seen_press=0 buttons=0x0
+```
+
+`npad-idle` + `FullKey` 的意思是：Eden 确实仿了一个 Pro Controller 给客机，但**它永远不变**，
+因为没有宿主手柄绑上去。Eden 自己的配置也是这么写的
+（`user/config/qt-config.ini`：`player_0_button_a="engine:keyboard,code:67"`，
+每个玩家的每个键都是键盘，外加 `enable_all_controllers=false`）。
+手柄本身是好的：XInput slot 0 = CONNECTED。
+
+**做法：** Eden → 设置 → 控制器 → 配置当前游戏 → Player 1 的设备选你的 Xbox 精英控制器，
+逐个按键绑定（客机侧的类型保持 Pro Controller）。
+
+**验证：** 再跑一轮，日志里应该有
+
+```
+phase=npad-heartbeat ... state=npad-active ... seen_press=1
+```
+
+`npad-active` 就说明宿主手柄真的进了客机。详细说明见 `docs/CONTROLLER-ON-PC.md`。
