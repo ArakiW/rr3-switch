@@ -51,6 +51,20 @@ else {
     & (Join-Path $root '.build\deploy-census-conf.ps1')
 }
 
+# THE GUEST'S STATE IS KEPT PER ROUND.
+#
+# MEASURED 2026-11-09: the guest advances to the NEXT EVENT after each race,
+# so which event a round races depends on how many races came before it.  The
+# NASCAR round (which showed the magenta AI opponents) and the Hockenheim
+# round asked for exactly the same 41 asset paths and differed only in the
+# event, so comparing them proved nothing -- and the state that produced the
+# NASCAR round was gone, because the baseline was overwritten every round.
+#
+# ⇒ So the state is snapshotted under THIS ROUND'S NAME before the round
+# starts, and .build\guest-state.ps1 -Restore -Tag <name> puts it back.  A
+# round that shows something is then a round anybody can run again.
+& (Join-Path $root '.build\guest-state.ps1') -Snapshot -Tag $Tag
+
 Write-Host '=== deploy the build ==='
 Assert-EdenIdle
 & (Join-Path $root '.build\deploy-card-romfs.ps1')
