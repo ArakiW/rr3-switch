@@ -2870,11 +2870,6 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             m.targetFromLine ? 1 : 0, m.lineResidual, m.racingResidual,
             static_cast<double>(m.lookAheadMetres), raceLineChunk(),
             raceLineLookAheadMode(),
-            // THE CAR'S DISTANCE TO THE CHUNK THE TARGET CAME FROM.  A large
-            // number here is the "the line was fitted on the wrong chunk" case
-            // (13,215 m measured on 2026-11-10), and it is what the chunk
-            // picker has to keep small.
-            static_cast<double>(m.chunkForTarget),
             // THE DIRECTION LOCK, AND THE MOTION VECTOR IT CAME FROM.
             //
             // MEASURED 2026-11-09 (round m1): the car turned around and drove
@@ -2889,6 +2884,11 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             gRaceLine.direction,
             gRaceLine.haveMotion ? gRaceLine.motionX : 0.0,
             gRaceLine.haveMotion ? gRaceLine.motionY : 0.0,
+            // THE CAR'S DISTANCE TO THE CHUNK THE TARGET CAME FROM.  A large
+            // number here is the "the line was fitted on the wrong chunk" case
+            // (13,215 m measured on 2026-11-10), and it is what the chunk
+            // picker has to keep small.
+            static_cast<double>(m.chunkForTarget),
             static_cast<double>(g_drive.steerError), g_drive.pursuit ? 1 : 0,
             static_cast<unsigned long long>(m.membersIdentified),
             g_drive.enabled ? 1 : 0, static_cast<double>(g_drive.steer),
