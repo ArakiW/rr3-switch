@@ -11,6 +11,10 @@
 #include "rr3/gfx_backend.hpp"
 #include "rr3/gfx_text_probe.hpp"
 #include "rr3/dxt_decode.hpp"
+// getRecentServedTexture: the port's own record of what it handed the guest,
+// and with which container.  It is what tells the software DXT path whether
+// the bytes it is looking at really are DXT.
+#include "rr3/guest_filesystem.hpp"
 // appendGuestBootLine: the one line the read-back writes. It keeps its own
 // handle open and only flushes, and it is what every other diagnostic in the
 // port uses, so the read-back line lands in the same file as the rest.
@@ -1106,6 +1110,30 @@ extern "C" void __wrap_glCompressedTexImage2D(GLenum target, GLint level,
                          internalformat == 0x83F3 /* GL_COMPRESSED_RGBA_S3TC_DXT5_EXT */);
     if (rr3::gfxSoftwareDxt() && isS3tc && data != nullptr && width > 0 && height > 0) {
         const bool isDxt5 = (internalformat == 0x83F3);
+        // ONLY DECODE WHAT REALLY IS DXT.
+        //
+        // MEASURED 2026-11-10: the guest uploads SOME textures under an S3TC
+        // internal format while the bytes it passes are NOT DXT -- the
+        // event-card atlas is a PVR texture
+        // (files/.depot/gui_assets/2048x1536/events/event_cards/
+        // sprites_0.rgb.pvr.z) and it arrived as rainbow noise the moment this
+        // path decoded it as DXT.  The internal format alone therefore proves
+        // nothing; the FILE the port served does, and the port knows it: the
+        // served-texture ring records the FourCC of every texture it hands
+        // over (include/rr3/guest_filesystem.hpp).
+        //
+        // No record, or a record that is not DXT, means the GPU keeps it -- the
+        // same as before this path existed.
+        bool servedIsDxt = false;
+        ServedTextureRecord recent{};
+        if (getRecentServedTexture(0, &recent) && recent.fourcc[0] != '\0') {
+            if (std::strncmp(recent.fourcc, "DXT1", 4) == 0) {
+                servedIsDxt = !isDxt5;
+            } else if (std::strncmp(recent.fourcc, "DXT5", 4) == 0) {
+                servedIsDxt = isDxt5;
+            }
+        }
+        if (servedIsDxt) {
         const size_t expected =
             isDxt5 ? rr3::dxt5MipBytes(static_cast<uint32_t>(width), static_cast<uint32_t>(height))
                    : rr3::dxt1MipBytes(static_cast<uint32_t>(width), static_cast<uint32_t>(height));
@@ -1124,6 +1152,7 @@ extern "C" void __wrap_glCompressedTexImage2D(GLenum target, GLint level,
                 dxtRememberUploadedTexel(target, level, internalformat, width, height, data);
                 return;
             }
+        }
         }
     }
 

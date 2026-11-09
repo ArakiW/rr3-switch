@@ -8755,6 +8755,11 @@ void rememberServedTexture(const char* guestPath, const char* localPath) {
                     std::memcpy(&rec.mips, ddsHdr + 28, 4);
                     std::memcpy(rec.fourcc, ddsHdr + 84, 4);
                     rec.fourcc[4] = '\0';
+                } else if (strm.total_out >= 4 &&
+                           std::memcmp(ddsHdr, "PVR!", 4) == 0) {
+                    // A PVR texture: the container is not a DDS at all.
+                    std::memcpy(rec.fourcc, "PVR!", 4);
+                    rec.fourcc[4] = '\0';
                 }
             }
         } else if (nRead >= 128 && std::memcmp(headerBuf, "DDS ", 4) == 0) {
@@ -8940,7 +8945,19 @@ std::FILE* guestFopen(const char* path, const char* mode) {
             }
         }
         if (file != nullptr && served != nullptr) {
-            if (std::strstr(served, ".dds") != nullptr || (path != nullptr && std::strstr(path, ".dds") != nullptr)) {
+            // EVERY texture is remembered, not just the .dds ones: the software
+            // DXT path has to know whether the file it is looking at is really
+            // a DXT one.  MEASURED 2026-11-10: the event-card atlas is a PVR
+            // texture (files/.depot/gui_assets/2048x1536/events/event_cards/
+            // sprites_0.rgb.pvr.z), the guest uploads it under an S3TC
+            // internal format, and decoding those bytes as DXT turned the
+            // whole card into rainbow noise.
+            const bool looksLikeTexture =
+                std::strstr(served, ".dds") != nullptr ||
+                std::strstr(served, ".pvr") != nullptr ||
+                (path != nullptr && std::strstr(path, ".dds") != nullptr) ||
+                (path != nullptr && std::strstr(path, ".pvr") != nullptr);
+            if (looksLikeTexture) {
                 rememberServedTexture(path != nullptr ? path : served, served);
             }
         }

@@ -2899,12 +2899,18 @@ decodes them into a normal grey car, mean RGB 125,122,126, zero green-zeroed
 pixels) and the guest hands them over in the right format with no GL error --
 and the result on screen is the same texture with its GREEN CHANNEL ZEROED.
 
-**THE FIX (a conf key, because an NRO on a console has no environment):**
-`swdxt=1` in `sdmc:/switch/rr3-gfx.conf` makes the port decode DXT1/DXT5 on
-the CPU (`include/rr3/dxt_decode.hpp`) and upload the pixels as plain RGBA,
-which takes Mesa out of the S3TC decode entirely.  The decoder is proved by
+**THE FIX, AND ITS STATE: `swdxt=1` IN `sdmc:/switch/rr3-gfx.conf`**
+`swdxt=1` makes the port decode DXT1/DXT5 itself
+(`include/rr3/dxt_decode.hpp`) and upload the pixels as plain RGBA, which
+takes Mesa out of the S3TC decode entirely.  The decoder is proved by
 `native-switch/tests/test_dxt_decode_contract.py` (27 checks, and the gate
-runs it).
+runs it).  It is a conf key and not an environment variable because the port
+runs as an NRO on a console, where there is no environment to set.
+**IT IS OFF BY DEFAULT (`swdxt=0`), because the first version of it broke the
+event card -- see 9.19.**  The mechanism is right (the read-back says the GPU
+returns the CPU's own pixels unchanged) but the port cannot yet attribute an
+upload to the file it served, and the safe form of this fix re-encodes at
+SERVE time instead.
 
 **THE INSTRUMENT, AND TWO WAYS IT WAS WRONG FIRST:**
 `phase=dxt-readback` prints what the GPU returned for a texel next to what the
@@ -2950,4 +2956,105 @@ key.
 
 ⇒ **Same bytes, same game, same shader, one switch: the GPU's S3TC decode is
 what turned a grey car into a magenta one.**
+
+### 9.19 The software DXT path broke the event card, and why "the internal format says DXT" is not enough
+
+**WHAT HAPPENED (measured, round `dxtab1`):** with `swdxt=1` the event card in
+the main menu rendered as rainbow noise (989 pink pixels per frame against the
+10-pixel noise floor of the billboard), while the SAME frame of round `dxtab0`
+(`swdxt` off) shows the red car perfectly.  The difference between the two
+rounds was one conf key, so the key was the cause.
+
+**WHY, AND IT IS NOT A DECODER BUG:** the event-card atlas is not a DXT
+texture at all.  In the pack it is
+`files/.depot/gui_assets/2048x1536/events/event_cards/sprites_0.rgb.pvr.z` --
+a PVR texture -- and the guest uploads it under an S3TC internal format.  The
+software path took "the internal format is 0x83F1, so these bytes are DXT1"
+and decoded PVR bytes as DXT blocks, which is what turns an image into noise.
+
+⇒ **THE INTERNAL FORMAT PROVES NOTHING.  THE FILE DOES.**  The port already
+knows what it handed over: the served-texture ring records the FourCC of every
+texture it serves, and the software path now decodes ONLY when that record
+says DXT1 (for 0x83F0/0x83F1) or DXT5 (for 0x83F3).  Anything else -- a PVR
+atlas, an ETC1 texture, no record at all -- goes to the GPU exactly as before.
+
+**WHY IT WAS MISSED TWICE, AND THE RULE:**
+1. The trace that showed the uploads (`ctex-upload`) had a 32-line budget and
+   it was spent entirely on the car's own textures, so the GUI atlas upload
+   that broke was never recorded.  **A BUDGET ON THE OUTPUT HIDES THE CASES
+   THAT MATTER; THE BUDGET HAS TO COVER THE DIFFERENT KINDS OF ASSET.**
+2. The first A/B was run against a race, and the race looked FINE, so the
+   corruption was not noticed until the menu was compared frame by frame.
+   **A FIX THAT IS VERIFIED IN ONE SCENE IS NOT VERIFIED.**
+
+⇒ **THE RULE THIS ADDS:** a port-side change to how a texture is delivered has
+to be compared in EVERY kind of screen that uses a texture -- menu, race, HUD
+-- and the delivery decision has to be made from the FILE the port served, not
+from a parameter the guest passed.
+
+**AND THE LINKAGE WAS NOT ENOUGH EITHER (round `dxtab2`):** the second
+attempt decoded only when the served-texture ring said "DXT1/DXT5" for the
+most recently served texture, and the event card was STILL rainbow noise.
+The reason is the age of the record: the guest mmaps the GUI atlases at
+startup and uploads them hundreds of frames later, so by the time the menu
+draws, the ring holds some other texture entirely.  **"THE TEXTURE I SERVED
+MOST RECENTLY" IS NOT "THE TEXTURE BEING UPLOADED".**
+
+⇒ **SO THE SWITCH IS OFF BY DEFAULT (`swdxt=0`) AND THE FIX IS NOT YET
+SHIPPED AS A DEFAULT.**  The mechanism is proved -- with the switch on, the
+read-back says the GPU returns the CPU's own pixels unchanged
+(`match=1 sw=1`, eight textures) -- but the port cannot yet tell WHICH upload
+belongs to WHICH file it served.
+
+⇒ **WHAT THE SAFE FIX LOOKS LIKE, AND WHY IT IS THE NEXT PIECE OF WORK:** do
+not decide at upload time at all.  Re-encode AT SERVE TIME: when the port
+serves a `.dds.z` whose DDS says DXT1/DXT5, decode it, write an UNCOMPRESSED
+DDS header and the RGBA pixels, and publish the new size and md5 in the asset
+list (the port already rewrites those).  The guest then reads the DDS header
+out of the file it mapped, sees an uncompressed format, and uploads RGBA --
+so the format cannot disagree with the bytes, because the bytes SAY so.  The
+read-back stays as the instrument that proves it.
+
+### 9.20 The grey-white HUD blocks: a file the game GENERATES, and nothing we have has it
+
+**THE SYMPTOM:** parts of the HUD render as grey-white blocks.
+
+**WHAT THE GUEST ACTUALLY ASKS FOR (measured, m9 guest-view.log):**
+```
+phase=stat-path ... rc=-1 errno=2 guest='sdmc:/switch/rr3-native-rehost/.depot/gui/processed/LocalStyles.gui'
+                       primary='rr3core:/files/.depot/gui/processed/LocalStyles.gui' fallback='rr3core:/files/apk/res/gui/processed/LocalStyles.gui'
+phase=guest-log-any ... LoadReadOnlyMappedFile failed getting full path: gui/processed/LocalStyles.gui
+phase=guest-log-any ... Asset::LoadFile unable to load file: 'gui/processed/LocalStyles.gui'
+```
+and the same for `gui/processed/LocalStyles_480x320.gui`.
+
+**WHERE IT IS NOT:**
+- not in the card's loose `.depot/gui/` (338 raw `.gui` files, no LocalStyles),
+- not in `core.romfs` (`gui/processed/` has 3,870 entries there, and the ones
+  for the series DO exist: `gui/processed/limited_time_series/common/LocalStyles.gui`
+  is served with size 1014),
+- not in the DXT, ETC or ATC data packs (zero `LocalStyles` members).
+
+**AND THE GUEST NEVER WRITES IT:** every `map-write` line in the archive is for
+something else (`ttss.2.dat.bak`, `webimage_cache`, `asset_list_base.txtCache.txt`,
+the `assets_2048x1536/...` directories).  So it is not a write that the port
+blocks -- the file simply is not there.
+
+⇒ **⇒ IT IS A FILE THE APP GENERATES IN ITS OWN FILES DIRECTORY ON FIRST RUN**
+(the name says it: LOCAL styles, next to a pre-baked set for every series), and
+every copy we have came from the APK or from a data pack, neither of which
+carries it.  **THE ONLY PLACE IT EXISTS IS THE ANDROID DEVICE THAT HAS RUN
+THE GAME.**
+
+⇒ **WHAT CLOSES IT:** copy it off the phone, into the card, where the port's
+third candidate (the same path on the SD card) will find it:
+```
+Android/data/com.ea.gp.fifteen15.fnhd/files/.depot/gui/processed/LocalStyles.gui
+Android/data/com.ea.gp.fifteen15.fnhd/files/.depot/gui/processed/LocalStyles_480x320.gui
+  ->  sdmc:/switch/rr3-native-rehost/.depot/gui/processed/
+```
+⇒ **THE LESSON:** a content set assembled from an APK and from data packs is
+not the same as the content set a device has after the game has run on it.
+**THE MISSING FILES ARE THE ONES THE APP GENERATES, AND ONLY THE DEVICE HAS
+THEM.**
 
