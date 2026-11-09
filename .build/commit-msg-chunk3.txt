@@ -1,0 +1,51 @@
+THE PURSUIT IMPROVED BY A FACTOR OF FOUR, AND THE ROUND NAMED THE TWO THINGS
+THAT ARE STILL WRONG
+
+MEASURED 2026-11-10, round chunk3, on the build with the projection aim
+point, the along-track flip criterion, the along-track stuck test and the
+recovery's ownership of the wheel.
+
+THE ERROR CAME DOWN:
+
+    chunk2:  perr = 1.5 to 2.9 rad (86 to 166 degrees), steadily
+    chunk3:  perr = -0.49 to -2.52 rad, and -0.53 (30 degrees) for the last
+             150 frames of the pursuit phase
+
+and the stall counter went 7 (chunk1) -> 6 (chunk2) -> 3 (chunk3).
+
+AND THE NEW INSTRUMENT SHOWS WHY IT IS STILL NOT A LAP:
+
+    f     perr     along    pdist   fdelta   total   steer  thr brk owner
+    4830  -2.3116   114.32    6.99  -48.33   33004   1.000   0  0  pursuit
+    4980  -2.5211   112.68   13.45  205.21   34523   1.000   0  0  pursuit
+    5190  -0.4892   123.85    9.47    0.00   34501   0.978   1  0  pursuit
+    5340  -0.5307   123.87    9.50    0.00   34507   1.000   1  0  pursuit
+
+THREE THINGS THAT WERE NOT MEASURED BEFORE ARE NOW:
+
+1. THE CAR CAN SIT STILL WITH THE PURSUIT AT FULL LOCK AND THE THROTTLE ON,
+   AND NOTHING CATCHES IT IN TIME.  `along` is frozen (123.85 -> 123.87 over
+   150 frames) and so is the guest's progress (34,501 -> 34,507), while
+   `steer` is at full lock, `thr` is 1 and `brk` is 0.  The limit-cycle
+   detector needs an error above 1.40 rad and this state has 0.53 rad, so it
+   does not fire; the stuck test needs 600 frames (18.2 s) of no progress and
+   the round ended first.  => THE CRITERION FOR "THE PURSUIT MUST YIELD" HAS
+   TO BE "THE CAR IS NOT ADVANCING", NOT "THE ERROR IS LARGE": a car pinned
+   against a barrier with a 30 degree error is still pinned.
+
+2. THE ALONG-TRACK COORDINATE IS NOT COMPARABLE ACROSS A CHUNK SWITCH.  The
+   coordinate is measured on the chunk the picker chose, and the picker
+   changed: `along` is 32.26 at f=4530 and 132.11 at f=4800 with the car in
+   the same place, so the flip criterion's window saw a +100 m "progress"
+   that never happened and printed `fdelta = 205.21`.  => THE RING HAS TO BE
+   CLEARED WHEN THE CHUNK CHANGES, or the criterion has to be measured on a
+   chunk-independent quantity.
+
+3. THE PORT CAN NOW MEASURE WHY A CAR IS STUCK: `pdist` (the live distance to
+   the line) and `along` (the arc coordinate) together say "13 m off the line
+   and not moving along the track for 150 frames".  Before this round the same
+   fact was invisible, because `lineResidual` held the FIT's residual, which
+   is a constant.
+
+docs/OPEN-ISSUES.md gains 9.28 with the measurement, the residue and the two
+item spec for the next iteration.
