@@ -45,6 +45,17 @@ $appOut = Join-Path $stage 'switch\rr3-native-rehost'
 New-Item -ItemType Directory -Force -Path $appOut | Out-Null
 
 # The port itself.
+#
+# THE NSP IS THE SHIPPABLE ARTIFACT.  It installs as a title and launches
+# from the Home menu; the NRO is still in the package because the emulator
+# card runs it, and because it carries the RomFS that the NSP cannot (the
+# guest's libraries and the UI faces are ALSO on the card, so the port's
+# own fallback finds them either way).
+$nsp = Join-Path $build 'rr3-native-rehost.nsp'
+if (-not (Test-Path -LiteralPath $nsp -PathType Leaf)) {
+    throw ("the NSP is not there: {0} -- build the port first" -f $nsp)
+}
+Copy-Item -LiteralPath $nsp -Destination (Join-Path $stage 'rr3-native-rehost.nsp') -Force
 Copy-Item -LiteralPath (Join-Path $build 'rr3-native-rehost.nro') -Destination (Join-Path $appOut 'rr3-native-rehost.nro') -Force
 Copy-Item -LiteralPath (Join-Path $build 'rr3.romfs') -Destination (Join-Path $appOut 'rr3.romfs') -Force
 
@@ -71,8 +82,11 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
     [System.IO.Compression.CompressionLevel]::Optimal, $false)
 
 $nro = Get-Item -LiteralPath (Join-Path $appOut 'rr3-native-rehost.nro')
+$nspInfo = Get-Item -LiteralPath (Join-Path $stage 'rr3-native-rehost.nsp')
 Write-Host ("package : {0}" -f $out)
 Write-Host ("size    : {0:N1} MiB" -f ((Get-Item -LiteralPath $out).Length / 1MB))
+Write-Host ("nsp     : {0} bytes, sha256 {1}" -f $nspInfo.Length,
+    (Get-FileHash -LiteralPath $nspInfo.FullName -Algorithm SHA256).Hash.Substring(0, 16))
 Write-Host ("nro     : {0} bytes, sha256 {1}" -f $nro.Length,
     (Get-FileHash -LiteralPath $nro.FullName -Algorithm SHA256).Hash.Substring(0, 16))
 Write-Host ("build   : {0}" -f (Get-Item -LiteralPath (Join-Path $build 'rr3-native-rehost.nro')).LastWriteTime)

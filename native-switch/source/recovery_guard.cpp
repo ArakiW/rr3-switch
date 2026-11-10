@@ -1,5 +1,6 @@
 #include "rr3/recovery_guard.hpp"
 #include "rr3/libcxx_shims.hpp"
+#include "rr3/elf_preflight.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -186,6 +187,40 @@ extern "C" void __libnx_exception_handler(ThreadExceptionDump* dump) {
     crashHex("fp", dump->fp.x);
     crashHex("far", dump->far.x);
     crashHex("esr", dump->esr);
+    // THE EXCEPTION CLASS, DECODED FROM THE ESR.
+    //
+    // MEASURED 2026-11-10: the console crash's ESR is 0x92000005, and the
+    // class in the top bits is (esr >> 26) & 0x3f = 0x24 = SPAL -- a
+    // POINTER AUTHENTICATION failure.  The repository's own note read this
+    // ESR as "data abort, translation fault", which is 0x4E000005 and not
+    // this value: the wrong reading sent the search after a translation
+    // fault instead of after a pointer authentication.
+    //
+    // crashHex() and not the C++ formatting helpers: this handler runs on
+    // the kernel's exception stack, where nothing may allocate and nothing
+    // may call into the C++ runtime.  The contract test
+    // (tests/test_graphics_isolation_contract.py) enforces that.
+    crashHex("ec", (dump->esr >> 26) & 0x3fULL);
+    // WHOSE CODE FAULTED.
+    //
+    // The one question the console crash has not answered is whether the
+    // faulting pc is the port's code or the guest's, and everything else
+    // follows from the answer: the port's fix is a port fix, and the
+    // guest's fix is about the context the guest runs in.  One line each,
+    // written before the process goes down.
+    {
+        char where[128];
+        if (rr3::loaderLocateAddress(dump->pc.x, where, sizeof(where))) {
+            crashText("pc_attribution=");
+            crashText(where);
+            crashText("\n");
+        }
+        if (rr3::loaderLocateAddress(dump->lr.x, where, sizeof(where))) {
+            crashText("lr_attribution=");
+            crashText(where);
+            crashText("\n");
+        }
+    }
     crashHex("pstate", dump->pstate);
     for (unsigned int index = 0; index < 29; ++index) {
         char name[] = {'x', static_cast<char>('0' + index / 10),
@@ -473,6 +508,42 @@ bool writeGuestBootProgressNoSync(const char* path, const char* phase,
 // into returning false forever, and a card that comes back recovers on the
 // next line. While a card is genuinely gone this costs one failed fopen per
 // line -- the old behaviour, not worse.
+// FLUSH THE CACHED LOG HANDLE FOR THIS PATH, NOW.
+//
+// WHY: the loader's diagnostics are written ONCE, at boot, a few dozen lines,
+// and the thing they exist to explain is a CRASH.  The log's normal policy
+// is to buffer 64 lines and flush in bulk -- which means a crash in the
+// middle of the loader takes the loader's OWN lines down with it, and the
+// diagnostic that was added precisely for that crash never arrives.
+//
+// => So the loader flushes its own lines.  The cost is bounded and paid
+// once: this runs only during the loader's pass, never per frame, and the
+// loader's budget is 320 lines.
+//
+// A path with no cached handle is not an error: there is nothing to flush.
+bool flushGuestBootLog(const char* path) {
+    if (path == nullptr) {
+        return false;
+    }
+    mutexLock(&g_logCacheMutex);
+    bool ok = true;
+    for (size_t index = 0; index < kGuestLogCacheSlots; ++index) {
+        GuestLogCacheSlot& slot = g_logCache[index];
+        if (!slot.used || slot.file == nullptr ||
+            std::strcmp(slot.path, path) != 0) {
+            continue;
+        }
+        ok = std::fflush(slot.file) == 0;
+        if (!ok || std::ferror(slot.file) != 0) {
+            std::fclose(slot.file);
+            slot.file = nullptr;
+        }
+        break;
+    }
+    mutexUnlock(&g_logCacheMutex);
+    return ok;
+}
+
 bool appendGuestBootLine(const char* path, const char* phase,
                          unsigned long long ordinal,
                          unsigned long long target,

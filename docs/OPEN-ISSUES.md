@@ -4084,48 +4084,378 @@ MEASUREMENT THAT READS A STRING OUT OF A LOG MUST BE MOVED ONTO A COUNTER
 BEFORE THE LOG MAY CHANGE -- AND A FILE THAT IS EDITED BY SCRIPT MUST BE
 RESTORED FROM ITS SOURCE, NOT REPAIRED BY ANOTHER SCRIPT.**
 
-### 9.41 The console crash: a SPAL inside the seven-DSO loader, and the loader now has a voice
+### 9.41 The console crash: a SPAL, and the first version of this section got the attribution wrong
 
-**MEASURED 2026-11-10 (the console run the user attached): the crash-early
-dump, the guest-view log and the teardown log.**
+**MEASURED 2026-11-10 (the console run the user attached): crash-early.txt,
+guest-view.log and teardown-repair.log.**
 
-**⇒ ⇒ THE FAULT IS A POINTER-AUTHENTICATION FAILURE, IN THE PORT'S OWN
-CODE.**  `esr=0x92000005` => EC = 0x24 = **SPAL**, and `pc=0x6d47ea4334` /
-`lr=0x6d47ea4330` are both inside the port's own image.
+**=> THIS SECTION CORRECTS ITSELF.  The first version of it said the fault
+was a pointer-authentication failure in the PORT'S OWN CODE and put it in
+the seven-DSO loader.  That was wrong, and the reason it was wrong is
+measurable.**
 
-**⇒ ⇒ AND IT HAPPENS IN THE SEVEN-DSO LOADER.**  The guest-view log's last
-line is `gl-ctx-early ... disabled by conf`, which is `main.cpp:992`
-(`ensureEarlyGuestGlContext()`); the next statement is `main.cpp:993`
-(`loadLinkElfSet()`), the loader that links the guest's seven DSOs.
+**=> AND THE FAULT IS A SPAL.**  `esr=0x92000005`; the exception class is
+`(esr >> 26) & 0x3f` = **0x24 = SPAL**, a pointer-authentication failure.
+The repository's own note read this ESR as "data abort, translation fault",
+which is `0x4E000005` and NOT this value -- the wrong reading sent the
+search after a translation fault instead of after a pointer authentication.
 
-**⇒ ⇒ AND TWO THINGS I HAD WRONG AT FIRST:**
-* `create=00000000 exec=00000000 close=00000000` on the JIT probe line reads
-  like three failures, and it is not: **a libnx `Result` of 0 is SUCCESS.**
-  The image-sized JIT probe succeeded, all three steps.
-* The teardown log is NOT the crash scene: every line is `HOP-TRACE`, and the
-  last one is `pass=1 expected=1 checks_passed=38 checks_failed=0` -- the
-  port's own stack-unwinding self-test, which PASSED.  The crash is after it.
+**=> ⇒ ⇒ AND THE FAULT IS NOT IN THE PORT'S OWN CODE.**  The port's NRO
+carries **exactly TWO** PAC/AUT instructions, both in libunwind's
+`uw_update_context` (file offsets 0x5c7e2c and 0x5c7e4c), in the current
+ELF and in the crashed binary alike.  A SPAL needs a pointer-authentication
+check to fail; the port's code has almost none.  And the NRO base implied
+by the crash pc (`0x6d478dc508` / `0x6d478dc4e8`) is **not page-aligned**,
+and an NRO base must be.  **⇒ THE pc IS IN A GUEST IMAGE**, mapped into
+code memory by the loader -- not in the port.
 
-**⇒ ⇒ AND THE REAL REASON THE CRASH WAS UNDIAGNOSABLE: THE LOADER'S
-DIAGNOSTICS WENT NOWHERE.**  main.cpp's `bootPrintf` is a no-op in this build
--- `((void)format; return 0;)` -- so the `segdiag` / `procdiag` /
-`permissions` lines were never written to any file.  The instrument existed and
-was compiled out.
+**=> ⇒ ⇒ AND THE GUEST'S CODE IS POINTER-AUTHENTICATED.**  The APK's
+`libc++_shared.so` carries **1328 `paciasp` and 1372 `autiasp`**
+(`libRealRacing3.so`: 2; `libfmodex.so`: 0).  So the guest is
+PAC-compiled code being run on a console that enforces PAC, by a port that
+has no PAC context for it.
 
-**⇒ ⇒ SO THE LOADER NOW SAYS IT ITSELF.**  `multi_dso_linker.cpp` writes a
-progress line BEFORE each segment mapping (the DSO, the segment index, the
-offset, the size and the permission) and a failure line (the stage, the
-Result, the actual and expected permissions), into the guest-view log, with a
-128-line budget.  **⇒ ⇒ ⇒ THE NEXT CONSOLE RUN NAMES THE FAILING DSO AND
-SEGMENT IN THE FILE THE USER ALREADY ATTACHES** -- no boot log needed.
+**=> ⇒ ⇒ AND "IT CRASHED IN THE LOADER" WAS ALSO UNSOUND.**  `appendGuestBootLine`
+opens the log in APPEND mode, so the log's last line can be the PREVIOUS
+session's tail: the loader's first line only appears once it starts
+mapping.  So "the last line is `gl-ctx-early ... disabled by conf`, and the
+next statement is `loadLinkElfSet()`" does not place the crash.
 
-**⇒ ⇒ AND THE RUN WAS FURTHER THAN THE LAST ONE.**  The guest-view log has
-`assetlist-req` 400, `manifest-asset` 58, `api-touch` 201 and `path-req` 120:
-the guest was loading its assets and the port was serving them, so the guest's
-Java layer was alive.  The previous console runs froze 2.8 minutes in, in the
-view-sync wait.
+**=> AND TWO EARLIER READINGS WERE WRONG TOO:**
+* `create=00000000 exec=00000000 close=00000000` on the JIT probe reads
+  like three failures and is not: a libnx `Result` of 0 is SUCCESS, and the
+  image-sized JIT probe passed all three steps.
+* The teardown log is NOT the crash scene: every line is `HOP-TRACE` and the
+  last is `pass=1 expected=1 checks_passed=38 checks_failed=0` -- the port's
+  own stack-unwinding self-test, which PASSED.  The crash is after it.
 
-**⇒ ⇒ AND ONE MORE MEASUREMENT OUT OF THAT RUN: THERE WERE NO CENSUS LINES**,
+**=> ⇒ ⇒ SO BOTH SIDES GET AN INSTRUMENT, AND THE NEXT CONSOLE RUN ANSWERS
+THE QUESTION IN THE FILE THE USER ALREADY ATTACHES.**
+
+1. **THE LOADER SAYS IT ITSELF, AND ITS LINES REACH THE CARD.**
+   `multi_dso_linker.cpp` writes, before each segment mapping, the DSO, the
+   segment, the offset, the size and the permission; on failure, the stage,
+   the Result and the actual and expected permissions; and **a PAC census
+   per DSO** (`pac=` and `aut=` counts over the image's own bytes), because
+   whether the guest's pointer authentication comes along for the ride is
+   the difference between "the loader broke" and "the guest is
+   authenticated and the port is not".  The budget is 320 lines and the
+   budget says so when it runs out.
+   **⇒ AND EVERY ONE OF THOSE LINES IS FLUSHED IMMEDIATELY.**  The log's
+   normal policy is 64 lines and a bulk flush, which is right for the frame
+   loop and WRONG here: these lines are written once, at boot, and the thing
+   they exist to explain is a crash -- so a crash inside the loader would
+   have taken the loader's own evidence with it, which is exactly what
+   happened on 2026-11-10.
+
+2. **THE CRASH DUMP SAYS WHOSE CODE FAULTED.**  It now carries the decoded
+   exception class (`ec=0x..`) and, for `pc` and `lr`, the attribution:
+   the DSO and the offset, or `port-nro+0x...`, or `unmapped`.  One line
+   each, written before the process goes down.
+
+**=> ⇒ ⇒ ⇒ THE NEXT CONSOLE RUN NAMES THE FAILING DSO AND SEGMENT, SAYS
+WHETHER THE GUEST'S CODE IS PAC-COMPILED, AND SAYS WHOSE CODE THE FAULTING
+pc IS IN -- all in the guest-view log and the crash file the user already
+attaches.**
+
+**=> AND ONE MORE MEASUREMENT OUT OF THAT RUN: THERE WERE NO CENSUS LINES**,
 because the crash happens before the frame loop starts -- so the console's
 `tt=` (the 60 FPS number) is still unmeasured, and it can only be measured
 after the loader survives.
+
+### 9.42 The 60 FPS number, and three things that did not look like what they were
+
+**MEASURED 2026-11-10: the archived Eden rounds, the frame budget from the
+census line, and a fresh 400-second round on the current build.**
+
+#### 9.42.1 THE 60 FPS NUMBER: THE PORT'S OWN OVERHEAD IS ZERO
+
+The census line carries the frame's three costs: `tt` (the whole frame),
+`tr` (the guest's own render), `ts` (the swap) and `tp` (the port's own
+overhead, `tt - tr - ts`).  The rounds split by phase -- a frame that is
+waiting for an asset (`fs > 0`) is a LOADING frame, and averaging the two
+phases describes neither.
+
+    round            phase   n      tt p25  tt med  tt p75   tr med   tp med   jni med   tt <= 17 ms
+    yield2          render  1668     29       66      118        37        0         7        222/1668  13%
+    yield2          loading  678     54      168      452       157        0         8         24/678    4%
+    pcall1buf        render  1503     32       51       92        40        0        11        156/1503  10%
+    pcall1buf        loading  514     79      183      649       168        0        10         11/514    2%
+    slim1            render  1877     30       40       95        37        0         8        197/1877  10%
+    slim1            loading  501    104      181      808       168        0         8         17/501    3%
+
+**=> ⇒ ⇒ `tp` -- THE PORT'S OWN COST -- IS ZERO IN EVERY ROUND AND EVERY
+PHASE.**  The port adds nothing measurable to the frame.  The frame is the
+guest's own render (`tr` = 37-40 ms) plus the emulator's own overhead.
+
+**=> ⇒ ⇒ SO THE PORT SIDE OF THE 60 FPS QUESTION IS CLOSED, AND THE REST OF
+THE QUESTION IS NOT.**  On Eden the guest renders in 37-40 ms; on a real
+Maxwell GPU it will be much cheaper, and only a console measurement says by
+how much.  **THE ONLY HONEST 60 FPS CRITERION IS THE `tt=` OF A CONSOLE
+RUN**, and it is the same instrument the census already prints.  What the
+port still owns is the guest's QUALITY SETTINGS (README 10.10), not the
+frame's cost.
+
+#### 9.42.2 THE RESOLUTION CACHE IS DEAD CODE, AND THE FILESYSTEM IS A QUARTER OF THE ROUND
+
+The round's filesystem service cost **99,120 / 110,605 / 120,044 ms** in
+slim1 / yield2 / pcall1buf -- a quarter of a 400-second round -- and in the
+SAME rounds the resolution cache's counters never moved ONCE (max hit 0,
+max miss 0, over every census line with `fs > 0`).
+
+**=> ⇒ ⇒ THE CACHE IS ON THE WRONG FUNCTION.**  The 1024-entry cache is on
+`resolveAssetLocalFile()`, the BOOT-time list builder.  The hot path is
+`resolvePath()`, which the guest's own asset requests go through.  So the
+cache has never once answered a request.
+
+**=> ⇒ ⇒ AND UNTIL THE TIME IS SPLIT, "THE CACHE DOES NOT HELP" AND "THE
+CACHE IS IN THE WRONG FUNCTION" ARE THE SAME SENTENCE WITH OPPOSITE FIXES.**
+So the census now prints `fsr=` -- the resolution inside the service -- next
+to `fs=`, and `fs - fsr` is the I/O.  One round says which.
+
+#### 9.42.3 THE CENSUS PRINTED A FIELD THAT DOES NOT EXIST
+
+The census line read `fs= fshit= fhit= fsmiss=`, and the arguments were
+`fs, fshit, fshit, fsmiss`: **`fhit` printed `fshit`'s value**, because
+there are only two filesystem counters, not three.  A reader could not
+tell the two apart, and the cache's hit rate could not be computed from the
+log at all.  The line is now `fs= fsr= fshit= fsmiss=` with the two real
+counters.
+
+#### 9.42.4 THE ROUNDS WERE NEVER CONTROLLED FOR THE GUEST'S OWN STATE
+
+**THIS IS THE ONE THAT MATTERS FOR THE RACE COUNTS.**  The rounds' start
+lights went 7 (chunk1..chunk3) -> 19 (fps1) -> 27 (yield2) -> **1** (slim1,
+census2, aa0, fx0, view960) -> 2 (pcall1buf, and the fresh loaderdiag1
+round).  The obvious reading is a regression in the port.
+
+**=> ⇒ ⇒ BUT `run-pinned-round.ps1` SNAPSHOTS THE GUEST'S STATE AND NEVER
+RESTORES IT.**  It takes a snapshot under the round's own name before the
+round starts, so every round begins from whatever the PREVIOUS round left
+behind.  And the guest persists: it advances to the NEXT EVENT after each
+race, and it writes its popups into the save.  So each round inherited its
+predecessor's progress -- which is the same trap the project has already
+paid for once ("a 2x2 with one uncontrolled cell is not a 2x2").
+
+**=> ⇒ ⇒ SO THE RACE-COUNT COLLAPSE CANNOT BE ATTRIBUTED TO CODE YET.**
+The controlled experiment is now defined and cheap:
+`.build/guest-state.ps1 -Restore -Tag yield2` (that snapshot exists, and it
+is the state that produced 27 start lights and 36 race screens), then the
+same 400 seconds on the same build.  If the numbers come back, the code did
+not regress and the rounds were measuring the save.  If they do not, the
+thinning at `logResolvedPathOnce()` is the suspect: the path trace went
+from **108,419 lines (105,150 of them asset paths) in yield2 to 80 lines**
+(census2, pcall1buf, loaderdiag1) because it is now thinned to
+`gui/processed/` only.
+
+#### 9.42.5 AND THE GUEST IS ASKING FOR A TRACK DETAIL MAP IN A SPELLING THAT IS NOT SHIPPED
+
+The fresh round's guest shows an error: its own Java string is the
+localised Chinese message for "error loading track data, please reinstall",
+written here as the escapes the guest carries
+(`\u52A0\u8F7D\u8D5B\u9053\u6570\u636E\u65F6\u51FA\u9519` = "error loading
+track data", then `\uFF0C\u8BF7\u91CD\u65B0\u5B89\u88C5\uFF01` = ", please
+reinstall!"), which reaches the port's log as GBK mojibake -- a port-side
+log-encoding detail, not the game's own text.
+
+**MEASURED: the guest asks for `detailmap_road_surface_norm_a` in four
+spellings -- `.dxt.dds.z`, `.dxt.dds`, `.etc.dds.z`, `.etc.dds` -- across
+three guest roots and two passes: 24 probes, every one of them ENOENT.**
+Meanwhile the published asset list (`asset_list_track_common.txt`, both the
+original and the port's rewritten copy, which agree) carries exactly ONE
+entry for that leaf:
+
+    /Tracks/common/detail/detailmap_road_surface_norm_a.rgb.pvr.z  84b9989df0a3e5cc7964844e56a9a263  522565  522565
+
+and the card's loose tree carries exactly that file, 522,565 bytes.  Every
+OTHER detailmap on the card is `.etc.dds.z`; this one, and only this one,
+is `.rgb.pvr.z`.
+
+**=> ⇒ ⇒ SO THE SHIPPED SPELLING AND THE PROBED SPELLINGS DISAGREE FOR THIS
+ONE LEAF, AND THE PORT ANSWERS ENOENT FOR ALL FOUR.**  The whole round
+logged **46,789 `stat-path` failures with errno=2**.
+
+**=> ⇒ ⇒ THIS IS NOT YET ATTRIBUTED, AND IT IS NOT YET FIXED.**  What is
+NOT the cause: the list is correct, the file is on the card, and the port
+routes the path to the right volumes.  What is open: whether the guest
+walks a format list that the port's published list is supposed to extend,
+or whether this asset needs a format conversion the pipeline does not do.
+The next instrument is the one that answers it: a count, per leaf, of the
+spellings the guest asked for against the spellings the card holds.
+
+### 9.43 What the game actually DOES, measured by the frames
+
+**MEASURED 2026-11-10, round loaderdiag1 (archive
+`20261110-211723-eden-rr3-loaderdiag1`), read off the archived frames.**
+
+The counters of that round say: race screens 2, start lights 2, HUD planes
+88, EventMapScreen 168, main-menu layouts 12.  The frames say much more,
+because the counters count SCREENS and the frames show the game.
+
+**=> THE FRONT END IS COMPLETE AND CORRECT.**  `frames/frame-002000.png`
+shows the event-selection screen: the header with the currency counters,
+the three daily-race cards, and every card's artwork correctly textured --
+a Porsche 911 GT3, an Audi R8 and a Nissan GT-R, no magenta anywhere --
+with the game's own Chinese labels laid out over them ("daily race",
+"overtime race", "cup race", "Silverstone", "car rally track").
+
+**=> THE 3-D CAR SHOWROOM IS CORRECT.**  `frames/frame-001400.png` shows the
+car-selection screen with a fully rendered Formula 1 car -- the Real Racing
+liveries, the "Birel ART" and "3REAL" branding on the wings, the pink
+Brawn-livery car beside it, the red car behind it -- plus the car's class
+column (R / MR / PR), the driver's level (110.3), the four performance
+bars, the car-parts row and the Chinese tooltip.
+
+**=> AND THE RACE ITSELF REACHES THE PRE-GRID.**  `frames/frame-001800.png`
+shows the race's start screen: the player's Nissan GT-R in its white and red
+NISMO livery, correct headlights and correct bodywork, and beside it the
+whole grid of TWENTY AI cars -- Verstappen 1, Perez 11, Sainz 55, Leclerc
+16, Colapinto 43, Zhou 24, Ocon 31, Magnussen 20, Stroll 18, Piastri 21,
+Norris 4, Hulkenberg 27, Tsunoda 22, Russell 63, Albon 23, Gasly 10,
+Hamilton 44, Alonso 14 -- with correct liveries, correct numbers and
+correct names, the race's leaderboard on the right, and the race's Chinese
+title at the bottom left.
+
+**=> ⇒ ⇒ AND THE HUD IS NOT GREY BLOCKS ON THESE SCREENS.**  The HUD text
+renders, the leaderboard renders, the Chinese renders.  Whatever the grey
+and white blocks complaint was about, it is not about these screens -- which
+means the `LocalStyles*.gui` files are still worth copying (README 10.6),
+but they are NOT what stands between the port and a playable front end.
+
+**=> AND ONE DETAIL WORTH RECORDING: THE PORT'S LOG ENCODING IS WRONG FOR
+CHINESE, THE GAME'S IS NOT.**  The guest's own Java string is the localised
+message for "error loading track data, please reinstall"
+(`\u52A0\u8F7D\u8D5B\u9053\u6570\u636E\u65F6\u51FA\u9519` ...), and the
+game draws its Chinese correctly on screen -- but the port's log line for it
+arrives as GBK mojibake.  So the mojibake is the PORT'S log encoding, not the
+game's text, and the frames are the proof.
+
+**=> ⇒ ⇒ ⇒ SO THE HONEST ANSWER TO "HOW FAR FROM PLAYABLE" IS:**  the front
+end, the car showroom, the race grid, the textures and the Chinese text all
+work.  What is left is the part that has not been measured on the target:
+the console crash (section 9.41), the player's own driving, the controller
+binding, and the console's frame time.
+
+### 9.44 The NSP package, the TPIDR_EL0 reading, and what the controlled round settled
+
+#### 9.44.1 THE APP NOW SHIPS AS AN NSP
+
+An NSP installs as a TITLE -- through hbloader or an NSP installer -- and
+launches from the Home menu.  An NRO has to be launched by a homebrew menu
+every time, and the user has to put the file in the right place by hand.
+
+**THE PACKAGING IS THREE STEPS AND TWO TRAPS.**
+
+    elf2nso   <elf>          -> exefs/main       (the NSO)
+    npdmtool  <descriptor>   -> exefs/main.npdm  (the meta)
+    <pfs0 writer>            -> rr3-native-rehost.nsp
+
+*TRAP ONE: libnx's own `%.nsp` rule builds the PFS0 from the DIRECTORY
+`exefs`.*  `build_pfs0` packs only the TOP LEVEL of its input directory --
+it prints "Directories aren't supported, skipping..." for a subdirectory
+and does not recurse into it.  So that rule's `.nsp` contains the entries
+`main` and `main.npdm`: that is an EXEFS IMAGE, not an NSP.  An NSP's
+entries have to be named `exefs/main` and `exefs/main.npdm`, i.e. the
+directory layout has to live INSIDE the container.  The container is
+therefore written by `tools/make-pfs0.py`, whose format was read back off
+`build_pfs0`'s own output (header 0x10 bytes, then count * 0x18 entries of
+{u64 offset, u64 size, u32 string offset, u32 parent}, then the string
+table, then the data).
+
+*TRAP TWO: npdmtool cannot describe a RomFS section.*  Its descriptor has
+no `icon`, no `nacp` and no `romfs` key -- each one was tried and each one
+produced a byte-identical 848-byte meta.  So an NSP built this way has no
+RomFS and no icon.
+
+**⇒ ⇒ AND THE MISSING ROMFS DOES NOT MATTER, BECAUSE THE PORT ALREADY HAS A
+FALLBACK FOR IT.**  Every port asset is read through `resolvePortAssetPath()`,
+which tries `romfs:/X` first and falls back to
+`sdmc:/switch/rr3-native-rehost/X`; and the guest's own libraries
+(`libRealRacing3.so`, `libc++_shared.so`, `libfmodex.so`) and the UI faces
+are ALREADY on the card there.  The same fallback is why the game library
+is found without a RomFS: `selectGameLibrary()` falls through to
+`sdmc:/switch/rr3-native-rehost/libRealRacing3.so`.
+
+**⇒ ⇒ AND THE PACKAGE IS CHECKED, NOT ASSUMED.**  `Pack-NativeSwitchNsp.ps1`
+reads the container back after writing it and refuses to report success
+unless the two entries are named `exefs/main` and `exefs/main.npdm`.  So
+"the build said it worked" can never hide a container whose entries are
+the exefs image's.
+
+**⇒ ⇒ WHAT THE NSP DOES NOT CARRY, AND STILL HAS TO BE COPIED: the game's
+own data -- the seven volumes and the .depot tree, about 11.8 GiB.**  That
+has never been in the executable and it is not in the NSP either; it goes
+onto the card as before.
+
+#### 9.44.2 THE NEW CONSOLE DUMP ANSWERS THE SPAL QUESTION IN ONE FIELD
+
+**MEASURED 2026-11-11, the dump the user attached after the run of
+2026-11-10:**
+
+    esr=0000000092000005
+    pc=0000001abfbb96f4
+    lr=0000001abfbb96f0
+    far=00000059a492e5d0
+    fault_tpidr_el0=000000018eff3e60
+    sp=000000018eff39b0
+    fp=000000018eff39e0
+
+**=> THE EXCEPTION CLASS IS STILL SPAL** (0x24), and `pc = lr + 4` again.
+
+**=> ⇒ ⇒ AND THE ONE FIELD THAT MATTERS IS `fault_tpidr_el0`: IT IS 0x18eff3e60,
+AND THE STACK POINTER IS 0x18eff39b0.**  The thread pointer that names the
+thread-local area -- the value every PAC key is derived from -- points
+**1,200 bytes ABOVE THE STACK POINTER, INSIDE THE STACK FRAME.**
+
+**=> ⇒ ⇒ ⇒ THAT IS THE PORT'S OWN FAKE TCB.**  `GuestTlsScope`
+(`tls_probe.cpp`) fabricates a 256-byte block ON THE STACK and points
+TPIDR_EL0 at it, and it is active across the whole guest-constructor
+window (the loader's calls at `multi_dso_linker.cpp:2345`, `:2748`,
+`:2910`).  On a console, TPIDR_EL0 must name a real thread-local area
+whose PAC key material lives there; a stack address for TPIDR_EL0 means
+the guest's `autiasp`/`paciasp` computes a PAC against the wrong key.
+
+**=> ⇒ ⇒ ⇒ AND THE GUEST'S CODE IS PAC-COMPILED** (1328 `paciasp` + 1372
+`autiasp` in `libc++_shared.so`, section 9.41), so the guest signs and
+authenticates pointers on every function entry and exit.  **⇒ THE PORT'S
+FAKE TLS IS THE MOST LIKELY CAUSE OF THE SPAL**, and it is a port-side
+bug, not a guest bug.
+
+**=> ⇒ ⇒ ⇒ ⇒ THE FIX IS NAMED AND SMALL: the port must not clobber
+TPIDR_EL0.**  It has to save the host's value and restore it around the
+guest-constructor window, or allocate a real thread-local block for the
+guest instead of pointing at the stack.  The next console run is not
+needed to find that; it is needed to confirm the fix.
+
+#### 9.44.3 THE CONTROLLED ROUND SETTLED THE RACE-COUNT QUESTION
+
+**THE QUESTION.**  The start lights went 7 (chunk1..chunk3) -> 19 (fps1) ->
+27 (yield2) -> **1** (slim1, census2, aa0, fx0, view960) -> 2 (pcall1buf,
+loaderdiag1).  The obvious reading is "the port regressed".
+
+**THE EXPERIMENT.**  `run-pinned-round.ps1` SNAPSHOTS the guest's state and
+never RESTORES it, so every round began from whatever the previous round
+left behind -- and the guest advances to the next event after each race
+and writes its popups into the save.  So the round `ctl1` restored
+`.build/guest-state/yield2` (the state that produced the 27) and ran the
+SAME binary as `loaderdiag1` for the same 400 seconds.
+
+    round          state            binary      event  lights  race  hud  scanf
+    yield2         inherited        A           300    27      36    0     0
+    loaderdiag1    inherited        B (9543C130) 168    2       2   88   13385
+    ctl1           RESTORED yield2  B (9543C130) 167    2       2   88   13385
+
+**=> ⇒ ⇒ AND THE STATE IS NOT THE VARIABLE.**  ctl1 put the SAME binary
+back on the state that produced 27, and it came back at 2/2 -- the same
+numbers as the round that inherited a drifted save.  **⇒ THE COLLAPSE IS
+NOT THE SAVE.**
+
+**=> ⇒ ⇒ ⇒ SO IT IS THE OTHER HALF OF THE A/B: the binary, or the logging
+switch that moved with it.**  `loaderdiag1` and `ctl1` ran with
+`percall=1` (13,385 guest-scanf lines) and `yield2` ran with `percall=0`
+(0).  **⇒ ⇒ ⇒ ⇒ ⇒ THE NEXT EXPERIMENT IS ONE VARIABLE: the SAME binary with
+`percall=0`, and then with the path trace restored** -- because the path
+trace went from 108,419 lines (105,150 of them asset paths) to 80 lines
+when `logResolvedPathOnce()` was thinned to `gui/processed/` only, and
+section 9.33 already recorded that the port's own front-end navigation
+reads that trace.

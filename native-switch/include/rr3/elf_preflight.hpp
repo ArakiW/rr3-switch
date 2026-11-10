@@ -294,6 +294,11 @@ uintptr_t resolveMainImageSpanBytes();
 // Writes up to `max` addresses into `out` and returns the count found.
 size_t collectGuestExports(const char* name, uintptr_t* out, size_t max);
 uint64_t loaderRollbackSelfTest();
+// WHOSE CODE IS THIS ADDRESS IN?  Writes the DSO and the offset, or
+// "port-nro+0x...", or "unmapped", into `out`.  Used by the crash handler
+// to settle, in one line, whether the faulting pc is the port's code or
+// the guest's.  See loaderLocateAddress() in multi_dso_linker.cpp.
+bool loaderLocateAddress(uint64_t address, char* out, size_t outSize);
 int guestDlIteratePhdr(GuestDlPhdrCallback callback, void* data);
 void* guestDlopen(const char* fileName, int flags);
 void* guestDlsym(void* handle, const char* symbolName);

@@ -44,6 +44,14 @@ bool appendGuestBootLine(const char* path, const char* phase,
                          unsigned long long ordinal,
                          unsigned long long target,
                          const char* details = nullptr);
+// Flush the cached handle for `path` NOW.
+//
+// WHY: the log buffers 64 lines and flushes in bulk, which is right for the
+// frame loop and WRONG for the loader: the loader's lines are written once,
+// at boot, and the thing they exist to explain is a crash -- so a crash
+// inside the loader would take the loader's own lines with it.  The loader
+// calls this after each of its lines.
+bool flushGuestBootLog(const char* path);
 // Snapshot of the append-handle cache counters: how many times a handle was
 // freshly opened, reused from the cache, and reopened after an error. Read this
 // at an existing periodic point (the census/sweep in pthread_bridge.cpp) rather

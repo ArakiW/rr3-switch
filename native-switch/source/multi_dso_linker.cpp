@@ -15,6 +15,13 @@
 #include <utility>
 #include <vector>
 
+// THE PORT'S OWN IMAGE BASE.
+//
+// _start is at vaddr 0 in the link, so its runtime address IS the NRO base.
+// The crash handler needs it to tell "the fault is in the port" from "the
+// fault is in the guest", so it lives here at file scope.
+extern "C" void _start();
+
 namespace rr3 {
 namespace {
 
@@ -996,7 +1003,7 @@ void closeSegmentedMappings() {
 //
 // THE PROGRESS LINES ARE BUDGETED IN LINES, AND THE BUDGET SAYS SO.
 void loaderDiag(const char* format, ...) {
-    constexpr unsigned kLoaderDiagBudget = 128;
+    constexpr unsigned kLoaderDiagBudget = 320;
     static unsigned s_loaderDiagLines = 0;
     char detail[384];
     va_list args;
@@ -1009,10 +1016,17 @@ void loaderDiag(const char* format, ...) {
     ++s_loaderDiagLines;
     rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                               "loader-diag", 0, 0, detail);
+    // ⇒ FLUSH THIS LINE NOW.  The log's own policy is 64 lines and a bulk
+    // flush, which is right for the frame loop and WRONG here: these lines
+    // are written once, at boot, and the thing they exist to explain is a
+    // crash.  A crash inside the loader would otherwise take the loader's
+    // own evidence with it -- which is exactly what happened on 2026-11-10.
+    rr3::flushGuestBootLog("sdmc:/switch/rr3-native-rehost.guest-view.log");
     if (s_loaderDiagLines == kLoaderDiagBudget) {
         rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                                   "loader-diag", 0, 0,
-                                  "budget exhausted (128 lines)");
+                                  "budget exhausted (320 lines)");
+        rr3::flushGuestBootLog("sdmc:/switch/rr3-native-rehost.guest-view.log");
     }
 }
 
@@ -2369,6 +2383,110 @@ int stopPhdrCallback(GuestDlPhdrInfo*, size_t, void*) {
 
 } // namespace
 
+// THE PAC CENSUS OF THE GUEST IMAGES.
+//
+// WHY: MEASURED 2026-11-10, the console crash's ESR is 0x92000005, and the
+// exception class in the top bits is 0x24 = SPAL -- a POINTER AUTHENTICATION
+// failure.  The port's own NRO carries exactly TWO PAC/AUT instructions (both
+// in libunwind's uw_update_context), so a SPAL cannot have been raised by
+// the port's own code; and the NRO base implied by the crash pc is not
+// page-aligned, so the pc is not in the port image either.  The guest's
+// libc++_shared.so, on the other hand, carries 1328 paciasp and 1372
+// autiasp: the GUEST's code is PAC-compiled.
+//
+// => So the census counts the PAC/AUT opcodes in each guest image BEFORE it
+// is mapped.  One line per DSO says whether the guest's pointer
+// authentication is coming along for the ride, which is the difference
+// between "the loader broke" and "the guest is authenticated and the port
+// is not".
+//
+// The encoding: every PAC/AUT instruction is 0xD5032xxx with the low ten
+// bits one of {0x1,0x3,0x5,0xb,0xf,0x1b,0x1f,0x3b,0x3f,0x5b,0x7b,0x7b,0xbb,
+// 0xbf,0xfb,0xff}; bit 6 of the low byte tells the two apart (0 = PACIA /
+// PACIB, 1 = AUTIA / AUTIB).
+//
+// IT LIVES HERE, OUTSIDE THE ANONYMOUS NAMESPACE, ON PURPOSE: the crash
+// handler in recovery_guard.cpp calls loaderLocateAddress() across
+// translation units, and a function in an unnamed namespace has internal
+// linkage, so the link would fail with exactly the one error that says
+// nothing about the cause.
+void loaderPacCensus() {
+    for (size_t index = 0; index < gLoaderImageCount; ++index) {
+        const CrossImage& image = gLoaderImages[index];
+        unsigned pac = 0;
+        unsigned aut = 0;
+        const size_t bytes = image.image.size();
+        const size_t words = bytes / 4;
+        const unsigned char* data = image.image.data();
+        for (size_t word = 0; word < words; ++word) {
+            uint32_t value = 0;
+            std::memcpy(&value, data + word * 4, sizeof(value));
+            if ((value & 0xFFFFFC00u) != 0xD5032000u) {
+                continue;
+            }
+            if ((value & 0x40u) != 0u) {
+                ++aut;
+            }
+            else {
+                ++pac;
+            }
+        }
+        loaderDiag("pac-census image=%zu name=%s soname=%s bytes=%zu pac=%u aut=%u",
+                   index, image.name.c_str(), image.soname.c_str(),
+                   bytes, pac, aut);
+    }
+}
+
+// WHOSE CODE IS THIS ADDRESS IN?
+//
+// WHY: the one question the console crash has not answered is whether the
+// faulting pc is the port's code or the guest's.  Everything else follows
+// from it: the port's fix is a port fix, and the guest's fix is about the
+// context the guest runs in.
+//
+// => One line per address, from the crash handler, before the process goes
+// down.  It answers with the DSO and the offset, or "port-nro+0x...", or
+// "unmapped".
+bool loaderLocateAddress(uint64_t address, char* out, size_t outSize) {
+    if (out == nullptr || outSize == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    for (size_t index = 0; index < gLoaderImageCount; ++index) {
+        const CrossImage& image = gLoaderImages[index];
+        const SegmentedImageMapping& mapped = gSegmentedImages[index];
+        const uint64_t base = reinterpret_cast<uint64_t>(mapped.targetBase);
+        if (base == 0) {
+            continue;
+        }
+        const uint64_t size = image.maximumAddress > image.minimumAddress
+            ? (image.maximumAddress - image.minimumAddress)
+            : 0;
+        if (size == 0 || address < base || address >= base + size) {
+            continue;
+        }
+        const char* name = image.soname[0] != '\0' ? image.soname.c_str()
+                                                   : image.name.c_str();
+        std::snprintf(out, outSize, "%s+0x%llx", name,
+                      static_cast<unsigned long long>(address - base));
+        return true;
+    }
+    // The port's own image.  _start is at vaddr 0 in the link, so the base
+    // is its runtime address.
+    static uintptr_t nroBase = 0;
+    if (nroBase == 0) {
+        nroBase = reinterpret_cast<uintptr_t>(&_start);
+    }
+    constexpr uint64_t kPortImageWindow = 96ULL * 1024ULL * 1024ULL;
+    if (address >= nroBase && address < nroBase + kPortImageWindow) {
+        std::snprintf(out, outSize, "port-nro+0x%llx",
+                      static_cast<unsigned long long>(address - nroBase));
+        return true;
+    }
+    std::snprintf(out, outSize, "unmapped");
+    return false;
+}
+
 ElfCrossLink crossLinkElfPair(const char* primaryPath, const char* dependencyPath) {
     ElfCrossLink result{};
     result.resolutionPlanHash = 1469598103934665603ULL;
@@ -2457,6 +2575,10 @@ ElfLoaderSession loadLinkElfSet(const char* const* paths, size_t pathCount) {
         result.tlsBytes += image.tlsBytes;
     }
     result.imageCount = pathCount;
+
+    // THE PAC CENSUS, BEFORE ANY RELOCATION OR MAPPING: the guest's pointer
+    // authentication is a property of the bytes, not of the mapping.
+    loaderPacCensus();
 
     for (size_t index = 0; index < pathCount; ++index) {
         for (const std::string& needed : gLoaderImages[index].neededNames) {

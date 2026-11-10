@@ -21,6 +21,29 @@ APP_TITLE   := RR3 Native Rehost
 APP_AUTHOR  := Native Port Lab
 APP_VERSION := 0.22.4
 
+# THE NSP PACKAGE.
+#
+# WHY THE APP SHIPS AS AN NSP AND NOT AS AN NRO.  An NSP installs as a
+# TITLE -- through hbloader or an NSP installer -- and launches from the
+# Home menu; an NRO has to be launched by a homebrew menu every time.
+#
+# THE NSP IS NOT BUILT HERE.  libnx's own `%.nsp` rule builds the PFS0
+# from the DIRECTORY `exefs`, so the container's entries come out named
+# `main` and `main.npdm` -- that is an EXEFS image, not an NSP, and an NSP
+# needs its entries named `exefs/main` and `exefs/main.npdm`.  So
+# tools/Pack-NativeSwitchNsp.ps1 does the three steps (elf2nso, npdmtool,
+# build_pfs0) with the container's layout in a staging tree, and reads the
+# container back afterwards to assert the two entries are named right.
+#
+# The descriptor npdmtool takes is rr3-nsp.json, next to this Makefile.
+#
+# THE ROMFS IS NOT INSIDE THE NSP, AND THAT IS DELIBERATE.  npdmtool
+# cannot describe a RomFS section, and the port does not need one: every
+# port asset is read through resolvePortAssetPath(), which falls back from
+# "romfs:/X" to "sdmc:/switch/rr3-native-rehost/X", and the guest's own
+# libraries and the UI faces are ALREADY on the card there.  See
+# tools/README-hardware-test.md, section 10.12.
+
 # Runtime-selectable graphics backend (native-switch/source/gfx).
 #
 # Every guest graphics import gets a -Wl,--wrap shim, so the rehosted guest and
@@ -88,7 +111,7 @@ $(BUILD): $(ROMFS_IMAGE)
 
 clean:
 	@echo clean ...
-	@rm -fr $(BUILD) $(TARGET).nro $(TARGET).nacp $(TARGET).elf
+	@rm -fr $(BUILD) $(TARGET).nro $(TARGET).nacp $(TARGET).elf $(TARGET).nsp
 
 else
 

@@ -135,6 +135,11 @@ native-switch/*.map
 native-switch/*.nacp
 # The embedded romfs image is a build product; its source tree IS tracked.
 native-switch/rr3.romfs
+# The NSP and the staging tree it is packed from are build products too.
+# (tools/make-pfs0.py and tools/Pack-NativeSwitchNsp.ps1 ARE tracked: they
+# are how the package is made, and the package has to be reproducible.)
+native-switch/*.nsp
+native-switch/nsp-stage/
 
 # --- reverse-engineering databases ------------------------------------------
 # Regenerable from reverse/native/arm64/libRealRacing3.so with Ghidra.

@@ -188,5 +188,8 @@ void fsResetFrameStats();
 uint64_t fsGetFrameTicks();
 uint64_t fsGetFrameHits();
 uint64_t fsGetFrameMisses();
+// The resolution half of the filesystem service, timed apart from its I/O.
+// See ScopedFsResolveTimer in guest_filesystem.cpp for why the split exists.
+uint64_t fsGetFrameResolveTicks();
 
 } // namespace rr3

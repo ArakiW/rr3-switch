@@ -7305,6 +7305,7 @@ void* frameLoopDriver(void* opaque) {
     uint64_t prevJniFileTick = 0;
     uint64_t prevJniOtherTick = 0;
     uint64_t prevFsTick = 0;
+    uint64_t prevFsResolveTick = 0;
     uint64_t prevFsHit = 0;
     uint64_t prevFsMiss = 0;
     bool havePrevTiming = false;
@@ -9047,6 +9048,7 @@ void* frameLoopDriver(void* opaque) {
                 unsigned long long jnifile = 0;
                 unsigned long long jnioth = 0;
                 unsigned long long fs = 0;
+                unsigned long long fsr = 0;
                 unsigned long long fshit = 0;
                 unsigned long long fsmiss = 0;
                 if (havePrevTiming) {
@@ -9065,6 +9067,7 @@ void* frameLoopDriver(void* opaque) {
                         jnifile = (unsigned long long)(prevJniFileTick * 1000ULL / freq);
                         jnioth = (unsigned long long)(prevJniOtherTick * 1000ULL / freq);
                         fs = (unsigned long long)(prevFsTick * 1000ULL / freq);
+                        fsr = (unsigned long long)(prevFsResolveTick * 1000ULL / freq);
                     }
                     fshit = prevFsHit;
                     fsmiss = prevFsMiss;
@@ -9076,7 +9079,7 @@ void* frameLoopDriver(void* opaque) {
                     " draws=%u arr=%u"
                     " tt=%llu tr=%llu ts=%llu tp=%llu"
                     " jni=%llu jnitex=%llu jnistr=%llu jnifile=%llu jnioth=%llu"
-                    " fs=%llu fshit=%llu fhit=%llu fsmiss=%llu"
+                    " fs=%llu fsr=%llu fshit=%llu fsmiss=%llu"
                     " gui=%llu twosq=%llu",
                     static_cast<unsigned long long>(frames),
                     static_cast<int>(g_hdBoundAfterRender),
@@ -9090,7 +9093,7 @@ void* frameLoopDriver(void* opaque) {
                     stats.drawElements, stats.drawArrays,
                     tt, tr, ts, tp,
                     jni, jnitex, jnistr, jnifile, jnioth,
-                    fs, fshit, fshit, fsmiss,
+                    fs, fsr, fshit, fsmiss,
                     // THE CENSUS'S COUNTERS, read by the round's census instead
                     // of a regex over this log's text (docs/OPEN-ISSUES.md 9.37).
                     static_cast<unsigned long long>(rr3::guestGuiLayoutOpens()),
@@ -10026,6 +10029,7 @@ void* frameLoopDriver(void* opaque) {
         prevJniFileTick = jniGetFrameFileTicks();
         prevJniOtherTick = jniGetFrameOtherTicks();
         prevFsTick = fsGetFrameTicks();
+        prevFsResolveTick = fsGetFrameResolveTicks();
         prevFsHit = fsGetFrameHits();
         prevFsMiss = fsGetFrameMisses();
         havePrevTiming = true;

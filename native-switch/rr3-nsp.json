@@ -1,0 +1,27 @@
+{
+  "name": "RR3 Native Rehost",
+  "author": "Native Port Lab",
+  "version": "0.22.4",
+  "title_id": "0x010000000000F00D",
+  "main_thread_stack_size": "0x10000",
+  "main_thread_priority": 40,
+  "default_cpu_id": 3,
+  "address_space_type": 3,
+  "pool_partition": 1,
+  "system_resource_size": "0x10000000",
+  "filesystem_access": {
+    "permissions": "0xFFFFFFFFFFFFFFFF"
+  },
+  "is_64_bit": true,
+  "optimize_memory_allocation": false,
+  "disable_device_address_space_merge": false,
+  "enable_alias_region_extra_size": false,
+  "prevent_code_reads": true,
+  "signature_key_generation": 0,
+  "is_retail": false,
+  "program_id_range_min": "0x0",
+  "program_id_range_max": "0x0",
+  "program_id": "0x0",
+  "kernel_capabilities": [],
+  "services": []
+}

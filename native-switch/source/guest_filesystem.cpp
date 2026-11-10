@@ -31,7 +31,42 @@ namespace rr3 {
 std::atomic<uint64_t> g_frameFsTicks{0};
 std::atomic<uint64_t> g_frameFsHits{0};
 std::atomic<uint64_t> g_frameFsMisses{0};
+std::atomic<uint64_t> g_frameFsResolveTicks{0};
 thread_local int s_fsDepth = 0;
+thread_local int s_resolveDepth = 0;
+
+// THE RESOLUTION HALF OF THE FILESYSTEM SERVICE, TIMED ON ITS OWN.
+//
+// WHY: MEASURED 2026-11-10, rounds yield2 / pcall1buf / slim1 -- the
+// filesystem service burned 99,120 to 120,044 MILLISECONDS of a 400-second
+// round (a quarter of the round), and in the SAME rounds the resolution
+// cache's counters never moved ONCE (max hit 0, max miss 0).  So the hot
+// path does not consult the cache: the cache is on resolveAssetLocalFile
+// (the BOOT-time list builder) and the hot path is resolvePath.
+//
+// Until the time is split, "the cache does not help" and "the cache is in
+// the wrong function" are the same sentence, and they have opposite fixes.
+// One of them costs the guest a quarter of its loading time.
+//
+// => So the resolution is timed separately.  fs is the whole service, fsr
+// is the resolution inside it, and fs - fsr is the I/O.
+struct ScopedFsResolveTimer {
+    uint64_t startTick = 0;
+    bool active;
+    ScopedFsResolveTimer() {
+        active = (s_resolveDepth++ == 0);
+        if (active) {
+            startTick = armGetSystemTick();
+        }
+    }
+    ~ScopedFsResolveTimer() {
+        if (active) {
+            g_frameFsResolveTicks.fetch_add(armGetSystemTick() - startTick,
+                                             std::memory_order_relaxed);
+        }
+        --s_resolveDepth;
+    }
+};
 
 struct ScopedFsTimer {
     uint64_t startTick = 0;
@@ -55,6 +90,7 @@ void fsResetFrameStats() {
     g_frameFsTicks.store(0, std::memory_order_relaxed);
     g_frameFsHits.store(0, std::memory_order_relaxed);
     g_frameFsMisses.store(0, std::memory_order_relaxed);
+    g_frameFsResolveTicks.store(0, std::memory_order_relaxed);
 }
 
 uint64_t fsGetFrameTicks() {
@@ -67,6 +103,10 @@ uint64_t fsGetFrameHits() {
 
 uint64_t fsGetFrameMisses() {
     return g_frameFsMisses.load(std::memory_order_relaxed);
+}
+
+uint64_t fsGetFrameResolveTicks() {
+    return g_frameFsResolveTicks.load(std::memory_order_relaxed);
 }
 
 // Bounded resolution cache: 1024 entries, direct-mapped by FNV-1a hash.
@@ -2152,6 +2192,11 @@ bool resolvePathImpl(const char* path, bool writing, Resolution& resolution);
 bool maybeSubstituteDeviceProfile(const char* guestPath, Resolution& resolution);
 
 bool resolvePath(const char* path, bool writing, Resolution& resolution) {
+    // THE RESOLUTION, TIMED SEPARATELY FROM THE SERVICE THAT CALLS IT.
+    // See ScopedFsResolveTimer for why: the filesystem service costs a
+    // quarter of the round and the resolution cache's counters never move,
+    // and only a split says whether the cost is the routing or the I/O.
+    ScopedFsResolveTimer resolveTimer;
     const bool resolved = resolvePathImpl(path, writing, resolution);
     if (resolved && !writing) {
         // THE GUEST'S DEVICE PROFILE, WITH THE CARD'S SETTINGS APPLIED.

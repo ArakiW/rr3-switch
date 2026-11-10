@@ -331,3 +331,15 @@ if (-not (Test-Path $nro -PathType Leaf)) {
 }
 
 Write-Host "Built: $nro" -ForegroundColor Green
+
+# THE NSP IS THE SHIPPABLE ARTIFACT NOW.
+#
+# The NRO is still built, because it is what the emulator card runs, and
+# because it carries the RomFS that the NSP cannot (npdmtool cannot
+# describe a RomFS section).  The NSP is what goes on the console: it
+# installs as a title and launches from the Home menu.
+& (Join-Path $PSScriptRoot 'Pack-NativeSwitchNsp.ps1') -ProjectRoot $projectRoot
+if ($LASTEXITCODE -ne 0) {
+    throw 'NSP packaging failed.'
+}
+
