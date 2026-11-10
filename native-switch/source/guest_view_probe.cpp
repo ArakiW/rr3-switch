@@ -869,7 +869,9 @@ static uintptr_t g_renderTarget = 0;
 // ---------------------------------------------------------------------------
 static const char* kEglWatchdogPath = "sdmc:/switch/rr3-native-rehost.egl-probe.log";
 
-void appendWatchdogLine(const char* text) {
+// THE EGL WATCHDOG'S OWN LOG LINE.  It is a diagnostic that the probe uses
+// while it is armed, so it is kept even when the arming path is compiled out.
+[[maybe_unused]] void appendWatchdogLine(const char* text) {
     std::FILE* f = std::fopen(kEglWatchdogPath, "ab");
     if (f == nullptr) {
         return;
@@ -3039,7 +3041,7 @@ GuestViewProbe runGuestViewProbe(NWindow* window, const char* progressPath) {
     // non main thread" (xref 0x13a4468), so both call sites now record it.
     {
         char tdiag[96];
-        const int tn = __builtin_snprintf(
+        __builtin_snprintf(
             tdiag, sizeof(tdiag), "th=0x%llx site=jni-view-render",
             static_cast<unsigned long long>(threadGetCurHandle()));
         appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
@@ -5098,7 +5100,10 @@ void emitFeGateSample(uint64_t frames, const char* carrier,
                            s.st47c.value == kFeGateStateBlocked ? 1 : 0);
     }
 
-    char line[768];
+    // The line carries about twenty guest-supplied strings of up to 63 bytes
+    // each, so 768 bytes was not enough for the compiler to prove (and the
+    // guest to see) the whole thing: it reported the truncation.
+    char line[2048];
     __builtin_snprintf(
         line, sizeof(line),
         "fe-gate: f=%llu t=%llu via=%s g=%s gok=%c gsrc=%s g2=%s g2ok=%c"
@@ -7295,6 +7300,10 @@ void* frameLoopDriver(void* opaque) {
     uint64_t prevRenderTick = 0;
     uint64_t prevSwapTick = 0;
     uint64_t prevJniTick = 0;
+    uint64_t prevJniTexTick = 0;
+    uint64_t prevJniStrTick = 0;
+    uint64_t prevJniFileTick = 0;
+    uint64_t prevJniOtherTick = 0;
     uint64_t prevFsTick = 0;
     uint64_t prevFsHit = 0;
     uint64_t prevFsMiss = 0;
@@ -9033,6 +9042,10 @@ void* frameLoopDriver(void* opaque) {
                 unsigned long long ts = 0;
                 unsigned long long tp = 0;
                 unsigned long long jni = 0;
+                unsigned long long jnitex = 0;
+                unsigned long long jnistr = 0;
+                unsigned long long jnifile = 0;
+                unsigned long long jnioth = 0;
                 unsigned long long fs = 0;
                 unsigned long long fshit = 0;
                 unsigned long long fsmiss = 0;
@@ -9047,6 +9060,10 @@ void* frameLoopDriver(void* opaque) {
                                                   1000ULL / freq);
                         tp = tt > tr + ts ? tt - tr - ts : 0;
                         jni = (unsigned long long)(prevJniTick * 1000ULL / freq);
+                        jnitex = (unsigned long long)(prevJniTexTick * 1000ULL / freq);
+                        jnistr = (unsigned long long)(prevJniStrTick * 1000ULL / freq);
+                        jnifile = (unsigned long long)(prevJniFileTick * 1000ULL / freq);
+                        jnioth = (unsigned long long)(prevJniOtherTick * 1000ULL / freq);
                         fs = (unsigned long long)(prevFsTick * 1000ULL / freq);
                     }
                     fshit = prevFsHit;
@@ -9058,7 +9075,8 @@ void* frameLoopDriver(void* opaque) {
                     " scene=fbo=%u size=%ux%u binds=%u changes=%u vpChanges=%u"
                     " draws=%u arr=%u"
                     " tt=%llu tr=%llu ts=%llu tp=%llu"
-                    " jni=%llu fs=%llu fshit=%llu fhit=%llu fsmiss=%llu",
+                    " jni=%llu jnitex=%llu jnistr=%llu jnifile=%llu jnioth=%llu"
+                    " fs=%llu fshit=%llu fhit=%llu fsmiss=%llu",
                     static_cast<unsigned long long>(frames),
                     static_cast<int>(g_hdBoundAfterRender),
                     static_cast<int>(g_hdViewportAfterRender[0]),
@@ -9070,7 +9088,8 @@ void* frameLoopDriver(void* opaque) {
                     stats.fboBindChanges, stats.viewportChanges,
                     stats.drawElements, stats.drawArrays,
                     tt, tr, ts, tp,
-                    jni, fs, fshit, fshit, fsmiss);
+                    jni, jnitex, jnistr, jnifile, jnioth,
+                    fs, fshit, fshit, fsmiss);
                 appendGuestBootLine(
                     "sdmc:/switch/rr3-native-rehost.guest-view.log",
                     "guest-frame-census", 249, 0, cdiag);
@@ -9997,6 +10016,10 @@ void* frameLoopDriver(void* opaque) {
         prevRenderTick = tickRender;
         prevSwapTick = tickSwap;
         prevJniTick = jniGetFrameTicks();
+        prevJniTexTick = jniGetFrameTexTicks();
+        prevJniStrTick = jniGetFrameStrTicks();
+        prevJniFileTick = jniGetFrameFileTicks();
+        prevJniOtherTick = jniGetFrameOtherTicks();
         prevFsTick = fsGetFrameTicks();
         prevFsHit = fsGetFrameHits();
         prevFsMiss = fsGetFrameMisses();

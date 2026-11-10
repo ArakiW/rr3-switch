@@ -71,16 +71,30 @@ uint64_t fsGetFrameMisses() {
 
 // Bounded resolution cache: 1024 entries, direct-mapped by FNV-1a hash.
 // Protected by libnx Mutex (s_assetCacheMutex). std::mutex is NEVER used.
-// Revalidated on hit via ::stat (st_size and st_mtime) to ensure safety
-// if card is pulled or file replaced.
+// Revalidation is throttled to once per kAssetCacheRevalidateWindowSeconds
+// (default 3 seconds): in a 60 FPS budget (16.67 ms), calling ::stat on every
+// hit touches the emulated SD card dozens of times a frame. If revalidation
+// fails after the window expires, the cache falls back to uncached resolution.
 struct CachedAssetResolution {
     char assetPath[256];
     char resolvedPath[256];
     char digest[33];
     unsigned long long size;
     time_t mtime;
+    uint64_t lastValidatedTick;
     bool valid;
 };
+
+// Revalidation window for cached asset resolutions: 3 seconds.
+//
+// WHY IT EXISTS. Round fps2 measured fs at 0 ms with the cache, but every hit
+// still invoked ::stat to revalidate size and mtime against the emulated SD
+// card. In a 60 FPS budget (16.67 ms), repeated stat calls on an emulated
+// filesystem add unnecessary card I/O. Assets in the game's romfs/depot are
+// static during gameplay, but we preserve safety: if the SD card is pulled or an
+// asset is replaced, revalidation after the window detects it and falls back to
+// uncached resolution. A stale answer is never served.
+constexpr uint64_t kAssetCacheRevalidateWindowSeconds = 3;
 
 constexpr size_t kAssetCacheEntries = 1024;
 static CachedAssetResolution s_assetCache[kAssetCacheEntries]{};
@@ -108,10 +122,28 @@ static uint64_t hashAssetPath(const char* str) {
 // hash set of the paths already reported keeps the information and drops the
 // repetition.  The key is a 64-bit hash, so a collision can only cost one
 // diagnostic line.
+// THE PATH-RESOLUTION TRACE IS NOT A PER-CALL LINE, AND IT IS NOT SWITCHED
+// OFF.
+//
+// MEASURED 2026-11-10 (rounds fps2, yield1 and fps3): with the per-call
+// logging off, this trace was off with it, and TWO things went blind:
+//
+//   1. THE CENSUS.  tools/Test-OnEden.ps1 counts the main-menu layout in
+//      the guest-view log's TEXT, so it read 'front-end layout opened 0' and
+//      'race screen 0' in three rounds in a row -- while the archived frames
+//      showed the front end fully drawn and correctly textured
+//      (yield1/frames/frame-000340.png).  The game was fine; the MEASUREMENT
+//      was a lie.
+//   2. THE PORT'S OWN FRONT END NAVIGATION, which reads the same trace to
+//      tell which screen the guest is on.  Blind, it stopped navigating, the
+//      guest sat in the event map, and it began asking for the same assets
+//      over and over (guest-scanf-bounded: 1,005 lines in chunk3, 14,297 in
+//      yield1) -- so the frame time did not improve either.
+//
+// ⇒ SO THE PORT'S OWN EYES STAY OPEN.  The switch covers the high-volume
+// per-call sites; this one is the trace the instruments and the navigation
+// read, and it costs one line per DISTINCT path.
 void logResolvedPathOnce(const char* path) {
-    if (!rr3::gfxPerCallLog()) {
-        return;
-    }
     constexpr size_t kPathSlots = 2048;
     static uint64_t seen[ kPathSlots ] = {0};
     static size_t seenCount = 0;
@@ -1441,7 +1473,8 @@ void redirectWriteToAppLocal(Resolution& resolution) {
 // absolute sdmc: paths under it. isDevicePath used to pass those straight to
 // FAT, so files/.depot/gui_assets/** never reached the seven romfs volumes.
 // Save trees (doc/, cache/, .depot/CC_Data, *.dat) stay on SD.
-bool mapAppRootToContent(const char* path, bool writing, Resolution& resolution) {
+bool mapAppRootToContent(const char* path, [[maybe_unused]] bool writing,
+                          Resolution& resolution) {
     if (path == nullptr || !startsWith(path, kAppRoot)) {
         return false;
     }
@@ -1580,17 +1613,17 @@ bool mapAppRootToContent(const char* path, bool writing, Resolution& resolution)
         // guestOpen, guestOpendir) -- so the fallback has to land here, in the
         // resolver, and not in the pure-snprintf writeContentPath.
         std::snprintf(contentRelative, sizeof(contentRelative),
-                      "files/apk/res/%s", appResLeaf);
+                      "files/apk/res/%.1200s", appResLeaf);
     }
     else if (startsWith(rest, "apk/")) {
         std::snprintf(contentRelative, sizeof(contentRelative),
-                      "files/.depot/%s", rest + 4);
+                      "files/.depot/%.1200s", rest + 4);
     }
     else if (startsWith(rest, "files/")) {
-        std::snprintf(contentRelative, sizeof(contentRelative), "%s", rest);
+        std::snprintf(contentRelative, sizeof(contentRelative), "%.1200s", rest);
     }
     else if (startsWith(rest, ".depot/")) {
-        std::snprintf(contentRelative, sizeof(contentRelative), "files/%s", rest);
+        std::snprintf(contentRelative, sizeof(contentRelative), "files/%.1200s", rest);
     }
     else if (isAssetRelative(rest)) {
         std::snprintf(contentRelative, sizeof(contentRelative),
@@ -1943,6 +1976,9 @@ void logWatchedResult(const char* api, const char* guestPath,
 // peek is 16 bytes and the offset is restored, so this is observation, not a
 // change of open behaviour.
 void logWatchedOpen(const char* guestPath, const Resolution& resolution, int fd) {
+    if (!rr3::gfxPerCallLog()) {
+        return;
+    }
     const int index = watchedPathClass(guestPath);
     const unsigned ordinal = claimWatchedLine(index);
     if (ordinal == 0) {
@@ -2522,7 +2558,7 @@ void collectManifestAssets(const char* device, const char* volumeRelative,
         }
         if (S_ISDIR(info.st_mode)) {
             char childLogical[256];
-            std::snprintf(childLogical, sizeof(childLogical), "%s%s/",
+            std::snprintf(childLogical, sizeof(childLogical), "%.120s%.120s/",
                           logicalPrefix, entry->d_name);
             collectManifestAssets(device, childRelative, childLogical,
                                   assets, count, overflow);
@@ -2537,7 +2573,7 @@ void collectManifestAssets(const char* device, const char* volumeRelative,
         if (manifestPathKnown(assets, count, logical)) {
             continue;
         }
-        std::snprintf(assets[count].logical, sizeof(assets[count].logical), "%s", logical);
+        std::snprintf(assets[count].logical, sizeof(assets[count].logical), "%.200s", logical);
         ++count;
     }
     ::closedir(handle);
@@ -3454,7 +3490,7 @@ bool rewriteVehicleBodyAlias(const char* guestPath, char* out, size_t outSize) {
 template <typename Callback>
 int withReadFallback(const Resolution& resolution, const char* guestPath,
                      Callback callback, const char** servedOut = nullptr) {
-    const bool probe = resolution.primary != nullptr &&
+    const bool probe = rr3::gfxPerCallLog() && resolution.primary != nullptr &&
                        std::strstr(resolution.primary, kProbeSubtree) != nullptr;
     // The asset-list requests are traced here because this is the only place
     // that knows WHICH candidates the host tried and what the last attempt
@@ -5201,12 +5237,24 @@ bool resolveAssetLocalFile(const char* assetPath, char* outPath, size_t outPathS
         mutexLock(&s_assetCacheMutex);
         CachedAssetResolution& entry = s_assetCache[slot];
         if (entry.valid && std::strcmp(entry.assetPath, assetPath) == 0) {
-            // Revalidate that the target file still exists and size/mtime haven't changed.
-            struct stat st{};
-            if (::stat(entry.resolvedPath, &st) == 0 &&
-                static_cast<unsigned long long>(st.st_size) == entry.size &&
-                st.st_mtime == entry.mtime) {
-                // Cache hit!
+            const uint64_t nowTick = armGetSystemTick();
+            const uint64_t freq = armGetSystemTickFreq();
+            const uint64_t windowTicks = kAssetCacheRevalidateWindowSeconds * (freq != 0 ? freq : 19200000ULL);
+            const bool needRevalidate = (nowTick - entry.lastValidatedTick >= windowTicks);
+            if (needRevalidate) {
+                // Time to revalidate that the target file still exists and size/mtime haven't changed.
+                struct stat st{};
+                if (::stat(entry.resolvedPath, &st) == 0 &&
+                    static_cast<unsigned long long>(st.st_size) == entry.size &&
+                    st.st_mtime == entry.mtime) {
+                    entry.lastValidatedTick = nowTick;
+                } else {
+                    // Stale or missing: invalidate and fall back to uncached resolution.
+                    entry.valid = false;
+                }
+            }
+            if (entry.valid) {
+                // Cache hit! (either revalidated or served within valid time window)
                 g_frameFsHits.fetch_add(1, std::memory_order_relaxed);
                 std::snprintf(outPath, outPathSize, "%s", entry.resolvedPath);
                 std::memcpy(digest, entry.digest, 33);
@@ -5216,8 +5264,6 @@ bool resolveAssetLocalFile(const char* assetPath, char* outPath, size_t outPathS
                 mutexUnlock(&s_assetCacheMutex);
                 return true;
             }
-            // Invalidate stale entry
-            entry.valid = false;
         }
         mutexUnlock(&s_assetCacheMutex);
     }
@@ -5270,6 +5316,7 @@ bool resolveAssetLocalFile(const char* assetPath, char* outPath, size_t outPathS
         std::memcpy(entry.digest, digest, 33);
         entry.size = selection.size;
         entry.mtime = mtime;
+        entry.lastValidatedTick = armGetSystemTick();
         entry.valid = true;
         mutexUnlock(&s_assetCacheMutex);
     }
@@ -8356,7 +8403,11 @@ bool bionicDirentLayoutSelfTest() {
     //    the bytes themselves rather than on the compiler's word, so the
     //    boot line reports the layout that is actually in force.
     struct dirent host{};
-    host.d_ino = 0x0123456789abULL;
+    // A FAKE INODE, AND IT HAS TO FIT: ino_t is 16 bits wide in this ABI, so the
+    // value the old code wrote was TRUNCATED (the compiler said so with
+    // -Woverflow).  The inode only has to be a constant that is not one of
+    // the real ones, and the code below compares the raw struct bytes.
+    host.d_ino = static_cast<ino_t>(0x89ab);
     host.d_type = DT_DIR;
     std::strcpy(host.d_name, "480x320");
     unsigned char hostRaw[sizeof(struct dirent)];
@@ -9053,8 +9104,9 @@ std::FILE* guestFopen(const char* path, const char* mode) {
         // e89f6ac8... -- an instrument that lies about the very thing it
         // exists to measure. A lying instrument is worse than no instrument,
         // so the digest is taken from the path that was SERVED.
-        if (file != nullptr && mode != nullptr && std::strchr(mode, 'w') == nullptr &&
-            std::strchr(mode, 'a') == nullptr && served != nullptr) {
+        if (rr3::gfxPerCallLog() && file != nullptr && mode != nullptr &&
+            std::strchr(mode, 'w') == nullptr && std::strchr(mode, 'a') == nullptr &&
+            served != nullptr) {
             char streamDigest[33]{};
             if (digestOfLocalFile(served, streamDigest)) {
                 char details[900];
@@ -9255,7 +9307,7 @@ int guestOpen(const char* path, int flags, ...) {
     // pages through open/mmap, so this is the count of what it really
     // consumed.
     censusGuiAssetRequest(path, fd >= 0 ? 0 : -1, true);
-    if (path != nullptr &&
+    if (rr3::gfxPerCallLog() && path != nullptr &&
         (std::strstr(path, "Shaders") != nullptr ||
          std::strstr(path, ".vsh") != nullptr ||
          std::strstr(path, ".fsh") != nullptr ||

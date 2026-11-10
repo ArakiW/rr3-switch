@@ -199,8 +199,13 @@ bool rr3ByteArrayMagic(uintptr_t handle, uint32_t* outMagic);
 void startAlertPumpEarly();
 
 // Split-tr frame timing instrument: accumulator for time spent inside
-// the port's JNI dispatch entry points.
+// the port's JNI dispatch entry points, with per-call-type buckets.
 void jniResetFrameTicks();
 uint64_t jniGetFrameTicks();
+uint64_t jniGetFrameTexTicks();
+uint64_t jniGetFrameStrTicks();
+uint64_t jniGetFrameFileTicks();
+uint64_t jniGetFrameOtherTicks();
+const char* jniGetDominantSite(uint64_t* outTicks = nullptr);
 
 } // namespace rr3

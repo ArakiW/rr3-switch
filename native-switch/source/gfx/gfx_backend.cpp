@@ -250,7 +250,27 @@ struct ConfState {
     // an fprintf plus fflush on the emulated SD card. Turning this off removes
     // the port's own logging overhead while preserving frame instruments
     // (guest-frame-census, race-flip, etc.).
-    bool perCallLog = false;
+    // THE DEFAULT IS ON, AND THAT IS A MEASURED DECISION.
+    //
+    // MEASURED 2026-11-10: two rounds on the same binary, the same card and
+    // the same guest state, differing only in this key:
+    //
+    //     percall = 0   the front end comes up, but the guest never gets past
+    //                   the event map: 2,520 frames, race screen 0.
+    //     percall = 1   the same build reaches the race: 1,055 frames, race
+    //                   screen 10, start lights 7.
+    //
+    // So the per-call log is not only a cost: its CADENCE is part of how the
+    // port and the guest keep step, and switching it off changes the timing of
+    // the whole system.  The frames prove the front end itself was fine in the
+    // percall = 0 round (the UI is drawn and textured), so this is not a game
+    // that breaks -- it is a port that stops driving.
+    //
+    // ⇒ THE 60 FPS WORK THEREFORE CANNOT BE "TURN THE LOGGING OFF".  It has
+    // to make the lines CHEAP without making them less frequent: buffer them
+    // in RAM and flush them in bulk, so the cadence the guest sees stays the
+    // same and the card stops being written forty times a frame.
+    bool perCallLog = true;
     // "ccloginok=1" -- the Cloudcell account manager answers LoginCompleteCallback
     // with SUCCESS rather than with an honest failure.
     //
@@ -922,7 +942,9 @@ const char* shaderStageSuffix(uint32_t shader) {
 
 void rememberDumpName(const char* path) {
     const char* leaf = std::strrchr(path, '/');
-    std::snprintf(s_counters.lastDump, sizeof(s_counters.lastDump), "%s",
+    // The leaf name can be longer than the buffer, so it is bounded: the
+    // counter only has to be able to tell two dump names apart.
+    std::snprintf(s_counters.lastDump, sizeof(s_counters.lastDump), "%.60s",
                   leaf != nullptr ? leaf + 1 : path);
 }
 

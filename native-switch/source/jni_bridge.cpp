@@ -85,13 +85,98 @@
 namespace rr3 {
 
 std::atomic<uint64_t> g_frameJniTicks{0};
+std::atomic<uint64_t> g_frameJniTexTicks{0};
+std::atomic<uint64_t> g_frameJniStrTicks{0};
+std::atomic<uint64_t> g_frameJniFileTicks{0};
+std::atomic<uint64_t> g_frameJniOtherTicks{0};
+
+// Tracking dominant call site across frames
+struct JniCallSiteRecord {
+    const char* name;
+    std::atomic<uint64_t> ticks;
+    std::atomic<uint32_t> count;
+};
+
+constexpr size_t kMaxTrackedSites = 32;
+static JniCallSiteRecord s_trackedSites[kMaxTrackedSites]{};
+static std::atomic<size_t> s_trackedSiteCount{0};
+
+static bool rawEqualsEarly(const char* left, const char* right) {
+    if (left == nullptr || right == nullptr) {
+        return left == right;
+    }
+    size_t index = 0;
+    while (index < 192 && left[index] == right[index]) {
+        if (left[index] == '\0') {
+            return true;
+        }
+        ++index;
+    }
+    return false;
+}
+
+static void recordJniCallSiteTicks(const char* name, uint64_t ticks) {
+    if (name == nullptr || ticks == 0) return;
+    const size_t count = s_trackedSiteCount.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < count && i < kMaxTrackedSites; ++i) {
+        if (s_trackedSites[i].name != nullptr && rawEqualsEarly(s_trackedSites[i].name, name)) {
+            s_trackedSites[i].ticks.fetch_add(ticks, std::memory_order_relaxed);
+            s_trackedSites[i].count.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+    if (count < kMaxTrackedSites) {
+        const size_t idx = s_trackedSiteCount.fetch_add(1, std::memory_order_relaxed);
+        if (idx < kMaxTrackedSites) {
+            s_trackedSites[idx].name = name;
+            s_trackedSites[idx].ticks.store(ticks, std::memory_order_relaxed);
+            s_trackedSites[idx].count.store(1, std::memory_order_relaxed);
+        }
+    }
+}
 
 void jniResetFrameTicks() {
     g_frameJniTicks.store(0, std::memory_order_relaxed);
+    g_frameJniTexTicks.store(0, std::memory_order_relaxed);
+    g_frameJniStrTicks.store(0, std::memory_order_relaxed);
+    g_frameJniFileTicks.store(0, std::memory_order_relaxed);
+    g_frameJniOtherTicks.store(0, std::memory_order_relaxed);
 }
 
 uint64_t jniGetFrameTicks() {
     return g_frameJniTicks.load(std::memory_order_relaxed);
+}
+
+uint64_t jniGetFrameTexTicks() {
+    return g_frameJniTexTicks.load(std::memory_order_relaxed);
+}
+
+uint64_t jniGetFrameStrTicks() {
+    return g_frameJniStrTicks.load(std::memory_order_relaxed);
+}
+
+uint64_t jniGetFrameFileTicks() {
+    return g_frameJniFileTicks.load(std::memory_order_relaxed);
+}
+
+uint64_t jniGetFrameOtherTicks() {
+    return g_frameJniOtherTicks.load(std::memory_order_relaxed);
+}
+
+const char* jniGetDominantSite(uint64_t* outTicks) {
+    size_t count = s_trackedSiteCount.load(std::memory_order_relaxed);
+    if (count > kMaxTrackedSites) count = kMaxTrackedSites;
+    const char* bestName = "none";
+    uint64_t bestTicks = 0;
+    for (size_t i = 0; i < count; ++i) {
+        uint64_t t = s_trackedSites[i].ticks.load(std::memory_order_relaxed);
+        if (t > bestTicks) {
+            bestTicks = t;
+            bestName = s_trackedSites[i].name != nullptr ? s_trackedSites[i].name : "unknown";
+        }
+    }
+    if (outTicks != nullptr) *outTicks = bestTicks;
+    return bestName;
 }
 
 // Defined in pthread_bridge.cpp. Declared here so the JNI call paths below can
@@ -441,25 +526,127 @@ bool perCallLogAllow(const char* site) {
 
 // Split-tr frame timing instrument: time spent inside the port's JNI dispatch
 // entry points. Measured in armGetSystemTick() cycles, converted to ms on the
-// census line.
+// census line, split into TEXTURE / STRING / FILE / OTHER buckets.
+enum class JniBucket : uint8_t {
+    Other = 0,
+    Texture = 1,
+    String = 2,
+    File = 3,
+    Count = 4
+};
+
 static thread_local int s_jniDepth = 0;
+static thread_local JniBucket s_currentJniBucket = JniBucket::Other;
+static thread_local const char* s_currentJniSite = nullptr;
+
+static bool hasSubstrEarly(const char* str, const char* sub) {
+    if (str == nullptr || sub == nullptr) return false;
+    for (size_t i = 0; str[i] != '\0' && i < 256; ++i) {
+        size_t j = 0;
+        while (sub[j] != '\0' && str[i + j] == sub[j]) {
+            ++j;
+        }
+        if (sub[j] == '\0') return true;
+    }
+    return false;
+}
+
+static JniBucket classifyJniCall(const char* name, const char* cls = nullptr) {
+    if (name != nullptr) {
+        if (rawEqualsEarly(name, "loadTextureFromMemory") ||
+            rawEqualsEarly(name, "createTexture") ||
+            rawEqualsEarly(name, "renderToTexture") ||
+            rawEqualsEarly(name, "loadBitmap") ||
+            rawEqualsEarly(name, "loadBitmapDynamic") ||
+            rawEqualsEarly(name, "loadGlyph") ||
+            rawEqualsEarly(name, "texId") ||
+            rawEqualsEarly(name, "texWidth") ||
+            rawEqualsEarly(name, "texHeight")) {
+            return JniBucket::Texture;
+        }
+        if (rawEqualsEarly(name, "NewString") ||
+            rawEqualsEarly(name, "NewStringUTF") ||
+            rawEqualsEarly(name, "GetStringUTFChars") ||
+            rawEqualsEarly(name, "GetStringUTFLength") ||
+            rawEqualsEarly(name, "ReleaseStringUTFChars") ||
+            rawEqualsEarly(name, "GetStringChars") ||
+            rawEqualsEarly(name, "ReleaseStringChars") ||
+            rawEqualsEarly(name, "GetStringLength")) {
+            return JniBucket::String;
+        }
+        if (rawEqualsEarly(name, "getAppPath") ||
+            rawEqualsEarly(name, "getExternalStorageDir") ||
+            rawEqualsEarly(name, "getExternalStorageState") ||
+            rawEqualsEarly(name, "extractRes")) {
+            return JniBucket::File;
+        }
+    }
+    if (cls != nullptr) {
+        if (hasSubstrEarly(cls, "EAIO") ||
+            hasSubstrEarly(cls, "StorageDirectory") ||
+            hasSubstrEarly(cls, "AppDataDirectory") ||
+            hasSubstrEarly(cls, "AssetManager")) {
+            return JniBucket::File;
+        }
+    }
+    return JniBucket::Other;
+}
 
 class ScopedJniTimer {
     uint64_t m_start;
     bool m_active;
+    JniBucket m_prevBucket;
+    const char* m_prevSite;
 public:
-    ScopedJniTimer() : m_start(0), m_active(false) {
+    explicit ScopedJniTimer(JniBucket bucket = JniBucket::Other, const char* site = nullptr)
+        : m_start(0), m_active(false), m_prevBucket(s_currentJniBucket), m_prevSite(s_currentJniSite) {
         if (s_jniDepth++ == 0) {
             m_start = armGetSystemTick();
             m_active = true;
+            s_currentJniBucket = bucket;
+            s_currentJniSite = site;
+        } else if (bucket != JniBucket::Other) {
+            s_currentJniBucket = bucket;
+            if (site != nullptr) {
+                s_currentJniSite = site;
+            }
+        }
+    }
+    void set(JniBucket b, const char* site = nullptr) {
+        s_currentJniBucket = b;
+        if (site != nullptr) {
+            s_currentJniSite = site;
         }
     }
     ~ScopedJniTimer() {
         if (m_active) {
             const uint64_t end = armGetSystemTick();
             if (end > m_start) {
-                g_frameJniTicks.fetch_add(end - m_start, std::memory_order_relaxed);
+                const uint64_t elapsed = end - m_start;
+                g_frameJniTicks.fetch_add(elapsed, std::memory_order_relaxed);
+                switch (s_currentJniBucket) {
+                    case JniBucket::Texture:
+                        g_frameJniTexTicks.fetch_add(elapsed, std::memory_order_relaxed);
+                        break;
+                    case JniBucket::String:
+                        g_frameJniStrTicks.fetch_add(elapsed, std::memory_order_relaxed);
+                        break;
+                    case JniBucket::File:
+                        g_frameJniFileTicks.fetch_add(elapsed, std::memory_order_relaxed);
+                        break;
+                    default:
+                        g_frameJniOtherTicks.fetch_add(elapsed, std::memory_order_relaxed);
+                        break;
+                }
+                if (s_currentJniSite != nullptr) {
+                    recordJniCallSiteTicks(s_currentJniSite, elapsed);
+                }
             }
+            s_currentJniBucket = JniBucket::Other;
+            s_currentJniSite = nullptr;
+        } else {
+            s_currentJniBucket = m_prevBucket;
+            s_currentJniSite = m_prevSite;
         }
         --s_jniDepth;
     }
@@ -2705,7 +2892,7 @@ uintptr_t jniIsSameObject(uintptr_t /*env*/, uintptr_t a, uintptr_t b) {
 }
 
 uintptr_t jniNewStringUTF(uintptr_t /*env*/, const char* bytes) {
-    ScopedJniTimer jniTimer;
+    ScopedJniTimer jniTimer(JniBucket::String, "NewStringUTF");
     rawLog("[jni] NewStringUTF ");
     rawLog(bytes);
     rawLog("\n");
@@ -2812,7 +2999,7 @@ size_t decodeUtf16ToUtf8(const uint16_t* chars, int32_t count, char* out,
 // not a character buffer. Reading it as one would be a wild pointer read, so
 // such an argument is answered with the stub's null instead.
 uintptr_t jniNewStringSlot163(uintptr_t env, const uint16_t* chars, int32_t count) {
-    ScopedJniTimer jniTimer;
+    ScopedJniTimer jniTimer(JniBucket::String, "NewStringSlot163");
     if (chars == nullptr) {
         return 0;
     }
@@ -2863,13 +3050,13 @@ uintptr_t jniNewStringSlot163(uintptr_t env, const uint16_t* chars, int32_t coun
 }
 
 uintptr_t jniGetStringUTFLength(uintptr_t /*env*/, uintptr_t string) {
-    ScopedJniTimer jniTimer;
+    ScopedJniTimer jniTimer(JniBucket::String, "GetStringUTFLength");
     return static_cast<uintptr_t>(rawStrlen(jniStringValue(string)));
 }
 
 uintptr_t jniGetStringUTFChars(uintptr_t /*env*/, uintptr_t string,
                                uintptr_t /*isCopy*/) {
-    ScopedJniTimer jniTimer;
+    ScopedJniTimer jniTimer(JniBucket::String, "GetStringUTFChars");
     return reinterpret_cast<uintptr_t>(jniStringValue(string));
 }
 
@@ -3000,6 +3187,7 @@ uintptr_t jniCallObjectMethodV(uintptr_t /*env*/, uintptr_t object,
                                uintptr_t methodId, void* args) {
     ScopedJniTimer jniTimer;
     const char* name = jniMethodName(methodId);
+    jniTimer.set(classifyJniCall(name), name);
     const bool returnsString = jniMethodReturnsString(methodId);
     jniPairMark("enter", name, methodId, 0);
     // The response-header map, answered before every name-keyed fallback.
@@ -3082,6 +3270,7 @@ uintptr_t jniCallStaticObjectMethodV(uintptr_t /*env*/, uintptr_t /*clazz*/,
                                      uintptr_t methodId, void* args) {
     ScopedJniTimer jniTimer;
     const char* name = jniMethodName(methodId);
+    jniTimer.set(classifyJniCall(name), name);
     if (name == nullptr) {
         return jniObjectForMethod(methodId);
     }
@@ -3390,6 +3579,7 @@ int32_t jniCallBooleanMethodV(uintptr_t env, uintptr_t object,
                               uintptr_t methodId, void* args) {
     ScopedJniTimer jniTimer;
     const char* name = jniMethodName(methodId);
+    jniTimer.set(classifyJniCall(name), name);
     // The guest's boolean helper (guest 0x10e8f2c) calls JNIEnv::
     // CallBooleanMethodV -- table slot 38 -- whose fourth argument is the
     // GUEST's own va_list block: the same 32-byte block the void slot
@@ -4806,6 +4996,7 @@ void jniCallVoidMethodV(uintptr_t env, uintptr_t object,
     ScopedJniTimer jniTimer;
     // `env` is the JNIEnv the guest passed.
     const char* name = jniMethodName(methodId);
+    jniTimer.set(classifyJniCall(name), name);
     jniPairMark("enter", name, methodId, 0);
     if (name == nullptr) {
         // The SLOT was reached and the id was not resolvable. Those are two
@@ -5228,6 +5419,7 @@ void jniCallStaticVoidMethodV(uintptr_t env, uintptr_t clazz,
                               uintptr_t methodId, void* args) {
     ScopedJniTimer jniTimer;
     const char* name = jniMethodName(methodId);
+    jniTimer.set(classifyJniCall(name), name);
     if (name == nullptr) {
         return;
     }
@@ -5273,6 +5465,7 @@ uintptr_t jniCallStaticBooleanMethodV(uintptr_t /*env*/, uintptr_t /*clazz*/,
                                       uintptr_t methodId, void* args) {
     ScopedJniTimer jniTimer;
     const char* name = jniMethodName(methodId);
+    jniTimer.set(classifyJniCall(name), name);
     if (name == nullptr) {
         return 0;
     }

@@ -850,7 +850,7 @@ void guestViewTracedFree(void* allocation) {
         const bool firstFew = total <= 8;
         const bool milestone = run == 64 || run == 1024 || run == 16384 ||
                                run == 131072 || run == 1048576;
-        if (firstFew || milestone) {
+        if (rr3::gfxPerCallLog() && (firstFew || milestone)) {
             char line[256];
             __builtin_snprintf(line, sizeof(line),
                 "total=%llu ptr=0x%llx prev=0x%llx stride=0x%llx run=%llu "
@@ -1943,15 +1943,23 @@ void guestViewNoteAndroidLog(const char* text) {
             break;
         }
     }
+    if (interesting || cloudcell) {
+        uint32_t hash = 2166136261u;
+        for (const char* p = text; *p != '\0' && p < text + 120; ++p) {
+            hash ^= static_cast<uint8_t>(*p);
+            hash *= 16777619u;
+        }
+        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                            "guest-log", 76, hash, text);
+        return;
+    }
+    if (!rr3::gfxPerCallLog()) {
+        return;
+    }
     uint32_t hash = 2166136261u;
     for (const char* p = text; *p != '\0' && p < text + 120; ++p) {
         hash ^= static_cast<uint8_t>(*p);
         hash *= 16777619u;
-    }
-    if (interesting || cloudcell) {
-        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
-                            "guest-log", 76, hash, text);
-        return;
     }
     // Content-independent quota. The guest boot is deterministic, so this count
     // is reproducible run to run; 200 bounds the growth of the archived run's

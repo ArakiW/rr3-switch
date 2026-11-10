@@ -1,0 +1,43 @@
+THE PER-CALL LOG IS NOT ONLY A COST: ITS CADENCE IS PART OF THE SYNC
+
+MEASURED 2026-11-10: two rounds, the SAME binary, the same card, the same
+guest state, the same 400 s, differing only in the `percall` key on the card.
+
+    round      percall   layout menu event race  lights  frames  frames/s
+    fps5          0         3    27   481    0      0      2520     6.3
+    percall1      1         7    40   183   10      7      1055    15.2
+
+WITH THE LOGGING OFF THE GUEST NEVER GETS PAST THE EVENT MAP; with it on, the
+same build reaches the race in 1,055 frames -- the fastest loading of any
+round.
+
+AND THE GAME IS NOT BROKEN WITH THE LOGGING OFF: the frames of the
+percall = 0 rounds show the front end fully drawn and correctly textured
+(yield1/frames/frame-000340.png).  IT IS NOT THE GAME THAT BREAKS; IT IS THE
+PORT THAT STOPS DRIVING.
+
+AND NONE OF THE SWITCH'S SITES CHANGES WHAT THE GUEST RECEIVES: all eight are
+in LOG functions, so the switch does not change a byte the guest reads -- it
+changes WHEN the port writes, and that is enough.
+
+SO THE PLAN FOR 60 FPS CHANGES, AND THIS IS THE POINT OF THE ROUND.  "Turn the
+per-call logging off" was the plan, and it is WRONG: it does not buy a frame
+rate (the rounds that "won" with it off never reached a race, so they never
+measured a race's frame time), and it costs the port its ability to drive the
+guest.  THE DEFAULT IS THEREFORE BACK ON (percall = 1), and the work becomes:
+make the lines CHEAP without making them LESS FREQUENT -- the lines stay, the
+writes do not (RAM buffering, flushed in bulk).
+
+THE SAME RULE GOVERNS THE RESOLUTION CACHE: its hit path was writing a line
+per hit, which is the repetition the dedup existed to stop (the asset-service
+phases went from 0.19-0.48 lines a frame to 1.17-5.42, and the guest's own
+requests with them: guest-scanf-bounded 1,005 -> 14,297).  A CACHE MUST NOT
+ADD A WRITE PER HIT EITHER.
+
+AND THE BUILD IS CLEAN: the twenty -Wformat-truncation= warnings that
+guest_filesystem.cpp had never shown (the file had not been recompiled since
+the incremental build was introduced) are fixed with explicit precisions, the
+four in jni_bridge.cpp likewise, plus the pre-existing unused variable and
+unused function in guest_view_probe.cpp and an ino_t truncation that the
+compiler had been reporting since before this session.  A clean rebuild is
+warning-free and the gate is 40 run, 0 failed, GATE OK.

@@ -393,7 +393,7 @@ int guestSscanf(const char* text, const char* format, ...) {
 
     const bool interesting =
         input.state != TextState::Ok || fmt.state != TextState::Ok;
-    if (interesting || g_scanfCalls <= kScanfLogCap) {
+    if (rr3::gfxPerCallLog() && (interesting || g_scanfCalls <= kScanfLogCap)) {
         char head[64]{};
         const size_t shown = input.length < 24 ? input.length : 24;
         for (size_t i = 0; i < shown; ++i) {
