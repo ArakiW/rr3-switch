@@ -214,6 +214,17 @@ struct RaceMetricsSample {
     double alongTrack{0.0};
     // The projection distance from the car to the polyline segment, in metres.
     double projDistance{0.0};
+    // THE CHUNK THE ALONG-TRACK COORDINATE WAS MEASURED ON.
+    //
+    // WHY IT IS HERE: the arc coordinate is a property of the CHUNK it was
+    // measured on -- node 0 of that chunk's polyline is its origin.  The chunk
+    // picker chooses the chunk the car is on, and it can change while the car
+    // drives, so two coordinates from DIFFERENT chunks are not comparable:
+    // MEASURED 2026-11-10 (round chunk3), the coordinate jumped from 32.26 to
+    // 132.11 with the car in the same place, and the flip criterion's window
+    // read that as 205.21 m of progress the car never made.  The chunk's name
+    // is what tells the two apart.
+    char targetChunk[32]{""};
     // THE LOOK-AHEAD DISTANCE THE PURSUIT USED, IN METRES.
     //
     // WHY IT IS REPORTED: the look-ahead is the single number that decides
@@ -327,6 +338,10 @@ struct RaceDriveState {
     int stalls{};
     // The windowed along-track delta that the flip criterion uses, in metres.
     float flipDelta{};
+    // How far the car advanced along the track in the last 120 frames, in
+    // metres.  This is the signal the pursuit's yield criterion uses: below
+    // 1.0 m in that window the car is PINNED, not crawling.
+    float yieldAdvance{};
     unsigned long long frames{};
     unsigned long long sinceProgress{};
 };

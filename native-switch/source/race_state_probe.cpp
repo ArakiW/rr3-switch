@@ -1005,6 +1005,23 @@ constexpr double kLimitCycleErrorRad = 1.40;
 // kStuckAlongDistanceMetres (2.0 m) along the track, pursuit yields to recovery.
 constexpr unsigned long long kLimitCycleFrames = 240ULL;
 
+// THE YIELD WINDOW: HOW LONG THE CAR MAY GO WITHOUT ADVANCING ALONG THE
+// TRACK BEFORE THE PURSUIT HAS TO GIVE THE WHEEL TO THE RECOVERY.
+//
+// 120 frames = 3.6 s at the port's measured frame time (30.35 ms).
+constexpr unsigned long long kYieldFrames = 120ULL;
+
+// THE DISTANCE THE CAR MUST COVER IN THAT WINDOW TO KEEP THE WHEEL.
+//
+// MEASURED 2026-11-10 (round chunk3, the last pursuit phase): the pinned car
+// advanced 0.02 m in 3.6 s (along 123.85 -> 123.87 over 150 frames, and the
+// guest's own progress 34,501 -> 34,507).  A car CRAWLING along a barrier at
+// 0.3 m/s covers 1.08 m in the same window, so 1.0 m separates "pinned" from
+// "crawling" -- and it is a DISTANCE, because a distance is what tells the
+// two apart.  A time would not: the same 3.6 s is 1.08 m for the crawler and
+// 0.02 m for the pinned car.
+constexpr double kYieldAdvanceMetres = 1.0;
+
 static double s_lastAlong = 0.0;
 static unsigned long long s_alongMoveFrame = 0;
 static bool s_haveAlong = false;
@@ -1553,6 +1570,11 @@ void fillCarState(RaceMetricsSample* out) {
                 out->lookAheadMetres = static_cast<float>(lookAheadUsed);
                 out->alongTrack = alongTrack;
                 out->projDistance = projDistance;
+                // THE CHUNK THE COORDINATE BELONGS TO.  The arc coordinate is
+                // measured on this chunk's polyline, so it only means
+                // something together with its name.
+                std::snprintf(out->targetChunk, sizeof(out->targetChunk), "%s",
+                              lineForTarget.chunk);
                 gRaceLine.alongTrack = alongTrack;
                 gRaceLine.projDistance = projDistance;
                 gRaceLine.loopLength = loopLength;
@@ -2535,6 +2557,26 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
     // change either, because the guest holds the car at the grid.  So the
     // pinned test also requires that the car has ALREADY made progress in
     // this race: a car that has never moved is being HELD, not stuck.
+    // THE ALONG-TRACK COORDINATE IS A PROPERTY OF ITS CHUNK, SO A CHUNK
+    // SWITCH INVALIDATES EVERY WINDOW THAT USES IT.
+    //
+    // MEASURED 2026-11-10 (round chunk3): the coordinate jumped from 32.26 to
+    // 132.11 with the car in the same place -- the chunk picker had moved to
+    // another chunk -- and the flip criterion's window read that jump as
+    // 205.21 m of progress the car never made.  A window that spans two
+    // chunks is not a measurement of anything, so the window is CLEARED when
+    // the chunk changes and the criteria start again.
+    static char s_alongChunk[32] = {0};
+    if (m.targetFromLine && m.targetChunk[0] != '\0') {
+        if (std::strcmp(s_alongChunk, m.targetChunk) != 0) {
+            std::snprintf(s_alongChunk, sizeof(s_alongChunk), "%s", m.targetChunk);
+            clearAlongRing();
+            s_haveAlong = false;
+            s_alongMoveFrame = frame;
+            s_lastAlong = m.alongTrack;
+        }
+    }
+
     // FIX B1: Continuous windowed along-track delta over kFlipWindowFrames (360).
     double fdelta = 0.0;
     if (m.targetFromLine && gRaceLine.loopLength > 0.0) {
@@ -2547,6 +2589,24 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
         }
     }
     g_drive.flipDelta = static_cast<float>(fdelta);
+
+    // HOW FAR THE CAR ADVANCED ALONG THE TRACK IN THE LAST kYieldFrames.
+    //
+    // This is the signal that tells "the car is PINNED" from "the car is
+    // CRAWLING", and it is what the pursuit's yield criterion is built on.
+    // The ring entry for the current frame has already been written above, so
+    // the entry kYieldFrames back is the one to compare with.
+    double advance = 0.0;
+    bool haveAdvance = false;
+    if (m.targetFromLine && gRaceLine.loopLength > 0.0 && frame >= kYieldFrames) {
+        const AlongSample& old = s_alongRing[(frame - kYieldFrames) % kAlongRingSize];
+        if (old.valid && old.frame + kYieldFrames == frame) {
+            advance = rr3::raceLineArcDelta(m.alongTrack, old.along, gRaceLine.loopLength) *
+                      (gRaceLine.direction < 0 ? -1.0 : 1.0);
+            haveAdvance = true;
+        }
+    }
+    g_drive.yieldAdvance = static_cast<float>(advance);
 
     // FIX C1: Pinned/stuck discriminator based on progress along the track (m.alongTrack),
     // not world position. A car crawling along a barrier advances along the track; a car
@@ -2798,9 +2858,25 @@ void updateDrive(unsigned long long frame, const RaceStateSample& sample) {
     // around the aim point and the error never falls. If the car is not making progress
     // along the track, the pursuit has to give way to the recovery.
     // The along-track progress signal is the same one the stall test uses.
+    //
+    // AND THE CRITERION IS "THE CAR IS NOT ADVANCING", NOT "THE ERROR IS
+    // LARGE".
+    //
+    // MEASURED 2026-11-10 (round chunk3, the last pursuit phase): the car sat
+    // with `along` FROZEN (123.85 -> 123.87 over 150 frames) and the guest's
+    // own progress frozen (34,501 -> 34,507) while the pursuit held
+    // steer = -1.000 (full lock) with thr = 1 and brk = 0.  The error was only
+    // 0.53 rad, so the old criterion (an error above 1.40 rad) never fired and
+    // the car stayed pinned for the rest of the round.
+    //
+    // A CAR PINNED AGAINST A BARRIER WITH A 30 DEGREE ERROR IS STILL PINNED.
+    // So the error condition is kept as an ADDITIONAL trigger, and the
+    // progress condition is what makes it fire on its own.
+    const bool notAdvancing = haveAdvance && advance < kYieldAdvanceMetres;
     const bool limitCycle = g_sawProgress && m.targetFromLine && pursuit && !g_drive.brake &&
-                            (std::fabs(steerError) > kLimitCycleErrorRad) &&
-                            (s_haveAlong && frame >= s_alongMoveFrame + kLimitCycleFrames);
+                            (notAdvancing ||
+                             ((std::fabs(steerError) > kLimitCycleErrorRad) &&
+                              (s_haveAlong && frame >= s_alongMoveFrame + kLimitCycleFrames)));
     if (limitCycle) {
         ++g_drive.stalls;
         g_drive.bestRate = 0.0f;
@@ -2940,7 +3016,7 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             "car=0x%llx cnum=%u cnode=%u cprev=%u cpos=%d,%d,%d ctgt=%d,%d,%d "
             "snode=%u sdist=%u tsok=%d posok=%d ctok=%d ctdist=%.2f "
             "line=%d lres=%.2f rres=%.2f la=%.2f lachunk=%s lam=%s dir=%d mot=%.3f,%.3f "
-            "cchunk=%.2f along=%.2f pdist=%.2f fdelta=%.2f "
+            "cchunk=%.2f along=%.2f pdist=%.2f fdelta=%.2f tchunk=%s adv=%.2f "
             "perr=%.4f pur=%d ident=0x%llx "
             "drive=%d steer=%.3f mag=%.3f sign=%d best=%.6f flips=%d stalls=%d "
             "thr=%d brk=%d owner=%s",
@@ -3024,6 +3100,11 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             static_cast<double>(m.alongTrack),
             static_cast<double>(m.projDistance),
             static_cast<double>(g_drive.flipDelta),
+            // THE CHUNK THE ALONG-TRACK COORDINATE BELONGS TO, and how far the
+            // car advanced along it in the last 120 frames.  A coordinate
+            // without its chunk is not comparable with the next one.
+            m.targetChunk,
+            static_cast<double>(g_drive.yieldAdvance),
             static_cast<double>(g_drive.steerError), g_drive.pursuit ? 1 : 0,
             static_cast<unsigned long long>(m.membersIdentified),
             g_drive.enabled ? 1 : 0, static_cast<double>(g_drive.steer),
