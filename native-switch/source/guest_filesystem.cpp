@@ -34,7 +34,7 @@ std::atomic<uint64_t> g_frameFsMisses{0};
 thread_local int s_fsDepth = 0;
 
 struct ScopedFsTimer {
-    uint64_t startTick;
+    uint64_t startTick = 0;
     bool active;
     ScopedFsTimer() {
         active = (s_fsDepth++ == 0);
@@ -143,6 +143,32 @@ static uint64_t hashAssetPath(const char* str) {
 // ⇒ SO THE PORT'S OWN EYES STAY OPEN.  The switch covers the high-volume
 // per-call sites; this one is the trace the instruments and the navigation
 // read, and it costs one line per DISTINCT path.
+//
+// ⇒ ⇒ AND THE TRACE IS THINNED ONLY WHERE NOTHING READS IT -- AND THE
+// MEASUREMENT SAYS NOTHING READS IT YET.
+//
+// MEASURED 2026-11-10 (round yield2): 108,418 of the round's 124,464 log
+// lines were this trace -- 46 LINES A FRAME -- because the guest walks tens
+// of thousands of distinct asset paths while it loads.
+//
+// MEASURED 2026-11-10 (round slim1): thinning it to the gui/processed/
+// subtree DID cut the log, and it DID make the census worse -- 'front-end
+// layout opened 1' and 'main menu layouts open 5' against yield2's 15 and 75
+// -- because the census COUNTS THE LOG'S TEXT.
+//
+// ⇒ ⇒ SO THE THINNING IS REVERTED, AND THE REAL FIX IS NAMED: **the census
+// must read a counter the port keeps, not a string the port may stop
+// writing.**  Until that exists, the trace stays whole.  What made the trace
+// expensive is not the line count but the CARD WRITE per line, and the log
+// is buffered now (recovery_guard.cpp), so that part is gone.
+// THE NUMBER OF PATH RESOLUTIONS, so the information survives even when the
+// trace is thinned one day.  It is on the race-state line as `paths=`.
+unsigned long long g_resolvedPathCount = 0;
+
+unsigned long long guestResolvedPathCount() {
+    return __atomic_load_n(&g_resolvedPathCount, __ATOMIC_RELAXED);
+}
+
 void logResolvedPathOnce(const char* path) {
     constexpr size_t kPathSlots = 2048;
     static uint64_t seen[ kPathSlots ] = {0};
@@ -150,6 +176,9 @@ void logResolvedPathOnce(const char* path) {
     if (path == nullptr || path[0] == '\0') {
         return;
     }
+    // THE NUMBER OF RESOLUTIONS, so the information survives even when the
+    // trace is thinned one day.  It is on the race-state line as `paths=`.
+    __atomic_add_fetch(&g_resolvedPathCount, 1ULL, __ATOMIC_RELAXED);
     uint64_t hash = 1469598103934665603ULL;
     for (const char* p = path; *p != '\0'; ++p) {
         hash ^= static_cast<uint8_t>(*p);
@@ -1541,7 +1570,7 @@ bool mapAppRootToContent(const char* path, [[maybe_unused]] bool writing,
         }
         char docRelative[0x500]{};
         std::snprintf(docRelative, sizeof(docRelative),
-                      "files/.depot/%s", afterDoc);
+                      "files/.depot/%.1260s", afterDoc);
         resolution.readOnly = true;
         resolution.mapped = true;
         const bool docOk = writeContentPath(resolution.primary,
@@ -1598,7 +1627,7 @@ bool mapAppRootToContent(const char* path, [[maybe_unused]] bool writing,
     // without re-testing the prefix.
     const char* appResLeaf = startsWith(rest, "apk/res/") ? rest + 8 : nullptr;
     if (startsWith(rest, "apk/files/")) {
-        std::snprintf(contentRelative, sizeof(contentRelative), "%s", rest + 4);
+        std::snprintf(contentRelative, sizeof(contentRelative), "%.1200s", rest + 4);
     }
     else if (appResLeaf != nullptr) {
         // The volume ships TWO trees, not one: files/apk/res/ (1,519 names) and
@@ -1653,7 +1682,7 @@ bool mapAppRootToContent(const char* path, [[maybe_unused]] bool writing,
     if (rewriteGuiResolutionPath(contentRelative, guiRewritten, sizeof(guiRewritten))) {
         std::snprintf(effectiveRelative, sizeof(effectiveRelative), "%s", guiRewritten);
     } else {
-        std::snprintf(effectiveRelative, sizeof(effectiveRelative), "%s", contentRelative);
+        std::snprintf(effectiveRelative, sizeof(effectiveRelative), "%.1265s", contentRelative);
     }
     const bool ok = writeContentPath(resolution.primary, sizeof(resolution.primary),
                                      effectiveRelative);
@@ -1708,7 +1737,7 @@ bool mapAppRootToContent(const char* path, [[maybe_unused]] bool writing,
             // The legacy .depot target becomes the second candidate, not the
             // only one, so no name that resolved before stops resolving.
             char alias[0x500]{};
-            std::snprintf(alias, sizeof(alias), "files/.depot/%s", appResLeaf);
+            std::snprintf(alias, sizeof(alias), "files/.depot/%.1264s", appResLeaf);
             writeContentPath(resolution.fallback, sizeof(resolution.fallback),
                              alias);
         }
@@ -1737,7 +1766,7 @@ bool mapAppRootToContent(const char* path, [[maybe_unused]] bool writing,
             // (asset_list_updates.txt is in NONE of the three packs, so its
             // ENOENT is correct: the shipping game does not have it either.)
             char alias[0x500]{};
-            std::snprintf(alias, sizeof(alias), "files/apk/res/%s", rest + 7);
+            std::snprintf(alias, sizeof(alias), "files/apk/res/%.1200s", rest + 7);
             writeContentPath(resolution.fallback, sizeof(resolution.fallback),
                              alias);
         }
@@ -2999,7 +3028,7 @@ bool buildCompletedGuiAssetsManifest() {
                 ++logged;
                 char diag[640];
                 std::snprintf(diag, sizeof(diag),
-                              "path=%s candidates=%u ABSENT", assets[index].logical,
+                              "path=%.633s candidates=%u ABSENT", assets[index].logical,
                               candidateCount);
                 appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                                     "manifest-asset", logged, 0, diag);
@@ -3018,7 +3047,7 @@ bool buildCompletedGuiAssetsManifest() {
             ++logged;
             char diag[640];
             std::snprintf(diag, sizeof(diag),
-                          "path=%s md5=%s size=%llu from=%s",
+                          "path=%.210s md5=%.210s size=%llu from=%.210s",
                           assets[index].logical, digest, size, source);
             appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                                 "manifest-asset", logged, 0, diag);
@@ -4705,9 +4734,9 @@ void probeApkResDir(const char* deviceRel, const char* guestRel, unsigned depth,
         }
         char childDevice[0x400]{};
         char childGuest[0x400]{};
-        std::snprintf(childDevice, sizeof(childDevice), "%s/%s", deviceRel,
+        std::snprintf(childDevice, sizeof(childDevice), "%.499s/%.499s", deviceRel,
                       entry->d_name);
-        std::snprintf(childGuest, sizeof(childGuest), "%s/%s", guestRel,
+        std::snprintf(childGuest, sizeof(childGuest), "%.499s/%.499s", guestRel,
                       entry->d_name);
         struct stat info{};
         if (::stat(childDevice, &info) != 0) continue;
@@ -4721,7 +4750,7 @@ void probeApkResDir(const char* deviceRel, const char* guestRel, unsigned depth,
         // Old rule: apk/res/<leaf> resolved only if files/.depot/<leaf> exists.
         char depotProbe[0x400]{};
         struct stat depotInfo{};
-        std::snprintf(depotProbe, sizeof(depotProbe), "rr3core:/files/.depot/%s",
+        std::snprintf(depotProbe, sizeof(depotProbe), "rr3core:/files/.depot/%.1000s",
                       childGuest + 8);  // strip the leading "apk/res/"
         if (::stat(depotProbe, &depotInfo) == 0) ++out.before;
 
@@ -4944,8 +4973,8 @@ void guiAssetCensusSelfTest() {
         const bool good = keyed && (hit == probe.expectHit);
         if (!good) ok = 0;
         char* slot = probe.expectHit ? present : absent;
-        std::snprintf(slot, 640, "%s rc=%d errno=%d classified=%s key=%s/%s "
-                                   "resolved=%s",
+        std::snprintf(slot, 640, "%.117s rc=%d errno=%d classified=%.117s key=%.117s/%.117s "
+                                   "resolved=%.117s",
                       probe.label, rc, rc == 0 ? 0 : errno, classified,
                       res, fmt,
                       resolution.primary[0] != '\0' ? resolution.primary : "-");
@@ -7776,7 +7805,7 @@ bool buildDeviceProfile(const char* profileName) {
             !readWholeFile(resolution.fallback, original)) {
             char diag[640];
             std::snprintf(diag, sizeof(diag),
-                          "profile=%s FAILED no-stock primary=%s fallback=%s",
+                          "profile=%.195s FAILED no-stock primary=%.195s fallback=%.195s",
                           profileName, resolution.primary, resolution.fallback);
             appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                                 "settings-profile", 0, 0, diag);
@@ -7957,8 +7986,8 @@ bool maybeSubstituteDeviceProfile(const char* guestPath, Resolution& resolution)
         ++s_reported;
         char diag[900];
         std::snprintf(diag, sizeof(diag),
-                      "why=%s substituted=%d guest=%.240s primary=%.240s "
-                      "generated=%s",
+                      "why=%.175s substituted=%d guest=%.240s primary=%.240s "
+                      "generated=%.175s",
                       why, substituted ? 1 : 0,
                       guestPath != nullptr ? guestPath : "-", resolution.primary,
                       gProfileSettings.generated);
@@ -8275,7 +8304,7 @@ void censusAssetListInventory() {
     if (directory == nullptr) {
         char diag[600];
         std::snprintf(diag, sizeof(diag),
-                      "status=FAILED reason=opendir dir=%s errno=%d",
+                      "status=FAILED reason=opendir dir=%.565s errno=%d",
                       resolution.primary, errno);
         appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                             "assetlist-inventory", 0, 0, diag);
@@ -9111,7 +9140,7 @@ std::FILE* guestFopen(const char* path, const char* mode) {
             if (digestOfLocalFile(served, streamDigest)) {
                 char details[900];
                 std::snprintf(details, sizeof(details),
-                              "primary=%s served=%s stream_md5=%.32s",
+                              "primary=%.238s served=%.238s stream_md5=%.32s",
                               resolution.primary,
                               served,
                               streamDigest);
@@ -9752,7 +9781,7 @@ void logStatPath(const char* guestPath, const Resolution& resolution,
     }
     char details[384];
     __builtin_snprintf(details, sizeof(details),
-                       "rc=%d errno=%d guest='%s' primary='%s' fallback='%s'",
+                       "rc=%d errno=%d guest='%.116s' primary='%.116s' fallback='%.116s'",
                        rc, error,
                        guestPath != nullptr ? guestPath : "-",
                        resolution.primary[0] != '\0' ? resolution.primary : "-",
@@ -9889,7 +9918,7 @@ void logMkdirOutcome(const char* path, int rc, int err, const char* why) {
     ++gGuestMkdirLogged;
     char details[256];
     __builtin_snprintf(details, sizeof(details),
-                       "rc=%d errno=%d why=%s path=%s", rc, err, why,
+                       "rc=%d errno=%d why=%.95s path=%.95s", rc, err, why,
                        path != nullptr ? path : "(null)");
     appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
                         "mkdir", gGuestMkdirLogged,
@@ -9963,7 +9992,7 @@ DIR* guestOpendir(const char* path) {
                             resolution.primary);
         if (directory != nullptr) {
             static char s_lastGuiDir[0x400]{};
-            std::snprintf(s_lastGuiDir, sizeof(s_lastGuiDir), "%s", resolution.primary);
+            std::snprintf(s_lastGuiDir, sizeof(s_lastGuiDir), "%.1000s", resolution.primary);
             g_lastOpendirPath = s_lastGuiDir;
             // Only the bare gui_assets root, not 960x640 itself.
             const char* leaf = resolution.primary;
@@ -10186,7 +10215,7 @@ int guestRename(const char* oldPath, const char* newPath) {
         if (rr3::gfxPerCallLog()) {
             char diag[640];
             std::snprintf(diag, sizeof(diag),
-                          "resolve-failed old=%s new=%s oldp=%s newp=%s",
+                          "resolve-failed old=%.150s new=%.150s oldp=%.150s newp=%.150s",
                           oldPath != nullptr ? oldPath : "-",
                           newPath != nullptr ? newPath : "-",
                           oldResolution.primary, newResolution.primary);
@@ -10207,7 +10236,7 @@ int guestRename(const char* oldPath, const char* newPath) {
     if (rr3::gfxPerCallLog()) {
         char diag[640];
         std::snprintf(diag, sizeof(diag),
-                      "rc=%d errno=%d old=%s new=%s oldg=%s newg=%s",
+                      "rc=%d errno=%d old=%.149s new=%.149s oldg=%.149s newg=%.149s",
                       rc, errno, oldResolution.primary, newResolution.primary,
                       oldPath != nullptr ? oldPath : "-",
                       newPath != nullptr ? newPath : "-");

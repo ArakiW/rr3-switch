@@ -1337,7 +1337,7 @@ static void http_init(JNIEnv *env, jobject self, jstring /*userAgent*/,
         }
         head[headLen * 2u] = '\0';
         __builtin_snprintf(details, sizeof(details),
-                           "bodyLen=%u head=%s url=%s",
+                           "bodyLen=%u head=%.72s url=%.72s",
                            (unsigned)req->bodyLen, head,
                            req->urlLen > 0u ? req->url : "(none)");
         rr3::guestViewWideLog("cc-http-init", (unsigned long long)req->bodyLen,
@@ -3781,7 +3781,7 @@ static bool deliverServerTime(JNIEnv *env, CCHttpRequest *req)
     {
         char details[192];
         __builtin_snprintf(details, sizeof(details),
-                           "url=%s header=%s value=%s map=%p", req->url,
+                           "url=%.45s header=%.45s value=%.45s map=%p", req->url,
                            server_time->name, server_time->value, (void *)map);
         rr3::guestViewWideLog("cc-srvtime",
                               static_cast<unsigned long long>(req->callback),

@@ -341,7 +341,7 @@ FT_Face openFace(const char* romfsPath) {
     }
     FaceSlot& slot = g_faces[g_faceCount];
     slot.face = face;
-    snprintf(slot.key, sizeof(slot.key), "%s", path);
+    snprintf(slot.key, sizeof(slot.key), "%.80s", path);
     ++g_faceCount;
     return face;
 }

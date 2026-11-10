@@ -1,0 +1,35 @@
+THE THINNING WAS MEASURED AND REVERTED, AND THE CENSUS'S NEXT MOVE IS NAMED
+
+MEASURED 2026-11-10, round slim1 (the path trace thinned to the gui/processed/
+subtree):
+
+    round     front-end layout  main menu layouts  EventMapScreen  race  lights
+    yield2            15                75               300          36     27
+    slim1              1                 5               152           1      1
+
+The thinning cut the log and BLINDED THE CENSUS, because the census COUNTS
+THE LOG'S TEXT (tools/Test-OnEden.ps1 counts
+'gui/processed/main_menu/main_menu_twosquare.gui' in the guest-view log) and
+the thinned trace no longer contains the repeated main-menu opens the count
+depends on.  So the thinning is REVERTED.
+
+And the fix it named is the one this project keeps re-arriving at: A
+MEASUREMENT THAT READS A STRING OUT OF THE LOG IS ONLY AS GOOD AS THE LOG IT
+READS.  Every census counter in Test-OnEden.ps1 is a regex over the guest-view
+log, so any change to what the port writes turns the counter into a lie.  The
+CENSUS MUST READ A COUNTER THE PORT KEEPS.  The port already counts path
+resolutions (paths= on the race-state line, added with this round); the census's
+counters are the next step, and then the trace can be thinned for real.
+
+THE WARNING TAIL IS PRE-EXISTING AND IS DOCUMENTED, NOT HIDDEN.
+guest_filesystem.cpp had not been fully recompiled since the incremental build
+was introduced, so its -Wformat-truncation= warnings were invisible -- all of
+them the same thing (a guest-supplied path or error string formatted into a
+buffer that is a little too small) and they surface one by one as the file is
+touched.  Twenty-four are fixed, with explicit precisions, plus one ino_t
+truncation (a value written into a 16-bit field) that the compiler had been
+reporting since before this session.  A tail remains and it is DIAGNOSTIC-ONLY:
+a truncated log line, not a byte the guest receives.  It is written down here
+because a build that is clean for the files you touched and dirty for the file
+you did not is exactly how "the build is warning free" got wrong in the first
+place.

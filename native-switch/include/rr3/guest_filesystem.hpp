@@ -11,6 +11,11 @@
 
 namespace rr3 {
 
+// HOW MANY PATH RESOLUTIONS WERE COUNTED INSTEAD OF WRITTEN TO THE LOG.
+// The path trace is thinned to the gui/processed/ subtree (the census reads
+// that part); everything else is counted here, so the number survives.
+unsigned long long guestResolvedPathCount();
+
 constexpr size_t kExternalDataVolumeCount = 7;
 
 struct ExternalDataStatus {

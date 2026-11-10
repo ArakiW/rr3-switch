@@ -77,6 +77,7 @@
 #include "rr3/race_state_probe.hpp"
 
 #include "rr3/elf_preflight.hpp"
+#include "rr3/guest_filesystem.hpp"
 #include "rr3/guest_spline.hpp"
 #include "rr3/guest_rtti.hpp"
 #include "rr3/member_value_store.hpp"
@@ -3016,7 +3017,7 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             "car=0x%llx cnum=%u cnode=%u cprev=%u cpos=%d,%d,%d ctgt=%d,%d,%d "
             "snode=%u sdist=%u tsok=%d posok=%d ctok=%d ctdist=%.2f "
             "line=%d lres=%.2f rres=%.2f la=%.2f lachunk=%s lam=%s dir=%d mot=%.3f,%.3f "
-            "cchunk=%.2f along=%.2f pdist=%.2f fdelta=%.2f tchunk=%s adv=%.2f "
+            "cchunk=%.2f along=%.2f pdist=%.2f fdelta=%.2f tchunk=%s adv=%.2f paths=%llu "
             "perr=%.4f pur=%d ident=0x%llx "
             "drive=%d steer=%.3f mag=%.3f sign=%d best=%.6f flips=%d stalls=%d "
             "thr=%d brk=%d owner=%s",
@@ -3105,6 +3106,7 @@ void logSample(unsigned long long frame, const RaceStateSample& sample) {
             // without its chunk is not comparable with the next one.
             m.targetChunk,
             static_cast<double>(g_drive.yieldAdvance),
+            static_cast<unsigned long long>(rr3::guestResolvedPathCount()),
             static_cast<double>(g_drive.steerError), g_drive.pursuit ? 1 : 0,
             static_cast<unsigned long long>(m.membersIdentified),
             g_drive.enabled ? 1 : 0, static_cast<double>(g_drive.steer),
