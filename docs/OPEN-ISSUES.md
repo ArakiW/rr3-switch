@@ -4033,3 +4033,53 @@ share is now about a millisecond a frame (`tp` 0.4 ms, `fs` 0 ms).
    the census line's `tt` against the 16.67 ms budget, and `jni` for the
    port's share of it.  **⇒ ⇒ AND THE CONSOLE'S ANSWER IS THE NUMBER THAT
    DECIDES WHETHER THE GAME SHIPS AT 60.**
+
+### 9.40 Three levers measured, three refused, and what that leaves
+
+**MEASURED 2026-11-10, four rounds of the SAME binary on the same card, the
+same guest state, 400 s each.**  The race phase's frame time (`tt` median):
+
+    round      what changed                                   tt median   p25
+    chunk3     before all of this                                  35.0 ms   32.0
+    percall1   + the new instrument, the per-call logging ON        144.5 ms  49.0
+    yield2     the log BUFFERED, the frame loop YIELDING           67.0 ms   31.0
+    aa0        AA_LEVEL 4 -> 0                                    83.0 ms   71.0
+    fx0        twelve guest quality knobs OFF                     70.0 ms   31.0
+    view960    the guest's view 1280x720 -> 960x640 (and fx off)   77.0 ms   33.0
+
+**⇒ ⇒ THE THREE LEVERS, AND WHAT EACH ONE MEASURED:**
+1. **THE PER-CALL LOGGING.**  Turning it off does not buy a frame rate; it
+   starves the guest (four rounds that never got past the event map), because
+   the card write's wait was the guest's CPU.  It was made CHEAP instead
+   (buffered) and the yield was made EXPLICIT.  The race frame went 144.5 ->
+   67.0 ms and the guest reached the race on every round (race screen 36,
+   start lights 27 -- the best of any round).
+2. **THE GUEST'S ANTI-ALIASING.**  `AA_LEVEL` 4 -> 0 did not make the frame
+   faster (67 -> 83 ms).  Refused.
+3. **THE GUEST'S QUALITY KNOBS.**  The full-screen pass, the particles, the
+   dynamic reflections, every shadow map, the interior LOD, the damage, the
+   anisotropic filtering and the high-res menu -- all off at once -- moved the
+   frame by 3 % (72 -> 70 ms).  Refused.
+4. **THE GUEST'S RESOLUTION.**  1280x720 -> 960x640 (half the pixels) did not
+   make the frame faster either (72 -> 77 ms).  Refused.
+
+**⇒ ⇒ ⇒ SO WHAT IS LEFT IS THE GUEST'S OWN ENGINE AND THE EMULATOR'S GL
+PATH, AND NEITHER IS THE PORT'S.**  The port's own share of a frame is now
+about a millisecond (`tp` 0.4 ms, `fs` 0 ms, the log buffered).  **⇒ ⇒ AND
+THAT IS THE POINT OF THE FOUR ROUNDS: THERE IS NO HIDDEN OVERHEAD LEFT IN
+THE PORT.**  The 60-170 ms that a frame still costs in Eden is the guest's
+engine running on the emulator's CPU through the emulator's Mesa.
+
+**⇒ ⇒ ⇒ ⇒ SO 60 FPS IS A CONSOLE MEASUREMENT AND NOT AN EDEN ONE.**  The
+instrument that can answer it is already on the card -- the census line's `tt`
+against the 16.67 ms budget -- and the emulator's numbers are a reference,
+not a verdict.
+
+**⇒ ⇒ AND THE CARD'S SETTINGS ARE BACK WHERE THEY BELONG.**  The three
+experiments wrote to the card's `rr3-settings.txt` and `rr3-screen.txt`, and
+one of them damaged a file, so both were restored from the repository's
+shipping copies (sha256 verified) rather than by editing the damaged ones.
+**⇒ ⇒ ⇒ AND THE LESSON IS THE SAME ONE THE PROJECT KEEPS MEETING: A
+MEASUREMENT THAT READS A STRING OUT OF A LOG MUST BE MOVED ONTO A COUNTER
+BEFORE THE LOG MAY CHANGE -- AND A FILE THAT IS EDITED BY SCRIPT MUST BE
+RESTORED FROM ITS SOURCE, NOT REPAIRED BY ANOTHER SCRIPT.**
