@@ -62,6 +62,14 @@ unsigned int g_logCacheVictim = 0;
 unsigned long long g_logCacheOpens = 0;
 unsigned long long g_logCacheReuses = 0;
 unsigned long long g_logCacheReopens = 0;
+// HOW MANY LINES ARE WAITING FOR THE BULK FLUSH.
+//
+// MEASURED 2026-11-10: the per-line flush was 42 card writes a frame, and
+// the card write's wait was the guest's CPU lifeline (see appendGuestBootLine).
+// 64 lines is about one and a half frames of the busiest log, so the card
+// sees about one write per frame and a half instead of forty-two.
+constexpr unsigned long long kGuestLogFlushLines = 64ULL;
+unsigned long long g_logPendingLines = 0;
 unsigned int g_logCacheAnnounced = 0;
 
 // One lock for the whole cache, not one per slot: the critical section is a
@@ -516,15 +524,40 @@ bool appendGuestBootLine(const char* path, const char* phase,
                  phase != nullptr && phase[0] != '\0' ? phase : "unknown",
                  ordinal, target, details != nullptr ? " " : "",
                  details != nullptr ? details : "");
-    const bool flushed = std::fflush(file) == 0;
-    bool ok = flushed;
-    if (!ok || std::ferror(file) != 0) {
-        // Still no fsync: reopening is a fresh fopen, not a card sync.
-        std::fclose(file);
-        slot->file = nullptr;
-        g_logCacheReopens =
-            __atomic_add_fetch(&g_logCacheReopens, 1ULL, __ATOMIC_RELAXED);
-        ok = false;
+    // THE LINE IS NOT FLUSHED ON EVERY CALL, AND THAT IS THE WHOLE POINT.
+    //
+    // MEASURED 2026-11-10 (rounds fps5 and percall1, the same binary, the
+    // same card, the same guest state, differing only in whether the per-call
+    // sites log): with the logging on, the port wrote 42 lines a frame and
+    // every one of them was an fflush onto the card; with it off, the guest
+    // stopped getting past the event map (2,520 frames and no race, against
+    // 1,055 frames and a race with it on).
+    //
+    // ⇒ THE BLOCKING WRITE WAS BOTH THE PORT'S COST AND THE GUEST'S CPU
+    // LIFELINE: the card write waits, and the CPU is free during the wait, so
+    // the guest's other threads ran in it.  Removing the writes therefore
+    // speeds the port up AND starves the guest, and keeping them keeps the
+    // guest fed AND costs the port 42 card writes a frame.
+    //
+    // ⇒ SO THE LINES STAY AND THE WRITES GO: stdio's own buffer takes them
+    // and the file is flushed in bulk, which is what kGuestLogFlushLines is
+    // for.  The guest's CPU comes from the frame loop's EXPLICIT yield now
+    // (see the frame loop in guest_view_probe.cpp), not from the log's
+    // latency.
+    const unsigned long long pending =
+        __atomic_add_fetch(&g_logPendingLines, 1ULL, __ATOMIC_RELAXED);
+    bool ok = true;
+    if (pending >= kGuestLogFlushLines) {
+        __atomic_store_n(&g_logPendingLines, 0ULL, __ATOMIC_RELAXED);
+        ok = std::fflush(file) == 0;
+        if (!ok || std::ferror(file) != 0) {
+            // Still no fsync: reopening is a fresh fopen, not a card sync.
+            std::fclose(file);
+            slot->file = nullptr;
+            g_logCacheReopens =
+                __atomic_add_fetch(&g_logCacheReopens, 1ULL, __ATOMIC_RELAXED);
+            ok = false;
+        }
     }
     mutexUnlock(&g_logCacheMutex);
     return ok;

@@ -10051,16 +10051,39 @@ void* frameLoopDriver(void* opaque) {
         // budget 19.2 times too long, so it is converted here.
         {
             constexpr uint64_t kFrameBudgetNs = 16666666ULL;  // 60 Hz
+            //
+            // THE YIELD: 2 ms, EVERY FRAME, HOWEVER LONG THE FRAME WAS.
+            //
+            // MEASURED 2026-11-10 (rounds fps5 and percall1, the same binary):
+            // the port's per-call log used to write 42 lines a frame and every
+            // one of them was a BLOCKING card write -- and the CPU is FREE
+            // while a card write waits, so that wait was how the guest's
+            // other threads got any time at all.  With the log buffered
+            // instead of flushed per line, the port loses that accidental
+            // yield point and the guest starves: that round measured 2,520
+            // frames and never got past the event map, against 1,055 frames
+            // and a race when the log was writing per line.
+            //
+            // ⇒ SO THE YIELD IS EXPLICIT, AND IT IS NOT CONDITIONAL.  It does
+            // not depend on the frame being short, because the frames that
+            // need it are the LONG ones: during the loading phase the guest's
+            // own work is 300-600 ms a frame, and a yield that only happened
+            // in short frames would never fire there.
+            constexpr int64_t kFrameYieldNs = 2000000LL;  // 2 ms
             const uint64_t tickPaced = armGetSystemTick();
             const uint64_t spent = (tickPaced > tickTop) ? (tickPaced - tickTop) : 0ULL;
             const uint64_t frequency = armGetSystemTickFreq();
             const uint64_t budgetTicks =
                 (frequency != 0ULL) ? (kFrameBudgetNs * frequency) / 1000000000ULL : 0ULL;
+            int64_t sleepNs = kFrameYieldNs;
             if (budgetTicks != 0ULL && spent < budgetTicks) {
                 const uint64_t remainingNs =
                     (budgetTicks - spent) * 1000000000ULL / frequency;
-                svcSleepThread(static_cast<int64_t>(remainingNs));
+                if (static_cast<int64_t>(remainingNs) > sleepNs) {
+                    sleepNs = static_cast<int64_t>(remainingNs);
+                }
             }
+            svcSleepThread(sleepNs);
         }
         if (frames >= 360000ULL) { // defensive cap ~100 minutes
             g_frameLoopExitReason = "frame-cap";

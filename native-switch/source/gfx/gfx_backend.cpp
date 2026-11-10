@@ -270,7 +270,30 @@ struct ConfState {
     // to make the lines CHEAP without making them less frequent: buffer them
     // in RAM and flush them in bulk, so the cadence the guest sees stays the
     // same and the card stops being written forty times a frame.
-    bool perCallLog = true;
+    // THE DEFAULT IS OFF, AND THE MEASUREMENT SAYS WHY IT IS NOT THE WHOLE
+    // STORY ANY MORE.
+    //
+    // MEASURED 2026-11-10 (rounds percall1 and yield2, the same binary, the
+    // same card, the same guest state):
+    //
+    //     percall = 1   the port writes 42+ lines a frame and flushes each
+    //                   one onto the card: the race frame is 35-144 ms.
+    //     percall = 0   with the log BUFFERED (recovery_guard.cpp) and the
+    //                   frame loop yielding explicitly 2 ms a frame, the
+    //                   guest reaches the race on every round -- race screen
+    //                   36 and start lights 27, the best of any round -- and
+    //                   the race frame is 67 ms.
+    //
+    // ⇒ THE LOG'S CARD WRITE WAS BOTH THE PORT'S COST AND THE GUEST'S CPU
+    // LIFELINE (the CPU is free while a card write waits, and the guest is
+    // multi-threaded).  The explicit yield in the frame loop replaces that
+    // lifeline without the 42 card writes, so the logging can be off.
+    //
+    // ⇒ WHAT IS STILL MEASURED AND NOT YET FIXED: 52.9 lines a frame remain,
+    // and they are the ASSET-SERVICE lines (served-digest, open-ok,
+    // fs-candidate, guest-scanf-bounded, ...), which are not per-call lines
+    // and are not gated yet.  They are the next target.
+    bool perCallLog = false;
     // "ccloginok=1" -- the Cloudcell account manager answers LoginCompleteCallback
     // with SUCCESS rather than with an honest failure.
     //
