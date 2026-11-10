@@ -3740,56 +3740,64 @@ logged is a criterion nobody can check:
 `adv` is what the yield criterion reads, and it is the number that says
 "pinned" (0.02 m) against "crawling" (1.08 m).
 
-### 9.33 The cache broke the front end, and the log said so
+### 9.33 The front end did not break: the CENSUS went blind, and so did the port
 
-**MEASURED 2026-11-10: rounds chunk3, fps1, fps2 and yield1, all on the same
-card with the same guest state, and the front-end census says which build
-comes up.**
+**THIS SECTION CORRECTS ITSELF.  The first version of it said the resolution
+cache broke the front end.  That was wrong, and the frames say so.**
 
-    round   build                                    layout menu event race  frames
-    chunk2  before                                    4    20   193   10   5640
-    chunk3  before                                    4    20   179   10   5280
-    fps1    the pacing fix alone                     13    67   324   28   1800
-    fps2    + percall switch + cache + instrument     0     0   143    0   2640
-    yield1  + the pursuit's yield criterion          0     0   137    0   2640
+**MEASURED 2026-11-10: four rounds, the same card, the same guest state.**
 
-**⇒ ⇒ SO THE PACING FIX IS INNOCENT (fps1's front end was BETTER: 13/67/324
-and it raced 28 times), and the break came with the cache.**  Two rounds in a
-row did not even open the main menu.
+    round   build                                      layout menu event race  frames
+    chunk2  before                                      4    20   193   10   5640
+    chunk3  before                                      4    20   179   10   5280
+    fps1    the pacing fix alone                       13    67   324   28   1800
+    fps2    + percall switch + instrument                0     0   143    0   2640
+    yield1  + the pursuit's yield criterion             0     0   137    0   2640
 
-**⇒ ⇒ AND THE LOG SAYS EXACTLY WHY.**  The per-call phases are gone (the
-switch works), and the ASSET-SERVICE phases EXPLODED:
+The first reading of that table is "the front end broke in fps2".  **⇒ ⇒ AND
+THE FRAMES SAY OTHERWISE:** `frames/frame-000340.png` of round yield1 shows
+the front end fully drawn -- the "choose event" screen, the three daily-race
+cards with the Audi R8, the orange McLaren and the Nissan GT-R, every one of
+them textured correctly and not one of them magenta, and the UI automation's
+own red glove marker on the first card.  **THE GAME WAS FINE.**
+
+**⇒ ⇒ SO WHAT READS ZERO IS THE CENSUS, AND THE REASON IS THAT IT COUNTS THE
+PORT'S OWN TRACE.**  `tools/Test-OnEden.ps1` counts the main-menu layout in
+the guest-view log's text:
+
+    $summary.msTwosquare = [regex]::Matches(
+        $guestText, 'gui/processed/main_menu/main_menu_twosquare\.gui').Count
+
+and that trace is the path-resolution log, which the `percall` switch turns
+off.  **⇒ ⇒ AND THE PORT'S OWN FRONT END NAVIGATION READS THE SAME TRACE**,
+so with the switch off the port cannot tell which screen the guest is on, it
+stops navigating, the guest sits in the event map, and it starts asking for
+the same assets over and over:
 
     phase                  chunk3    yield1    per frame (chunk3 -> yield1)
     guest-scanf-bounded      1,005    14,297     0.19  ->  5.42
-    served-digest            2,578     6,956     0.48  ->  2.64
-    open-ok                  2,174     6,413     0.41  ->  2.43
-    guest-free-seq           1,401     3,096     0.26  ->  1.17
 
-**⇒ ⇒ THE MECHANISM: THE CACHE LOGS EVERY HIT.**  Before the cache, the
-repeated path requests were DEDUPED on the way to the log -- one line per
-DISTINCT path, and the guest's set of distinct paths is small.  The cache's hit
-path writes a line per REQUEST, so the log went from tens of distinct paths to
-thousands of requests, and every line is one fprintf plus one fflush on the
-card.  **THE PORT'S OWN LOGGING STARVED THE GUEST'S LOADING**, and the guest
-never got past the event map.
+**⇒ ⇒ WHICH IS ALSO WHY fps2's FRAME TIME DID NOT MOVE.**  The per-call lines
+went away and the asset-service lines went UP by twenty-eight times, because
+the guest was stuck asking for the same thing.  The frame was slow for a
+completely different reason than the one the switch was meant to fix.
 
-**⇒ ⇒ AND THIS CORRECTS SECTION 9.31.**  There it was written that "the
-per-call log was NOT the cost, and removing it buys nothing measurable".  The
-truth is narrower: the PER-CALL log was not the cost, but the logging as a
-whole was -- it moved from the per-call sites to the asset-service sites, and
-the asset-service sites got WORSE because the cache removed their dedup.
+**⇒ ⇒ SO TWO RULES, AND THE SECOND ONE IS THE GENERAL ONE:**
+1. **THE PORT'S OWN INSTRUMENTS MUST NOT BE SWITCHED OFF.**  The census reads
+   the path trace; the front end navigation reads the path trace.  A switch
+   that silences the port's eyes silences the port's ability to drive the
+   guest, and the round then measures a guest that is stuck rather than the
+   thing the round was for.  The path-resolution trace therefore STAYS ON
+   whatever the switch says; only the high-volume per-call sites go.
+2. **A MEASUREMENT THAT READS A STRING OUT OF THE LOG IS ONLY AS GOOD AS THE
+   LOG IT READS.**  Every census counter in `Test-OnEden.ps1` is a regex over
+   the guest-view log, so turning a phase off does not turn a counter down --
+   it turns it into a LIE.  A census counter must read a counter the port
+   keeps, not a string the port may stop writing.
 
-**⇒ ⇒ SO THE FIX HAS TWO HALVES, AND BOTH ARE NEEDED:**
-1. the asset-service lines go behind the same `percall` switch (they are
-   per-request lines, and there are 16 of them a frame), and
-2. the cache's hit path must not write a line per hit -- a cache that removes
-   work must not ADD a write per request, and a line that is written on every
-   hit of the same path is the same repetition the dedup existed to stop.
-
-**⇒ ⇒ AND THE LESSON IS THE GENERAL ONE:** a cache changes WHICH work is done,
-and the work it removes is not always the work that was expensive.  Here the
-cache removed the path mapping and the card stat, and replaced them with a
-log line per request -- and the log line was the expensive thing all along.
-**⇒ ⇒ SO A CACHE HAS TO BE MEASURED ON THE WHOLE FRAME, NOT ON THE FUNCTION
-IT REPLACES.**
+**⇒ ⇒ AND THE CACHE IS CLEARED OF THE CHARGE.**  The build logs say the
+incremental build did not recompile `guest_filesystem.cpp` for fps2 or yield1
+(`build-fps2.log` and `build-pursuit-yield.log` mention it zero times), so
+**neither of those rounds contained the cache at all**.  The cache is still
+untested in a round, and it has to be tested in one -- with the front end's
+eye open.
