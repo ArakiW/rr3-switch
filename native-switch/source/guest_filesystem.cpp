@@ -165,8 +165,32 @@ static uint64_t hashAssetPath(const char* str) {
 // trace is thinned one day.  It is on the race-state line as `paths=`.
 unsigned long long g_resolvedPathCount = 0;
 
+// THE CENSUS'S COUNTERS, KEPT BY THE PORT.
+//
+// WHY THEY EXIST: the round's census counted the front-end layout by
+// REGEXING THE LOG'S TEXT ('gui/processed/main_menu/...'), and that made the
+// census a function of what the port writes.  MEASURED 2026-11-10 (round
+// slim1): thinning the path trace to the census's own subtree cut the census
+// with it -- 'front-end layout opened 1' and 'main menu layouts open 5'
+// against yield2's 15 and 75 -- while the game was visibly fine.
+//
+// ⇒ SO THE PORT COUNTS THE EVENT ITSELF, and the census reads the counter.
+// The counts are of RESOLUTION EVENTS (the dedup below only applies to the
+// log), so they are what the census meant to measure: how many times the
+// guest asked for the main menu's layout.
+unsigned long long g_guiLayoutOpens = 0;
+unsigned long long g_guiTwosquareOpens = 0;
+
 unsigned long long guestResolvedPathCount() {
     return __atomic_load_n(&g_resolvedPathCount, __ATOMIC_RELAXED);
+}
+
+unsigned long long guestGuiLayoutOpens() {
+    return __atomic_load_n(&g_guiLayoutOpens, __ATOMIC_RELAXED);
+}
+
+unsigned long long guestGuiTwosquareOpens() {
+    return __atomic_load_n(&g_guiTwosquareOpens, __ATOMIC_RELAXED);
 }
 
 void logResolvedPathOnce(const char* path) {
@@ -179,6 +203,30 @@ void logResolvedPathOnce(const char* path) {
     // THE NUMBER OF RESOLUTIONS, so the information survives even when the
     // trace is thinned one day.  It is on the race-state line as `paths=`.
     __atomic_add_fetch(&g_resolvedPathCount, 1ULL, __ATOMIC_RELAXED);
+    // THE CENSUS'S COUNTERS: how many times the guest asked for the main
+    // menu's layout, and for the two-square panel inside it.  Counted BEFORE
+    // the dedup below, because the dedup applies to the LOG and these count
+    // EVENTS -- which is what the census meant to measure.
+    if (std::strstr(path, "gui/processed/main_menu/") != nullptr) {
+        __atomic_add_fetch(&g_guiLayoutOpens, 1ULL, __ATOMIC_RELAXED);
+        if (std::strstr(path, "main_menu_twosquare.gui") != nullptr) {
+            __atomic_add_fetch(&g_guiTwosquareOpens, 1ULL, __ATOMIC_RELAXED);
+        }
+    }
+    // ⇒ ⇒ AND THE TRACE IS NOW THINNED TO THE PART THE CENSUS READS.
+    //
+    // MEASURED 2026-11-10 (round yield2): 108,418 of the round's 124,464 log
+    // lines were this trace -- 46 LINES A FRAME -- because the guest walks
+    // tens of thousands of distinct asset paths while it loads.
+    //
+    // The thinning was tried in round slim1 and REVERTED, because the census
+    // counted the log's text and went blind with it.  The census now reads the
+    // port's counters (guestGuiLayoutOpens / guestGuiTwosquareOpens), so the
+    // trace can be thinned for real: the gui/processed/ paths are written, the
+    // rest are counted.
+    if (std::strstr(path, "gui/processed/") == nullptr) {
+        return;
+    }
     uint64_t hash = 1469598103934665603ULL;
     for (const char* p = path; *p != '\0'; ++p) {
         hash ^= static_cast<uint8_t>(*p);

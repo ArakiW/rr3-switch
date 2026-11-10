@@ -16,6 +16,14 @@ namespace rr3 {
 // that part); everything else is counted here, so the number survives.
 unsigned long long guestResolvedPathCount();
 
+// THE CENSUS'S COUNTERS, KEPT BY THE PORT: how many times the guest asked
+// for the main menu's layout, and for the two-square panel inside it.  The
+// census used to count them by regexing the log's text, which made the
+// measurement a function of what the port writes; see docs/OPEN-ISSUES.md
+// section 9.37.
+unsigned long long guestGuiLayoutOpens();
+unsigned long long guestGuiTwosquareOpens();
+
 constexpr size_t kExternalDataVolumeCount = 7;
 
 struct ExternalDataStatus {
