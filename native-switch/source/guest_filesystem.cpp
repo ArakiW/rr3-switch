@@ -27,6 +27,74 @@
 #include <zlib.h>
 
 namespace rr3 {
+
+std::atomic<uint64_t> g_frameFsTicks{0};
+std::atomic<uint64_t> g_frameFsHits{0};
+std::atomic<uint64_t> g_frameFsMisses{0};
+thread_local int s_fsDepth = 0;
+
+struct ScopedFsTimer {
+    uint64_t startTick;
+    bool active;
+    ScopedFsTimer() {
+        active = (s_fsDepth++ == 0);
+        if (active) {
+            startTick = armGetSystemTick();
+        }
+    }
+    ~ScopedFsTimer() {
+        if (active) {
+            uint64_t elapsed = armGetSystemTick() - startTick;
+            g_frameFsTicks.fetch_add(elapsed, std::memory_order_relaxed);
+        }
+        --s_fsDepth;
+    }
+};
+
+void fsResetFrameStats() {
+    g_frameFsTicks.store(0, std::memory_order_relaxed);
+    g_frameFsHits.store(0, std::memory_order_relaxed);
+    g_frameFsMisses.store(0, std::memory_order_relaxed);
+}
+
+uint64_t fsGetFrameTicks() {
+    return g_frameFsTicks.load(std::memory_order_relaxed);
+}
+
+uint64_t fsGetFrameHits() {
+    return g_frameFsHits.load(std::memory_order_relaxed);
+}
+
+uint64_t fsGetFrameMisses() {
+    return g_frameFsMisses.load(std::memory_order_relaxed);
+}
+
+// Bounded resolution cache: 1024 entries, direct-mapped by FNV-1a hash.
+// Protected by libnx Mutex (s_assetCacheMutex). std::mutex is NEVER used.
+// Revalidated on hit via ::stat (st_size and st_mtime) to ensure safety
+// if card is pulled or file replaced.
+struct CachedAssetResolution {
+    char assetPath[256];
+    char resolvedPath[256];
+    char digest[33];
+    unsigned long long size;
+    time_t mtime;
+    bool valid;
+};
+
+constexpr size_t kAssetCacheEntries = 1024;
+static CachedAssetResolution s_assetCache[kAssetCacheEntries]{};
+static Mutex s_assetCacheMutex = 0;
+
+static uint64_t hashAssetPath(const char* str) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (const char* p = str; *p != '\0'; ++p) {
+        hash ^= static_cast<uint8_t>(*p);
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
 // THE PATH-RESOLUTION LOG, DEDUPED.
 //
 // The guest asks for the same paths over and over -- a font, a texture, a
@@ -41,6 +109,9 @@ namespace rr3 {
 // repetition.  The key is a 64-bit hash, so a collision can only cost one
 // diagnostic line.
 void logResolvedPathOnce(const char* path) {
+    if (!rr3::gfxPerCallLog()) {
+        return;
+    }
     constexpr size_t kPathSlots = 2048;
     static uint64_t seen[ kPathSlots ] = {0};
     static size_t seenCount = 0;
@@ -5111,6 +5182,7 @@ bool probeAssetCandidate(const asset::Candidate& candidate, unsigned index,
 
 bool resolveAssetLocalFile(const char* assetPath, char* outPath, size_t outPathSize,
                            char digest[33], unsigned long long* sizeOut) {
+    ScopedFsTimer fsTimer;
     if (assetPath == nullptr || outPath == nullptr || outPathSize == 0 ||
         digest == nullptr) {
         return false;
@@ -5120,6 +5192,38 @@ bool resolveAssetLocalFile(const char* assetPath, char* outPath, size_t outPathS
     if (sizeOut != nullptr) {
         *sizeOut = 0;
     }
+
+    const size_t pathLen = std::strlen(assetPath);
+    const bool canCache = (pathLen < sizeof(CachedAssetResolution::assetPath));
+    const size_t slot = canCache ? (hashAssetPath(assetPath) % kAssetCacheEntries) : 0;
+
+    if (canCache) {
+        mutexLock(&s_assetCacheMutex);
+        CachedAssetResolution& entry = s_assetCache[slot];
+        if (entry.valid && std::strcmp(entry.assetPath, assetPath) == 0) {
+            // Revalidate that the target file still exists and size/mtime haven't changed.
+            struct stat st{};
+            if (::stat(entry.resolvedPath, &st) == 0 &&
+                static_cast<unsigned long long>(st.st_size) == entry.size &&
+                st.st_mtime == entry.mtime) {
+                // Cache hit!
+                g_frameFsHits.fetch_add(1, std::memory_order_relaxed);
+                std::snprintf(outPath, outPathSize, "%s", entry.resolvedPath);
+                std::memcpy(digest, entry.digest, 33);
+                if (sizeOut != nullptr) {
+                    *sizeOut = entry.size;
+                }
+                mutexUnlock(&s_assetCacheMutex);
+                return true;
+            }
+            // Invalidate stale entry
+            entry.valid = false;
+        }
+        mutexUnlock(&s_assetCacheMutex);
+    }
+
+    g_frameFsMisses.fetch_add(1, std::memory_order_relaxed);
+
     // THE ONE CANDIDATE LIST: rules 1 to 6, from the shared header, so the
     // manifest side and the endpoint see the same files in the same order --
     // including the guest's own download cache (rule 5) and the nearest lower
@@ -5150,6 +5254,24 @@ bool resolveAssetLocalFile(const char* assetPath, char* outPath, size_t outPathS
     std::memcpy(digest, selection.digest, 33);
     if (sizeOut != nullptr) {
         *sizeOut = selection.size;
+    }
+
+    // Populate cache entry
+    if (canCache && std::strlen(outPath) < sizeof(CachedAssetResolution::resolvedPath)) {
+        struct stat st{};
+        time_t mtime = 0;
+        if (::stat(outPath, &st) == 0) {
+            mtime = st.st_mtime;
+        }
+        mutexLock(&s_assetCacheMutex);
+        CachedAssetResolution& entry = s_assetCache[slot];
+        std::snprintf(entry.assetPath, sizeof(entry.assetPath), "%s", assetPath);
+        std::snprintf(entry.resolvedPath, sizeof(entry.resolvedPath), "%s", outPath);
+        std::memcpy(entry.digest, digest, 33);
+        entry.size = selection.size;
+        entry.mtime = mtime;
+        entry.valid = true;
+        mutexUnlock(&s_assetCacheMutex);
     }
     return true;
 }
@@ -8807,6 +8929,7 @@ bool getRecentServedTexture(size_t indexFromLatest, ServedTextureRecord* outReco
 bool stubSuppressed(const char* path);
 
 std::FILE* guestFopen(const char* path, const char* mode) {
+    ScopedFsTimer fsTimer;
     gResolveApi = "guestFopen";
     if (stubSuppressed(path)) {
         errno = kGuestErrnoENOENT;
@@ -9032,6 +9155,7 @@ std::FILE* guestFopen(const char* path, const char* mode) {
 }
 
 int guestOpen(const char* path, int flags, ...) {
+    ScopedFsTimer fsTimer;
     gResolveApi = "guestOpen";
     if (stubSuppressed(path)) {
         errno = kGuestErrnoENOENT;
@@ -9188,6 +9312,7 @@ int guestOpen(const char* path, int flags, ...) {
 }
 
 int guestOpen2(const char* path, int flags) {
+    ScopedFsTimer fsTimer;
     gResolveApi = "guestOpen2";
     if ((flags & O_CREAT) != 0) {
         errno = kGuestErrnoEINVAL;
@@ -9197,6 +9322,7 @@ int guestOpen2(const char* path, int flags) {
 }
 
 int guestAccess(const char* path, int mode) {
+    ScopedFsTimer fsTimer;
     gResolveApi = "guestAccess";
     if (stubSuppressed(path)) {
         errno = kGuestErrnoENOENT;
@@ -9284,6 +9410,9 @@ unsigned gStatLayoutDistinct = 0;
 
 void logStatLayout(const char* resolvedPath, const void* guestBuffer,
                    const struct stat& host) {
+    if (!rr3::gfxPerCallLog()) {
+        return;
+    }
     const auto trueSize = static_cast<unsigned long long>(host.st_size);
     const auto* bytes = static_cast<const unsigned char*>(guestBuffer);
     unsigned long long values[sizeof(kStatProbeOffsets) / sizeof(*kStatProbeOffsets)];
@@ -9562,6 +9691,9 @@ unsigned gStatPathLogged = 0;
 
 void logStatPath(const char* guestPath, const Resolution& resolution,
                  int rc, int error) {
+    if (!rr3::gfxPerCallLog()) {
+        return;
+    }
     ++gStatPathLogged;
     if (gStatPathLogged > kStatPathBudget && rc == 0) {
         return;
@@ -9634,6 +9766,7 @@ bool bionicStatLayoutSelfTest() {
 // `namespace rr3`, and writing `namespace rr3 { ... }` here created rr3::rr3.
 void censusNoteImportFrom(const void* returnAddress, const char* symbol);
 int guestStat(const char* path, struct stat* output) {
+    ScopedFsTimer fsTimer;
     censusNoteImportFrom(__builtin_return_address(0), "fs:guestStat");
     gResolveApi = "guestStat";
     if (stubSuppressed(path)) {
@@ -9668,6 +9801,7 @@ int guestStat(const char* path, struct stat* output) {
 }
 
 int guestLstat(const char* path, struct stat* output) {
+    ScopedFsTimer fsTimer;
     gResolveApi = "guestLstat";
     Resolution resolution{};
     if (!resolvePath(path, false, resolution)) return -1;
@@ -9711,6 +9845,7 @@ void logMkdirOutcome(const char* path, int rc, int err, const char* why) {
 }
 
 int guestMkdir(const char* path, mode_t mode) {
+    ScopedFsTimer fsTimer;
     gResolveApi = "guestMkdir";
     Resolution resolution{};
     if (!resolvePath(path, true, resolution) || rejectReadOnlyWrite(resolution, true)) {
@@ -9741,6 +9876,7 @@ int guestMkdir(const char* path, mode_t mode) {
 }
 
 DIR* guestOpendir(const char* path) {
+    ScopedFsTimer fsTimer;
     gResolveApi = "guestOpendir";
     if (stubSuppressed(path)) {
         errno = kGuestErrnoENOENT;
@@ -9797,6 +9933,7 @@ DIR* guestOpendir(const char* path) {
 }
 
 void* guestReaddir(DIR* directory) {
+    ScopedFsTimer fsTimer;
     gResolveApi = "guestReaddir";
     struct dirent* entry = ::readdir(directory);
     if (entry != nullptr && g_injectGui2048 && entry->d_name[0] != '\0') {
@@ -9941,6 +10078,7 @@ void* guestReaddir(DIR* directory) {
 }
 
 long guestPathconf(const char* path, int name) {
+    ScopedFsTimer fsTimer;
     gResolveApi = "guestPathconf";
     Resolution resolution{};
     if (!resolvePath(path, false, resolution)) return -1;
@@ -9948,6 +10086,7 @@ long guestPathconf(const char* path, int name) {
 }
 
 ssize_t guestReadlink(const char* path, char* output, size_t size) {
+    ScopedFsTimer fsTimer;
     gResolveApi = "guestReadlink";
     Resolution resolution{};
     if (!resolvePath(path, false, resolution)) return -1;
@@ -9955,6 +10094,7 @@ ssize_t guestReadlink(const char* path, char* output, size_t size) {
 }
 
 char* guestRealpath(const char* path, char* output) {
+    ScopedFsTimer fsTimer;
     gResolveApi = "guestRealpath";
     Resolution resolution{};
     if (!resolvePath(path, false, resolution)) return nullptr;
@@ -9962,6 +10102,7 @@ char* guestRealpath(const char* path, char* output) {
 }
 
 int guestStatvfs(const char* path, struct statvfs* output) {
+    ScopedFsTimer fsTimer;
     gResolveApi = "guestStatvfs";
     Resolution resolution{};
     if (!resolvePath(path, false, resolution)) return -1;
@@ -9969,6 +10110,7 @@ int guestStatvfs(const char* path, struct statvfs* output) {
 }
 
 int guestRemove(const char* path) {
+    ScopedFsTimer fsTimer;
     gResolveApi = "guestRemove";
     Resolution resolution{};
     if (!resolvePath(path, true, resolution) || rejectReadOnlyWrite(resolution, true)) return -1;
@@ -9976,6 +10118,7 @@ int guestRemove(const char* path) {
 }
 
 int guestRename(const char* oldPath, const char* newPath) {
+    ScopedFsTimer fsTimer;
     gResolveApi = "guestRename";
     Resolution oldResolution{};
     Resolution newResolution{};
@@ -9988,14 +10131,16 @@ int guestRename(const char* oldPath, const char* newPath) {
         // paths do not resolve the installed file stays STALE -- which is
         // exactly what the guest then md5s against the manifest and rejects
         // with "didn't match its MD5".
-        char diag[640];
-        std::snprintf(diag, sizeof(diag),
-                      "resolve-failed old=%s new=%s oldp=%s newp=%s",
-                      oldPath != nullptr ? oldPath : "-",
-                      newPath != nullptr ? newPath : "-",
-                      oldResolution.primary, newResolution.primary);
-        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
-                            "rename", 0, 0, diag);
+        if (rr3::gfxPerCallLog()) {
+            char diag[640];
+            std::snprintf(diag, sizeof(diag),
+                          "resolve-failed old=%s new=%s oldp=%s newp=%s",
+                          oldPath != nullptr ? oldPath : "-",
+                          newPath != nullptr ? newPath : "-",
+                          oldResolution.primary, newResolution.primary);
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                "rename", 0, 0, diag);
+        }
         return -1;
     }
     // BOTH ARGUMENTS ARE CARD PATHS, AND THAT IS THE POINT.
@@ -10007,7 +10152,7 @@ int guestRename(const char* oldPath, const char* newPath) {
     // path the card's own ".ast", the very file the guest wrote. So ::rename
     // moves THAT file, and never tries to rename a read-only volume path.
     const int rc = ::rename(oldResolution.primary, newResolution.primary);
-    {
+    if (rr3::gfxPerCallLog()) {
         char diag[640];
         std::snprintf(diag, sizeof(diag),
                       "rc=%d errno=%d old=%s new=%s oldg=%s newg=%s",
@@ -10021,6 +10166,7 @@ int guestRename(const char* oldPath, const char* newPath) {
 }
 
 int guestUnlink(const char* path) {
+    ScopedFsTimer fsTimer;
     gResolveApi = "guestUnlink";
     Resolution resolution{};
     if (!resolvePath(path, true, resolution) || rejectReadOnlyWrite(resolution, true)) return -1;
@@ -10028,6 +10174,7 @@ int guestUnlink(const char* path) {
 }
 
 int guestLink(const char* oldPath, const char* newPath) {
+    ScopedFsTimer fsTimer;
     gResolveApi = "guestLink";
     Resolution oldResolution{};
     Resolution newResolution{};
@@ -10039,6 +10186,7 @@ int guestLink(const char* oldPath, const char* newPath) {
 }
 
 int guestSymlink(const char* target, const char* linkPath) {
+    ScopedFsTimer fsTimer;
     gResolveApi = "guestSymlink";
     Resolution targetResolution{};
     Resolution linkResolution{};
@@ -10049,6 +10197,7 @@ int guestSymlink(const char* target, const char* linkPath) {
 }
 
 int guestBionicStatfs(const char* path, void* output) {
+    ScopedFsTimer fsTimer;
     gResolveApi = "guestBionicStatfs";
     Resolution resolution{};
     if (!resolvePath(path, false, resolution)) return -1;

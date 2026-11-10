@@ -1,4 +1,5 @@
 #include "rr3/jni_bridge.hpp"
+#include "rr3/guest_filesystem.hpp"
 
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
@@ -7293,10 +7294,16 @@ void* frameLoopDriver(void* opaque) {
     uint64_t prevTopTick = 0;
     uint64_t prevRenderTick = 0;
     uint64_t prevSwapTick = 0;
+    uint64_t prevJniTick = 0;
+    uint64_t prevFsTick = 0;
+    uint64_t prevFsHit = 0;
+    uint64_t prevFsMiss = 0;
     bool havePrevTiming = false;
     while (probe.frameLoopActive) {
         // The top of the iteration: everything below is inside this window.
         const uint64_t tickTop = armGetSystemTick();
+        jniResetFrameTicks();
+        fsResetFrameStats();
         // Publish the guest's own frame counter for the host sampler thread,
         // which labels its menu-gate samples with it. The frame loop is the
         // only place that knows it.
@@ -9014,7 +9021,7 @@ void* frameLoopDriver(void* opaque) {
             if (want) {
                 glGetIntegerv(GL_FRAMEBUFFER_BINDING, &g_hdBoundAfterRender);
                 glGetIntegerv(GL_VIEWPORT, g_hdViewportAfterRender);
-                char cdiag[384];
+                char cdiag[512];
                 // THE FRAME'S THREE COSTS.  See the comment at the top of the
                 // loop: the frame rate is a phase measurement and the CPU is
                 // flat, so the only way to know what the frame waits on is to
@@ -9025,6 +9032,10 @@ void* frameLoopDriver(void* opaque) {
                 unsigned long long tr = 0;
                 unsigned long long ts = 0;
                 unsigned long long tp = 0;
+                unsigned long long jni = 0;
+                unsigned long long fs = 0;
+                unsigned long long fshit = 0;
+                unsigned long long fsmiss = 0;
                 if (havePrevTiming) {
                     const uint64_t freq = armGetSystemTickFreq();
                     if (freq != 0) {
@@ -9035,14 +9046,19 @@ void* frameLoopDriver(void* opaque) {
                         ts = (unsigned long long)((prevSwapTick - prevRenderTick) *
                                                   1000ULL / freq);
                         tp = tt > tr + ts ? tt - tr - ts : 0;
+                        jni = (unsigned long long)(prevJniTick * 1000ULL / freq);
+                        fs = (unsigned long long)(prevFsTick * 1000ULL / freq);
                     }
+                    fshit = prevFsHit;
+                    fsmiss = prevFsMiss;
                 }
                 std::snprintf(
                     cdiag, sizeof(cdiag),
                     "frame=%llu census bound=%d viewport=%d,%d,%d,%d"
                     " scene=fbo=%u size=%ux%u binds=%u changes=%u vpChanges=%u"
                     " draws=%u arr=%u"
-                    " tt=%llu tr=%llu ts=%llu tp=%llu",
+                    " tt=%llu tr=%llu ts=%llu tp=%llu"
+                    " jni=%llu fs=%llu fshit=%llu fhit=%llu fsmiss=%llu",
                     static_cast<unsigned long long>(frames),
                     static_cast<int>(g_hdBoundAfterRender),
                     static_cast<int>(g_hdViewportAfterRender[0]),
@@ -9053,7 +9069,8 @@ void* frameLoopDriver(void* opaque) {
                     stats.lastNonZeroFboHeight, stats.bindFramebuffer,
                     stats.fboBindChanges, stats.viewportChanges,
                     stats.drawElements, stats.drawArrays,
-                    tt, tr, ts, tp);
+                    tt, tr, ts, tp,
+                    jni, fs, fshit, fshit, fsmiss);
                 appendGuestBootLine(
                     "sdmc:/switch/rr3-native-rehost.guest-view.log",
                     "guest-frame-census", 249, 0, cdiag);
@@ -9979,6 +9996,10 @@ void* frameLoopDriver(void* opaque) {
         prevTopTick = tickTop;
         prevRenderTick = tickRender;
         prevSwapTick = tickSwap;
+        prevJniTick = jniGetFrameTicks();
+        prevFsTick = fsGetFrameTicks();
+        prevFsHit = fsGetFrameHits();
+        prevFsMiss = fsGetFrameMisses();
         havePrevTiming = true;
         ++frames;
         if ((padGetButtonsDown(&framePad) & HidNpadButton_Plus) != 0) {
@@ -10013,7 +10034,9 @@ void* frameLoopDriver(void* opaque) {
             const uint64_t budgetTicks =
                 (frequency != 0ULL) ? (kFrameBudgetNs * frequency) / 1000000000ULL : 0ULL;
             if (budgetTicks != 0ULL && spent < budgetTicks) {
-                svcSleepThread(static_cast<int64_t>(budgetTicks - spent));
+                const uint64_t remainingNs =
+                    (budgetTicks - spent) * 1000000000ULL / frequency;
+                svcSleepThread(static_cast<int64_t>(remainingNs));
             }
         }
         if (frames >= 360000ULL) { // defensive cap ~100 minutes

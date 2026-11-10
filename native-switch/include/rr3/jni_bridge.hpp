@@ -198,4 +198,9 @@ bool rr3ByteArrayMagic(uintptr_t handle, uint32_t* outMagic);
 // Calling it twice is harmless: the thread is created once.
 void startAlertPumpEarly();
 
+// Split-tr frame timing instrument: accumulator for time spent inside
+// the port's JNI dispatch entry points.
+void jniResetFrameTicks();
+uint64_t jniGetFrameTicks();
+
 } // namespace rr3

@@ -14,6 +14,7 @@
 // check, with a hard length limit, and the host's parser only sees the copy.
 #include "rr3/guest_strto.hpp"
 
+#include "rr3/gfx_backend.hpp"
 #include "rr3/recovery_guard.hpp"
 
 #include <switch.h>
@@ -146,6 +147,9 @@ GuestText takeGuestText(const char* text) {
 // pointer was 0 and the lap distance was -1.  **A BOUND ON THE SCAN MUST
 // NOT CHANGE THE ANSWER.**
 void logRefusal(const char* function, const char* text, const GuestText& copy) {
+    if (!rr3::gfxPerCallLog()) {
+        return;
+    }
     char head[96]{};
     const size_t shown = copy.length < 32 ? copy.length : 32;
     for (size_t i = 0; i < shown; ++i) {

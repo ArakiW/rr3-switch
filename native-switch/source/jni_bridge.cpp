@@ -84,6 +84,16 @@
 
 namespace rr3 {
 
+std::atomic<uint64_t> g_frameJniTicks{0};
+
+void jniResetFrameTicks() {
+    g_frameJniTicks.store(0, std::memory_order_relaxed);
+}
+
+uint64_t jniGetFrameTicks() {
+    return g_frameJniTicks.load(std::memory_order_relaxed);
+}
+
 // Defined in pthread_bridge.cpp. Declared here so the JNI call paths below can
 // push themselves into the per-thread census ring.
 void censusNoteImportFrom(const void* returnAddress, const char* symbol);
@@ -404,6 +414,9 @@ void perCallLogReport(const char* where) {
 // suppressed AND counted, which is the number a run needs to show the cap
 // engaged rather than merely showing a shorter log.
 bool perCallLogAllow(const char* site) {
+    if (!rr3::gfxPerCallLog()) {
+        return false;
+    }
     if (g_perCallLogBudget.fetch_sub(1, std::memory_order_relaxed) == 0) {
         const unsigned long long n =
             g_perCallLogSuppressed.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -425,6 +438,32 @@ bool perCallLogAllow(const char* site) {
     g_perCallLogEmitted.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
+
+// Split-tr frame timing instrument: time spent inside the port's JNI dispatch
+// entry points. Measured in armGetSystemTick() cycles, converted to ms on the
+// census line.
+static thread_local int s_jniDepth = 0;
+
+class ScopedJniTimer {
+    uint64_t m_start;
+    bool m_active;
+public:
+    ScopedJniTimer() : m_start(0), m_active(false) {
+        if (s_jniDepth++ == 0) {
+            m_start = armGetSystemTick();
+            m_active = true;
+        }
+    }
+    ~ScopedJniTimer() {
+        if (m_active) {
+            const uint64_t end = armGetSystemTick();
+            if (end > m_start) {
+                g_frameJniTicks.fetch_add(end - m_start, std::memory_order_relaxed);
+            }
+        }
+        --s_jniDepth;
+    }
+};
 
 // ---- fake jbyteArray pool --------------------------------------------------
 // Guest code creates byte[] via NewByteArray, fills it, then hands the handle
@@ -478,6 +517,7 @@ const uint8_t* byteArrayBytes(uintptr_t handle, int32_t* outLength) {
 }
 
 uintptr_t jniNewByteArray(uintptr_t /*env*/, int32_t length) {
+    ScopedJniTimer jniTimer;
     if (length < 0) {
         return 0;
     }
@@ -520,12 +560,14 @@ uintptr_t jniNewByteArray(uintptr_t /*env*/, int32_t length) {
 }
 
 int32_t jniGetArrayLength(uintptr_t /*env*/, uintptr_t arrayHandle) {
+    ScopedJniTimer jniTimer;
     FakeByteArray* array = asByteArray(arrayHandle);
     return array != nullptr ? array->length : 0;
 }
 
 uintptr_t jniGetByteArrayElements(uintptr_t /*env*/, uintptr_t arrayHandle,
                                   uintptr_t isCopy) {
+    ScopedJniTimer jniTimer;
     FakeByteArray* array = asByteArray(arrayHandle);
     if (array == nullptr) {
         return 0;
@@ -538,12 +580,14 @@ uintptr_t jniGetByteArrayElements(uintptr_t /*env*/, uintptr_t arrayHandle,
 
 void jniReleaseByteArrayElements(uintptr_t /*env*/, uintptr_t arrayHandle,
                                  uintptr_t /*elems*/, int32_t /*mode*/) {
+    ScopedJniTimer jniTimer;
     // Direct pointer: nothing to copy back or free.
     (void)arrayHandle;
 }
 
 void jniGetByteArrayRegion(uintptr_t /*env*/, uintptr_t arrayHandle,
                            int32_t start, int32_t length, uintptr_t buf) {
+    ScopedJniTimer jniTimer;
     FakeByteArray* array = asByteArray(arrayHandle);
     if (array == nullptr || buf == 0 || length <= 0 || start < 0) {
         return;
@@ -559,6 +603,7 @@ void jniGetByteArrayRegion(uintptr_t /*env*/, uintptr_t arrayHandle,
 
 void jniSetByteArrayRegion(uintptr_t /*env*/, uintptr_t arrayHandle,
                            int32_t start, int32_t length, uintptr_t buf) {
+    ScopedJniTimer jniTimer;
     FakeByteArray* array = asByteArray(arrayHandle);
     if (array == nullptr || buf == 0 || length <= 0 || start < 0) {
         return;
@@ -1272,6 +1317,7 @@ void jniNativeJavaSideTick() {
 // recorded, and one line is written so a run can say what was bound.
 uintptr_t jniRegisterNatives(uintptr_t env, uintptr_t clazz, const void* methods,
                              int32_t count) {
+    ScopedJniTimer jniTimer;
     if (methods == nullptr || count <= 0) {
         return static_cast<uintptr_t>(-1);  // JNI_ERR
     }
@@ -1331,6 +1377,7 @@ uintptr_t jniRegisterNatives(uintptr_t env, uintptr_t clazz, const void* methods
 
 // UnregisterNatives: the guest drops the bindings for a class.
 uintptr_t jniUnregisterNatives(uintptr_t /*env*/, uintptr_t clazz) {
+    ScopedJniTimer jniTimer;
     const char* classText = className(clazz);
     const char* classLabel = classText != nullptr ? classText : "(unknown)";
     size_t removed = 0;
@@ -1974,7 +2021,7 @@ uintptr_t jniNamedObjectForMethod(uintptr_t methodId, void* args,
     // pass the same argument never alias each other's object.
     char key[96];
     if (text != nullptr) {
-        __builtin_snprintf(key, sizeof(key), "%s:%s", name, text);
+        __builtin_snprintf(key, sizeof(key), "%.40s:%.40s", name, text);
     }
     else {
         __builtin_snprintf(key, sizeof(key), "%s:arg:%llx", name,
@@ -2519,6 +2566,7 @@ bool ccHeaderTrace(const char* what, const char* a, const char* b) {
 }
 
 uintptr_t jniFindClass(uintptr_t /*env*/, const char* name) {
+    ScopedJniTimer jniTimer;
     rawLog("[jni] FindClass ");
     rawLog(name);
     rawLog("\n");
@@ -2556,6 +2604,7 @@ uintptr_t jniGetObjectClass(uintptr_t /*env*/, uintptr_t object) {
 
 uintptr_t jniGetMethodID(uintptr_t /*env*/, uintptr_t clazz,
                          const char* name, const char* signature) {
+    ScopedJniTimer jniTimer;
     rawLog("[jni] GetMethodID ");
     rawLog(name);
     rawLog("\n");
@@ -2571,6 +2620,7 @@ uintptr_t jniGetMethodID(uintptr_t /*env*/, uintptr_t clazz,
 
 uintptr_t jniGetStaticMethodID(uintptr_t /*env*/, uintptr_t clazz,
                                const char* name, const char* signature) {
+    ScopedJniTimer jniTimer;
     rawLog("[jni] GetStaticMethodID ");
     rawLog(name);
     rawLog("\n");
@@ -2580,6 +2630,7 @@ uintptr_t jniGetStaticMethodID(uintptr_t /*env*/, uintptr_t clazz,
 
 uintptr_t jniGetFieldID(uintptr_t /*env*/, uintptr_t clazz,
                         const char* name, const char* /*signature*/) {
+    ScopedJniTimer jniTimer;
     rawLog("[jni] GetFieldID ");
     rawLog(name);
     rawLog("\n");
@@ -2587,6 +2638,7 @@ uintptr_t jniGetFieldID(uintptr_t /*env*/, uintptr_t clazz,
 }
 
 int32_t jniGetIntField(uintptr_t /*env*/, uintptr_t object, uintptr_t fieldId) {
+    ScopedJniTimer jniTimer;
     if (object == 0) {
         return 0;
     }
@@ -2623,6 +2675,7 @@ int32_t jniGetIntField(uintptr_t /*env*/, uintptr_t object, uintptr_t fieldId) {
 // float, so they cannot be served by GetIntField; the slot has to exist for the
 // object to be self-consistent at all.
 float jniGetFloatField(uintptr_t /*env*/, uintptr_t object, uintptr_t fieldId) {
+    ScopedJniTimer jniTimer;
     FakeFont* font = asFontObject(object);
     if (font == nullptr) {
         // GlyphVector: offsetX, offsetY, boundsW, boundsH, pixelBoundsW and
@@ -2642,14 +2695,17 @@ uintptr_t jniNewGlobalRef(uintptr_t /*env*/, uintptr_t object) {
 }
 
 uintptr_t jniNewLocalRef(uintptr_t /*env*/, uintptr_t object) {
+    ScopedJniTimer jniTimer;
     return object;
 }
 
 uintptr_t jniIsSameObject(uintptr_t /*env*/, uintptr_t a, uintptr_t b) {
+    ScopedJniTimer jniTimer;
     return a == b ? 1u : 0u;
 }
 
 uintptr_t jniNewStringUTF(uintptr_t /*env*/, const char* bytes) {
+    ScopedJniTimer jniTimer;
     rawLog("[jni] NewStringUTF ");
     rawLog(bytes);
     rawLog("\n");
@@ -2756,6 +2812,7 @@ size_t decodeUtf16ToUtf8(const uint16_t* chars, int32_t count, char* out,
 // not a character buffer. Reading it as one would be a wild pointer read, so
 // such an argument is answered with the stub's null instead.
 uintptr_t jniNewStringSlot163(uintptr_t env, const uint16_t* chars, int32_t count) {
+    ScopedJniTimer jniTimer;
     if (chars == nullptr) {
         return 0;
     }
@@ -2797,7 +2854,7 @@ uintptr_t jniNewStringSlot163(uintptr_t env, const uint16_t* chars, int32_t coun
         raw[shown] = '\0';
         char details[288];
         __builtin_snprintf(details, sizeof(details),
-                           "slot=163 NewString units=%d utf8Bytes=%u raw=[%s] text=%s",
+                           "slot=163 NewString units=%d utf8Bytes=%u raw=[%.100s] text=%.100s",
                            count, (unsigned)length, raw, utf8);
         guestViewWideLog("jni-utf163", 0, handle, details);
     }
@@ -2806,11 +2863,13 @@ uintptr_t jniNewStringSlot163(uintptr_t env, const uint16_t* chars, int32_t coun
 }
 
 uintptr_t jniGetStringUTFLength(uintptr_t /*env*/, uintptr_t string) {
+    ScopedJniTimer jniTimer;
     return static_cast<uintptr_t>(rawStrlen(jniStringValue(string)));
 }
 
 uintptr_t jniGetStringUTFChars(uintptr_t /*env*/, uintptr_t string,
                                uintptr_t /*isCopy*/) {
+    ScopedJniTimer jniTimer;
     return reinterpret_cast<uintptr_t>(jniStringValue(string));
 }
 
@@ -2839,6 +2898,7 @@ static bool isAndroidAccountManagerClass(uintptr_t clazz) {
 
 uintptr_t jniNewObjectV(uintptr_t /*env*/, uintptr_t clazz,
                         uintptr_t methodId, void* args) {
+    ScopedJniTimer jniTimer;
     // MEASURED 2026-10-21: this path used to ignore the method id and the
     // argument block entirely, so a guest NewObject(clazz, ctorId, ...) could
     // never store anything, and a run could not say which slot the guest had
@@ -2938,6 +2998,7 @@ void jniPairMark(const char* phase, const char* name, uintptr_t methodId,
 
 uintptr_t jniCallObjectMethodV(uintptr_t /*env*/, uintptr_t object,
                                uintptr_t methodId, void* args) {
+    ScopedJniTimer jniTimer;
     const char* name = jniMethodName(methodId);
     const bool returnsString = jniMethodReturnsString(methodId);
     jniPairMark("enter", name, methodId, 0);
@@ -3019,6 +3080,7 @@ uintptr_t jniCallObjectMethodV(uintptr_t /*env*/, uintptr_t object,
 
 uintptr_t jniCallStaticObjectMethodV(uintptr_t /*env*/, uintptr_t /*clazz*/,
                                      uintptr_t methodId, void* args) {
+    ScopedJniTimer jniTimer;
     const char* name = jniMethodName(methodId);
     if (name == nullptr) {
         return jniObjectForMethod(methodId);
@@ -3138,6 +3200,7 @@ uintptr_t jniCallStaticObjectMethodV(uintptr_t /*env*/, uintptr_t /*clazz*/,
 // loadTextureFromMemory unanswered even after the V path existed.
 uintptr_t jniCallStaticObjectMethod(uintptr_t env, uintptr_t clazz,
                                     uintptr_t methodId, ...) {
+    ScopedJniTimer jniTimer;
     va_list arguments;
     va_start(arguments, methodId);
     uintptr_t result = jniCallStaticObjectMethodV(env, clazz, methodId,
@@ -3148,6 +3211,7 @@ uintptr_t jniCallStaticObjectMethod(uintptr_t env, uintptr_t clazz,
 
 uintptr_t jniCallObjectMethod(uintptr_t env, uintptr_t object,
                               uintptr_t methodId, ...) {
+    ScopedJniTimer jniTimer;
     va_list arguments;
     va_start(arguments, methodId);
     uintptr_t result = jniCallObjectMethodV(env, object, methodId, &arguments);
@@ -3158,6 +3222,7 @@ uintptr_t jniCallObjectMethod(uintptr_t env, uintptr_t object,
 // Non-V CallLongMethod (slot 52). No CallLongMethodV yet; answer 0.
 int64_t jniCallLongMethod(uintptr_t /*env*/, uintptr_t /*object*/,
                           uintptr_t /*methodId*/, ...) {
+    ScopedJniTimer jniTimer;
     return 0;
 }
 
@@ -3175,6 +3240,7 @@ int64_t jniCallLongMethod(uintptr_t /*env*/, uintptr_t /*object*/,
 // hat: a zero horizontal scale is not a scale.
 float jniCallFloatMethod(uintptr_t /*env*/, uintptr_t object,
                          uintptr_t methodId, ...) {
+    ScopedJniTimer jniTimer;
     FakeFont* font = asFontObject(object);
     if (font != nullptr) {
         const char* name = jniMethodName(methodId);
@@ -3322,6 +3388,7 @@ void captureFontInit(FakeFont* font, const jvalue* argv, size_t argc, void* args
 
 int32_t jniCallBooleanMethodV(uintptr_t env, uintptr_t object,
                               uintptr_t methodId, void* args) {
+    ScopedJniTimer jniTimer;
     const char* name = jniMethodName(methodId);
     // The guest's boolean helper (guest 0x10e8f2c) calls JNIEnv::
     // CallBooleanMethodV -- table slot 38 -- whose fourth argument is the
@@ -3441,18 +3508,20 @@ int32_t jniCallBooleanMethodV(uintptr_t env, uintptr_t object,
         if (method != nullptr && !method->takes_class) {
             const FakeObjectHeader* owned = fakeObjectHeaderFor(object);
             if (owned == nullptr) {
-                char why[224];
-                __builtin_snprintf(why, sizeof(why),
-                                   "REFUSED %s.%s: receiver %p is not an object from "
-                                   "this pool",
-                                   method->clazz != nullptr &&
-                                           method->clazz->classname
-                                       ? method->clazz->classname
-                                       : "?",
-                                   name, (void *)object);
-                guestViewWideLog("cc-dispatch-bool",
-                                 static_cast<unsigned long long>(methodId),
-                                 static_cast<unsigned long long>(object), why);
+                if (rr3::gfxPerCallLog()) {
+                    char why[224];
+                    __builtin_snprintf(why, sizeof(why),
+                                       "REFUSED %s.%s: receiver %p is not an object from "
+                                       "this pool",
+                                       method->clazz != nullptr &&
+                                               method->clazz->classname
+                                           ? method->clazz->classname
+                                           : "?",
+                                       name, (void *)object);
+                    guestViewWideLog("cc-dispatch-bool",
+                                     static_cast<unsigned long long>(methodId),
+                                     static_cast<unsigned long long>(object), why);
+                }
             } else {
                 using Fn = jboolean (*)(JNIEnv*, jobject, jvalue*);
                 jboolean result = 0;
@@ -3471,16 +3540,18 @@ int32_t jniCallBooleanMethodV(uintptr_t env, uintptr_t object,
                         reinterpret_cast<jobject>(object), forwarded);
                     va_end(forwarded);
                 }
-                char detail[224];
-                __builtin_snprintf(detail, sizeof(detail),
-                                   "class=%s method=%s -> %d",
-                                   cls != nullptr
-                                       ? cls
-                                       : (guessClass != nullptr ? guessClass : "(none)"),
-                                   name, (int)result);
-                guestViewWideLog("cc-dispatch-bool",
-                                 static_cast<unsigned long long>(methodId),
-                                 static_cast<unsigned long long>(object), detail);
+                if (rr3::gfxPerCallLog()) {
+                    char detail[224];
+                    __builtin_snprintf(detail, sizeof(detail),
+                                       "class=%s method=%s -> %d",
+                                       cls != nullptr
+                                           ? cls
+                                           : (guessClass != nullptr ? guessClass : "(none)"),
+                                       name, (int)result);
+                    guestViewWideLog("cc-dispatch-bool",
+                                     static_cast<unsigned long long>(methodId),
+                                     static_cast<unsigned long long>(object), detail);
+                }
                 return result ? 1 : 0;
             }
         }
@@ -3492,6 +3563,7 @@ int32_t jniCallBooleanMethodV(uintptr_t env, uintptr_t object,
 // form through a function pointer; wrap the V path.
 int32_t jniCallBooleanMethod(uintptr_t env, uintptr_t object,
                              uintptr_t methodId, ...) {
+    ScopedJniTimer jniTimer;
     va_list arguments;
     va_start(arguments, methodId);
     // Same entry-site marker as the void slot: slot 37 passes a va_list* and
@@ -3511,6 +3583,7 @@ int32_t jniCallBooleanMethod(uintptr_t env, uintptr_t object,
 
 int32_t jniCallIntMethodV(uintptr_t /*env*/, uintptr_t object,
                           uintptr_t methodId, void* /*args*/) {
+    ScopedJniTimer jniTimer;
     const char* name = jniMethodName(methodId);
     // The response-header map: "size" on the value list. The name table
     // below has no "size", so the list would look empty and the guest would
@@ -3539,6 +3612,7 @@ int32_t jniCallIntMethodV(uintptr_t /*env*/, uintptr_t object,
 // Non-V CallIntMethod (slot 49). Same va_list wrap as CallObjectMethod.
 int32_t jniCallIntMethod(uintptr_t env, uintptr_t object,
                          uintptr_t methodId, ...) {
+    ScopedJniTimer jniTimer;
     va_list arguments;
     va_start(arguments, methodId);
     int32_t result = jniCallIntMethodV(env, object, methodId, &arguments);
@@ -3548,6 +3622,7 @@ int32_t jniCallIntMethod(uintptr_t env, uintptr_t object,
 
 int32_t jniCallStaticIntMethodV(uintptr_t /*env*/, uintptr_t /*clazz*/,
                                 uintptr_t methodId, void* /*args*/) {
+    ScopedJniTimer jniTimer;
     const char* name = jniMethodName(methodId);
     const int32_t result = platformIntForMethod(name);
     if (name != nullptr && gateScalarNameInteresting(name)) {
@@ -3559,6 +3634,7 @@ int32_t jniCallStaticIntMethodV(uintptr_t /*env*/, uintptr_t /*clazz*/,
 // Non-V CallStaticIntMethod (slot 129). Wrap the V path.
 int32_t jniCallStaticIntMethod(uintptr_t env, uintptr_t clazz,
                                uintptr_t methodId, ...) {
+    ScopedJniTimer jniTimer;
     va_list arguments;
     va_start(arguments, methodId);
     int32_t result = jniCallStaticIntMethodV(env, clazz, methodId, &arguments);
@@ -3681,7 +3757,8 @@ ShowMessageCall gateTraceShowMessage(void* args) {
         // truncate the very value this line exists to show.
         __builtin_snprintf(
             details, sizeof(details),
-            "title='%s' body='%s' pos='%s' neg='%s' neutral='%s' ids=%lld/%lld/%lld"
+            "title='%.48s' body='%.48s' pos='%.48s' neg='%.48s' neutral='%.48s'"
+            " ids=%lld/%lld/%lld"
             " -> enqueue alertMessageExecuteCallback(%lld)",
             call.title, call.body, call.positive, call.negative, call.neutral,
             static_cast<long long>(call.idPositive),
@@ -4726,6 +4803,7 @@ static size_t decodeGuestVarArgs(const void* block, const char* signature,
 
 void jniCallVoidMethodV(uintptr_t env, uintptr_t object,
                        uintptr_t methodId, void* args) {
+    ScopedJniTimer jniTimer;
     // `env` is the JNIEnv the guest passed.
     const char* name = jniMethodName(methodId);
     jniPairMark("enter", name, methodId, 0);
@@ -4966,18 +5044,20 @@ void jniCallVoidMethodV(uintptr_t env, uintptr_t object,
                                                           : "no method")
                                       : (method->takes_class ? "skipped takes_class"
                                                              : "MATCH");
-            char dd[256];
-            __builtin_snprintf(dd, sizeof(dd),
-                               "level=%d class=%s method=%s -> %s static=%d obj=%p",
-                               dispatchLevel,
-                               dispatchClass != nullptr
-                                   ? dispatchClass
-                                   : (guessClass != nullptr ? guessClass : "(none)"),
-                               name, verdict,
-                               method != nullptr ? (method->is_static_method ? 1 : 0) : -1,
-                               (void *)object);
-            guestViewWideLog("cc-dispatch", static_cast<unsigned long long>(methodId),
-                             static_cast<unsigned long long>(object), dd);
+            if (rr3::gfxPerCallLog()) {
+                char dd[256];
+                __builtin_snprintf(dd, sizeof(dd),
+                                   "level=%d class=%s method=%s -> %s static=%d obj=%p",
+                                   dispatchLevel,
+                                   dispatchClass != nullptr
+                                       ? dispatchClass
+                                       : (guessClass != nullptr ? guessClass : "(none)"),
+                                   name, verdict,
+                                   method != nullptr ? (method->is_static_method ? 1 : 0) : -1,
+                                   (void *)object);
+                guestViewWideLog("cc-dispatch", static_cast<unsigned long long>(methodId),
+                                 static_cast<unsigned long long>(object), dd);
+            }
 
             // INTERLOCK: ccdisp=2 with objid=0 is not merely discouraged, it
             // is refused. aam_constructor stores two jlongs at self+0 and
@@ -5012,20 +5092,22 @@ void jniCallVoidMethodV(uintptr_t env, uintptr_t object,
                 // was the thing that broke the run.
                 const FakeObjectHeader* owned = fakeObjectHeaderFor(object);
                 if (owned == nullptr) {
-                    const char* owner = hostHandleOwner(object);
-                    char why[256];
-                    __builtin_snprintf(why, sizeof(why),
-                                       "REFUSED %s.%s: receiver %p is not a pool "
-                                       "object; it belongs to %s, which carries no "
-                                       "class and no room for instance fields",
-                                       method->clazz != nullptr && method->clazz->classname
-                                               ? method->clazz->classname
-                                               : "?",
-                                       name, (void *)object,
-                                       owner != nullptr ? owner : "nothing in this file");
-                    guestViewWideLog("cc-dispatch",
-                                     static_cast<unsigned long long>(methodId),
-                                     static_cast<unsigned long long>(object), why);
+                    if (rr3::gfxPerCallLog()) {
+                        const char* owner = hostHandleOwner(object);
+                        char why[256];
+                        __builtin_snprintf(why, sizeof(why),
+                                           "REFUSED %s.%s: receiver %p is not a pool "
+                                           "object; it belongs to %s, which carries no "
+                                           "class and no room for instance fields",
+                                           method->clazz != nullptr && method->clazz->classname
+                                                   ? method->clazz->classname
+                                                   : "?",
+                                           name, (void *)object,
+                                           owner != nullptr ? owner : "nothing in this file");
+                        guestViewWideLog("cc-dispatch",
+                                         static_cast<unsigned long long>(methodId),
+                                         static_cast<unsigned long long>(object), why);
+                    }
                 } else if (rawEquals(t_jniVoidEntry, "62") && args != nullptr) {
                     // Slot 62 is JNIEnv::CallVoidMethodV, whose fourth argument
                     // is a va_list - NOT a jvalue array. The guest builds that
@@ -5144,6 +5226,7 @@ void jniCallVoidMethodV(uintptr_t env, uintptr_t object,
 
 void jniCallStaticVoidMethodV(uintptr_t env, uintptr_t clazz,
                               uintptr_t methodId, void* args) {
+    ScopedJniTimer jniTimer;
     const char* name = jniMethodName(methodId);
     if (name == nullptr) {
         return;
@@ -5176,6 +5259,7 @@ void jniCallStaticVoidMethodV(uintptr_t env, uintptr_t clazz,
 // Non-V CallStaticVoidMethod (slot 141). Wrap the V path.
 void jniCallStaticVoidMethod(uintptr_t env, uintptr_t clazz,
                              uintptr_t methodId, ...) {
+    ScopedJniTimer jniTimer;
     va_list arguments;
     va_start(arguments, methodId);
     jniCallStaticVoidMethodV(env, clazz, methodId, &arguments);
@@ -5187,6 +5271,7 @@ void jniCallStaticVoidMethod(uintptr_t env, uintptr_t clazz,
 // after each callback, so only acknowledge the call here.
 uintptr_t jniCallStaticBooleanMethodV(uintptr_t /*env*/, uintptr_t /*clazz*/,
                                       uintptr_t methodId, void* args) {
+    ScopedJniTimer jniTimer;
     const char* name = jniMethodName(methodId);
     if (name == nullptr) {
         return 0;
@@ -5233,12 +5318,12 @@ uintptr_t jniCallStaticBooleanMethodV(uintptr_t /*env*/, uintptr_t /*clazz*/,
         const char* key =
             argc >= 1 ? jniStringValue(reinterpret_cast<uintptr_t>(argv[0].l))
                       : nullptr;
-        if (key != nullptr) {
+        if (key != nullptr && rr3::gfxPerCallLog()) {
             // The KEY is the whole point of this slot, so it is written down:
             // "the port answered TRUE for enable_rookie" and "the port never saw
             // the key" look identical from the outside otherwise.
             char detail[128];
-            __builtin_snprintf(detail, sizeof(detail), "key=%s answer=%u",
+            __builtin_snprintf(detail, sizeof(detail), "key=%.100s answer=%u",
                                key, gfxRookieHubEnabled() &&
                                            rawEquals(key, "enable_rookie")
                                        ? 1u
@@ -5260,6 +5345,7 @@ uintptr_t jniCallStaticBooleanMethodV(uintptr_t /*env*/, uintptr_t /*clazz*/,
 // Non-V CallStaticBooleanMethod (slot 117). Wrap the V path.
 uintptr_t jniCallStaticBooleanMethod(uintptr_t env, uintptr_t clazz,
                                      uintptr_t methodId, ...) {
+    ScopedJniTimer jniTimer;
     va_list arguments;
     va_start(arguments, methodId);
     uintptr_t result = jniCallStaticBooleanMethodV(env, clazz, methodId,
@@ -5271,6 +5357,7 @@ uintptr_t jniCallStaticBooleanMethod(uintptr_t env, uintptr_t clazz,
 // Non-V CallVoidMethod (slot 61). Wrap the V path.
 void jniCallVoidMethod(uintptr_t env, uintptr_t object,
                        uintptr_t methodId, ...) {
+    ScopedJniTimer jniTimer;
     va_list arguments;
     va_start(arguments, methodId);
     // Mark the entry site so the shared body knows its `args` is a va_list*, not
@@ -5289,6 +5376,7 @@ void jniCallVoidMethod(uintptr_t env, uintptr_t object,
 // null check regresses.
 uintptr_t jniGetObjectField(uintptr_t /*env*/, uintptr_t object,
                             uintptr_t fieldId) {
+    ScopedJniTimer jniTimer;
     FakeFont* font = asFontObject(object);
     if (font != nullptr && rawEquals(jniFieldName(fieldId), "bmpData")) {
         return fontBmpData(font);
@@ -5301,23 +5389,28 @@ uintptr_t jniGetObjectField(uintptr_t /*env*/, uintptr_t object,
 // GetStaticBooleanField (slot 146) / GetStaticIntField (slot 150).
 uintptr_t jniGetStaticBooleanField(uintptr_t /*env*/, uintptr_t /*clazz*/,
                                    uintptr_t /*fieldId*/) {
+    ScopedJniTimer jniTimer;
     return 0;
 }
 
 int32_t jniGetStaticIntField(uintptr_t /*env*/, uintptr_t /*clazz*/,
                              uintptr_t /*fieldId*/) {
+    ScopedJniTimer jniTimer;
     return 0;
 }
 
 uintptr_t jniPushLocalFrame(uintptr_t /*env*/, int32_t /*capacity*/) {
+    ScopedJniTimer jniTimer;
     return 0; // JNI_OK; sentinel handles are immortal and need no frame.
 }
 
 uintptr_t jniPopLocalFrame(uintptr_t /*env*/, uintptr_t result) {
+    ScopedJniTimer jniTimer;
     return result;
 }
 
 uintptr_t jniGetObjectRefType(uintptr_t /*env*/, uintptr_t /*object*/) {
+    ScopedJniTimer jniTimer;
     return 2; // JNIGlobalRefType for the stable fake handles.
 }
 

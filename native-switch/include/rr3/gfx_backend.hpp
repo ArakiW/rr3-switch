@@ -154,6 +154,14 @@ bool gfxMkdirIdempotent();
 // the GPU's pixels against the CPU's.
 bool gfxSoftwareDxt();
 
+// "percall=0|1": per-call log lines (jni-*, cc-dispatch*, scissor, viewport,
+// map-app, ...). Default 0 (OFF).
+//
+// WHY IT EXISTS. Round chunk3 measured 42 log lines per frame, every line an
+// fprintf plus fflush on the emulated SD card. Turning this off removes the
+// port's own logging overhead while preserving census and event lines.
+bool gfxPerCallLog();
+
 // "ccloginok=1": the Cloudcell account manager answers LoginCompleteCallback
 // with success instead of an honest failure.
 //

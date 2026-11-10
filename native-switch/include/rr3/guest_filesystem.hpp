@@ -171,4 +171,9 @@ struct ServedTextureRecord {
 void rememberServedTexture(const char* guestPath, const char* localPath);
 bool getRecentServedTexture(size_t indexFromLatest, ServedTextureRecord* outRecord);
 
+void fsResetFrameStats();
+uint64_t fsGetFrameTicks();
+uint64_t fsGetFrameHits();
+uint64_t fsGetFrameMisses();
+
 } // namespace rr3

@@ -3586,3 +3586,106 @@ Eden's realistic target is 35-40 fps, and the 60 fps figure is a CONSOLE
 target -- the same port overhead, but NVN's present instead of the
 emulator's, and a faster CPU.  That has to be measured on the console; the
 emulator cannot show it.
+
+### 9.30 A change that got slower, and the arithmetic that cleared it
+
+**MEASURED 2026-11-10: rounds `chunk3` (before the pacing change) and `fps1`
+(after it), same card, same guest state, same 400 s.**
+
+The same frame ranges, computed by the same script (.build/frame-stats.py):
+
+    frames        chunk3 tt          fps1 tt
+    0 - 600       485.6 ms           597.7 ms
+    600 - 1200    122.0 ms           353.3 ms
+    1200 - 1855   185.7 ms           485.4 ms
+
+and `fps1` never got past frame 1855, so it never reached the race phase that
+`chunk3` measured at 43.6 ms.
+
+**⇒ ⇒ THAT LOOKS LIKE A REGRESSION, AND IT IS NOT ONE.**  The pacing change
+(the sleep is now the remainder of the 16.67 ms budget) can only affect a
+frame whose WORK is under 16.67 ms; a frame that takes longer than the budget
+gets no sleep either way, before or after.  So the change's SCOPE is exactly
+the frames faster than 17 ms, and they can be counted:
+
+    chunk3:  29 of 5342 frames faster than 17 ms  (0.54 %)
+    fps1:    50 of 1856 frames faster than 17 ms  (2.69 %)
+
+Even if every one of those 50 frames had become 16.67 ms faster, the whole
+round would have saved 0.83 s out of 408 s -- **0.2 %**.  A 0.2 % effect
+cannot explain a 2-3x difference.
+
+**⇒ ⇒ SO THE DIFFERENCE IS THE GUEST'S LOADING PHASE, AND IT VARIES.**  Both
+rounds contain a single enormous frame -- 51,155 ms in chunk3 and 54,511 ms in
+fps1 -- which is the guest's cloud/login wait, and the loading phase around it
+runs anywhere between 96 ms and 597 ms a frame depending on the round.  A
+single round is NOT a comparison of a build change: it is a comparison of a
+build change AND the round's luck.
+
+**⇒ ⇒ THE TECHNIQUE, WHICH IS THE GENERAL PART:** when a change appears to
+have made things worse, COUNT THE SAMPLES THE CHANGE CAN TOUCH.  If the
+change's scope is arithmetic -- a few frames, a few calls, one branch -- then
+its maximum possible effect can be computed, and a measurement outside that
+bound clears the change without needing another round.  Only if the measured
+effect is INSIDE the bound does the change become the suspect, and only then is
+a control round worth running.
+
+**⇒ ⇒ AND THE CONSEQUENCE FOR 60 FPS IS THE SAME ARITHMETIC.**  The frame's
+work is 43.6 ms, of which the port's own work outside the guest's render call
+is 0.37 ms and the rest is inside it -- the guest's own simulation plus the
+port's per-call work (42 log lines a frame, 4.8 path resolutions a frame, a
+full-screen readback every 30 frames).  To reach 16.67 ms the frame's work
+has to come down by 27 ms, and every millisecond of that has to come out of
+the per-call work, because the guest's own simulation is not the port's to
+optimise.  The order is therefore fixed: **the per-call overhead first, and
+the pacing second** -- the pacing change alone cannot buy a frame rate.
+
+### 9.31 The per-call log was not the cost: the JNI SERVICE path is
+
+**MEASURED 2026-11-10, round `fps2`** (the build with the `percall` switch at
+its DEFAULT, which is OFF, the bounded asset resolution cache, and the new
+instrument on the census line), against round `chunk3` (the same card, the same
+guest state, the per-call logging ON and no cache).
+
+    chunk3 (percall ON,  no cache): 41.9 log lines per frame
+    fps2   (percall OFF, cache ON) : 30.0 log lines per frame
+
+and the race phase (frames > 2500):
+
+    chunk3:  tt median 35.0 ms   p25 32.0 ms
+    fps2:    tt median 37.0 ms   p25 32.0 ms   jni median 21.0 ms
+                                        fs median 0.0 ms
+
+**⇒ ⇒ THE SWITCH WORKS: THE PER-CALL LINES ARE GONE.**  The phases that used
+to dominate the log are not there any more -- chunk3's top six were scissor
+(37,583), map-app (25,403), cc-dispatch (20,978), jni-void (20,976),
+jni-utf163 (20,685) and cc-dispatch-bool (11,267); fps2's top six are
+guest-scanf-bounded (17,553), served-digest (7,847), open-ok (7,399),
+fs-candidate (4,002), guest-log-any (3,999) and guest-free-seq (3,586).
+
+**⇒ ⇒ AND THE FRAME TIME DID NOT MOVE: 35.0 ms -> 37.0 ms median, which is
+INSIDE the round-to-round variance of the loading phase.**  So the 42 log
+lines a frame were NOT the dominant cost, and the honest conclusion is that
+removing them buys nothing measurable on its own.
+
+**⇒ ⇒ WHAT THE INSTRUMENT SAYS IS THE COST: THE PORT'S JNI SERVICE PATH.**
+`jni` -- the time inside the port's JNI dispatch entry points -- is 21 ms in
+the race phase, against a 37 ms frame.  `fs` -- the time inside the asset
+resolution itself -- is 0 ms, because the cache is serving the repeated
+requests.  So the port spends 21 ms a frame SERVING THE GUEST's calls, and
+almost none of it is the resolution: it is what the guest asks for through
+those calls (and the remaining per-frame lines -- served-digest, open-ok,
+fs-candidate, guest-scanf-bounded -- are the asset-service logs, still 16
+lines a frame, still one fprintf plus one fflush each).
+
+**⇒ ⇒ SO 60 FPS NEEDS THE NEXT TWO THINGS, IN THIS ORDER:**
+1. the asset-SERVICE logs go behind the same switch (they are not per-call
+   lines, they are per-request lines, and there are 16 of them a frame);
+2. the cache must stop touching the card on every hit -- it revalidates with
+   `::stat` per hit, which is a card touch per request -- and the JNI
+   service path's 21 ms has to be accounted for request by request.
+
+**⇒ ⇒ AND THE CEILING IS NOW HONEST:** with the port's own service work at
+21 ms of a 37 ms frame, 16.67 ms is unreachable until that 21 ms comes down.
+The guest's own drawing is what is left after it, and that part is not the
+port's to optimise.

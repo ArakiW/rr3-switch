@@ -1050,6 +1050,9 @@ int nextPowerOfTwo(int value) {
 
 void noteGlyphVector(const char* what, const GlyphVectorFacade* facade,
                      size_t textLen, float sizePx, const char* text) {
+    if (!rr3::gfxPerCallLog()) {
+        return;
+    }
     // The first few calls of each kind, NOT one line per distinct key: the
     // key-only version logged the first occurrence of each size and so
     // reported "textLen=0" for every one of them, which reads like "the text
@@ -1133,6 +1136,9 @@ void noteParagraph(float wrapWidth, float maxHeight, int breakStyle,
                    int alignment, bool wrapping, size_t layoutLines, size_t usedLines,
                    float boundsW, float boundsH, float sizePx, float widthScale,
                    size_t textLen, const char* text) {
+    if (!rr3::gfxPerCallLog()) {
+        return;
+    }
     bool nonAscii = false;
     if (text != nullptr) {
         for (size_t i = 0; text[i] != '\0' && i < 64; ++i) {

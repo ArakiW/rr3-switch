@@ -1,0 +1,50 @@
+THE PER-CALL LOG WAS NOT THE COST: THE JNI SERVICE PATH IS
+
+Round fps2, on the build with the `percall` switch at its default (OFF), the
+bounded asset resolution cache and the new instrument on the census line,
+against round chunk3 (same card, same guest state, the per-call logging ON and
+no cache).
+
+    chunk3 (percall ON,  no cache): 41.9 log lines per frame
+    fps2   (percall OFF, cache ON) : 30.0 log lines per frame
+
+    race phase (frames > 2500)
+    chunk3:  tt median 35.0 ms   p25 32.0 ms
+    fps2:    tt median 37.0 ms   p25 32.0 ms   jni median 21.0 ms
+                                        fs median 0.0 ms
+
+THE SWITCH WORKS.  The phases that used to dominate the log are gone: chunk3's
+top six were scissor (37,583), map-app (25,403), cc-dispatch (20,978),
+jni-void (20,976), jni-utf163 (20,685) and cc-dispatch-bool (11,267); fps2's
+top six are guest-scanf-bounded (17,553), served-digest (7,847), open-ok
+(7,399), fs-candidate (4,002), guest-log-any (3,999) and guest-free-seq (3,586)
+-- all of them ASSET SERVICE lines, not per-call lines.
+
+AND THE FRAME TIME DID NOT MOVE: 35.0 ms -> 37.0 ms median, which is inside
+the loading phase's round-to-round variance.  So the 42 log lines a frame were
+NOT the dominant cost, and removing them buys nothing measurable on its own.
+
+WHAT THE INSTRUMENT SAYS IS THE COST: THE PORT'S JNI SERVICE PATH.  `jni` --
+the time inside the port's JNI dispatch entry points -- is 21 ms in the race
+phase against a 37 ms frame, while `fs` -- the time inside the asset
+resolution -- is 0 ms, because the cache serves the repeated requests.  So the
+port spends 21 ms a frame SERVING THE GUEST's calls, and almost none of it is
+the resolution: it is what the guest asks for through those calls, plus the
+16 asset-service lines a frame that are still one fprintf plus one fflush each.
+
+SO 60 FPS NEEDS THE NEXT TWO THINGS, IN THIS ORDER:
+  1. the asset-SERVICE logs go behind the same switch (they are per-request
+     lines, and there are 16 of them a frame);
+  2. the cache must stop touching the card on every hit -- it revalidates
+     with ::stat per hit, which is a card touch per request -- and the JNI
+     service path's 21 ms has to be accounted for request by request.
+
+THE CEILING IS NOW HONEST: with the port's own service work at 21 ms of a
+37 ms frame, 16.67 ms is unreachable until that 21 ms comes down.  What is
+left after it is the guest's own drawing, and that part is not the port's to
+optimise.
+
+THE BUILD IS CLEAN: the four -Wformat-truncation= warnings that jni_bridge.cpp
+had never shown (the file had not been recompiled since the incremental build
+was introduced) are fixed with explicit precisions, and the build is now
+warning-free again.  GATE: 40 run, 0 failed, GATE OK.

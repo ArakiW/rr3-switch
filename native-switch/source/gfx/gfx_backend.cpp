@@ -243,6 +243,14 @@ struct ConfState {
     // native-switch/source/graphics_probe.cpp draws a real texture and
     // compares the GPU's pixels with the CPU's.
     bool softwareDxt = false;
+    // "percall=0|1" -- the per-call log lines (jni-*, cc-dispatch*, scissor,
+    // viewport, map-app, ...). DEFAULT 0: OFF.
+    //
+    // WHY IT EXISTS. Round chunk3 measured 42 log lines per frame, every line
+    // an fprintf plus fflush on the emulated SD card. Turning this off removes
+    // the port's own logging overhead while preserving frame instruments
+    // (guest-frame-census, race-flip, etc.).
+    bool perCallLog = false;
     // "ccloginok=1" -- the Cloudcell account manager answers LoginCompleteCallback
     // with SUCCESS rather than with an honest failure.
     //
@@ -761,6 +769,11 @@ void readConf() {
                  std::strcmp(key, "dxt-cpu") == 0) {
             s_conf.softwareDxt = parseSwitch(value);
         }
+        else if (std::strcmp(key, "percall") == 0 ||
+                 std::strcmp(key, "per-call") == 0 ||
+                 std::strcmp(key, "percall-log") == 0) {
+            s_conf.perCallLog = parseSwitch(value);
+        }
         else if (std::strcmp(key, "ccloginok") == 0 ||
                  std::strcmp(key, "cc-login-ok") == 0 ||
                  std::strcmp(key, "loginsuccess") == 0) {
@@ -866,7 +879,7 @@ void resolveBackend() {
     char details[256];
     std::snprintf(details, sizeof(details),
                   " backend=%s source=%s value=%s dumpdir=%s zeropage=%d"
-                  " ccmode=%s menugate=%d ccdone=%d ccdisp=%d conf_trunc=%d conf_bytes=%zu",
+                  " ccmode=%s menugate=%d ccdone=%d ccdisp=%d percall=%d conf_trunc=%d conf_bytes=%zu",
                   gfxBackendName(), s_backendSource,
                   chosen[0] != '\0' ? chosen : "(unset)", kDumpDir,
                   s_conf.zeroPage ? 1 : 0,
@@ -874,6 +887,7 @@ void resolveBackend() {
                   s_conf.menuGate ? 1 : 0,
                   s_conf.cloudcellComplete ? 1 : 0,
                   s_conf.ccDispatch,
+                  s_conf.perCallLog ? 1 : 0,
                   s_confTruncated ? 1 : 0, s_confBytes);
     writeLine("gfx-backend", 300, static_cast<unsigned long long>(s_backend), details);
 }
@@ -1040,6 +1054,12 @@ bool gfxMkdirIdempotent() {
 bool gfxSoftwareDxt() {
     ensureResolved();
     return s_conf.softwareDxt;
+}
+
+// "percall=0|1": the per-call log lines (default 0, OFF).
+bool gfxPerCallLog() {
+    ensureResolved();
+    return s_conf.perCallLog;
 }
 
 // "ccloginok=1": the Cloudcell account manager reports a successful login.

@@ -1,5 +1,6 @@
 #include "rr3/guest_view_trace.hpp"
 
+#include "rr3/gfx_backend.hpp"
 #include "rr3/gfx_text_probe.hpp"
 #include "rr3/guest_filesystem.hpp"
 #include "rr3/guest_frame_probe.hpp"
@@ -1656,7 +1657,7 @@ void guestViewTracedGlViewport(GLint x, GLint y, GLsizei width, GLsizei height) 
         // layout is the "the picture lands in a corner" symptom, so the
         // viewport has to be measured against the framebuffer it is aimed at
         // -- which is what this line says.
-        if (g_glStats.viewportChanges <= 200) {
+        if (rr3::gfxPerCallLog() && g_glStats.viewportChanges <= 200) {
             char diag[192];
             __builtin_snprintf(diag, sizeof(diag),
                 "glViewport x=%d y=%d w=%d h=%d (change #%u, fbo=%u)",
@@ -1723,14 +1724,16 @@ void guestViewTracedGlScissor(GLint x, GLint y, GLsizei width, GLsizei height) {
         g_glStats.lastScissor[1] = static_cast<uint32_t>(y);
         g_glStats.lastScissor[2] = static_cast<uint32_t>(width);
         g_glStats.lastScissor[3] = static_cast<uint32_t>(height);
-        char diag[192];
-        __builtin_snprintf(diag, sizeof(diag),
-            "glScissor x=%d y=%d w=%d h=%d (call #%u, viewport=%u,%u,%u,%u)",
-            x, y, width, height, g_glStats.scissors,
-            g_glStats.lastViewport[0], g_glStats.lastViewport[1],
-            g_glStats.lastViewport[2], g_glStats.lastViewport[3]);
-        appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
-                            "scissor", 249, 0, diag);
+        if (rr3::gfxPerCallLog()) {
+            char diag[192];
+            __builtin_snprintf(diag, sizeof(diag),
+                "glScissor x=%d y=%d w=%d h=%d (call #%u, viewport=%u,%u,%u,%u)",
+                x, y, width, height, g_glStats.scissors,
+                g_glStats.lastViewport[0], g_glStats.lastViewport[1],
+                g_glStats.lastViewport[2], g_glStats.lastViewport[3]);
+            appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                "scissor", 249, 0, diag);
+        }
     }
     ::glScissor(x, y, width, height);
 }
