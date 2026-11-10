@@ -7,6 +7,7 @@
 #include <switch.h>
 
 #include <algorithm>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <malloc.h>
@@ -287,7 +288,9 @@ extern "C" void* guestCodeWritableAddress(uintptr_t guestAddress) {
             if (guestAddress < base || guestAddress - base >= range.size) {
                 continue;
             }
-            return reinterpret_cast<void*>(range.ownerAddress
+            // The arithmetic is on the ADDRESS, not on a void*: casting keeps the
+            // compiler's pointer-arithmetic warning away without changing the value.
+            return reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(range.ownerAddress)
                                            + (guestAddress - base));
         }
     }
@@ -976,6 +979,43 @@ void closeSegmentedMappings() {
     (void)closeSegmentedMappingsDetailed();
 }
 
+// THE LOADER'S OWN VOICE IN THE GUEST-VIEW LOG.
+//
+// WHY THIS EXISTS: the loader's diagnostics existed and went NOWHERE.
+// main.cpp's bootPrintf is a no-op in this build -- ((void)format; return 0;)
+// -- so the segdiag / procdiag / permissions lines were never written to any
+// file.  MEASURED 2026-11-10 (the console): the crash was a SPAL (a
+// pointer-authentication fault) INSIDE this loader, and the only thing on the
+// record was the line before it ('gl-ctx-early ... disabled by conf').  The
+// fault was not diagnosable, because the instrument that would have named the
+// DSO, the segment, the offset and the permission was compiled out.
+//
+// => SO THE LOADER SAYS IT ITSELF, FROM INSIDE THE LOADER, WHERE A CRASH
+// CANNOT SKIP IT: one progress line BEFORE each segment mapping, and one
+// failure line with the stage, the Result and the permissions.
+//
+// THE PROGRESS LINES ARE BUDGETED IN LINES, AND THE BUDGET SAYS SO.
+void loaderDiag(const char* format, ...) {
+    constexpr unsigned kLoaderDiagBudget = 128;
+    static unsigned s_loaderDiagLines = 0;
+    char detail[384];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(detail, sizeof(detail), format, args);
+    va_end(args);
+    if (s_loaderDiagLines >= kLoaderDiagBudget) {
+        return;
+    }
+    ++s_loaderDiagLines;
+    rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                              "loader-diag", 0, 0, detail);
+    if (s_loaderDiagLines == kLoaderDiagBudget) {
+        rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                  "loader-diag", 0, 0,
+                                  "budget exhausted (128 lines)");
+    }
+}
+
 bool mapNormalSegmentedRange(size_t imageIndex, uint64_t pageOffset,
                              uint64_t bytes, u32 permission,
                              ElfLoaderSession* result) {
@@ -1258,12 +1298,31 @@ bool mapSegmentedRange(size_t imageIndex, uint64_t pageOffset, uint64_t bytes,
                 const uint64_t pageOffset = static_cast<uint64_t>(page) * kPageSize;
                 const uint64_t rangeBytes =
                     static_cast<uint64_t>(endPage - page) * kPageSize;
+                // THE LAST LINE BEFORE THE MAPPING, SO A FAULT INSIDE IT STILL
+                // NAMES THE DSO, THE SEGMENT, THE OFFSET AND THE PERMISSION.
+                loaderDiag("map image=%zu name=%s soname=%s seg=%zu off=0x%llx bytes=%llu perm=%u",
+                           imageIndex, image.name.c_str(), image.soname.c_str(),
+                           page, static_cast<unsigned long long>(pageOffset),
+                           static_cast<unsigned long long>(rangeBytes),
+                           static_cast<unsigned int>(permission));
                 const bool mapped = permission == Perm_Rx
                     ? mapSegmentedRange(imageIndex, pageOffset, rangeBytes,
                                         permission, result)
                     : mapNormalSegmentedRange(imageIndex, pageOffset, rangeBytes,
                                               permission, result);
                 if (!mapped) {
+                    loaderDiag("FAILED image=%zu name=%s seg=%zu off=0x%llx "
+                               "perm=%u stage=%llu rc=%08x actual=%x expected=%x "
+                               "regions=%llu failures=%llu",
+                               imageIndex, image.name.c_str(), page,
+                               static_cast<unsigned long long>(pageOffset),
+                               static_cast<unsigned int>(permission),
+                               static_cast<unsigned long long>(result->segmentedFailureStage),
+                               result->segmentedFailureResult,
+                               result->segmentedActualPermission,
+                               result->segmentedExpectedPermission,
+                               static_cast<unsigned long long>(result->segmentedRegions),
+                               static_cast<unsigned long long>(result->segmentedFailures));
                     return false;
                 }
             }
@@ -1398,7 +1457,7 @@ bool mapProcessCodeImages(ElfLoaderSession* result) {
     return true;
 }
 
-bool finalizeCodeMappings(ElfLoaderSession* result) {
+[[maybe_unused]] bool finalizeCodeMappings([[maybe_unused]] ElfLoaderSession* result) {
     // Replicate the mapSegmentedRange pattern: svcCreateCodeMemory from the
     // memalign buffer, then MapOwner at a FRESH virtmemFindCodeMemory address
     // (not targetBase which is already reserved). Try RWX so guest code can

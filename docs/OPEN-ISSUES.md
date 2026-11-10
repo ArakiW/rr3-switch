@@ -4083,3 +4083,49 @@ shipping copies (sha256 verified) rather than by editing the damaged ones.
 MEASUREMENT THAT READS A STRING OUT OF A LOG MUST BE MOVED ONTO A COUNTER
 BEFORE THE LOG MAY CHANGE -- AND A FILE THAT IS EDITED BY SCRIPT MUST BE
 RESTORED FROM ITS SOURCE, NOT REPAIRED BY ANOTHER SCRIPT.**
+
+### 9.41 The console crash: a SPAL inside the seven-DSO loader, and the loader now has a voice
+
+**MEASURED 2026-11-10 (the console run the user attached): the crash-early
+dump, the guest-view log and the teardown log.**
+
+**⇒ ⇒ THE FAULT IS A POINTER-AUTHENTICATION FAILURE, IN THE PORT'S OWN
+CODE.**  `esr=0x92000005` => EC = 0x24 = **SPAL**, and `pc=0x6d47ea4334` /
+`lr=0x6d47ea4330` are both inside the port's own image.
+
+**⇒ ⇒ AND IT HAPPENS IN THE SEVEN-DSO LOADER.**  The guest-view log's last
+line is `gl-ctx-early ... disabled by conf`, which is `main.cpp:992`
+(`ensureEarlyGuestGlContext()`); the next statement is `main.cpp:993`
+(`loadLinkElfSet()`), the loader that links the guest's seven DSOs.
+
+**⇒ ⇒ AND TWO THINGS I HAD WRONG AT FIRST:**
+* `create=00000000 exec=00000000 close=00000000` on the JIT probe line reads
+  like three failures, and it is not: **a libnx `Result` of 0 is SUCCESS.**
+  The image-sized JIT probe succeeded, all three steps.
+* The teardown log is NOT the crash scene: every line is `HOP-TRACE`, and the
+  last one is `pass=1 expected=1 checks_passed=38 checks_failed=0` -- the
+  port's own stack-unwinding self-test, which PASSED.  The crash is after it.
+
+**⇒ ⇒ AND THE REAL REASON THE CRASH WAS UNDIAGNOSABLE: THE LOADER'S
+DIAGNOSTICS WENT NOWHERE.**  main.cpp's `bootPrintf` is a no-op in this build
+-- `((void)format; return 0;)` -- so the `segdiag` / `procdiag` /
+`permissions` lines were never written to any file.  The instrument existed and
+was compiled out.
+
+**⇒ ⇒ SO THE LOADER NOW SAYS IT ITSELF.**  `multi_dso_linker.cpp` writes a
+progress line BEFORE each segment mapping (the DSO, the segment index, the
+offset, the size and the permission) and a failure line (the stage, the
+Result, the actual and expected permissions), into the guest-view log, with a
+128-line budget.  **⇒ ⇒ ⇒ THE NEXT CONSOLE RUN NAMES THE FAILING DSO AND
+SEGMENT IN THE FILE THE USER ALREADY ATTACHES** -- no boot log needed.
+
+**⇒ ⇒ AND THE RUN WAS FURTHER THAN THE LAST ONE.**  The guest-view log has
+`assetlist-req` 400, `manifest-asset` 58, `api-touch` 201 and `path-req` 120:
+the guest was loading its assets and the port was serving them, so the guest's
+Java layer was alive.  The previous console runs froze 2.8 minutes in, in the
+view-sync wait.
+
+**⇒ ⇒ AND ONE MORE MEASUREMENT OUT OF THAT RUN: THERE WERE NO CENSUS LINES**,
+because the crash happens before the frame loop starts -- so the console's
+`tt=` (the 60 FPS number) is still unmeasured, and it can only be measured
+after the loader survives.
