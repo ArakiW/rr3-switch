@@ -1,0 +1,48 @@
+THE PURSUIT YIELDS WHEN THE CAR IS NOT ADVANCING, AND A CHUNK SWITCH CLEARS
+THE WINDOW
+
+Two defects, both MEASURED in round chunk3 (2026-11-10), both in the pursuit's
+own criteria.
+
+1. THE CRITERION WAS "THE ERROR IS LARGE", AND A PINNED CAR HAS A SMALL ERROR.
+
+   MEASURED (round chunk3, the last pursuit phase, every 30 frames):
+
+       f     perr     along    pdist   total   steer  thr brk owner
+       5190  -0.4892   123.85    9.47   34501   0.978   1  0  pursuit
+       5340  -0.5307   123.87    9.50   34507   1.000   1  0  pursuit
+
+   `along` is FROZEN (123.85 -> 123.87 over 150 frames) and so is the guest's
+   own progress (34,501 -> 34,507), while the pursuit holds steer = -1.000
+   (FULL LOCK) with the throttle on and NO recovery (brk = 0).
+
+   The limit-cycle detector needed an error above 1.40 rad; this state has
+   0.53 rad, so it never fired, and the car stayed pinned for the rest of the
+   round.  **A CAR PINNED AGAINST A BARRIER WITH A 30 DEGREE ERROR IS STILL
+   PINNED.**  The criterion is now the car's own PROGRESS ALONG THE TRACK:
+
+       notAdvancing = (the car advanced less than 1.0 m in the last 120 frames)
+
+   and the error condition is kept as an ADDITIONAL trigger, not as the only
+   one.  The threshold is a DISTANCE and not a time, because a distance is what
+   tells "pinned" from "crawling": the pinned car measured above advanced
+   0.02 m in 3.6 s, and a car crawling along a barrier at 0.3 m/s covers
+   1.08 m in the same window.
+
+2. THE ALONG-TRACK COORDINATE IS A PROPERTY OF ITS CHUNK, AND THE WINDOW WAS
+   NOT CLEARED WHEN THE CHUNK CHANGED.
+
+   MEASURED (round chunk3): the coordinate jumped from 32.26 to 132.11 with the
+   car in the same place -- the chunk picker had moved to another chunk -- and
+   the flip criterion's window read that jump as **205.21 m of progress the
+   car never made**.  A window that spans two chunks is not a measurement of
+   anything.
+
+   The sample now carries the chunk the coordinate was measured on
+   (`targetChunk`), the race-state line reports it (`tchunk=`), and the window
+   is CLEARED whenever the chunk changes: the ring, the anchor and the stuck
+   timer all restart, and the criteria begin again from the new chunk.
+
+THE NEW LOG FIELDS: `tchunk=` (the chunk the coordinate belongs to) and
+`adv=` (how far the car advanced along the track in the last 120 frames).
+The second one is what the yield criterion reads, so it is on the record.
