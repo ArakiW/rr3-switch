@@ -103,6 +103,13 @@ reference/
 #   .build/agy-prompt-pursuit-v3.txt  the brief for the pursuit's control law
 #   .build/agy-prompt-pursuit-v4.txt  and the second brief, with the chunk2
 #                                     measurement that named the root cause
+#   .build/frame-stats.py              the frame statistics of a round, from the
+#                                     census lines the port already writes, so
+#                                     two rounds can be compared the same way
+#   .build/agy-prompt-fps1.txt         the brief for the 60 FPS work: the
+#                                     instrument, the resolution cache and the
+#                                     per-call log switch
+#   .build/agy-fps1.md                 what came back from it
 #
 # WHY THEY HAVE TO BE TRACKED: the archive packer silently reused a STALE
 # archive on 2026-11-03 and shipped one 1480 bytes off the package.  A fix to
