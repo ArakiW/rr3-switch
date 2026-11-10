@@ -1,0 +1,196 @@
+You are working in the repository E:\AI\RealRacing3-switch (a native Nintendo Switch port of an Android racing game, libnx + Mesa, running on the Eden emulator on this machine).
+
+# THE GOAL: 60 FPS
+
+The user asked for the game to run at 60 FPS.  It does not.  This brief is the
+first iteration: measure where the frame goes, and remove the port's own
+overhead.
+
+# WHAT IS ALREADY MEASURED (round chunk3, 2026-11-10, the race phase)
+
+The port ALREADY has a frame-time instrument: the `guest-frame-census` line,
+written every 60 frames, carries the previous iteration's four numbers:
+
+    tt  the whole iteration
+    tr  the guest's own render call (the port calls the guest's render entry)
+    ts  eglSwapBuffers -- the present
+    tp  the port's own per-frame work outside those two (tt - tr - ts)
+
+MEASURED over the race phase of round chunk3 (2,841 samples, frames > 2500):
+
+    tt = 43.6 ms   tr = 39.3 ms   ts = 3.9 ms   tp = 0.4 ms   =>  22.9 fps
+
+Over the WHOLE run (the boot and the loading phase dominate): tt = 125.8 ms.
+
+SO: 90 % of the frame is inside the guest's render call, and the port's own
+work outside it is 0.4 ms.  The guest's render call is where the port's
+per-call work happens, because the guest reaches the port through JNI, through
+the GL wrappers and through the filesystem resolver, and all of that is inside
+`tr`.
+
+THE PORT'S PER-FRAME WORK IS VISIBLE IN THE LOG'S OWN COMPOSITION.  Round
+chunk3: 223,677 log lines for 5,280 frames = 42 LINES PER FRAME, and every
+line is one fprintf plus one fflush on the emulated card:
+
+    scissor          37,583 lines   7.1 per frame
+    map-app          25,403 lines   4.8 per frame
+    cc-dispatch      20,978 lines   4.0 per frame
+    cc-dispatch-bool 11,267 lines   2.1 per frame
+    jni-void         20,976 lines   4.0 per frame
+    jni-utf163       20,685 lines   3.9 per frame
+    jni-obj          10,285 lines   1.9 per frame
+    stat-path         8,199 lines   1.6 per frame
+    guest-frame-census 5,342 lines 1.0 per frame
+    glyph-para        4,985 lines   0.9 per frame
+    glyph-vector      4,260 lines   0.8 per frame
+    viewport          4,242 lines   0.8 per frame
+    ... plus the rest
+
+AND THE FILESYSTEM SITES: the guest asks for the SAME assets over and over.
+`logResolvedPathOnce()` (guest_filesystem.cpp:43) already DEDUPES THE LOG, and
+its own comment says the point was "31,315 map-app lines ... every one of them
+is an fprintf plus an fflush on the emulated card" -- but the DEDUPE IS ONLY ON
+THE LOG.  The resolution itself still happens on every request:
+`resolveAssetLocalFile()` (guest_filesystem.cpp:5112) is called from
+guest_filesystem.cpp:2649, :2814 and :2868, and it maps the path and touches
+the card every time.
+
+# THE WORK, IN THIS ORDER
+
+## 1. THE INSTRUMENT: SPLIT `tr` (do this FIRST, and do not skip it)
+
+`tr` is 39.3 ms and the port cannot currently say how much of it is the
+guest's own drawing and how much is the port's per-call work.  Add two
+accumulators to the frame loop and report them ON THE CENSUS LINE, which is
+written every 60 frames, so the instrument costs no extra log writes and cannot
+change the thing it measures:
+
+    jni=<ms>   the time spent inside the port's JNI dispatch entry points
+    fs=<ms>    the time spent inside the port's filesystem resolution
+                (resolveAssetLocalFile and the open/stat/read path it drives)
+
+Use `armGetSystemTick()` exactly as the existing tt/tr/ts timing does (see the
+frame loop's `tickTop` and the `havePrevTiming` block, and the census line
+around guest_view_probe.cpp:9040).
+
+ALSO report, on the same line, the counters that make the fix verifiable:
+
+    fshit=<n>  the number of filesystem resolutions that were served from the
+                cache
+    fsmiss=<n> the number that had to be resolved
+
+`appendGuestBootLine` already flushes one line per call, so put EVERYTHING on
+the existing census line.  Do not add a new per-frame line.
+
+## 2. THE RESOLUTION CACHE
+
+Cache the result of `resolveAssetLocalFile()` per asset path, so a repeated
+request does not redo the path mapping and does not touch the card.
+
+REQUIREMENTS:
+
+- The cache key is the guest's asset path.  The value is the resolved local
+  path (and whatever else the resolver returns -- READ THE SIGNATURE AND KEEP
+  ALL OF IT).
+- It must be BOUNDED.  A guest that asks for thousands of distinct paths must
+  not grow the cache without limit.  A fixed-size table with a simple eviction
+  or a hash set with a cap; say which, in a comment.
+- It must be SAFE: the card can be pulled, and a file can be replaced between
+  two requests.  If a cached resolution no longer resolves, the code must fall
+  back to the uncached path rather than serve a stale answer.
+- It must not change WHAT the port serves.  A cache that changes the bytes the
+  guest sees is a regression, not an optimisation.
+
+## 3. THE PER-CALL LOGGING SWITCH
+
+The port writes 42 lines per frame.  A SHIPPING PORT MUST NOT DO THAT.
+
+Add a configuration key to the backend conf parser
+(native-switch/source/gfx/gfx_backend.cpp -- follow the pattern of the other
+keys there, for example `swdxt`, and the closed-vocabulary rule: an
+unrecognised value RESOLVES to the default rather than being ignored, so a typo
+in a hand-edited card file is distinguishable from the default in the log).
+
+    percall=0|1     the per-call log lines (jni-*, cc-dispatch*, scissor,
+                    viewport, map-app, ...).  DEFAULT 0 -- OFF.
+
+The default MUST be 0.  The measurement rounds turn it on explicitly.  The
+`guest-frame-census` line and the event lines (race-flip, race-stuck,
+npad-heartbeat, ...) are NOT per-call lines and MUST KEEP WORKING with the
+switch off, because they are the instruments everything else is measured with.
+
+When the switch is off, the log must not merely be quieter: the per-call
+sites must not build their strings either.  A `snprintf` of a 256 byte line
+42 times a frame is not free.
+
+## 4. WHAT TO REPORT, AND WHAT NOT TO CLAIM
+
+- Report the numbers your instrument produced: the average and the 90th
+  percentile of tt, tr, ts, tp, jni and fs over the RACE PHASE of a round
+  (frames > 2500), and the cache's hit rate.
+- Do NOT claim a frame rate you did not measure.  If you cannot run a round,
+  say so and give the code-level expectations with their reasoning.
+- Do NOT weaken or delete an existing diagnostic to make the frame rate look
+  better.  The instruments stay; only the per-call LINES go, and only behind
+  the switch.
+
+# THE RULES
+
+R1. Do not commit and do not run git push.  Leave the changes in the working
+    tree and write the report (see DELIVERABLE).
+R2. Do not touch anything under E:\AI\RealRacing3-switch\.build\ except reading
+    it and writing your report.
+R3. Do not add game assets and do not copy anything out of the .depot folders.
+    The repository is public and the assets belong to the publisher.
+R4. LINE ENDINGS: guest_filesystem.cpp and guest_view_trace.cpp are CRLF;
+    guest_view_probe.cpp, jni_bridge.cpp and gfx_backend.cpp are LF.  Do not
+    change a file's existing line endings -- a whole-file rewrite that flips
+    them is a regression.
+R5. Do not change the graphics, controller, HUD or filesystem BEHAVIOUR.  This
+    task is the frame's COST, not what the frame draws.
+R6. Do not weaken an existing test and do not delete one.
+R7. Every new diagnostic line must have a hard budget counted in LINES and must
+    print one 'budget exhausted' line when the budget runs out.  (Most of the
+    new output here goes on the EXISTING census line, so this mostly does not
+    apply -- but if you add a line, it applies.)
+R8. Keep every new constant justified by a measurement or an argument, in a
+    comment, in the style of the file.
+
+# BUILD AND GATE
+
+Run these EXACTLY as written, with no pipe and no extra redirection around
+them:
+
+    cmd /c "powershell -ExecutionPolicy Bypass -File E:\AI\RealRacing3-switch\tools\Build-NativeSwitch.ps1 > E:\AI\RealRacing3-switch\.build\build-fps1.log 2>&1"
+
+    cmd /c "powershell -ExecutionPolicy Bypass -File E:\AI\RealRacing3-switch\.build\gate.ps1 > E:\AI\RealRacing3-switch\.build\gate-fps1.log 2>&1"
+
+The gate must end with GATE OK and zero failures, and the build log must have
+no new warning.
+
+# THE ROUND (only if Eden is free)
+
+The emulator takes one round at a time and Eden must not be running when you
+start.  Check with `Get-Process -Name eden,eden-cli,eden-rr3,eden-rr3-cli`.
+
+    powershell -ExecutionPolicy Bypass -File E:\AI\RealRacing3-switch\.build\run-pinned-round.ps1 -Tag fps1 -Seconds 400 -CensusOff
+
+The round archives to
+E:\AI\RealRacing3-switch\.build\eden-runs\<stamp>-eden-rr3-fps1\ and its
+`rr3-native-rehost.guest-view.log` carries the census lines.  The frame
+statistics are computed from the census lines of the race phase (frames >
+2500), the same way round chunk3's numbers above were computed.
+
+# DELIVERABLE
+
+The edits in the working tree, plus a report in ENGLISH at
+E:\AI\RealRacing3-switch\.build\agy-report-fps1.md with these sections:
+
+1. What changed and why, one subsection per item 1, 2, 3.
+2. The measured frame statistics before and after, with the exact command or
+   script used to compute them, so anybody can reproduce them.
+3. The cache's hit rate and the per-call log line count per frame, before and
+   after.
+4. What the next step must be if 60 FPS is still out of reach, with the
+   numbers that say which part is still missing.
+5. Anything you could not verify.

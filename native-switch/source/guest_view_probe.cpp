@@ -9985,7 +9985,37 @@ void* frameLoopDriver(void* opaque) {
             probe.frameLoopActive = false;
             g_frameLoopExitReason = "plus-button";
         }
-        svcSleepThread(16666666LL); // ~60Hz
+        // THE PACE: 60 Hz, AND THE SLEEP IS THE REMAINDER OF THE BUDGET,
+        // NOT THE WHOLE PERIOD.
+        //
+        // MEASURED 2026-11-10 (round chunk3, the race phase, 2,841 census
+        // samples): the iteration's work is tt = 43.6 ms -- the guest's render
+        // call 39.3 ms, the present 3.9 ms, the port's own work 0.4 ms -- and
+        // the loop slept a FIXED 16.67 ms AFTER it.  So the frame PERIOD was
+        // the work PLUS a whole frame: every millisecond of the guest's own
+        // work was paid for twice, and the frame rate was 1/(43.6+16.7) =
+        // 16.6 fps instead of the 22.9 fps the work alone allows.
+        //
+        // THE SLEEP IS NOW THE REMAINDER.  The period becomes
+        // max(work, 16.67 ms): the port runs at 60 Hz whenever the work fits
+        // in the budget, and an idle frame still sleeps the whole budget, so
+        // the front end does not spin either.
+        //
+        // THE BUDGET IS IN TICKS, NOT NANOSECONDS: armGetSystemTick() counts
+        // at armGetSystemTickFreq() (19.2 MHz on the console), while
+        // svcSleepThread() takes NANOSECONDS.  Mixing the two would make the
+        // budget 19.2 times too long, so it is converted here.
+        {
+            constexpr uint64_t kFrameBudgetNs = 16666666ULL;  // 60 Hz
+            const uint64_t tickPaced = armGetSystemTick();
+            const uint64_t spent = (tickPaced > tickTop) ? (tickPaced - tickTop) : 0ULL;
+            const uint64_t frequency = armGetSystemTickFreq();
+            const uint64_t budgetTicks =
+                (frequency != 0ULL) ? (kFrameBudgetNs * frequency) / 1000000000ULL : 0ULL;
+            if (budgetTicks != 0ULL && spent < budgetTicks) {
+                svcSleepThread(static_cast<int64_t>(budgetTicks - spent));
+            }
+        }
         if (frames >= 360000ULL) { // defensive cap ~100 minutes
             g_frameLoopExitReason = "frame-cap";
             logFrameLoopExit(g_frameLoopExitReason, "frame-cap", frames,

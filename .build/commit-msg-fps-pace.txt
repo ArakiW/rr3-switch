@@ -1,0 +1,47 @@
+THE FRAME PACE WAS PAYING FOR THE WORK TWICE
+
+MEASURED 2026-11-10 (round chunk3, the census lines the port already
+writes).  The port has carried a frame-time instrument since the beginning:
+the guest-frame-census line reports the previous iteration's four numbers
+every 60 frames, so the measurement costs no extra log writes.
+
+    tt  the whole iteration
+    tr  the guest's render call (the port calls the guest's render entry)
+    ts  eglSwapBuffers -- the present
+    tp  the port's own per-frame work outside those two (tt - tr - ts)
+
+Round chunk3, the RACE phase (frames > 2500, 2,841 census samples):
+
+    tt = 43.59 ms   tr = 39.29 ms   ts = 3.94 ms   tp = 0.37 ms
+
+So the game runs at 22.9 FPS in a race, and the round's own average (5,280
+frames in 406 s = 13.0 fps) is the average of that and the loading phase
+(tt = 125.8 ms there), not a third number.
+
+AND THE PACE WAS WRONG.  The frame loop slept a FIXED 16.67 ms AFTER the
+work (guest_view_probe.cpp:9988), so the frame PERIOD was the work PLUS a
+whole frame: every millisecond of the guest's own work was paid for twice,
+and 43.6 ms of work produced a 60.3 ms frame -- 16.6 fps -- instead of the
+22.9 fps the work alone allows.
+
+THE SLEEP IS NOW THE REMAINDER OF THE BUDGET, so the period is
+max(work, 16.67 ms): the port runs at 60 Hz whenever the work fits in the
+budget, and an idle frame still sleeps the whole budget, so the front end
+does not spin either.
+
+THE BUDGET IS CONVERTED EXPLICITLY: armGetSystemTick() counts at
+armGetSystemTickFreq() (19.2 MHz on the console) while svcSleepThread() takes
+NANOSECONDS, and mixing the two would make the budget 19.2 times too long.
+The main thread's own 60 Hz wait (the one that parks while the render worker
+runs) is a different loop and is left alone.
+
+AND THE REST OF THE FRAME IS MEASURED TOO, because 60 FPS needs all of it:
+90 % of the frame is inside the guest's render call, and the port writes 42
+log lines per frame (scissor 7.1, map-app 4.8, cc-dispatch 6.1, jni-* 9.8),
+every one of them an fprintf plus an fflush on the card.  The path-resolution
+log is deduped but the RESOLUTION is not: resolveAssetLocalFile() maps the
+path and touches the card on every request, and the guest asks for the same
+assets over and over.
+
+docs/OPEN-ISSUES.md gains 9.29 with the numbers, and .build/frame-stats.py
+computes them the same way every time, so two rounds can be compared.
