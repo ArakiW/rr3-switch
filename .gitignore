@@ -140,6 +140,7 @@ native-switch/rr3.romfs
 # are how the package is made, and the package has to be reproducible.)
 native-switch/*.nsp
 native-switch/nsp-stage/
+native-switch/nsp-sdk-stage/
 
 # --- reverse-engineering databases ------------------------------------------
 # Regenerable from reverse/native/arm64/libRealRacing3.so with Ghidra.

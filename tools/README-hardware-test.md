@@ -965,59 +965,51 @@ $p = 'F:\switch\rr3-native-rehost.guest-view.log'
 **2026-11-11 起，出包改成 NSP。** NSP 装上去就是一个「游戏」，从主菜单直接点开；
 NRO 每次都得先用 hbmenu 之类的启动器把它打开。
 
-**打包在哪**：`tools/Pack-NativeSwitchNsp.ps1`（`tools/Build-NativeSwitch.ps1` 会自动调用它）。
-三步都是 devkitPro 自带的工具：
+### 这个 NSP 里有什么（这一节是上一版写错的地方）
 
-| 步骤 | 工具 | 产物 |
+**⇒ 第一版我给的是一个只有两个文件的 PFS0（`exefs/main` + `exefs/main.npdm`），
+那不是 NSP，是 exefs 镜像 —— 任何安装器都会拒绝它，报「未找到内容元数据」。**
+
+**⇒ ⇒ 一个能装的 NSP 里有三个 NCA：**
+
+| 容器内条目 | 是什么 |
+|---|---|
+| `a04cc32b….nca`（Program） | 端口可执行体 + `main.npdm` |
+| `9d5377d3….nca`（Control） | 控制数据：`control.nacp`（名字）+ `icon_AmericanEnglish.dat`（图标） |
+| **`ba129cfa….cnmt.nca`（Meta）** | **内容元数据（CNMT）—— 就是它，缺它就报「未找到内容元数据」** |
+
+**⇒ Meta NCA 里的 CNMT 末尾 32 字节必须是它前面 160 字节的 SHA256。**
+上游 hacBrewPack 只算了 CNMT 的一部分，所以 digest 对不上，安装器就认为
+内容元数据不存在 —— **你用的那个 `cfw_packer_cnmt_digest_fork` 修的正是这一处**
+（`cnmt.c`：hash 的是 CNMT body：header + extended header + content records）。
+
+### 出包的两级流程（`tools/Pack-NativeSwitchNsp.ps1`）
+
+| 级别 | 用谁 | 出什么 |
 |---|---|---|
-| 可执行体 | `elf2nso` | `exefs/main`（NSO） |
-| 元数据 | `npdmtool`（描述文件 `native-switch/rr3-nsp.json`） | `exefs/main.npdm` |
-| 容器 | `tools/make-pfs0.py` | `rr3-native-rehost.nsp` |
+| 1 | **官方 Nintendo SDK 18.3.1**（`elf2nso` / `MakeMeta.exe` / `AuthoringTool.exe creatensp`） | `exefs/main`、`exefs/main.npdm`、控制数据，以及一个签了名的开发包（`checkintegrity` 通过） |
+| 2 | **你的 hacBrewPack**（`cfw_packer_cnmt_digest_fork`，`--keyset` 指向你自己的 keyset） | 最终的 unsigned homebrew NSP |
 
-**为什么容器是自己写的**：devkitPro 的 `build_pfs0` 只打包输入目录的**第一层**，
-遇到子目录会打印 `Directories aren't supported, skipping...` 然后跳过 ——
-所以它做出来的 `%.nsp` 里只有 `main` 和 `main.npdm`，那是 **exefs 镜像，不是 NSP**。
-NSP 的条目必须叫 `exefs/main` 和 `exefs/main.npdm`，目录结构得在容器里面。
-`tools/make-pfs0.py` 就是干这个的，而且打包完会**把容器读回来**，
-断言这两个条目名字对（`tools/Pack-NativeSwitchNsp.ps1` 里的检查）。
+**⇒ 两级都要，因为：官方的 MakeMeta 出的 NPDM 带 ACID，控制数据（名字和图标）
+也是官方从 `.nmeta` 生成的；而最终那个 CNMT 的 digest 是你的 fork 算对的。**
 
-**Title ID**：`0x010000000000F00D`（homebrew 区间，不是零售游戏，不会和已装的游戏撞）。
+**⇒ `.nmeta`（`native-switch/rr3.nmeta`）是这份 NSP 的身份**：title id
+`0x0100ac50f00d0001`、名字「RR3 Native Rehost」、版本 0.22.9。
+图标路径在仓库里是占位符 `@SDK_SAMPLE_ICON@`，打包时**只**在 stage 副本里解析到
+本机 SDK 自带的样例图标（不重新分发图标）。
 
-### NSP 里有什么、没有什么（这一节最重要）
+**⇒ hacbrewpack 的 stdout/stderr 全部丢掉，只取退出码** —— 它的报错信息里会带 key 派生值。
 
-| 内容 | 在 NSP 里？ | 在哪 |
-|---|---|---|
-| 端口可执行体 | ✅ `exefs/main` | NSP 里 |
-| 端口元数据 | ✅ `exefs/main.npdm` | NSP 里 |
-| **客机的三个 .so**（`libRealRacing3.so` / `libc++_shared.so` / `libfmodex.so`） | ❌ | 卡的 `sdmc:/switch/rr3-native-rehost/` |
-| **UI 字体**（`ui/*.otf`） | ❌ | 同上 |
-| **游戏数据**（七个数据卷 + `.depot`，约 11.8 GiB） | ❌ | 同上 |
+### 怎么装
 
-**⇒ ⇒ 为什么客机的 .so 不在 NSP 里也没问题**：端口读自己的资源时走
-`resolvePortAssetPath()`，它先试 `romfs:/X`，**找不到就退到
-`sdmc:/switch/rr3-native-rehost/X`** —— 而客机的 .so 和字体本来就在那儿。
-NSP 里没有 RomFS 段（`npdmtool` 描述不了 RomFS 段），端口这条兜底链就是为它准备的。
-
-**⇒ ⇒ 但那 11.8 GiB 的游戏数据还是得单独拷到卡上**，NSP 里没有、也不会有。
-
-### 怎么装（三步）
-
-1. **装 NSP**：用 NSP 安装器（Tinfoil / Awoo / NSz），或者用 hbloader 配合 sigpatches。
-   装完主菜单里会出现一个叫 **RR3 Native Rehost** 的图标。
-2. **拷数据**：把七个数据卷和 `.depot` 拷到卡的 `sdmc:/switch/rr3-native-rehost/`。
-   `Copy-To-SwitchCard.ps1` 干这件事（第 3 节有说明）。
-3. **拷控制脚本**：把 9 个 `rr3-*.txt` 放到 `sdmc:/switch/rr3-native-rehost/`，
-   把 `rr3-gfx.conf` 放到 `sdmc:/switch/`。
-
-**⇒ 图标**：NSP 目前**没有图标**（`npdmtool` 不带图标，主菜单上是默认图标加名字）。
-要真图标得往 NPDM 的资产段里注入一张 512×512 的 JPEG —— 那是下一步的事，不影响能不能跑。
+1. **装 NSP**：用 NSP 安装器（Tinfoil / Awoo / NSz），或 hbloader + sigpatches。
+   装完主菜单出现 **RR3 Native Rehost**。
+2. **拷数据**：七个数据卷和 `.depot` 拷到卡的 `sdmc:/switch/rr3-native-rehost/`。
+3. **拷控制脚本**：9 份 `rr3-*.txt` 放同一目录，`rr3-gfx.conf` 放 `sdmc:/switch/`。
+4. **客机的 .so 和字体**：NSP 里没有这些（在卡上），端口会自己去
+   `sdmc:/switch/rr3-native-rehost/` 找。
 
 ### 怎么自己验一眼包对不对
 
-```powershell
-python E:\AI\RealRacing3-switch\tools\make-pfs0.py --help
-```
-
-打包器本身没有验包命令，但 `Pack-NativeSwitchNsp.ps1` 每次都会把容器读回来断言
-`exefs/main` 和 `exefs/main.npdm` 都在 —— 少了任何一个它会直接报错，
-**不会出现「构建说成功、包却是坏的」**。
+`tools/Pack-NativeSwitchNsp.ps1` 每次都会**把容器读回来**断言：条目必须正好是三个，
+且其中必须有一个 `.cnmt.nca` —— 少了就报错，**不会出现「构建说成功、包却装不上」**。

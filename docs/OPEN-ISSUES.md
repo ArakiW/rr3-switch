@@ -4338,54 +4338,65 @@ binding, and the console's frame time.
 
 ### 9.44 The NSP package, the TPIDR_EL0 reading, and what the controlled round settled
 
-#### 9.44.1 THE APP NOW SHIPS AS AN NSP
+#### 9.44.1 THE NSP PACKAGE, AND WHY THE FIRST ONE WAS NOT AN NSP
 
-An NSP installs as a TITLE -- through hbloader or an NSP installer -- and
-launches from the Home menu.  An NRO has to be launched by a homebrew menu
-every time, and the user has to put the file in the right place by hand.
+**THE FIRST PACKAGE WAS WRONG, AND THE USER FOUND IT BY INSTALLING IT.**
 
-**THE PACKAGING IS THREE STEPS AND TWO TRAPS.**
+**MEASURED 2026-11-11: the installer refused the first NSP with "no content
+meta found" (the Chinese installers phrase it as "content metadata not
+found").**
 
-    elf2nso   <elf>          -> exefs/main       (the NSO)
-    npdmtool  <descriptor>   -> exefs/main.npdm  (the meta)
-    <pfs0 writer>            -> rr3-native-rehost.nsp
+**=> ⇒ ⇒ AND THE FIRST PACKAGE WAS NOT AN NSP.**  It was a PFS0 with two
+entries, `exefs/main` (the NSO) and `exefs/main.npdm` (the meta).  That is
+an EXEFS IMAGE.  **An NSP that an installer accepts carries THREE NCAs:**
 
-*TRAP ONE: libnx's own `%.nsp` rule builds the PFS0 from the DIRECTORY
-`exefs`.*  `build_pfs0` packs only the TOP LEVEL of its input directory --
-it prints "Directories aren't supported, skipping..." for a subdirectory
-and does not recurse into it.  So that rule's `.nsp` contains the entries
-`main` and `main.npdm`: that is an EXEFS IMAGE, not an NSP.  An NSP's
-entries have to be named `exefs/main` and `exefs/main.npdm`, i.e. the
-directory layout has to live INSIDE the container.  The container is
-therefore written by `tools/make-pfs0.py`, whose format was read back off
-`build_pfs0`'s own output (header 0x10 bytes, then count * 0x18 entries of
-{u64 offset, u64 size, u32 string offset, u32 parent}, then the string
-table, then the data).
+    a04cc32b....nca          Program  (the executable and its meta)
+    9d5377d3....nca          Control  (control.nacp: the name; icon: the icon)
+    ba129cfa....cnmt.nca     Meta     (THE CONTENT META)
 
-*TRAP TWO: npdmtool cannot describe a RomFS section.*  Its descriptor has
-no `icon`, no `nacp` and no `romfs` key -- each one was tried and each one
-produced a byte-identical 848-byte meta.  So an NSP built this way has no
-RomFS and no icon.
+and the third one is exactly what the installer says it cannot find.
 
-**⇒ ⇒ AND THE MISSING ROMFS DOES NOT MATTER, BECAUSE THE PORT ALREADY HAS A
-FALLBACK FOR IT.**  Every port asset is read through `resolvePortAssetPath()`,
-which tries `romfs:/X` first and falls back to
-`sdmc:/switch/rr3-native-rehost/X`; and the guest's own libraries
-(`libRealRacing3.so`, `libc++_shared.so`, `libfmodex.so`) and the UI faces
-are ALREADY on the card there.  The same fallback is why the game library
-is found without a RomFS: `selectGameLibrary()` falls through to
-`sdmc:/switch/rr3-native-rehost/libRealRacing3.so`.
+**=> ⇒ ⇒ ⇒ AND WHY THE FIRST PACKAGE HAD NO Meta NCA IS A FACTORY RULE, NOT
+A BUG:** `npdmtool` can only produce the NPDM, `elf2nso` only the NSO, and
+neither of them can produce an NCA.  The tool that does is the packer, and it
+needs a keyset.
 
-**⇒ ⇒ AND THE PACKAGE IS CHECKED, NOT ASSUMED.**  `Pack-NativeSwitchNsp.ps1`
-reads the container back after writing it and refuses to report success
-unless the two entries are named `exefs/main` and `exefs/main.npdm`.  So
-"the build said it worked" can never hide a container whose entries are
-the exefs image's.
+**=> ⇒ ⇒ ⇒ ⇒ SO THE PACKAGE NOW GOES THROUGH TWO STAGES, BOTH OF THEM
+ALREADY ON THIS MACHINE.**
 
-**⇒ ⇒ WHAT THE NSP DOES NOT CARRY, AND STILL HAS TO BE COPIED: the game's
-own data -- the seven volumes and the .depot tree, about 11.8 GiB.**  That
-has never been in the executable and it is not in the NSP either; it goes
-onto the card as before.
+*Stage 1 -- the official Nintendo SDK 18.3.1 (E:\AI\Nintendo SDK
+18.3(1).1\installed-sdk-18.3.1\NintendoSDK):*
+
+    elf2nso                      -> exefs/main
+    MakeMeta.exe                  -> exefs/main.npdm
+    AuthoringTool.exe creatensp   -> the signed development NSP
+    AuthoringTool.exe extract     -> control.nacp + icon_AmericanEnglish.dat
+
+The control is taken back OUT of the development NSP, because the SDK
+generates it from the .nmeta and it carries the title's name and icon.
+The development NSP passes `checkintegrity`, and the SDK reports the content
+meta's digest: `08f4edbaa1ee42b3c310469e6f5ad633b6fb8fb02dbdd3e84f07dcb3855c319c`.
+
+*Stage 2 -- the user's own CFW packer, the CNMT-digest fork:*
+
+    hacbrewpack --keyset <the user's own keyset> --keygeneration 1 ...
+
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ AND THE FORK'S ONE-LINE FIX IS EXACTLY THIS BUG.**  The
+fork's `cnmt.c` computes the content meta's digest over the CNMT BODY -- the
+header, the extended header and the content records -- so the last 32 bytes
+are SHA256 of the first 160.  Upstream hashes only part of it, the digest
+does not match what the installer recomputes, and the installer reports the
+content metadata as missing.  **⇒ ⇒ ⇒ ⇒ ⇒ ⇒ THE ERROR THE USER HIT WAS THE
+DIGEST, NOT THE MISSING FILE.**
+
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE PACKAGE IS CHECKED, NOT ASSUMED.**  The packing
+script reads the container back and refuses to report success unless it holds
+exactly three entries and one of them is a `.cnmt.nca`.
+
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ WHAT IS AND IS NOT IN IT: the executable, its meta and the
+control.  NOT the game's data -- the seven volumes and the .depot tree,
+about 11.8 GiB -- which has never been in the executable and is still copied
+onto the card separately.**
 
 #### 9.44.2 THE NEW CONSOLE DUMP ANSWERS THE SPAL QUESTION IN ONE FIELD
 
@@ -4402,30 +4413,29 @@ onto the card as before.
 
 **=> THE EXCEPTION CLASS IS STILL SPAL** (0x24), and `pc = lr + 4` again.
 
-**=> ⇒ ⇒ AND THE ONE FIELD THAT MATTERS IS `fault_tpidr_el0`: IT IS 0x18eff3e60,
-AND THE STACK POINTER IS 0x18eff39b0.**  The thread pointer that names the
-thread-local area -- the value every PAC key is derived from -- points
+**=> ⇒ ⇒ AND THE ONE FIELD THAT MATTERS IS `fault_tpidr_el0`: IT IS
+0x18eff3e60, AND THE STACK POINTER IS 0x18eff39b0.**  The thread pointer that
+names the thread-local area -- the value every PAC key derives from -- points
 **1,200 bytes ABOVE THE STACK POINTER, INSIDE THE STACK FRAME.**
 
 **=> ⇒ ⇒ ⇒ THAT IS THE PORT'S OWN FAKE TCB.**  `GuestTlsScope`
 (`tls_probe.cpp`) fabricates a 256-byte block ON THE STACK and points
-TPIDR_EL0 at it, and it is active across the whole guest-constructor
-window (the loader's calls at `multi_dso_linker.cpp:2345`, `:2748`,
-`:2910`).  On a console, TPIDR_EL0 must name a real thread-local area
-whose PAC key material lives there; a stack address for TPIDR_EL0 means
-the guest's `autiasp`/`paciasp` computes a PAC against the wrong key.
+TPIDR_EL0 at it, and it is active across the whole guest-constructor window
+(the loader's calls at `multi_dso_linker.cpp:2345`, `:2748`, `:2910`).  On a
+console, TPIDR_EL0 must name a real thread-local area whose PAC key material
+lives there; a stack address for TPIDR_EL0 means the guest's `autiasp`/
+`paciasp` computes a PAC against the wrong key.
 
-**=> ⇒ ⇒ ⇒ AND THE GUEST'S CODE IS PAC-COMPILED** (1328 `paciasp` + 1372
+**=> ⇒ ⇒ ⇒ ⇒ AND THE GUEST'S CODE IS PAC-COMPILED** (1328 `paciasp` + 1372
 `autiasp` in `libc++_shared.so`, section 9.41), so the guest signs and
-authenticates pointers on every function entry and exit.  **⇒ THE PORT'S
-FAKE TLS IS THE MOST LIKELY CAUSE OF THE SPAL**, and it is a port-side
-bug, not a guest bug.
+authenticates pointers on every function entry and exit.  **=> THE PORT'S
+FAKE TLS IS THE MOST LIKELY CAUSE OF THE SPAL**, and it is a port-side bug,
+not a guest bug.
 
-**=> ⇒ ⇒ ⇒ ⇒ THE FIX IS NAMED AND SMALL: the port must not clobber
-TPIDR_EL0.**  It has to save the host's value and restore it around the
-guest-constructor window, or allocate a real thread-local block for the
-guest instead of pointing at the stack.  The next console run is not
-needed to find that; it is needed to confirm the fix.
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ THE FIX IS NAMED AND SMALL: the port must not clobber
+TPIDR_EL0.**  Save the host's value and restore it around the guest
+constructor window, or give the guest a real thread-local block.  The next
+console run is not needed to find that; it is needed to confirm the fix.
 
 #### 9.44.3 THE CONTROLLED ROUND SETTLED THE RACE-COUNT QUESTION
 
@@ -4434,11 +4444,11 @@ needed to find that; it is needed to confirm the fix.
 loaderdiag1).  The obvious reading is "the port regressed".
 
 **THE EXPERIMENT.**  `run-pinned-round.ps1` SNAPSHOTS the guest's state and
-never RESTORES it, so every round began from whatever the previous round
-left behind -- and the guest advances to the next event after each race
-and writes its popups into the save.  So the round `ctl1` restored
-`.build/guest-state/yield2` (the state that produced the 27) and ran the
-SAME binary as `loaderdiag1` for the same 400 seconds.
+never RESTORES it, so every round began from whatever the previous round left
+behind -- and the guest advances to the next event after each race and writes
+its popups into the save.  So the round `ctl1` restored
+`.build/guest-state/yield2` (the state that produced the 27) and ran the SAME
+binary as `loaderdiag1` for the same 400 seconds.
 
     round          state            binary      event  lights  race  hud  scanf
     yield2         inherited        A           300    27      36    0     0
@@ -4447,15 +4457,14 @@ SAME binary as `loaderdiag1` for the same 400 seconds.
 
 **=> ⇒ ⇒ AND THE STATE IS NOT THE VARIABLE.**  ctl1 put the SAME binary
 back on the state that produced 27, and it came back at 2/2 -- the same
-numbers as the round that inherited a drifted save.  **⇒ THE COLLAPSE IS
+numbers as the round that inherited a drifted save.  **=> THE COLLAPSE IS
 NOT THE SAVE.**
 
 **=> ⇒ ⇒ ⇒ SO IT IS THE OTHER HALF OF THE A/B: the binary, or the logging
-switch that moved with it.**  `loaderdiag1` and `ctl1` ran with
-`percall=1` (13,385 guest-scanf lines) and `yield2` ran with `percall=0`
-(0).  **⇒ ⇒ ⇒ ⇒ ⇒ THE NEXT EXPERIMENT IS ONE VARIABLE: the SAME binary with
-`percall=0`, and then with the path trace restored** -- because the path
-trace went from 108,419 lines (105,150 of them asset paths) to 80 lines
-when `logResolvedPathOnce()` was thinned to `gui/processed/` only, and
-section 9.33 already recorded that the port's own front-end navigation
-reads that trace.
+switch that moved with it** (`loaderdiag1` and `ctl1` ran with `percall=1`,
+13,385 guest-scanf lines; `yield2` ran with `percall=0`, zero).  **=> ⇒ ⇒ ⇒ ⇒
+AND THE PATH TRACE COLLAPSED IN THE SAME WINDOW** -- from 108,419 lines
+(105,150 of them asset paths) to 80 -- when `logResolvedPathOnce()` was
+thinned to `gui/processed/` only, and section 9.33 already recorded that the
+port's own front-end navigation reads that trace.  **⇒ THE NEXT EXPERIMENT IS
+ONE VARIABLE: the same binary with the trace restored.**

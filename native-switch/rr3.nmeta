@@ -1,0 +1,51 @@
+<?xml version="1.0"?>
+<!--
+    THE APPLICATION META FOR THE NSP.
+
+    WHY THIS FILE EXISTS: an NSP that an installer accepts is not a PFS0 with
+    two files in it, it is a container with three NCAs (Program, Control and
+    Meta), and the Meta NCA holds the content metadata.  The Meta NCA's
+    digest is computed by the packer from the CNMT BODY, so the pieces this
+    file describes have to be the real ones.
+
+    THE ICON PATH IS A MARKER.  "@SDK_SAMPLE_ICON@" is resolved to the
+    installed SDK's own sample icon in the staged copy only, so this file
+    stays machine-independent and the icon is never redistributed.
+-->
+<NintendoSdkMeta>
+    <Core>
+        <Name>Application</Name>
+        <ApplicationId>0x0100ac50f00d0001</ApplicationId>
+        <ProgramIndex>0</ProgramIndex>
+        <MainThreadStackSize>0x100000</MainThreadStackSize>
+        <Is64BitInstruction>True</Is64BitInstruction>
+        <ProcessAddressSpace>AddressSpace64Bit</ProcessAddressSpace>
+        <FsAccessControlData>
+            <FlagPresets>Debug</FlagPresets>
+        </FsAccessControlData>
+    </Core>
+
+    <Application>
+        <Title>
+            <Language>AmericanEnglish</Language>
+            <Name>RR3 Native Rehost</Name>
+            <Publisher>Native Port Lab</Publisher>
+        </Title>
+        <Icon>
+            <Language>AmericanEnglish</Language>
+            <IconPath>@SDK_SAMPLE_ICON@</IconPath>
+        </Icon>
+        <DisplayVersion>0.22.9</DisplayVersion>
+        <StartupUserAccount>None</StartupUserAccount>
+        <UserAccountSwitchLock>Disable</UserAccountSwitchLock>
+        <SupportedLanguage>AmericanEnglish</SupportedLanguage>
+        <Rating>
+            <Organization>ESRB</Organization>
+            <Age>0</Age>
+        </Rating>
+        <UserAccountSaveDataSize>0x0000000000000000</UserAccountSaveDataSize>
+        <UserAccountSaveDataJournalSize>0x0000000000000000</UserAccountSaveDataJournalSize>
+        <LogoType>LicensedByNintendo</LogoType>
+        <ReleaseVersion>0</ReleaseVersion>
+    </Application>
+</NintendoSdkMeta>

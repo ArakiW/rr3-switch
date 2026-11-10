@@ -1,4 +1,20 @@
 {
+  "_comment": [
+    "OBSOLETE for the NSP path -- KEPT ONLY AS A RECORD, DO NOT USE IT.",
+    "",
+    "This is the npdmtool descriptor for the FIRST NSP attempt, and that",
+    "attempt produced a PFS0 with two entries (exefs/main and exefs/main.npdm).",
+    "That is an EXEFS IMAGE, not an NSP: it carries no content metadata, and",
+    "every installer refuses it with 'no content meta found'.",
+    "",
+    "The NSP is now produced by native-switch/rr3.nmeta (the official SDK's",
+    ".nmeta) through tools/Pack-NativeSwitchNsp.ps1: elf2nso -> MakeMeta ->",
+    "AuthoringTool creatensp -> the control -> the CFW packer.  The package",
+    "carries Program + Control + Meta NCAs.",
+    "",
+    "The title id the shipped NSP uses is 0x0100ac50f00d0001 (rr3.nmeta),",
+    "NOT the 0x010000000000F00D below."
+  ],
   "name": "RR3 Native Rehost",
   "author": "Native Port Lab",
   "version": "0.22.4",
