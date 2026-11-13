@@ -34,10 +34,38 @@
     key-derived values in its error messages, so both streams are sent to
     the void and only the exit code is kept.
 
-    WHAT IS AND IS NOT IN THE NSP: the executable, its meta and the
-    control.  NOT the game's data (the seven volumes and the .depot tree,
-    about 11.8 GiB) -- that has never been in the executable and is still
-    copied onto the card separately.
+    THE ROMFS IS IN THE NSP, AND IT HAS TO BE.
+    The first version of this script passed "--noromfs", so the NSP carried
+    only the executable, its meta and the control: 5,411,032 bytes, against
+    53,756,401 for the NRO.  The difference was not packaging overhead --
+    it was the whole RomFS (44,948,780 bytes over 35 files) missing,
+    including the guest's own libraries:
+        romfs/libRealRacing3.so      33,110,472
+        romfs/libc++_shared.so         1,014,704
+        romfs/libfmodex.so             1,274,928
+        romfs/libNimble.so
+        romfs/ui/*.otf, *.ttf          the catalogue faces
+        romfs/original/.depot/text_en.txt, text_cn-Hans.txt
+    Without it the port cannot start, and the reason is in the code rather
+    than in the installer: main.cpp opens "romfs:/libc++_shared.so" with no
+    card fallback, so the guest's C++ runtime has exactly one source.
+
+    WHY THE ROMFS REACHES THE PROCESS AT ALL.  The Program NCA built by
+    hacbrewpack carries TWO sections: section 0 is the ExeFS (the NSO and
+    the NPDM) and section 1 is the RomFS, wrapped in IVFC and encrypted.
+    libnx's romfsInit() -- romfsMountSelf() -- documents the two cases
+    explicitly: "If the application is running as NRO, it mounts the
+    embedded RomFS section inside the NRO.  If on the other hand it's an
+    NSO, it behaves identically to romfsMountFromCurrentProcess."  An NSP
+    launches an NSO, so the RomFS the process sees is the one in the
+    Program NCA's second section -- which is exactly what "--romfsdir"
+    builds.  The NRO and the NSP therefore carry the same tree, reached by
+    two different mechanisms.
+
+    WHAT IS AND IS NOT IN THE NSP: the executable, its RomFS, its meta and
+    the control.  NOT the game's data (the seven volumes and the .depot
+    tree, about 11.8 GiB) -- that has never been in the executable and is
+    still copied onto the card separately.
 
 .PARAMETER Out
     Where to write the NSP.  Defaults to native-switch\rr3-native-rehost.nsp.
@@ -53,7 +81,8 @@ param(
     [string]$ProjectRoot = '',
     [string]$SdkRoot = '',
     [string]$Packer = '',
-    [string]$Keyset = ''
+    [string]$Keyset = '',
+    [string]$RomfsDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -64,6 +93,11 @@ if ($ProjectRoot -eq '') {
 $native = Join-Path $ProjectRoot 'native-switch'
 if ($Out -eq '') {
     $Out = Join-Path $native 'rr3-native-rehost.nsp'
+}
+# The tree that goes into the Program NCA's second section.  It is the same
+# tree the NRO embeds: the guest's libraries and the catalogue faces.
+if ($RomfsDir -eq '') {
+    $RomfsDir = Join-Path $native 'romfs'
 }
 
 # --- the pieces, and where they live ------------------------------------------
@@ -88,6 +122,18 @@ foreach ($required in @(
         throw ("required input is missing: {0}" -f $required)
     }
 }
+
+# The RomFS tree, and the one file in it that proves it is the right tree:
+# the guest's own main binary.  Without it the port has no guest at all.
+if (-not (Test-Path -LiteralPath $RomfsDir -PathType Container)) {
+    throw ("the RomFS directory is missing: {0}" -f $RomfsDir)
+}
+$guestMain = Join-Path $RomfsDir 'libRealRacing3.so'
+if (-not (Test-Path -LiteralPath $guestMain -PathType Leaf)) {
+    throw ("the RomFS tree carries no guest main binary: {0}" -f $guestMain)
+}
+$romfsFiles = @(Get-ChildItem -LiteralPath $RomfsDir -Recurse -File)
+$romfsBytes = [long](($romfsFiles | Measure-Object -Property Length -Sum).Sum)
 
 # The tools that make an NSO and a meta.  The local devkitPro has them.
 $toolBin = Join-Path $ProjectRoot '.tools\devkitPro\msys64\opt\devkitpro\tools\bin'
@@ -188,11 +234,51 @@ $argv = @(
     '--nspdir', (Convert-ToWslPath (Join-Path $cfw 'nsp')),
     '--backupdir', (Convert-ToWslPath (Join-Path $cfw 'backup')),
     '--exefsdir', (Convert-ToWslPath (Join-Path $cfw 'exefs')),
+    '--romfsdir', (Convert-ToWslPath $RomfsDir),
     '--controldir', (Convert-ToWslPath (Join-Path $cfw 'control')),
-    '--nosignncasig2', '--nopatchnacplogo', '--noromfs', '--nologo', '--keepncadir'
+    '--nosignncasig2', '--nopatchnacplogo', '--nologo', '--keepncadir'
 )
-& wsl @argv 1>$null 2>$null
-if ($LASTEXITCODE -ne 0) { throw ('the CFW packer failed, exit ' + $LASTEXITCODE) }
+# THE PACKER'S OUTPUT NEVER REACHES THE LOG.
+# hacbrewpack prints key-derived values in its error messages, so stdout and
+# stderr both have to stay out of the console and out of the build log.  They
+# go to temporary files instead of to $null, because $null is not enough:
+# with $ErrorActionPreference = 'Stop', a native command that writes to
+# stderr is turned into a TERMINATING error, and wsl.exe always writes a
+# UTF-16 proxy warning to stderr on this machine ("wsl: 检测到 localhost
+# 代理配置...").  That warning is not a failure -- the packer ran fine and
+# printed "Program NCA RomFS Section: Yes" -- but it killed the script
+# before the exit code could be read.  So: proxy variables are cleared for
+# the call, stderr goes to a file outside the repository, and the exit code
+# is the only thing that is kept.
+$savedProxy = @{}
+foreach ($name in @('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY',
+                     'http_proxy', 'https_proxy', 'all_proxy')) {
+    $savedProxy[$name] = [Environment]::GetEnvironmentVariable($name)
+    [Environment]::SetEnvironmentVariable($name, $null)
+}
+$stderrFile = Join-Path ([System.IO.Path]::GetTempPath()) `
+    ('rr3-nsp-pack-{0}.err' -f [guid]::NewGuid().ToString('N'))
+$packerExit = -1
+try {
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & wsl @argv 1>$null 2>$stderrFile
+        $packerExit = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousPreference
+    }
+}
+finally {
+    foreach ($name in $savedProxy.Keys) {
+        [Environment]::SetEnvironmentVariable($name, $savedProxy[$name])
+    }
+    if (Test-Path -LiteralPath $stderrFile) {
+        Remove-Item -LiteralPath $stderrFile -Force -ErrorAction SilentlyContinue
+    }
+}
+if ($packerExit -ne 0) { throw ('the CFW packer failed, exit ' + $packerExit) }
 
 $built = Get-ChildItem -LiteralPath (Join-Path $cfw 'nsp') -Filter '*.nsp' |
     Select-Object -First 1
@@ -211,6 +297,7 @@ $count = [System.BitConverter]::ToUInt32($bytes, 4)
 $table = 0x10
 $stringBase = $table + ($count * 0x18)
 $names = @()
+$sizes = @()
 for ($index = 0; $index -lt $count; $index++) {
     $base = $table + ($index * 0x18)
     $stringOffset = [System.BitConverter]::ToUInt32($bytes, $base + 0x10)
@@ -218,6 +305,7 @@ for ($index = 0; $index -lt $count; $index++) {
     while ($end -lt $bytes.Length -and $bytes[$end] -ne 0) { $end++ }
     $names += [System.Text.Encoding]::UTF8.GetString(
         $bytes, $stringBase + [int]$stringOffset, $end - ($stringBase + [int]$stringOffset))
+    $sizes += [long][System.BitConverter]::ToUInt64($bytes, $base + 0x08)
 }
 $meta = @($names | Where-Object { $_ -like '*.cnmt.nca' })
 if ($meta.Count -ne 1) {
@@ -227,6 +315,17 @@ if ($count -ne 3) {
     throw ("the NSP has {0} entries, expected Program + Control + Meta: {1}" -f $count, ($names -join ', '))
 }
 
+# THE SECOND CHECK: THE ROMFS HAS TO BE IN THE PACKAGE.
+# The first version of this package was 5,411,032 bytes and it did not run,
+# because the RomFS was not in it.  The ExeFS alone is under 9 MB, so the
+# Program NCA has to be bigger than the whole RomFS tree for the tree to be
+# inside it.  Reading the container's own entry sizes is the cheapest way to
+# see that, and it needs no key: the PFS0 table is in the clear.
+$largest = [long](($sizes | Measure-Object -Maximum).Maximum)
+if ($largest -le $romfsBytes) {
+    throw ("the largest NCA is {0:N0} bytes, which cannot hold the {1:N0} byte RomFS tree -- the RomFS is not in the package" -f $largest, $romfsBytes)
+}
+
 Copy-Item -LiteralPath $built.FullName -Destination $Out -Force
 
 $info = Get-Item -LiteralPath $Out
@@ -234,3 +333,7 @@ Write-Host ("NSP      : {0}" -f $Out)
 Write-Host ("size     : {0:N0} bytes" -f $info.Length)
 Write-Host ("sha256   : {0}" -f (Get-FileHash -LiteralPath $Out -Algorithm SHA256).Hash)
 Write-Host ("entries  : {0}" -f ($names -join ', '))
+for ($index = 0; $index -lt $count; $index++) {
+    Write-Host ("  NCA    : {0}  {1:N0} bytes" -f $names[$index], $sizes[$index])
+}
+Write-Host ("romfs    : {0} files, {1:N0} bytes (inside the Program NCA)" -f $romfsFiles.Count, $romfsBytes)

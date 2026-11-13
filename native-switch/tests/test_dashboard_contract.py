@@ -2,6 +2,7 @@
 """Static contract checks for the formal native loader dashboard."""
 
 from pathlib import Path
+import re
 
 
 def main() -> None:
@@ -25,7 +26,30 @@ def main() -> None:
     assert "summaryShown" not in main_source
     assert "333 strong" not in ui
     assert "APP_TITLE   := RR3 Native Rehost" in makefile
-    assert "APP_VERSION := 0.22.4" in makefile
+    # THE VERSION IS ONE NUMBER IN TWO PLACES, AND THE TEST CHECKS THAT
+    # INSTEAD OF A COPY OF IT.  The version used to be hardcoded here, which
+    # made this test fail on every bump and told nobody anything: the
+    # contract that matters is that the NRO's NACP and the NSP's .nmeta
+    # carry the SAME version.
+    nmeta = (root / "rr3.nmeta").read_text(encoding="utf-8")
+    make_version = re.search(r"^APP_VERSION := (\S+)\s*$", makefile, re.M)
+    assert make_version, "the Makefile has no APP_VERSION"
+    meta_version = re.search(r"<DisplayVersion>([^<]+)</DisplayVersion>", nmeta)
+    assert meta_version, "the .nmeta has no DisplayVersion"
+    assert make_version.group(1) == meta_version.group(1), (
+        "APP_VERSION (%s) and the .nmeta DisplayVersion (%s) disagree"
+        % (make_version.group(1), meta_version.group(1)))
+    # AND THE VERSION THE USER SEES IS THE SAME ONE.  The dashboard used to
+    # carry its own copy of the string, and it was the copy that went stale:
+    # the console's screen said 0.22.4 while the packages said 0.22.10.
+    version_header = (root / "include" / "rr3" / "version.hpp").read_text(
+        encoding="utf-8")
+    header_version = re.search(r'#define RR3_PORT_VERSION "([^"]+)"', version_header)
+    assert header_version, "version.hpp has no RR3_PORT_VERSION"
+    assert header_version.group(1) == make_version.group(1), (
+        "RR3_PORT_VERSION (%s) and APP_VERSION (%s) disagree"
+        % (header_version.group(1), make_version.group(1)))
+    assert "RR3_PORT_VERSION" in ui, "the dashboard does not print the version"
     assert main_source.count("consoleExit(nullptr)") == 1
     assert main_source.count("runWindowGraphicsProbe") == 1
     assert main_source.index("runWindowGraphicsProbe") < main_source.index("nativeUiInit()")

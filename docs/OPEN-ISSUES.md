@@ -4468,3 +4468,129 @@ AND THE PATH TRACE COLLAPSED IN THE SAME WINDOW** -- from 108,419 lines
 thinned to `gui/processed/` only, and section 9.33 already recorded that the
 port's own front-end navigation reads that trace.  **⇒ THE NEXT EXPERIMENT IS
 ONE VARIABLE: the same binary with the trace restored.**
+
+### 9.45 The NSP was 5.4 MB because the whole RomFS was left out of it
+
+**THE USER FOUND IT BY COMPARING SIZES, AND THE COMPARISON WAS RIGHT.**
+
+    NRO      53,756,401 bytes   (the artifact that runs on hardware)
+    NSP       5,411,032 bytes   (the artifact that installs)
+    gap     -48,345,369 bytes   (-47.6 MB of the NRO)
+
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE GAP WAS NOT PACKAGING OVERHEAD.  IT WAS A
+MISSING SECTION.**  The packing script called the packer with `--noromfs`, so
+the Program NCA carried only the ExeFS.  **MEASURED: the tree that was left
+out is 44,948,780 bytes over 35 files**, and it is not decoration:
+
+    romfs/libRealRacing3.so              33,110,472   the guest's own binary
+    romfs/original/.depot/text_en.txt      2,939,719
+    romfs/original/.depot/text_cn-Hans.txt 2,831,352
+    romfs/ui/NotoSansCJKsc-RR3Bootstrap.otf 1,802,168
+    romfs/libfmodex.so                    1,274,928
+    romfs/libc++_shared.so                1,014,704
+    ... 29 more files
+
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE PORT CANNOT START WITHOUT IT.**
+`main.cpp` opens `"romfs:/libc++_shared.so"` with NO card fallback
+(main.cpp:887), and `multi_dso_linker.cpp`'s `loadImage()` opens the path it
+is given with a plain `fopen`.  **=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ SO THE PACKAGE
+COULD NOT EVEN LOAD THE GUEST.**  The card also carries copies of the
+guest's libraries and the faces (measured on the Eden card:
+`libRealRacing3.so`, `libfmodex.so`, `libNimble.so`, `ui/`, `original/`),
+but `libc++_shared.so` is NOT among them -- it lives in the RomFS only.
+
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ THE FIX IS ONE FLAG.**  The packer already knew
+how: `--romfsdir` puts the tree in the Program NCA's SECOND section, wrapped
+in IVFC and encrypted, next to the ExeFS in section 0.  `npdm.c` does not
+touch it -- the section is described by the NCA's own fs header, not by the
+NPDM -- and the NPDM the SDK generates has no romfs descriptor at all
+(measured: the staged `main.npdm` is 1,604 bytes and contains exactly one
+`META` magic, at offset 0).
+
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE RESULT, MEASURED ON THE PACKAGE THAT
+WAS ABOUT TO BE PUBLISHED** (tools/verify-nsp-romfs.py decrypts the artifact
+itself: AES-256-XTS over the header with Nintendo's own tweak, AES-128-ECB
+over the key area, AES-128-CTR over the sections, then IVFC level 5):
+
+    NSP                 50,532,568 bytes
+      4597f9d1....nca   50,377,728   Program
+        section 0        5,253,120   ExeFS   (hash_type=2 PFS0,  crypt=3 CTR)
+        section 1       45,121,536   RomFS   (hash_type=3 ROMFS, crypt=3 CTR)
+      9d5377d3....nca      150,528   Control
+      a978960c....cnmt.nca   4,096   Meta
+    romfs image        44,951,852   IVFC levels=7
+    in the NSP             35 files  44,948,780 bytes  IDENTICAL to the reference
+
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE COMPARISON IS AGAINST THE TREE
+AND AGAINST THE NRO's OWN IMAGE**, not against a number typed by hand:
+`native-switch/romfs/` (35 files) and `native-switch/rr3.romfs` (the image
+the NRO embeds) are both parsed with the same reader and must match the
+package file for file and byte for byte.  **=> A PACKAGE THAT IS THE RIGHT
+SIZE BUT THE WRONG TREE STILL FAILS.**
+
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE PORT NOW COVERS THE LOADER'S
+BEHAVIOUR TOO.**  libnx's `romfsMountSelf()` documents the two launch paths:
+an NRO mounts the image embedded in the NRO, and **an NSO behaves like
+`romfsMountFromCurrentProcess`**, which is the process's DATA storage.
+Whether the loader surfaces the Program NCA's RomFS partition as that data
+storage is not something the port can count on, and the NPDM carries no
+descriptor that could say so.  **=> SO `mountPortRomfs()` (source/main.cpp)
+RUNS `romfsInit()` FIRST AND, ONLY IF THAT FAILS, MOUNTS THE CARD'S COPY OF
+THE SAME IMAGE** (`romfsMountFromFsdev("sdmc:/switch/rr3-native-rehost/
+rr3.romfs", 0, "romfs")`).  The NRO path is bit-for-bit unchanged.
+
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE PORT SAYS WHICH ROMFS IT
+GOT**, in the guest-view log (`romfs-src`, ordinal 315: `source=embedded` /
+`source=card` / `source=none`) and in the boot line (`RomFS=........ (card)`).
+**=> ⇒ THAT LINE IS THE FIRST THING TO READ WHEN AN INSTALLED NSP DOES NOT
+START.**  A debug flag, `debug-force-card-romfs.flag` on the card, skips the
+embedded mount so the card path can be exercised on the emulator without an
+NSP install -- the same shape as the other `debug-*.flag` files.
+
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ NOT PROVEN YET: the NSP's OWN
+launch on hardware.**  What is proven here is that the package carries the
+whole tree, that the port can reach the same tree from the card when the
+loader does not surface the NCA's section, and that the NRO path is
+untouched.  **THE CONSOLE RUN WITH THE NEW NSP IS STILL THE ACCEPTANCE
+TEST**, and the `romfs-src` line is what it will report.
+
+#### 9.45.1 THE CARD-ONLY ROMFS PATH, MEASURED
+
+**THE EXPERIMENT.  ONE VARIABLE: where the tree comes from.**  The round
+`romfscard1` (archive `20261113-235732-eden-rr3-romfscard1`) ran the SAME
+build as `ctl1`, from the SAME restored state (`.build/guest-state/yield2`),
+with the SAME settings (`-Seconds 400 -CensusOff`), and the only difference
+was `debug-force-card-romfs.flag` on the card: the port skipped
+`romfsInit()` and mounted the card's `rr3.romfs` instead.
+
+**=> ⇒ ⇒ ⇒ ⇒ AND THE PORT SAID WHICH ONE IT GOT, IN THE LOG:**
+
+    phase=romfs-src ordinal=315 target=0000000000000002 source=card forced=1
+
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ AND THE ROUND CAME OUT THE SAME AS THE EMBEDDED ONE:**
+
+    round        romfs          lights  race  frames  pixels lit
+    ctl1         embedded           2     2      --          --
+    romfscard1   card (forced)      2     2    2040   921549/921600
+
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ THE CARD-MOUNTED IMAGE IS THE TREE, NOT A SUBSTITUTE FOR
+IT.**  The guest's own libraries loaded from it, and the captured frame shows
+the guest's own Simplified-Chinese daily-reward dialog, drawn with the face
+that lives in the RomFS:
+
+```
+您的每日奖励
+收集
+```
+
+`md5 mismatch` was 0, `TrackDesc::load failures` was 0, and the
+start-lights and race counts are IDENTICAL to the embedded round (2 and 2).
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ SO THE TREE THAT COMES OFF THE CARD IS THE
+TREE THAT WAS EMBEDDED -- which is what the NSP now carries.**
+
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THIS IS THE MEASUREMENT THAT SETTLES
+THE NSP'S SELF-SUFFICIENCY WITHOUT GUESSING.**  If the loader surfaces the
+Program NCA's RomFS partition as the process's data storage, the port uses
+the NSP's own copy (`romfs-src target=1 source=embedded`).  If it does not,
+the port uses the card's copy (`target=2 source=card`).  **BOTH PATHS
+WORK, AND THE PACKAGE CARRIES THE TREE EITHER WAY.**

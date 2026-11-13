@@ -334,10 +334,18 @@ Write-Host "Built: $nro" -ForegroundColor Green
 
 # THE NSP IS THE SHIPPABLE ARTIFACT NOW.
 #
-# The NRO is still built, because it is what the emulator card runs, and
-# because it carries the RomFS that the NSP cannot (npdmtool cannot
-# describe a RomFS section).  The NSP is what goes on the console: it
-# installs as a title and launches from the Home menu.
+# The NRO is still built, because it is what the emulator card runs.  The
+# NSP is what goes on the console: it installs as a title and launches from
+# the Home menu.
+#
+# BOTH CARRY THE SAME ROMFS, AND THEY REACH IT DIFFERENTLY.  The NRO
+# embeds the image and libnx's romfsInit() mounts it.  The NSP carries it
+# in the Program NCA's second section (hacbrewpack --romfsdir), and libnx's
+# romfsMountSelf() answers an NSO with romfsMountFromCurrentProcess --
+# the process's data storage.  Whether the loader surfaces that section as
+# the data storage is not something the port can count on, so the port
+# ALSO mounts the card's copy (rr3.romfs) when romfsInit() fails.  See
+# mountPortRomfs() in native-switch/source/main.cpp.
 & (Join-Path $PSScriptRoot 'Pack-NativeSwitchNsp.ps1') -ProjectRoot $projectRoot
 if ($LASTEXITCODE -ne 0) {
     throw 'NSP packaging failed.'

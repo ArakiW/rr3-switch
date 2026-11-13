@@ -570,7 +570,7 @@ Get-Content checksums.sha256 | ForEach-Object {
 NRO 与 RomFS 的哈希可以和构建产物对照（构建是可复现的：门禁重编出来的字节完全一致）：
 
 ```
-rr3-native-rehost.nro  sha256 = 5515158395016d65d6283156d1c91d560926e58d1fe028f0cc36de6cf83c76b8
+rr3-native-rehost.nro  sha256 = 7ee28cb3ed32ac8b7ca8ecca3c3159d82967a3c2894a8c49e2eced4c68d2f489
 rr3.romfs              sha256 = 1cf7b850226d3f21cd157fc725a376377d893fbd061cc6fdfa4d0644d9bea02
 ```
 
@@ -972,11 +972,17 @@ NRO 每次都得先用 hbmenu 之类的启动器把它打开。
 
 **⇒ ⇒ 一个能装的 NSP 里有三个 NCA：**
 
-| 容器内条目 | 是什么 |
-|---|---|
-| `a04cc32b….nca`（Program） | 端口可执行体 + `main.npdm` |
-| `9d5377d3….nca`（Control） | 控制数据：`control.nacp`（名字）+ `icon_AmericanEnglish.dat`（图标） |
-| **`ba129cfa….cnmt.nca`（Meta）** | **内容元数据（CNMT）—— 就是它，缺它就报「未找到内容元数据」** |
+| 容器内条目 | 是什么 | 大小 |
+|---|---|---|
+| `4597f9d1….nca`（Program） | 端口可执行体 + `main.npdm`，**外加第二个 section：整棵 romfs** | 50,377,728 |
+| `9d5377d3….nca`（Control） | 控制数据：`control.nacp`（名字）+ `icon_AmericanEnglish.dat`（图标） | 150,528 |
+| **`a978960c….cnmt.nca`（Meta）** | **内容元数据（CNMT）—— 就是它，缺它就报「未找到内容元数据」** | 4,096 |
+
+**⇒ ⇒ ⇒ Program NCA 里现在有两个 section：section 0 是 ExeFS（可执行体），
+section 1 是 romfs（44.9 MB，35 个文件）。这一段是 2026-11-13 补上的 ——
+上一版的包只有 5,411,032 字节，比 NRO 的 53,756,401 小了 48 MB，
+少掉的正是整棵 romfs：客机自己的 `libRealRacing3.so`（33 MB）、
+`libc++_shared.so`、`libfmodex.so`、`libNimble.so`、字体、`original/.depot` 文本。**
 
 **⇒ Meta NCA 里的 CNMT 末尾 32 字节必须是它前面 160 字节的 SHA256。**
 上游 hacBrewPack 只算了 CNMT 的一部分，所以 digest 对不上，安装器就认为
@@ -1006,10 +1012,28 @@ NRO 每次都得先用 hbmenu 之类的启动器把它打开。
    装完主菜单出现 **RR3 Native Rehost**。
 2. **拷数据**：七个数据卷和 `.depot` 拷到卡的 `sdmc:/switch/rr3-native-rehost/`。
 3. **拷控制脚本**：9 份 `rr3-*.txt` 放同一目录，`rr3-gfx.conf` 放 `sdmc:/switch/`。
-4. **客机的 .so 和字体**：NSP 里没有这些（在卡上），端口会自己去
-   `sdmc:/switch/rr3-native-rehost/` 找。
+4. **客机的 .so 和字体**：**现在 NSP 里带了**（Program NCA 的第二个 section）。
+   卡上也放一份同样的（`libRealRacing3.so` / `libfmodex.so` / `libNimble.so` /
+   `ui/` / `original/` / `rr3.romfs`），**这是兜底**：
+   libnx 在 NSO 启动时用 `romfsMountFromCurrentProcess`（进程的数据存储），
+   而 loader 会不会把 Program NCA 的 romfs section 露成数据存储，端口不能打包票。
+   **⇒ 端口现在先试 `romfsInit()`，失败就改挂卡上的 `rr3.romfs`**
+   （`mountPortRomfs()`，main.cpp）。日志里会写一行 `romfs-src`：
+   `source=embedded` / `source=card` / `source=none` —— **装完不启动时先看这一行**。
 
 ### 怎么自己验一眼包对不对
 
 `tools/Pack-NativeSwitchNsp.ps1` 每次都会**把容器读回来**断言：条目必须正好是三个，
 且其中必须有一个 `.cnmt.nca` —— 少了就报错，**不会出现「构建说成功、包却装不上」**。
+
+**⇒ 2026-11-13 起还多一道更硬的校验：`tools/verify-nsp-romfs.py` 会把包真的解开**
+（XTS 解头 → ECB 解 key area → CTR 解 section → IVFC 里取出 romfs 镜像），
+**逐个文件核对那 35 个文件和 `native-switch/romfs/` 目录是不是一模一样**：
+
+```
+python tools/verify-nsp-romfs.py native-switch\rr3-native-rehost.nsp `
+    --romfs native-switch\romfs --romfs-image native-switch\rr3.romfs
+```
+
+输出里有 `in the NSP  35 files  44948780 bytes  identical to the reference`
+才算过 —— **这比「包变大了」可靠**：体积对但文件不对，它一样会报错。

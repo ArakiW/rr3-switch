@@ -19,7 +19,7 @@ ROMFS_IMAGE := rr3.romfs
 ROMFS_FILES := $(shell find $(ROMFS) -type f)
 APP_TITLE   := RR3 Native Rehost
 APP_AUTHOR  := Native Port Lab
-APP_VERSION := 0.22.4
+APP_VERSION := 0.22.10
 
 # THE NSP PACKAGE.
 #
@@ -31,17 +31,26 @@ APP_VERSION := 0.22.4
 # from the DIRECTORY `exefs`, so the container's entries come out named
 # `main` and `main.npdm` -- that is an EXEFS image, not an NSP, and an NSP
 # needs its entries named `exefs/main` and `exefs/main.npdm`.  So
-# tools/Pack-NativeSwitchNsp.ps1 does the three steps (elf2nso, npdmtool,
-# build_pfs0) with the container's layout in a staging tree, and reads the
-# container back afterwards to assert the two entries are named right.
+# tools/Pack-NativeSwitchNsp.ps1 does the work, and Build-NativeSwitch.ps1
+# calls it after this Makefile finishes.  The script reads the container
+# back afterwards and refuses to report success unless it holds exactly
+# three NCAs, one of them the content meta.
 #
-# The descriptor npdmtool takes is rr3-nsp.json, next to this Makefile.
+# THE ROMFS IS INSIDE THE NSP.  It was not, once, and that was the bug:
+# the first NSP was 5,411,032 bytes against the NRO's 53,756,401, because
+# the packer was called with --noromfs.  The 48 MB of difference was the
+# whole tree -- the guest's own libraries (libRealRacing3.so is 33 MB of
+# it), the catalogue faces and the original text -- and the port opens
+# "romfs:/libc++_shared.so" with no card fallback, so the package could
+# not even start the guest.  The packer now gets --romfsdir and the tree
+# lands in the Program NCA's second section.
 #
-# THE ROMFS IS NOT INSIDE THE NSP, AND THAT IS DELIBERATE.  npdmtool
-# cannot describe a RomFS section, and the port does not need one: every
-# port asset is read through resolvePortAssetPath(), which falls back from
-# "romfs:/X" to "sdmc:/switch/rr3-native-rehost/X", and the guest's own
-# libraries and the UI faces are ALREADY on the card there.  See
+# BOTH PACKAGES CARRY THE SAME TREE AND REACH IT DIFFERENTLY.  The NRO
+# embeds it and romfsInit() mounts it.  The NSP's lives in the Program
+# NCA's second section, and libnx's romfsMountSelf() answers an NSO with
+# romfsMountFromCurrentProcess -- the process's data storage.  So the
+# port ALSO mounts the card's copy (rr3.romfs) when romfsInit() fails;
+# see mountPortRomfs() in source/main.cpp.  See
 # tools/README-hardware-test.md, section 10.12.
 
 # Runtime-selectable graphics backend (native-switch/source/gfx).

@@ -2,6 +2,7 @@
 """Release-contract checks for the formal Switch NRO and embedded core DSOs."""
 
 from pathlib import Path
+import re
 import struct
 
 
@@ -12,9 +13,18 @@ def main() -> None:
     nro = nro_path.read_bytes()
     nacp = nacp_path.read_bytes()
 
+    # THE VERSION COMES FROM THE ONE PLACE THAT OWNS IT.  The .nmeta is the
+    # NSP's identity, and the Makefile's APP_VERSION is the NRO's; the two
+    # are checked against each other by test_dashboard_contract.py.  Here
+    # the contract is that BOTH artifacts carry that version -- so the test
+    # reads it instead of carrying a copy that went stale on every bump.
+    nmeta = (root / "rr3.nmeta").read_text(encoding="utf-8")
+    match = re.search(r"<DisplayVersion>([^<]+)</DisplayVersion>", nmeta)
+    assert match, "the .nmeta has no DisplayVersion"
+    version = match.group(1).encode()
+
     assert nro[0x10:0x14] == b"NRO0"
-    assert b"0.22.4" in nro
-    assert b"0.22.3" not in nro
+    assert version in nro
     assert b"--rr3-renderer" in nro
     assert b"--rr3-renderer-result=" in nro
     assert "简体中文本地化".encode() in nro
@@ -24,7 +34,7 @@ def main() -> None:
     assert len(nacp) == 0x4000
     assert b"RR3 Native Rehost\0" in nacp
     assert b"Native Port Lab\0" in nacp
-    assert b"0.22.4\0" in nacp
+    assert version + b"\0" in nacp
 
     embedded_size = 0
     for name in (
@@ -54,7 +64,7 @@ def main() -> None:
     ):
         assert (root / "romfs" / "ui" / font).stat().st_size > 20_000
     print(
-        f"PASS: NRO/NACP 0.22.4, native zh-Hans UI assets and external-data contract, "
+        f"PASS: NRO/NACP {match.group(1)}, native zh-Hans UI assets and external-data contract, "
         f"4 AArch64 core DSOs ({len(nro)} bytes)"
     )
 

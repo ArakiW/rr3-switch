@@ -47,10 +47,12 @@ New-Item -ItemType Directory -Force -Path $appOut | Out-Null
 # The port itself.
 #
 # THE NSP IS THE SHIPPABLE ARTIFACT.  It installs as a title and launches
-# from the Home menu; the NRO is still in the package because the emulator
-# card runs it, and because it carries the RomFS that the NSP cannot (the
-# guest's libraries and the UI faces are ALSO on the card, so the port's
-# own fallback finds them either way).
+# from the Home menu, and it CARRIES THE ROMFS (the Program NCA's second
+# section).  The NRO is still in the package because the emulator card
+# runs it, and rr3.romfs is still in the package because it is the card
+# copy the port falls back to when the loader does not surface the NCA's
+# RomFS partition as the process's data storage.  See
+# mountPortRomfs() in native-switch/source/main.cpp.
 $nsp = Join-Path $build 'rr3-native-rehost.nsp'
 if (-not (Test-Path -LiteralPath $nsp -PathType Leaf)) {
     throw ("the NSP is not there: {0} -- build the port first" -f $nsp)

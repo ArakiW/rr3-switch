@@ -35,7 +35,7 @@
             <Language>AmericanEnglish</Language>
             <IconPath>@SDK_SAMPLE_ICON@</IconPath>
         </Icon>
-        <DisplayVersion>0.22.9</DisplayVersion>
+        <DisplayVersion>0.22.10</DisplayVersion>
         <StartupUserAccount>None</StartupUserAccount>
         <UserAccountSwitchLock>Disable</UserAccountSwitchLock>
         <SupportedLanguage>AmericanEnglish</SupportedLanguage>

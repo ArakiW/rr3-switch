@@ -1,6 +1,7 @@
 #include "rr3/ui_dashboard.hpp"
 #include "rr3/native_ui.hpp"
 #include "rr3/pthread_bridge.hpp"
+#include "rr3/version.hpp"
 
 #include <cstdio>
 
@@ -20,8 +21,8 @@ void line() {
 
 void header(int page) {
     std::printf("\x1b[44;37;1m RR3 NATIVE REHOST   Horizon / libnx   No Android Runtime                     \x1b[0m\n");
-    std::printf(" Loader Control Center 0.22.4                               Page %d / %d\n",
-                page + 1, kDashboardPages);
+    std::printf(" Loader Control Center %s                              Page %d / %d\n",
+                RR3_PORT_VERSION, page + 1, kDashboardPages);
     line();
 }
 

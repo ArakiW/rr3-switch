@@ -571,6 +571,71 @@ void releaseDiagnosticConsole(bool& diagnosticConsole) {
     diagnosticConsole = false;
 }
 
+// THE ROMFS, UNDER BOTH LAUNCH PATHS.
+//
+// An NRO carries the tree inside itself and romfsInit() mounts the image
+// embedded in the NRO.  An NSP launches an NSO, and libnx answers that
+// case differently: romfsMountSelf() documents that "if the application is
+// running as NRO, it mounts the embedded RomFS section inside the NRO.  If
+// on the other hand it's an NSO, it behaves identically to
+// romfsMountFromCurrentProcess" -- and that is the process's DATA storage,
+// not the Program NCA's second section.
+//
+// Whether the loader surfaces the Program NCA's RomFS partition as that
+// data storage is not something the port can count on.  When it does not,
+// the guest's libraries are simply not there, and the port has no way to
+// say so: "romfs:/libc++_shared.so" is opened with no card fallback
+// (main.cpp:887), so the guest's C++ runtime has exactly one source.
+//
+// So when romfsInit() FAILS, mount the card's copy of the very same image.
+// The card carries it as a file (rr3.romfs), and romfsMountFromFsdev()
+// reads a RomFS image out of a file at an offset.  The NRO path is
+// untouched: this only ever runs after romfsInit() has already failed.
+//
+// WHICH ROMFS THE PORT GOT goes to the guest-view log, because it is the
+// first question worth asking when the guest does not start, and "the NSP
+// installed but the guest never loaded" is exactly the failure this whole
+// change exists to make visible instead of mysterious.
+constexpr const char* kCardRomfsImage = "sdmc:/switch/rr3-native-rehost/rr3.romfs";
+constexpr const char* kGuestViewLogPath = "sdmc:/switch/rr3-native-rehost.guest-view.log";
+
+// WHICH ROMFS THE PORT ENDED UP WITH, for the boot line.
+const char* gRomfsSource = "none";
+
+Result mountPortRomfs() {
+    // A FORCED CARD MOUNT exists so the card path can be exercised without
+    // an NSP install: the flag makes the port skip the embedded mount and
+    // take the card one, which is the path an NSP launch takes when the
+    // loader does not surface the Program NCA's RomFS partition.  Same
+    // shape as the other debug-*.flag files on the card.
+    const bool forceCard = pathExists(
+        "sdmc:/switch/rr3-native-rehost/debug-force-card-romfs.flag");
+    if (!forceCard) {
+        const Result embedded = romfsInit();
+        if (R_SUCCEEDED(embedded)) {
+            gRomfsSource = "embedded";
+            runtimeTrace("[rr3] romfs source=embedded\n");
+            rr3::appendGuestBootLine(kGuestViewLogPath, "romfs-src", 315, 1,
+                                     "source=embedded");
+            return embedded;
+        }
+    }
+    const Result card = romfsMountFromFsdev(kCardRomfsImage, 0, "romfs");
+    if (R_SUCCEEDED(card)) {
+        gRomfsSource = "card";
+        runtimeTrace("[rr3] romfs source=card\n");
+        rr3::appendGuestBootLine(kGuestViewLogPath, "romfs-src", 315, 2,
+                                 forceCard ? "source=card forced=1"
+                                           : "source=card");
+        return card;
+    }
+    gRomfsSource = "none";
+    runtimeTrace("[rr3] romfs source=none\n");
+    rr3::appendGuestBootLine(kGuestViewLogPath, "romfs-src", 315, 0,
+                             forceCard ? "source=none forced=1" : "source=none");
+    return card;
+}
+
 int main(int argc, char** argv) {
     runtimeTrace("[rr3] main entry\n");
     // The Cloudcell defer-queue drain starts HERE, before anything else.
@@ -594,7 +659,7 @@ int main(int argc, char** argv) {
         // the parent's mount at the bottom of main() does not carry into this
         // separately-loaded NRO stage.
         const bool childSd = R_SUCCEEDED(fsdevMountSdmc());
-        const bool childRomfs = R_SUCCEEDED(romfsInit());
+        const bool childRomfs = R_SUCCEEDED(mountPortRomfs());
         const bool childSkipData = pathExists(
             "sdmc:/switch/rr3-native-rehost/debug-skip-data.flag");
         if (!childSkipData) {
@@ -646,9 +711,9 @@ int main(int argc, char** argv) {
     const bool sdMountedHere = R_SUCCEEDED(sdMountResult);
     const bool sdAccessible = pathExists("sdmc:/");
     runtimeTrace("[rr3] sd mounted\n");
-    const Result romfsResult = romfsInit();
+    const Result romfsResult = mountPortRomfs();
     const bool romfsReady = R_SUCCEEDED(romfsResult);
-    runtimeTrace("[rr3] embedded romfs mounted\n");
+    runtimeTrace("[rr3] romfs mounted\n");
     const bool skipExternalData = pathExists(
         "sdmc:/switch/rr3-native-rehost/debug-skip-data.flag");
     runtimeTrace("[rr3] external data mount begin\n");
@@ -690,10 +755,11 @@ int main(int argc, char** argv) {
     bootPrintf("Real Racing 3 native rehost\n");
     bootPrintf("Horizon/libnx only - no Android runtime\n\n");
     bootPrintf("Formal UI 0.18.7: unload-gated renderer handoff\n");
-    bootPrintf("SD mount=%08x accessible=%s  RomFS=%08x\n",
+    bootPrintf("SD mount=%08x accessible=%s  RomFS=%08x (%s)\n",
                 sdMountResult,
                 sdAccessible ? "yes" : "no",
-                romfsResult);
+                romfsResult,
+                gRomfsSource);
 
     const rr3::TlsProbe tls = rr3::captureTlsProbe();
     const uint64_t guestTlsSelfTest = rr3::guestTlsScopeSelfTest();
