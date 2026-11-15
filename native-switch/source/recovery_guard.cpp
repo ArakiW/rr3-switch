@@ -218,11 +218,21 @@ extern "C" void __libnx_exception_handler(ThreadExceptionDump* dump) {
         const char* faultClass = "unknown";
         if (ec == 0x0cULL) {
             faultClass = "spal";
-        } else if (ec == 0x24ULL) {
+        } else if (ec == 0x24ULL || ec == 0x25ULL) {
+            // 0x24 is the AArch64 "Data Abort from a lower Exception level"
+            // and 0x25 the same form from the SAME level; both carry the
+            // 64-bit data-abort status in ISS[5:0].
             faultClass = (dfsc == 0x05ULL) ? "data-abort-translation-fault-l1"
                                            : "data-abort";
         } else if (ec == 0x13ULL || ec == 0x16ULL || ec == 0x17ULL || ec == 0x18ULL) {
+            // The instruction aborts: 0x13 lower EL, 0x16 the 64-bit EL
+            // form, 0x17 the same level, 0x18 the 64-bit form of that.
             faultClass = "instruction-abort";
+        } else if (ec == 0x20ULL || ec == 0x21ULL) {
+            // 0x20 and 0x21 are DATA aborts from a lower and from the same
+            // Exception level (the AArch32 forms).  The 64-bit forms of the
+            // data aborts are 0x24 and 0x25, above.
+            faultClass = "data-abort";
         }
         crashText("fault_class=");
         crashText(faultClass);

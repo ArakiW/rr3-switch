@@ -852,6 +852,32 @@ void censusAttach(CensusEntry* entry) {
                         (unsigned long long)key, details);
 }
 
+// IS THIS GUEST POINTER READABLE?
+//
+// The guest's own objects live on the guest's HEAP, which is not part of
+// the guest image, so guestImageContains() cannot answer for them -- only
+// the kernel can.  When the kernel cannot answer (the query itself fails)
+// the answer is "assume readable": the emulator does not implement every
+// query, and a probe that refused everything there would take the
+// diagnostic with it.  On the console the query always answers, and a
+// guest pointer that is not there is refused BEFORE it is read.
+//
+// WHY IT EXISTS.  The 2026-11-10 console crash was an unmapped read in the
+// reaper's asset-singleton probe.  The rungs after the guarded one follow
+// pointers the guest wrote, and dereferencing a wild one would be the same
+// crash one rung later.
+bool guestPointerReadable(uintptr_t address) {
+    if (address < 0x10000ULL || address >= 0x0000800000000000ULL) {
+        return false;
+    }
+    MemoryInfo info{};
+    u32 pageInfo = 0;
+    if (R_FAILED(svcQueryMemory(&info, &pageInfo, static_cast<u64>(address)))) {
+        return true;
+    }
+    return (info.perm & Perm_R) != 0;
+}
+
 void censusDetach(CensusEntry* entry) {
     if (entry == nullptr) {
         return;
@@ -5915,7 +5941,20 @@ void* reapDetachedThreadWorker(void*) {
                     continue;
                 }
                 if (biasNow != 0) {
-                const uintptr_t first = (obj != 0)
+                // EVERY RUNG OF THIS CHAIN IS A GUEST POINTER, AND THE GUEST
+                // HAS NOT PROMISED THAT ANY OF THEM IS THERE.
+                //
+                // The 2026-11-10 console crash was a data abort on an
+                // unmapped READ in this very probe -- the first rung.  The
+                // rungs after it follow pointers the GUEST wrote; a guest
+                // that has not populated them yet leaves a wild pointer
+                // behind, and dereferencing that would be the same crash one
+                // rung later.  The two rungs that live in the guest IMAGE
+                // are covered by the image predicate; the ones that live on
+                // the guest's HEAP are not, because the heap is not part of
+                // the image -- only the kernel can answer for those.
+                const uintptr_t first =
+                    (obj != 0 && guestImageContains(obj, sizeof(uintptr_t)))
                         ? *reinterpret_cast<const volatile uintptr_t*>(obj) : 0;
                     // Walk the ENGINE chain that 0x13bca64 and 0x12bcea8 use,
                     // one rung at a time, because "the table lookup missed" and
@@ -5926,17 +5965,23 @@ void* reapDetachedThreadWorker(void*) {
                     // engine->f8, vtable[0x38] and the first entries are all
                     // reported, so a zero is localised to a rung instead of
                     // being inferred.
+                    const uintptr_t engineSlot =
+                        static_cast<uintptr_t>(biasNow + kEngineSingletonElfVa);
                     const uintptr_t engine =
-                        *reinterpret_cast<const volatile uintptr_t*>(
-                            static_cast<uintptr_t>(biasNow + kEngineSingletonElfVa));
-                    const uintptr_t ef8 = (engine != 0)
-                        ? *reinterpret_cast<const volatile uintptr_t*>(engine + 8) : 0;
-                    const uintptr_t vt = (ef8 != 0)
-                        ? *reinterpret_cast<const volatile uintptr_t*>(ef8) : 0;
-                    const uintptr_t table = (vt != 0)
-                        ? *reinterpret_cast<const volatile uintptr_t*>(vt + 0x38) : 0;
+                        guestImageContains(engineSlot, sizeof(uintptr_t))
+                            ? *reinterpret_cast<const volatile uintptr_t*>(engineSlot)
+                            : 0;
+                    const uintptr_t ef8 =
+                        (engine != 0 && guestPointerReadable(engine + 8))
+                            ? *reinterpret_cast<const volatile uintptr_t*>(engine + 8) : 0;
+                    const uintptr_t vt = (ef8 != 0 && guestPointerReadable(ef8))
+                            ? *reinterpret_cast<const volatile uintptr_t*>(ef8) : 0;
+                    const uintptr_t table =
+                        (vt != 0 && guestPointerReadable(vt + 0x38))
+                            ? *reinterpret_cast<const volatile uintptr_t*>(vt + 0x38) : 0;
                     uint32_t e0 = 0, e1 = 0, e2 = 0, e3 = 0;
-                    if (table != 0) {
+                    if (table != 0 && guestPointerReadable(table) &&
+                        guestPointerReadable(table + 3 * sizeof(uint32_t))) {
                         const volatile uint32_t* t =
                             reinterpret_cast<const volatile uint32_t*>(table);
                         e0 = t[0]; e1 = t[1]; e2 = t[2]; e3 = t[3];

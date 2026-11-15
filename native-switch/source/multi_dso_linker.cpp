@@ -2469,9 +2469,15 @@ bool loaderLocateAddress(uint64_t address, char* out, size_t outSize) {
         if (base == 0) {
             continue;
         }
-        const uint64_t size = image.maximumAddress > image.minimumAddress
-            ? (image.maximumAddress - image.minimumAddress)
-            : 0;
+        // THE MAPPED BYTES, NOT THE DECLARED SPAN.  An address inside the
+        // ELF's declared range but outside the mapping is not this DSO's
+        // memory, and saying it is would make "far_attribution=" lie about
+        // exactly the case the dump exists for: an address that was never
+        // mapped at all.
+        if (!loaderImageIsMapped(index)) {
+            continue;
+        }
+        const uint64_t size = static_cast<uint64_t>(image.image.size());
         if (size == 0 || address < base || address >= base + size) {
             continue;
         }
@@ -3110,18 +3116,35 @@ bool loaderImageIsMapped(size_t index) {
         return true;
     }
     // The segmented path maps each range on its own and does not use the
-    // one-pass backing, so it never sets processMapped.  A mapped range is
-    // the same answer.
+    // one-pass backing, so it never sets processMapped.  EVERY range must
+    // be mapped: reporting the image as mapped after its FIRST range would
+    // let a reader walk into a segment that is not there yet.
+    if (mapped.ranges.empty()) {
+        return false;
+    }
     for (const SegmentCodeMapping& range : mapped.ranges) {
-        if (range.ownerMapped || range.slaveMapped || range.normalMapped) {
-            return true;
+        if (!range.ownerMapped && !range.slaveMapped && !range.normalMapped) {
+            return false;
         }
     }
-    return false;
+    return true;
 }
 
 bool loaderMainImageMapped() {
-    return loaderImageIsMapped(embeddedSonameIndex("libRealRacing3.so"));
+    // NOTHING IN HERE MAY ALLOCATE.  The crash handler calls this on the
+    // kernel exception stack, where the heap may be locked or corrupted,
+    // and a heap allocation there takes the crash dump down with it.
+    //
+    // The index lookup in this file takes a const std::string&, and an
+    // 18-character literal does not fit in libstdc++'s small-string buffer,
+    // so asking for the index that way WOULD allocate.  strcmp over the
+    // soname the loader already built does not.
+    for (size_t index = 0; index < gLoaderImageCount; ++index) {
+        if (std::strcmp(gLoaderImages[index].soname.c_str(), "libRealRacing3.so") == 0) {
+            return loaderImageIsMapped(index);
+        }
+    }
+    return false;
 }
 
 uintptr_t resolveMainImageLoadBias() {

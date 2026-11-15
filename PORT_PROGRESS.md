@@ -14210,3 +14210,31 @@ does run 1328 `paciasp` + 1372 `autiasp` -- but neither of those had
 anything to do with this crash, and "do not clobber TPIDR_EL0" was not the
 fix.  Removing the fake TCB would break the guest's own TLS layout, because
 the fake TCB exists for Bionic's stack canary at +0x28.
+
+### AND THE ANTIGRAVITY CLI REVIEW OF THE FIX FOUND THREE REAL DEFECTS IN IT
+
+The change was reviewed adversarially by the Antigravity CLI
+(`gemini-3.8-flash-high`) against a written brief.  Three of its findings
+were right and all three are fixed:
+
+- **THE CRASH HANDLER WOULD HAVE ALLOCATED.**  The new
+  `loaderMainImageMapped()` looked the main image up by name, and that
+  lookup takes a `const std::string&`; an 18-character literal does not fit
+  in libstdc++'s small-string buffer, so the handler would have
+  HEAP-ALLOCATED on the kernel exception stack, where nothing may allocate.
+  It is now a `strcmp` over the soname the loader already built.
+- **THE POINTER CHAIN AFTER THE GUARDED RUNG WAS STILL RAW.**  The reaper
+  follows the guest's own objects, and those live on the guest's HEAP,
+  which is not part of the guest image -- the image predicate cannot vouch
+  for them, so each rung now asks the kernel before it dereferences.  That
+  was the same crash one rung later.
+- **THE SEGMENTED MAPPING PATH WAS REPORTED AS MAPPED AFTER ITS FIRST
+  RANGE.**  It now requires every range.
+
+**AND ONE OF THE REVIEW'S FINDINGS WAS WRONG, WHICH IS ALSO ON THE RECORD:**
+it had the instruction-abort and data-abort exception classes swapped (0x13
+/ 0x16 / 0x17 / 0x18 are the instruction aborts; 0x20 / 0x21 are DATA
+aborts).  **=> A REVIEW IS EVIDENCE, NOT VERDICT** -- the same wrong field
+that produced the SPAL misreading was still sitting in the decode, and the
+review walked into it too.  The decode now names every family it claims,
+with the field each one comes from.

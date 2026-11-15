@@ -119,6 +119,43 @@ def main() -> None:
     for forbidden in ("std::", "malloc(", "free(", "fopen(", "snprintf("):
         assert forbidden not in handler, "the crash handler may not use " + forbidden
 
+    # 8. The handler's own callees must not allocate either.  Asking for the
+    #    main image index through embeddedSonameIndex() builds a std::string
+    #    from an 18-character literal, which does not fit in libstdc++'s
+    #    small-string buffer -- a heap allocation on the exception stack.
+    main_mapped = body_of(linker, "bool loaderMainImageMapped(")
+    assert "embeddedSonameIndex" not in main_mapped, \
+        "the crash handler's path must not build a std::string"
+    assert "strcmp" in main_mapped
+
+    # 9. The attribution must answer from the MAPPED bytes, not from the
+    #    ELF's declared span: an address that was never mapped is not a
+    #    DSO's memory, and "far_attribution=" must not say it is.
+    locate = body_of(linker, "bool loaderLocateAddress(")
+    assert "loaderImageIsMapped" in locate, \
+        "loaderLocateAddress answers from the ELF's declared span"
+    assert "image.image.size()" in locate
+    assert "std::string" not in locate, \
+        "loaderLocateAddress runs inside the crash handler"
+
+    # 10. The segmented mapping path must have EVERY range mapped; reporting
+    #     the image as mapped after its first range lets a reader walk into
+    #     a segment that is not there yet.
+    assert "mapped.ranges.empty()" in mapped, \
+        "the segmented path is reported as mapped with no ranges at all"
+    assert "return false;" in mapped
+
+    # 11. The reaper's chain of guest pointers must be guarded: the guest's
+    #     objects live on the guest's HEAP, which the image predicate cannot
+    #     vouch for, so each rung needs the kernel's answer.
+    assert "bool guestPointerReadable(" in pthread_bridge, \
+        "the guest pointer check is missing"
+    for needle in ("guestPointerReadable(engine + 8)",
+                   "guestPointerReadable(ef8)",
+                   "guestPointerReadable(vt + 0x38)",
+                   "guestPointerReadable(table)"):
+        assert needle in pthread_bridge, "unguarded guest pointer read: " + needle
+
     print("PASS: the guest load bias is withheld until the image is mapped; "
           "the dump decodes its own ESR")
 

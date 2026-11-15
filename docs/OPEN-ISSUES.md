@@ -4764,3 +4764,39 @@ stack block; if a real SPAL ever shows up in a dump (EC 0x0C), THAT is where
 it will have to be looked for.  But it is not this crash, and it is not this
 fix.  The 27-to-2 start-lights regression (section 9.44.3) and the 211
 compiler warnings are still open and untouched by this.
+
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒
+**AND THE ANTIGRAVITY CLI REVIEW OF THE FIX FOUND THREE REAL DEFECTS IN IT.**
+The change was reviewed adversarially by the Antigravity CLI
+(`gemini-3.8-flash-high`) against a written brief, and three of its findings
+were right:
+
+1. **THE CRASH HANDLER WOULD HAVE ALLOCATED.**  The new
+   `loaderMainImageMapped()` looked the main image up by name, and that
+   lookup takes a `const std::string&`.  An 18-character literal does not
+   fit in libstdc++'s small-string buffer, so the handler would have
+   HEAP-ALLOCATED on the kernel exception stack -- the one place where
+   nothing may allocate, because a locked or corrupted heap there takes
+   the crash dump down with it.  The index is now found with `strcmp` over
+   the soname the loader already built.
+2. **THE POINTER CHAIN AFTER THE GUARDED RUNG WAS STILL RAW.**  The reaper
+   follows the guest's own objects, and the guest's objects live on the
+   guest's HEAP, which is not part of the guest image -- so the image
+   predicate cannot vouch for them and the kernel has to.  Each rung now
+   asks the kernel before it dereferences.  **=> THIS IS THE SAME CRASH ONE
+   RUNG LATER**, and it would have been found on the next console run.
+3. **THE SEGMENTED MAPPING PATH WAS REPORTED AS MAPPED AFTER ITS FIRST
+   RANGE.**  It now requires every range.
+
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒
+**AND ONE OF THE REVIEW'S OWN FINDINGS WAS WRONG, WHICH IS ALSO WORTH
+RECORDING.**  It said the instruction-abort exception classes were 0x20 and
+0x21 and that 0x13 / 0x16 / 0x17 / 0x18 were something else.  It is the
+other way round: **0x13 is "Instruction Abort from a lower Exception level"**
+and 0x16 / 0x17 / 0x18 are its 64-bit EL forms, while **0x20 and 0x21 are
+DATA aborts**.  The decode now names both families explicitly.  **=> A REVIEW
+IS EVIDENCE, NOT VERDICT: the same wrong field that produced the SPAL
+misreading was still sitting in the decode, and the review walked into it
+too.**  Two independent readers making the same class of mistake is the
+reason the decode now names every family it claims, with the field each
+one comes from.
