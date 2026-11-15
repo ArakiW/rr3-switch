@@ -14148,3 +14148,65 @@ does not, and the `romfs-src` line says which one it used.
   dashboard said 0.22.4 while the packages said 0.22.10).  It is now one
   source (`rr3/version.hpp`) plus the Makefile and the `.nmeta`, and the
   contract tests DERIVE the agreement instead of carrying a copy.
+
+### THE 2026-11-10 CONSOLE CRASH IS CLOSED: THE LOAD BIAS WAS PUBLISHED BEFORE THE IMAGE WAS MAPPED
+
+**RE-MEASURED 2026-11-16.**  The exception class was read out of the wrong
+field, and that one bad reading is what sent the last investigation after
+TPIDR_EL0 and PAC keys.  `esr=0x92000005` has EC = `(esr >> 26) & 0x3f` =
+**0x24 = "Data Abort from a lower Exception level"**, and for that class the
+ISS carries a 64-bit data-abort status in ISS[5:0]: ISS = 0x05 gives DFSC =
+0b000101 = **"Translation fault, level 1"**, with WnR = 0, so the faulting
+access was a **READ**.  A pointer-authentication failure is EC **0x0C**
+(ESR 0x3000_00xx), so this was never a SPAL.
+
+**THE pc IS THE PORT'S OWN CODE, PROVEN BY AN ADDR2LINE AGAINST THE EXACT
+BUILD.**  The crash dump has no `pc_attribution=` field, which means the
+console ran the tree of commit `a5ba9487`; that commit was rebuilt and
+attributed:
+
+    nm(__libnx_exception_handler) = 0x8fb60
+    runtime base = 0x1abfbc5b60 - 0x8fb60 = 0x1abfb36000
+    pc  static 0x836f4 -> rr3::reapDetachedThreadWorker(void*)
+                        native-switch/source/pthread_bridge.cpp:5881
+    lr  static 0x836f0 -> native-switch/source/pthread_bridge.cpp:5872
+
+**THE FAULTING ADDRESS IS A GUEST VIRTUAL ADDRESS.**  `far - x25 = 0x1F6D5D0`,
+which is the port's own `kAssetSingletonElfVa`, and `bias` was
+`0x59a29c1000` -- a RESERVED CodeMemory address, not a mapped one.
+
+**THE ROOT CAUSE.**  `guestImageContains()` answered "is this guest vaddr
+inside the ELF's PT_LOAD table", not "is this memory mapped", and
+`resolveMainImageLoadBias()` published a non-zero bias as soon as the image
+was LOADED (`multi_dso_linker.cpp:645`), which is before
+`mapProcessCodeImages()` MAPS it (`multi_dso_linker.cpp:1435`).  In the
+window between the two, every reader of a guest address faulted.  The
+detached-thread reaper ticks once a second from early boot and read exactly
+there.  **THE 2026-11-03 CRASH WAS THE OTHER HALF OF THE SAME BUG** (there
+the bias was still 0, so the address was the raw ELF VA); only that half was
+fixed.
+
+**THE FIX IS ONE PREDICATE, MADE HONEST.**  `guestImageContains()` returns
+false and `resolveMainImageLoadBias()` returns 0 unless the main guest image
+is actually MAPPED.  That one gate is what `guest_rtti`, `race_state_probe`,
+`guest_action`, `guest_view_probe`'s `flRead` and the reaper all read
+through, so the whole class goes at once.
+
+**THE NEXT CONSOLE DUMP SAYS SO ITSELF**: `fault_class` (the exception,
+decoded from the ESR), `far_attribution` (whose memory faulted) and
+`main_image_mapped` (1 or 0 -- a 0 there is the whole bug in one field).
+
+**AND ONE MORE WRONG READING CLEANED UP:** the boot log's last line does not
+place a crash.  The log flushes every 64 lines, so its tail is up to 63
+lines stale, and the loader's own lines are flushed one by one, so the
+ABSENCE of a loader line means the crash came before the loader's first one.
+The image-sized JIT probe that looks like the culprit **succeeded** on that
+console (`create=00000000 exec=00000000 close=00000000`; a libnx `Result` of
+0 is success).
+
+**AND ONE MORE WRONG READING CLEANED UP:** the port's `GuestTlsScope` does
+point TPIDR_EL0 at a stack block, and the guest's `libc++_shared.so` really
+does run 1328 `paciasp` + 1372 `autiasp` -- but neither of those had
+anything to do with this crash, and "do not clobber TPIDR_EL0" was not the
+fix.  Removing the fake TCB would break the guest's own TLS layout, because
+the fake TCB exists for Bionic's stack canary at +0x28.

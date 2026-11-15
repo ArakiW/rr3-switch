@@ -189,18 +189,45 @@ extern "C" void __libnx_exception_handler(ThreadExceptionDump* dump) {
     crashHex("esr", dump->esr);
     // THE EXCEPTION CLASS, DECODED FROM THE ESR.
     //
-    // MEASURED 2026-11-10: the console crash's ESR is 0x92000005, and the
-    // class in the top bits is (esr >> 26) & 0x3f = 0x24 = SPAL -- a
-    // POINTER AUTHENTICATION failure.  The repository's own note read this
-    // ESR as "data abort, translation fault", which is 0x4E000005 and not
-    // this value: the wrong reading sent the search after a translation
-    // fault instead of after a pointer authentication.
+    // The ARMv8-A exception encoding puts the class in ESR[31:26]:
+    //
+    //   0x24 = "Data Abort from a lower Exception level" (the AArch64
+    //          form).  Its ISS carries a 64-bit data-abort status in
+    //          ISS[5:0]: ISS = 0x05 gives DFSC = 0b000101 = "Translation
+    //          fault, level 1", and WnR = ISS[6] = 0 means the faulting
+    //          access was a READ.
+    //   0x0C = "Failed pointer authentication check" (SPAL), whose ESR is
+    //          0x3000_00xx -- a different value from ours.
+    //
+    // MEASURED 2026-11-10 (the console): the ESR was 0x92000005, so EC =
+    // 0x24 and the fault was a stage-1 translation fault on a read -- an
+    // ordinary unmapped access.  A later reading of the same number called
+    // 0x24 "SPAL", and that wrong reading sent a whole investigation after
+    // TPIDR_EL0 and PAC keys instead of after the unmapped address.  The
+    // fault_class line below decodes the ESR every time, so this cannot be
+    // misread again.
     //
     // crashHex() and not the C++ formatting helpers: this handler runs on
     // the kernel's exception stack, where nothing may allocate and nothing
     // may call into the C++ runtime.  The contract test
     // (tests/test_graphics_isolation_contract.py) enforces that.
     crashHex("ec", (dump->esr >> 26) & 0x3fULL);
+    {
+        const u64 ec = (dump->esr >> 26) & 0x3fULL;
+        const u64 dfsc = dump->esr & 0x3fULL;
+        const char* faultClass = "unknown";
+        if (ec == 0x0cULL) {
+            faultClass = "spal";
+        } else if (ec == 0x24ULL) {
+            faultClass = (dfsc == 0x05ULL) ? "data-abort-translation-fault-l1"
+                                           : "data-abort";
+        } else if (ec == 0x13ULL || ec == 0x16ULL || ec == 0x17ULL || ec == 0x18ULL) {
+            faultClass = "instruction-abort";
+        }
+        crashText("fault_class=");
+        crashText(faultClass);
+        crashText("\n");
+    }
     // WHOSE CODE FAULTED.
     //
     // The one question the console crash has not answered is whether the
@@ -220,7 +247,21 @@ extern "C" void __libnx_exception_handler(ThreadExceptionDump* dump) {
             crashText(where);
             crashText("\n");
         }
+        // WHOSE MEMORY FAULTED.  The pc says whose CODE ran; the far says
+        // whose DATA was touched, which is the other half of the question
+        // and the one the 2026-11-10 crash needed answered.
+        if (rr3::loaderLocateAddress(dump->far.x, where, sizeof(where))) {
+            crashText("far_attribution=");
+            crashText(where);
+            crashText("\n");
+        }
     }
+    // WAS THE GUEST IMAGE MAPPED WHEN IT FAULTED?
+    //
+    // A 0 here IS the 2026-11-10 crash in one field: the port published the
+    // guest's load bias before it mapped the image, so a reader trusted a
+    // bias whose bytes did not exist yet and faulted on them.
+    crashHex("main_image_mapped", rr3::loaderMainImageMapped() ? 1ULL : 0ULL);
     crashHex("pstate", dump->pstate);
     for (unsigned int index = 0; index < 29; ++index) {
         char name[] = {'x', static_cast<char>('0' + index / 10),

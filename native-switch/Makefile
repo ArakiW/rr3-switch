@@ -19,7 +19,7 @@ ROMFS_IMAGE := rr3.romfs
 ROMFS_FILES := $(shell find $(ROMFS) -type f)
 APP_TITLE   := RR3 Native Rehost
 APP_AUTHOR  := Native Port Lab
-APP_VERSION := 0.22.11
+APP_VERSION := 0.22.12
 
 # THE NSP PACKAGE.
 #

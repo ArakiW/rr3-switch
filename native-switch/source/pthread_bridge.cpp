@@ -5869,10 +5869,23 @@ void* reapDetachedThreadWorker(void*) {
                 // which is unmapped on hardware: data abort, far=0x1f6d5d0,
                 // pc in this function. Eden happened to map it. Read nothing
                 // until the loader says the slot is inside the image.
+                //
+                // 2026-11-10 console crash: the OTHER half of the same bug.
+                // The bias was NOT zero that time -- the loader had already
+                // published one -- but the image was only RESERVED, not
+                // MAPPED, so the slot had no backing either.  The guard
+                // below did not catch it because guestImageContains() asked
+                // the ELF's PT_LOAD table whether the address was in range
+                // and never asked whether the image was mapped.  Both halves
+                // are closed on the loader's side now: it withholds the
+                // bias until the mapping exists, and guestImageContains()
+                // requires the mapping to be live.
                 if (biasNow == 0 || !guestImageContains(slot, sizeof(uintptr_t))) {
                     guestViewWideLog("reaper-asset-singleton", waitedNanos,
                                      kReaperWaitSliceNanos,
-                                     "asset-probe: SKIPPED main image not loaded yet");
+                                     rr3::loaderMainImageMapped()
+                                         ? "asset-probe: SKIPPED slot outside the mapped image"
+                                         : "asset-probe: SKIPPED main image not mapped yet");
                     // Still inside the wait loop with gRegistryLock held: go
                     // back to the pending/quiesce check and the next wait.
                     continue;

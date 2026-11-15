@@ -261,10 +261,26 @@ GuestInitializationResult initializeGuestDependencies();
 GuestInitializationResult initializeGuestMainConstructors(
     const char* progressPath = nullptr);
 uintptr_t resolveMainImageExport(const char* name);
-// Runtime load bias of libRealRacing3.so (0 if the image is not loaded).
+// Runtime load bias of libRealRacing3.so (0 if the image is not loaded or not mapped).
 // Guest VA = loadBias + ELF virtual address.
+//
+// A non-zero bias is a PROMISE that the guest's bytes are readable at
+// bias + vaddr.  The loader used to publish the bias as soon as the image
+// was LOADED, which is before the image is MAPPED, and every reader of a
+// guest address inside that window faulted (the 2026-11-10 console crash:
+// a stage-1 translation fault, level 1, on a read).  The bias is now
+// withheld until the mapping exists.
 uintptr_t resolveMainImageLoadBias();
-// True when [runtimeAddress, runtimeAddress + bytes) is inside the mapped
+// True when the image at `index` is not merely loaded but MAPPED, i.e. its
+// bytes really exist and can be read.  "Loaded" and "mapped" are two
+// different steps in the loader, and the gap between them is exactly where
+// a guest read faults.  See loaderImageIsMapped() in multi_dso_linker.cpp.
+bool loaderImageIsMapped(size_t index);
+// True when the main guest image is mapped.  The crash handler prints this
+// at the moment of the fault: a 0 there is the 2026-11-10 crash in one
+// field.
+bool loaderMainImageMapped();
+// True when [runtimeAddress, runtimeAddress + bytes) is inside the MAPPED
 // image of libRealRacing3.so.
 //
 // The guest image is mapped for the guest vaddr range
@@ -272,6 +288,13 @@ uintptr_t resolveMainImageLoadBias();
 // back to a guest vaddr by subtracting the image's load bias (the same one
 // resolveMainImageLoadBias() returns) and then tested against the PT_LOAD
 // program headers.
+//
+// "INSIDE THE MAPPED IMAGE" IS THE WHOLE POINT.  This predicate used to ask
+// only whether the address was inside the ELF's declared range, so it said
+// yes for addresses whose bytes did not exist yet -- the reserved-but-not-
+// mapped window between reserveSegmentedTargets() and mapProcessCodeImages()
+// -- and the reader behind it faulted.  It now also requires the image to be
+// mapped.
 //
 // Why it exists: a diagnostic that reads guest memory has to be able to say
 // "that address is not mapped" instead of faulting the process.

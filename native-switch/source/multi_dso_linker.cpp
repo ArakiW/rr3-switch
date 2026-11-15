@@ -991,11 +991,18 @@ void closeSegmentedMappings() {
 // WHY THIS EXISTS: the loader's diagnostics existed and went NOWHERE.
 // main.cpp's bootPrintf is a no-op in this build -- ((void)format; return 0;)
 // -- so the segdiag / procdiag / permissions lines were never written to any
-// file.  MEASURED 2026-11-10 (the console): the crash was a SPAL (a
-// pointer-authentication fault) INSIDE this loader, and the only thing on the
-// record was the line before it ('gl-ctx-early ... disabled by conf').  The
-// fault was not diagnosable, because the instrument that would have named the
+// file.  MEASURED 2026-11-10 (the console): the crash was a stage-1
+// translation fault on a READ -- an ordinary unmapped access, in the PORT's
+// own reaper rather than in this loader -- and the only thing on the record
+// was the line before it ('gl-ctx-early ... disabled by conf').  The fault
+// was not diagnosable, because the instrument that would have named the
 // DSO, the segment, the offset and the permission was compiled out.
+//
+// AND NOTE WHAT THE LOG'S LAST LINE IS WORTH: the log's own policy is a
+// 64-line bulk flush, so its tail can be up to 63 lines stale, and THESE
+// loader lines are flushed one by one -- so the ABSENCE of a loader line
+// means the crash came before the loader's first one, and the presence of a
+// loader line does NOT mean the crash came after it.
 //
 // => SO THE LOADER SAYS IT ITSELF, FROM INSIDE THE LOADER, WHERE A CRASH
 // CANNOT SKIP IT: one progress line BEFORE each segment mapping, and one
@@ -2385,14 +2392,17 @@ int stopPhdrCallback(GuestDlPhdrInfo*, size_t, void*) {
 
 // THE PAC CENSUS OF THE GUEST IMAGES.
 //
-// WHY: MEASURED 2026-11-10, the console crash's ESR is 0x92000005, and the
-// exception class in the top bits is 0x24 = SPAL -- a POINTER AUTHENTICATION
-// failure.  The port's own NRO carries exactly TWO PAC/AUT instructions (both
-// in libunwind's uw_update_context), so a SPAL cannot have been raised by
-// the port's own code; and the NRO base implied by the crash pc is not
-// page-aligned, so the pc is not in the port image either.  The guest's
-// libc++_shared.so, on the other hand, carries 1328 paciasp and 1372
-// autiasp: the GUEST's code is PAC-compiled.
+// WHY: the guest's code IS pointer-authenticated, and that is worth knowing
+// on its own account.  MEASURED 2026-11-10, the console crash's ESR is
+// 0x92000005, whose exception class is 0x24 -- "Data Abort from a lower
+// Exception level" -- with DFSC 0b000101 = "Translation fault, level 1" and
+// WnR = 0, i.e. an ordinary unmapped READ.  (It is NOT a SPAL: that is
+// EC 0x0C, whose ESR is 0x3000_00xx.  A later reading of the same number
+// called 0x24 "SPAL" and sent a whole investigation after PAC keys instead
+// of after the unmapped address; the crash dump now decodes its own ESR.)
+// The guest's libc++_shared.so carries 1328 paciasp and 1372 autiasp: the
+// GUEST's code is PAC-compiled, so this census is still worth having -- for
+// the day a real SPAL (EC 0x0C) shows up.
 //
 // => So the census counts the PAC/AUT opcodes in each guest image BEFORE it
 // is mapped.  One line per DSO says whether the guest's pointer
@@ -3061,15 +3071,74 @@ uintptr_t resolveMainImageExport(const char* name) {
     return address;
 }
 
+// True when the image at `index` is not merely LOADED but MAPPED, i.e. its
+// bytes really exist and can be read.
+//
+// WHY IT EXISTS.  "Loaded" and "mapped" are two different steps in the
+// loader, and the gap between them is a place where a guest read faults.
+//
+//   * `image.loaded` is set at the end of the LOAD phase.
+//   * `reserveSegmentedTargets()` then sets `image.executableLinkBase` to a
+//     RESERVED CodeMemory address.  A reservation is an address range with
+//     no backing: reading it faults.
+//   * Only `mapProcessCodeImages()` maps the image, and THAT is what sets
+//     `gSegmentedImages[index].processMapped`.
+//
+// MEASURED 2026-11-10 (the console): the detached-thread reaper read a
+// guest address through a load bias that had already been published while
+// the image was still only reserved.  The read faulted with esr 0x92000005
+// -- a data abort, stage-1 translation fault, level 1, on a READ -- at
+// `bias + 0x1F6D5D0`, which is the guest's asset-singleton slot.  The guard
+// that was supposed to stop it, guestImageContains(), asked the ELF's
+// PT_LOAD table whether the address was in range and never asked whether
+// the image was mapped, so it said yes.  The 2026-11-03 crash was the other
+// half of the same bug: there the bias was still 0 and the slot was the raw
+// ELF VA.
+//
+// Both guestImageContains() and resolveMainImageLoadBias() are gated on this,
+// because they are the two doors every guest-memory reader in the port goes
+// through.
+bool loaderImageIsMapped(size_t index) {
+    if (index >= gLoaderImageCount) {
+        return false;
+    }
+    if (!gLoaderImages[index].loaded) {
+        return false;
+    }
+    const SegmentedImageMapping& mapped = gSegmentedImages[index];
+    if (mapped.processMapped) {
+        return true;
+    }
+    // The segmented path maps each range on its own and does not use the
+    // one-pass backing, so it never sets processMapped.  A mapped range is
+    // the same answer.
+    for (const SegmentCodeMapping& range : mapped.ranges) {
+        if (range.ownerMapped || range.slaveMapped || range.normalMapped) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool loaderMainImageMapped() {
+    return loaderImageIsMapped(embeddedSonameIndex("libRealRacing3.so"));
+}
+
 uintptr_t resolveMainImageLoadBias() {
     const size_t mainIndex = embeddedSonameIndex("libRealRacing3.so");
     if (mainIndex >= gLoaderImageCount || !gLoaderImages[mainIndex].loaded) {
         return 0;
     }
+    // A bias is a PROMISE that the guest's bytes are readable at bias + vaddr,
+    // and that promise is only true once the image is mapped.  The loader's
+    // own code uses image.loadBias() directly and is unaffected by this.
+    if (!loaderImageIsMapped(mainIndex)) {
+        return 0;
+    }
     return gLoaderImages[mainIndex].loadBias();
 }
 
-// True when [runtimeAddress, runtimeAddress + bytes) is inside the mapped
+// True when [runtimeAddress, runtimeAddress + bytes) is inside the MAPPED
 // image of libRealRacing3.so.
 //
 // The guest image is mapped for the guest vaddr range
@@ -3077,6 +3146,13 @@ uintptr_t resolveMainImageLoadBias() {
 // converted back to a guest vaddr by subtracting the image's load bias and
 // then tested against the PT_LOAD program headers with the loader's own
 // CrossImage::containsMemory.
+//
+// "INSIDE THE MAPPED IMAGE" IS THE WHOLE POINT.  This predicate used to ask
+// only whether the address was inside the ELF's declared range, so it said
+// yes for addresses whose bytes did not exist yet -- the reserved-but-not-
+// mapped window between reserveSegmentedTargets() and mapProcessCodeImages()
+// -- and the reader behind it faulted.  It now also requires the image to be
+// mapped, and the address to be inside the bytes that were mapped.
 //
 // WHY IT EXISTS. A diagnostic that reads guest memory has to be able to say
 // "that address is not mapped" instead of faulting the process, and the
@@ -3089,12 +3165,28 @@ bool guestImageContains(uintptr_t runtimeAddress, size_t bytes) {
     if (mainIndex >= gLoaderImageCount || !gLoaderImages[mainIndex].loaded) {
         return false;
     }
+    if (!loaderImageIsMapped(mainIndex)) {
+        return false;
+    }
     const CrossImage& image = gLoaderImages[mainIndex];
     const uintptr_t bias = image.loadBias();
     if (runtimeAddress < bias) {
         return false;
     }
     const uint64_t vaddr = static_cast<uint64_t>(runtimeAddress - bias);
+    // The mapped bytes are the image buffer, which is indexed by
+    // (vaddr - minimumAddress): the loader builds it as one vaddr-indexed
+    // array (loadImage() assigns maximumAddress - minimumAddress bytes and
+    // reads each PT_LOAD at pointer(ph.virtualAddress)).  A vaddr past the
+    // end of that array is inside the ELF's declared range but outside
+    // anything that was mapped.
+    if (vaddr < image.minimumAddress) {
+        return false;
+    }
+    if (vaddr - image.minimumAddress + static_cast<uint64_t>(bytes) >
+        static_cast<uint64_t>(image.image.size())) {
+        return false;
+    }
     return image.containsMemory(vaddr, static_cast<uint64_t>(bytes));
 }
 

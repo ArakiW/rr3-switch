@@ -4084,36 +4084,63 @@ MEASUREMENT THAT READS A STRING OUT OF A LOG MUST BE MOVED ONTO A COUNTER
 BEFORE THE LOG MAY CHANGE -- AND A FILE THAT IS EDITED BY SCRIPT MUST BE
 RESTORED FROM ITS SOURCE, NOT REPAIRED BY ANOTHER SCRIPT.**
 
-### 9.41 The console crash: a SPAL, and the first version of this section got the attribution wrong
+### 9.41 The console crash, and the two readings of it that were wrong
 
 **MEASURED 2026-11-10 (the console run the user attached): crash-early.txt,
 guest-view.log and teardown-repair.log.**
 
-**=> THIS SECTION CORRECTS ITSELF.  The first version of it said the fault
-was a pointer-authentication failure in the PORT'S OWN CODE and put it in
-the seven-DSO loader.  That was wrong, and the reason it was wrong is
-measurable.**
+**=> THIS SECTION CORRECTS ITSELF, TWICE.  The first version of it said the
+fault was a pointer-authentication failure in the PORT'S OWN CODE and put it
+in the seven-DSO loader.  That was wrong.  The SECOND version said the fault
+was a pointer-authentication failure somewhere else.  That was wrong too, and
+both wrong readings came from the same mistake: reading the ESR's exception
+class out of the wrong field.  Section 9.46 is the measurement that ended
+the search.**
 
-**=> AND THE FAULT IS A SPAL.**  `esr=0x92000005`; the exception class is
-`(esr >> 26) & 0x3f` = **0x24 = SPAL**, a pointer-authentication failure.
-The repository's own note read this ESR as "data abort, translation fault",
-which is `0x4E000005` and NOT this value -- the wrong reading sent the
-search after a translation fault instead of after a pointer authentication.
+**=> ⇒ ⇒ ⇒ ⇒ AND THE FAULT IS NOT A SPAL, AND NOT A POINTER AUTHENTICATION
+FAILURE.**  `esr=0x92000005`; the exception class is
+`(esr >> 26) & 0x3f` = **0x24 = "Data Abort from a lower Exception level"**
+(the AArch64 form).  For that class the ISS holds a 64-bit data-abort status
+in ISS[5:0]: ISS = 0x05 gives DFSC = 0b000101 = **"Translation fault, level
+1"**, and WnR = ISS[6] = 0, so the faulting access was a **READ**.  **=> IT
+IS AN ORDINARY UNMAPPED DATA READ.**  SPAL is EC **0x0C**, whose ESR is
+0x3000_00xx; and "data abort, translation fault" is not 0x4E000005 either
+(0x4E000005 is EC 0x13, an instruction abort).  **=> THE REPOSITORY'S OWN
+EARLIER NOTE WAS RIGHT AND THE LATER "SPAL" READING WAS WRONG** -- and the
+wrong one is the one that got written into the code comment, into the commit
+message and into this section.  The crash dump itself now decodes its own
+ESR (see the `fault_class` line in section 9.46), so the next console run
+cannot be misread this way again.
 
-**=> ⇒ ⇒ AND THE FAULT IS NOT IN THE PORT'S OWN CODE.**  The port's NRO
-carries **exactly TWO** PAC/AUT instructions, both in libunwind's
-`uw_update_context` (file offsets 0x5c7e2c and 0x5c7e4c), in the current
-ELF and in the crashed binary alike.  A SPAL needs a pointer-authentication
-check to fail; the port's code has almost none.  And the NRO base implied
-by the crash pc (`0x6d478dc508` / `0x6d478dc4e8`) is **not page-aligned**,
-and an NRO base must be.  **⇒ THE pc IS IN A GUEST IMAGE**, mapped into
-code memory by the loader -- not in the port.
+**=> ⇒ ⇒ AND THE pc IS IN THE PORT'S OWN IMAGE AFTER ALL -- the first version of
+this section put it in a guest image, and that was wrong, but it was wrong
+for a reason that is now gone.**  The argument it used ("a SPAL
+needs a pointer-authentication check, and the port's code has almost none")
+no longer applies, because the fault is not a SPAL.  **THE pc IS THE PORT'S
+OWN CODE, AND THE PROOF IS AN ADDR2LINE AGAINST THE EXACT BINARY THE
+CONSOLE RAN:**  the build of commit `a5ba9487` (the tree the 2026-11-10 run
+came from) was reproduced, and
 
-**=> ⇒ ⇒ AND THE GUEST'S CODE IS POINTER-AUTHENTICATED.**  The APK's
-`libc++_shared.so` carries **1328 `paciasp` and 1372 `autiasp`**
-(`libRealRacing3.so`: 2; `libfmodex.so`: 0).  So the guest is
-PAC-compiled code being run on a console that enforces PAC, by a port that
-has no PAC context for it.
+    nm(__libnx_exception_handler) = 0x8fb60
+    runtime base = 0x1abfbc5b60 - 0x8fb60 = 0x1abfb36000
+    pc  static 0x836f4 -> rr3::reapDetachedThreadWorker(void*)
+                        native-switch/source/pthread_bridge.cpp:5881
+    lr  static 0x836f0 -> native-switch/source/pthread_bridge.cpp:5872
+
+**AND `lr = pc - 4` IS EXACTLY WHAT A CALL'S RETURN ADDRESS LOOKS LIKE:**
+line 5872 is the guard that calls `guestImageContains()`, and the
+instruction right after it is the load that faulted.  **SO THE FAULT IS THE
+PORT'S OWN DIAGNOSTIC READING A GUEST ADDRESS THAT WAS NOT MAPPED YET.**
+Section 9.46 has the whole chain.
+
+**=> ⇒ ⇒ ⇒ AND THE GUEST'S CODE IS POINTER-AUTHENTICATED -- TRUE, AND NOT
+THE CAUSE.**  The APK's `libc++_shared.so` carries **1328 `paciasp` and 1372
+`autiasp`** (`libRealRacing3.so`: 2; `libfmodex.so`: 0), so the guest signs
+and authenticates pointers on every function entry and exit.  That is a real
+fact about the guest and it is worth keeping on the record for the day the
+guest's own authentication does matter -- but **it is not what the
+2026-11-10 crash was.**  The crash was an unmapped read, before any
+authentication was involved.
 
 **=> ⇒ ⇒ AND "IT CRASHED IN THE LOADER" WAS ALSO UNSOUND.**  `appendGuestBootLine`
 opens the log in APPEND mode, so the log's last line can be the PREVIOUS
@@ -4398,7 +4425,7 @@ control.  NOT the game's data -- the seven volumes and the .depot tree,
 about 11.8 GiB -- which has never been in the executable and is still copied
 onto the card separately.**
 
-#### 9.44.2 THE NEW CONSOLE DUMP ANSWERS THE SPAL QUESTION IN ONE FIELD
+#### 9.44.2 THE CONSOLE DUMP, READ CORRECTLY (this subsection was wrong once)
 
 **MEASURED 2026-11-11, the dump the user attached after the run of
 2026-11-10:**
@@ -4411,31 +4438,35 @@ onto the card separately.**
     sp=000000018eff39b0
     fp=000000018eff39e0
 
-**=> THE EXCEPTION CLASS IS STILL SPAL** (0x24), and `pc = lr + 4` again.
+**=> THE EXCEPTION CLASS IS 0x24, WHICH IS "Data Abort from a lower Exception
+level", AND THE FAULT STATUS IN ISS[5:0] IS 0b000101 = "Translation fault,
+level 1".  WITH WnR = 0, THE FAULTING ACCESS WAS A READ.**  This subsection
+used to say the class was SPAL.  It is not: SPAL is EC 0x0C.  Section 9.41
+has the full correction and section 9.46 has the fault.
 
-**=> ⇒ ⇒ AND THE ONE FIELD THAT MATTERS IS `fault_tpidr_el0`: IT IS
-0x18eff3e60, AND THE STACK POINTER IS 0x18eff39b0.**  The thread pointer that
-names the thread-local area -- the value every PAC key derives from -- points
-**1,200 bytes ABOVE THE STACK POINTER, INSIDE THE STACK FRAME.**
+**=> ⇒ ⇒ ⇒ ⇒ AND `pc = lr + 4` IS NOT A POINTER-AUTHENTICATION SIGNATURE,
+IT IS A CALL'S RETURN ADDRESS.**  With the correct build attributed (section
+9.46), `lr` is the return address of the call to `guestImageContains()` and
+`pc` is the load that follows it.
 
-**=> ⇒ ⇒ ⇒ THAT IS THE PORT'S OWN FAKE TCB.**  `GuestTlsScope`
-(`tls_probe.cpp`) fabricates a 256-byte block ON THE STACK and points
-TPIDR_EL0 at it, and it is active across the whole guest-constructor window
-(the loader's calls at `multi_dso_linker.cpp:2345`, `:2748`, `:2910`).  On a
-console, TPIDR_EL0 must name a real thread-local area whose PAC key material
-lives there; a stack address for TPIDR_EL0 means the guest's `autiasp`/
-`paciasp` computes a PAC against the wrong key.
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ AND `fault_tpidr_el0` IS A RED HERRING FOR THIS CRASH.**
+It is 1,200 bytes above the stack pointer, inside the stack frame, and the
+port's `GuestTlsScope` does point TPIDR_EL0 at a stack block -- but that is
+beside the point: **the fault was an unmapped read, and no pointer
+authentication was involved at all.**  The port's fake TCB is a real thing
+and it is still a thing to keep an eye on (the guest's `libc++_shared.so`
+really does run 1328 `paciasp` + 1372 `autiasp`), but **it did not cause
+this crash, and "do not clobber TPIDR_EL0" is NOT the fix.**  Removing the
+fake TCB would break the guest's own TLS layout (`GuestTlsScope` exists
+because Bionic puts the stack canary at +0x28), so that "small fix" would
+have traded one crash for a different one.
 
-**=> ⇒ ⇒ ⇒ ⇒ AND THE GUEST'S CODE IS PAC-COMPILED** (1328 `paciasp` + 1372
-`autiasp` in `libc++_shared.so`, section 9.41), so the guest signs and
-authenticates pointers on every function entry and exit.  **=> THE PORT'S
-FAKE TLS IS THE MOST LIKELY CAUSE OF THE SPAL**, and it is a port-side bug,
-not a guest bug.
-
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ THE FIX IS NAMED AND SMALL: the port must not clobber
-TPIDR_EL0.**  Save the host's value and restore it around the guest
-constructor window, or give the guest a real thread-local block.  The next
-console run is not needed to find that; it is needed to confirm the fix.
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE FAULT'S OWN ADDRESS SAYS WHAT WAS WRONG.**
+`far - bias = 0x1F6D5D0`, which is the port's own constant
+`kAssetSingletonElfVa` -- a guest virtual address -- and `bias` was
+`0x59a29c1000`, a RESERVED CodeMemory address, not a mapped one.  **=> THE
+PORT READ A GUEST ADDRESS THROUGH A LOAD BIAS THAT HAD BEEN PUBLISHED
+BEFORE THE IMAGE WAS MAPPED.**  Section 9.46 is that finding.
 
 #### 9.44.3 THE CONTROLLED ROUND SETTLED THE RACE-COUNT QUESTION
 
@@ -4594,3 +4625,142 @@ Program NCA's RomFS partition as the process's data storage, the port uses
 the NSP's own copy (`romfs-src target=1 source=embedded`).  If it does not,
 the port uses the card's copy (`target=2 source=card`).  **BOTH PATHS
 WORK, AND THE PACKAGE CARRIES THE TREE EITHER WAY.**
+
+### 9.46 The 2026-11-10 console crash, closed: the load bias was published before the image was mapped
+
+**MEASURED 2026-11-10 (the console), and re-measured 2026-11-16 by
+reproducing the exact build the console ran.**
+
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE FIRST THING THAT WAS WRONG WAS THE
+EXCEPTION CLASS ITSELF.**  `esr=0x92000005`.  ARMv8-A puts the exception
+class in ESR[31:26]:
+
+    EC = (esr >> 26) & 0x3F = 0x24 = "Data Abort from a lower Exception level"
+
+For EC 0x24 the ISS carries a 64-bit data-abort status in ISS[5:0].  Our ISS
+is 0x05: DFSC = 0b000101 = **"Translation fault, level 1"**, and
+WnR = ISS[6] = 0, so the faulting access was a **READ**.  **=> IT IS AN
+UNMAPPED DATA READ.**  A pointer-authentication failure (SPAL) is EC **0x0C**
+and its ESR is 0x3000_00xx.  **=> THE "SPAL" READING WAS WRONG, AND IT WAS
+THE READING THAT WAS WRITTEN INTO THE CODE, INTO A COMMIT MESSAGE AND INTO
+THE DOCS.**  It was also the reading that sent a whole investigation after
+TPIDR_EL0 and PAC keys.  Sections 9.41 and 9.44.2 now say so.
+
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE pc IS THE PORT'S OWN CODE, AND THE
+PROOF IS AN ADDR2LINE AGAINST THE EXACT BINARY.**  The crash dump format
+proves the console ran the tree of commit `a5ba9487` (the dump has no
+`pc_attribution=` field, and that field arrived in `e06c2a35` on 2026-11-11).
+That commit was rebuilt:
+
+    nm(__libnx_exception_handler) = 0x8fb60
+    runtime base = 0x1abfbc5b60 - 0x8fb60 = 0x1abfb36000
+    pc  static 0x836f4 -> rr3::reapDetachedThreadWorker(void*)
+                        native-switch/source/pthread_bridge.cpp:5881
+    lr  static 0x836f0 -> native-switch/source/pthread_bridge.cpp:5872
+
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND `lr = pc - 4` IS THE SMOKING GUN, IN
+THE GOOD SENSE.**  Line 5872 is the guard that CALLS `guestImageContains()`,
+and the instruction right after the call is the load that faulted.  The crash
+is the port's own diagnostic, in the port's own code, reading a guest address.
+
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE FAULTING ADDRESS IS A GUEST
+VIRTUAL ADDRESS.**  `far = 0x59a492e5d0`, `x25 = 0x59a29c1000`, and
+
+    far - x25 = 0x1F6D5D0
+
+which is the port's own constant `kAssetSingletonElfVa`
+(`pthread_bridge.cpp`), the guest's asset-singleton slot.  `x27 == far`
+exactly, so x27 was the base register of the faulting load.  The code:
+
+    const uintptr_t biasNow = resolveMainImageLoadBias();
+    const uintptr_t slot = static_cast<uintptr_t>(biasNow + kAssetSingletonElfVa);
+    if (biasNow == 0 || !guestImageContains(slot, sizeof(uintptr_t))) {
+        ... SKIPPED ...
+        continue;
+    }
+    const uintptr_t obj =
+        *reinterpret_cast<const volatile uintptr_t*>(slot);   // 5881: faulted
+
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE ROOT CAUSE IS A HALF-OPEN
+GATE.**  `guestImageContains()` (`multi_dso_linker.cpp`) answers "is this guest
+virtual address inside the guest image?" by folding the runtime address back
+to a guest vaddr and testing it against the ELF's PT_LOAD table.  **=> IT
+NEVER ASKS WHETHER THE IMAGE IS MAPPED.**  And `resolveMainImageLoadBias()`
+returns a non-zero bias as soon as `gLoaderImages[mainIndex].loaded` is true
+-- which happens during the LOAD phase (`multi_dso_linker.cpp:645`), before
+the mapping exists.
+
+The mapping is made later, in `mapProcessCodeImages()`, and THAT is what sets
+`gSegmentedImages[index].processMapped = true` (`multi_dso_linker.cpp:1435`
+and `:1454`).  Between the two, `reserveSegmentedTargets()` has already set
+`image.executableLinkBase = targetBase` -- a RESERVED CodeMemory address with
+no backing -- so `loadBias()` is non-zero and points at memory that does not
+exist.  **=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ THERE IS A WINDOW IN
+WHICH THE PORT PUBLISHES A USABLE-LOOKING GUEST BIAS AND HAS NOT MAPPED THE
+IMAGE YET, AND EVERY READER OF A GUEST ADDRESS IN THAT WINDOW FAULTS.**
+
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THAT WINDOW IS WIDE
+ENOUGH TO CATCH THE REAPER.**  The detached-thread reaper starts during boot
+and ticks every second; the console's dry load of the 32 MiB image is slow,
+so the reaper's first tick lands right in the middle of the loader's work.
+**=> THE 2026-11-03 CRASH WAS THE OTHER HALF OF THE SAME BUG**: there
+`biasNow == 0`, so the slot was the raw ELF VA `0x1f6d5d0`, unmapped on
+hardware, and Eden happened to map it.  That half was fixed with the
+`biasNow == 0` check.  **=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ THIS
+HALF -- THE BIAS IS SET BUT THE IMAGE IS NOT MAPPED -- WAS NOT.**
+
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND `guestImageContains()` IS
+THE ONE GATE EVERY GUEST READ GOES THROUGH, WHICH IS WHY ONE FIX IS ENOUGH:**
+
+    native-switch/source/pthread_bridge.cpp:5872   (the crash site)
+    native-switch/source/guest_view_probe.cpp:7183  (flReadable -> flRead)
+    native-switch/source/guest_rtti.cpp:124,386,406 (readGuestWord)
+    native-switch/source/race_state_probe.cpp:305,318,347
+    native-switch/source/guest_action.cpp:230
+
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE SAME WINDOW ALSO
+POISONED OTHER THINGS.**  `guest_teardown_repair.cpp` LATCHES the bias on its
+first read; a pre-mapping bias latched there would have been wrong for the
+rest of the run.  `ui_control_probe.cpp` computes `bias + kGuestTextEndVa` and
+compares against it.  All of them get the same fail-closed answer once the
+bias is gated on the mapping.
+
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE FIX IS ONE PREDICATE,
+MADE HONEST.**
+
+    guestImageContains()          -> false unless the image is MAPPED
+    resolveMainImageLoadBias()    -> 0 unless the image is MAPPED
+
+Both now say "the bytes are there", not "the address is in the ELF".  The
+loader itself is unaffected: it uses `image.loadBias()` directly, never
+`resolveMainImageLoadBias()`.
+
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE NEXT CONSOLE DUMP
+SAYS SO ITSELF.**  The crash file now carries:
+
+| field | what it answers |
+|---|---|
+| `fault_class` | the exception, decoded from the ESR: `data-abort-translation-fault-l1`, `data-abort`, `spal`, `instruction-abort`, `unknown` |
+| `far_attribution` | whose memory the faulting address is: a guest DSO, `port-nro+0x...`, or unmapped |
+| `main_image_mapped` | 1 or 0 -- was the guest image mapped when it faulted?  **A 0 here is the whole bug in one field.** |
+| `pc_attribution` / `lr_attribution` | the pc and lr, already there since 2026-11-11 |
+
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE JIT PROBE WAS NOT
+THE CRASH, DESPITE LOOKING LIKE IT.**  The image-sized JIT probe
+(`captureImageSizedJitProbe`, 34,377,728 bytes) SUCCEEDED on that console:
+the log carries `step=image-jit-probe-done bytes=34377728 create=00000000
+exec=00000000 close=00000000`, and a libnx `Result` of 0 is success.  **=> THE
+BOOT LOG'S LAST LINE DOES NOT PLACE THE CRASH, AND NEITHER DOES THE PROBE
+BEFORE IT.**  The log's own policy is a 64-line bulk flush, so the tail of the
+file is up to 63 lines stale; and the loader's own diagnostic lines are
+flushed one by one, so the absence of a loader line means the crash came
+BEFORE the loader's first one.  That is what put the crash between the probe
+and the loader, and it is where it turned out to be.
+
+**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND WHAT IS STILL OPEN.**
+The guest's `libc++_shared.so` really does run 1328 `paciasp` + 1372
+`autiasp`, and the port's `GuestTlsScope` really does point TPIDR_EL0 at a
+stack block; if a real SPAL ever shows up in a dump (EC 0x0C), THAT is where
+it will have to be looked for.  But it is not this crash, and it is not this
+fix.  The 27-to-2 start-lights regression (section 9.44.3) and the 211
+compiler warnings are still open and untouched by this.
