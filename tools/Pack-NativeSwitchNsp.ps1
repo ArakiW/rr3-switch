@@ -108,7 +108,21 @@ if ($Packer -eq '') {
     $Packer = 'E:\AI\AC-SWITCH\analysis\nsp_sdk_20261012\implementer\cfw_packer_cnmt_digest_fork\source\hacbrewpack'
 }
 if ($Keyset -eq '') {
-    $Keyset = 'E:\AI\FH1_SWITCH\tools\Eden-Windows-v0.2.1-pgo\keys\prod.keys'
+    # THE KEYSET MOVED.  The old default was
+    # E:\AI\FH1_SWITCH\tools\Eden-Windows-v0.2.1-pgo\keys\prod.keys, and
+    # that directory is gone -- the packer was reading it through a link
+    # that the E:\AI cleanup replaced.  The live copy is under citron's
+    # user directory.  Both are tried, so a layout change on either side
+    # cannot silently break the packaging.
+    $KeysetCandidates = @(
+        'E:\AI\FH1_SWITCH\tools\citron\user\keys\prod.keys',
+        'E:\AI\FH1_SWITCH\tools\Eden-Windows-v0.2.1-pgo\keys\prod.keys'
+    )
+    $Keyset = $KeysetCandidates | Where-Object { Test-Path -LiteralPath $_ } |
+        Select-Object -First 1
+    if (-not $Keyset) {
+        throw ('no keyset found; looked at: {0}' -f ($KeysetCandidates -join ', '))
+    }
 }
 
 foreach ($required in @(

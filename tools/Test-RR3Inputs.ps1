@@ -8,7 +8,17 @@ $aapt2Candidates = Get-ChildItem "$env:LOCALAPPDATA\Android\Sdk\build-tools" -Fi
     Sort-Object FullName -Descending
 $aapt2 = $aapt2Candidates | Select-Object -First 1 -ExpandProperty FullName
 $apk = Get-ChildItem $projectRoot -Filter *.apk | Select-Object -First 1
-$archives = Get-ChildItem $projectRoot -Filter *.zip | Sort-Object Name
+# The data archives live in the project root.  A cleanup of E:\AI moved them
+# to F:\AI\stale\RealRacing3-switch, so the root is searched first and that
+# archive location is the fallback -- the preflight is about the DATA being
+# present, not about which drive it sits on.
+$archives = @(Get-ChildItem $projectRoot -Filter *.zip | Sort-Object Name)
+if ($archives.Count -eq 0) {
+    $stale = 'F:\AI\stale\RealRacing3-switch'
+    if (Test-Path -LiteralPath $stale) {
+        $archives = @(Get-ChildItem -LiteralPath $stale -Filter *.zip | Sort-Object Name)
+    }
+}
 
 if (-not $apk) {
     throw "No APK found in $projectRoot"

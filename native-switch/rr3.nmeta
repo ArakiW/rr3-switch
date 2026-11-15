@@ -15,7 +15,25 @@
 <NintendoSdkMeta>
     <Core>
         <Name>Application</Name>
-        <ApplicationId>0x0100ac50f00d0001</ApplicationId>
+        <!-- THE TITLE ID'S LOW 16 BITS ARE 0x8001, NOT 0x0001.
+
+             WHY: the console's Account Manager ("am") crashed while
+             handling our title, with the title id in its TLS, before the
+             port ever ran.  Everything else in the package was
+             byte-identical to a package that installs, so the title id was
+             the only difference left.  And 0x0100AC50F00D0001's low half
+             (0x0001) is the shape of a KERNEL-BUNDLED title (the same low
+             half the kernel's own "ldr" title has), while every homebrew
+             NSP and every retail title has the application bit (0x8000)
+             set in that low half.  The reference package that installed
+             used 0x0100AC5003488000.
+
+             See docs/OPEN-ISSUES.md 9.45, and the port's romfs-src line
+             (ordinal 315), which says which romfs the port ended up with.
+
+             NOTE: an XML comment may not contain a double hyphen, which is
+             why this block is worded around it. -->
+        <ApplicationId>0x0100ac50f00d8001</ApplicationId>
         <ProgramIndex>0</ProgramIndex>
         <MainThreadStackSize>0x100000</MainThreadStackSize>
         <Is64BitInstruction>True</Is64BitInstruction>
@@ -35,7 +53,7 @@
             <Language>AmericanEnglish</Language>
             <IconPath>@SDK_SAMPLE_ICON@</IconPath>
         </Icon>
-        <DisplayVersion>0.22.10</DisplayVersion>
+        <DisplayVersion>0.22.11</DisplayVersion>
         <StartupUserAccount>None</StartupUserAccount>
         <UserAccountSwitchLock>Disable</UserAccountSwitchLock>
         <SupportedLanguage>AmericanEnglish</SupportedLanguage>

@@ -14025,3 +14025,126 @@ ALSO MEASURED THIS ROUND
     REVERTED, because the net lap progress went from 10.35 % to 5.14 %: a
     20 m look-ahead overshoots the racing line's sharper apexes.  The rres
     instrument stays.
+
+## 2026-11-13/14: THE NSP WAS MISSING ITS ROMFS, AND THE ACCOUNT MANAGER SAID SO
+
+### THE USER FOUND IT BY COMPARING SIZES
+
+    NRO      53,756,401 bytes   (the artifact that runs on hardware)
+    NSP       5,411,032 bytes   (the artifact that installs)
+    gap     -48,345,369 bytes
+
+**THE GAP WAS NOT PACKAGING OVERHEAD.  IT WAS A MISSING SECTION.**  The
+packer had been called with `--noromfs`, so the Program NCA carried only
+the ExeFS.  The tree that was left out is 44,948,780 bytes over 35 files:
+the guest's own `libRealRacing3.so` (33,110,472), `libc++_shared.so`,
+`libfmodex.so`, `libNimble.so`, the catalogue faces and the original
+text.  **AND THE PORT COULD NOT EVEN LOAD THE GUEST WITHOUT IT**:
+`main.cpp` opens `"romfs:/libc++_shared.so"` with no card fallback, and
+the loader opens whatever path it is given.
+
+**THE FIX IS ONE FLAG.**  `--romfsdir` puts the tree in the Program NCA's
+SECOND section, wrapped in IVFC and encrypted, next to the ExeFS in
+section 0.  The NPDM does not describe it (the section is described by the
+NCA's own fs header), and the NPDM the SDK generates has exactly one `META`
+magic and no romfs descriptor at all.
+
+**AND THE PACKAGE IS NOW CHECKED FILE BY FILE, NOT BY SIZE.**
+`tools/verify-nsp-romfs.py` decrypts the artifact that is about to be
+published (AES-256-XTS over the header with Nintendo's own tweak,
+AES-128-ECB over the key area, AES-128-CTR over the sections), pulls the
+RomFS image out of IVFC level 5, and compares the file list with
+`native-switch/romfs/` and with the image the NRO embeds:
+
+    in the NSP             35 files       44,948,780 bytes
+             identical to the reference
+    romfs image            35 files       44,948,780 bytes
+             identical to the reference
+    OK: the NSP carries the whole RomFS tree
+
+`hactool` (the tool the user's own reference package was verified with)
+agrees: section 1 is a valid IVFC RomFS and it lists all 35 files.
+
+### THE PORT NO LONGER DEPENDS ON THE LOADER BEING KIND
+
+libnx's `romfsMountSelf()` documents the two launch paths: an NRO mounts
+the image embedded in the NRO, and **an NSO behaves like
+`romfsMountFromCurrentProcess`**, which is the process's DATA storage.
+Whether the loader surfaces the Program NCA's RomFS partition as that data
+storage is not something the port can count on, and the NPDM carries no
+descriptor that could say so.
+
+**SO `mountPortRomfs()` RUNS `romfsInit()` FIRST AND, ONLY IF THAT FAILS,
+MOUNTS THE CARD'S COPY OF THE SAME IMAGE** (`romfsMountFromFsdev`).  The
+NRO path is bit-for-bit unchanged, and the port now says which romfs it
+got -- `phase=romfs-src ordinal=315 source=embedded|card|none` -- because
+"installed but the guest never loaded" has to be readable.
+
+### MEASURED 2026-11-13, romfscard1 (archive 20261113-235732-eden-rr3-romfscard1)
+
+One variable: where the tree comes from.  Same build, same restored state
+(`.build/guest-state/yield2`), same settings (`-Seconds 400 -CensusOff`),
+and `debug-force-card-romfs.flag` on the card so the port skipped the
+embedded mount and took the card's `rr3.romfs`.
+
+    romfs source         card (forced)   phase=romfs-src target=2 source=card forced=1
+    frames               2040
+    pixels lit           921549 of 921600
+    start lights         2      (ctl1, the embedded round: 2)
+    race screen          2      (ctl1: 2)
+    md5 mismatch         0
+    TrackDesc failures   0
+    main menu layouts    15     EventMapScreen 101
+
+**=> THE CARD-MOUNTED IMAGE IS THE TREE, NOT A SUBSTITUTE FOR IT.**  The
+guest loaded its libraries from it, the Chinese face and the Chinese
+catalogue came out of it (the captured frame is the daily-reward dialog in
+Simplified Chinese), and the race counts are the same as the embedded
+round's.
+
+### AND THEN THE CONSOLE SAID WHAT WAS ACTUALLY WRONG
+
+The user installed the new NSP and it crashed on launch.  The Atmosphere
+fatal report (text form, v1.1) says:
+
+    Result:       0xE80 (2128-0007)
+    Program ID:   0100000000000023
+    Process Name: am
+    PC:           0000007177e39804     Start Address: 0000007177e00000
+
+**=> `am` IS THE ACCOUNT MANAGER, A KERNEL-BUNDLED MODULE, AND IT DIED WITH
+OUR TITLE ID IN ITS TLS** -- it crashed while handling our title, inside
+the kernel, before the port ever ran.  Everything else in the package is
+byte-identical to a package that installs (the NPDM differs from the
+reference by exactly one 4-byte word -- the title id -- and the NACP by the
+name, the version and the title id).
+
+**AND THE TITLE ID WAS THE SHAPE OF A KERNEL-BUNDLED TITLE, NOT OF AN
+APPLICATION**: ours was `0x0100AC50F00D0001`, whose low 16 bits are 0x0001
+-- the same low half the kernel's own "ldr" title has -- while every
+homebrew NSP and every retail title has the application bit set in that
+low half (the reference package that installed used 0x8000; a retail game
+like 0x01006A800016E000 has 0xE000).
+
+**=> THE VARIABLE MOVED: v0.22.11 uses `0x0100AC50F00D8001`**, which is
+the same package with the low half changed and NOTHING ELSE changed.  **IF
+IT STILL CRASHES IN `am`, THE TITLE ID IS EXONERATED** and the Program
+NCA's second section is the next suspect.
+
+### AND THE PORT IS BUILT FOR BOTH HALVES OF THE STORY
+
+Whichever way the loader goes, the port finds the tree: the NSP's own
+RomFS section if the loader surfaces it, the card's `rr3.romfs` if it
+does not, and the `romfs-src` line says which one it used.
+
+### TWO SMALL THINGS THAT WERE ALSO FIXED
+
+- The packing script died on a `wsl.exe` proxy warning written to stderr,
+  because `$ErrorActionPreference='Stop'` turns a native command's stderr
+  into a terminating error.  The packer had already printed "Program NCA
+  RomFS Section: Yes" when the script died, so the tool succeeded and the
+  script did not know it.
+- The version was in three places and two of them were stale (the console's
+  dashboard said 0.22.4 while the packages said 0.22.10).  It is now one
+  source (`rr3/version.hpp`) plus the Makefile and the `.nmeta`, and the
+  contract tests DERIVE the agreement instead of carrying a copy.

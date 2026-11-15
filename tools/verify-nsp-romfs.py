@@ -285,7 +285,11 @@ def main() -> int:
                         default=Path("native-switch/romfs"))
     parser.add_argument("--nro", type=Path, default=None)
     parser.add_argument("--keys", type=Path,
-                        default=Path(r"E:\AI\FH1_SWITCH\tools\Eden-Windows-v0.2.1-pgo\keys\prod.keys"))
+                        default=next(
+                            path for path in (
+                                Path(r"E:\AI\FH1_SWITCH\tools\citron\user\keys\prod.keys"),
+                                Path(r"E:\AI\FH1_SWITCH\tools\Eden-Windows-v0.2.1-pgo\keys\prod.keys"),
+                            ) if path.exists()))
     parser.add_argument("--romfs-image", type=Path, default=None,
                         help="a raw RomFS image to compare against (the NRO's)")
     args = parser.parse_args()

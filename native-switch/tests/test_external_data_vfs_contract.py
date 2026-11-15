@@ -24,6 +24,14 @@ def main() -> None:
     # literal would go stale a second time. Fail loudly on anything but a
     # single match instead of silently testing the wrong archive.
     candidates = sorted(project.glob("DXT_*.zip"))
+    if not candidates:
+        # A cleanup of E:\AI moved the data archives to F:\AI\stale.  The
+        # contract is about the DATA being present, not about which drive it
+        # sits on, so the archive location is a fallback rather than a
+        # reason to fail.
+        stale = Path(r"F:\AI\stale\RealRacing3-switch")
+        if stale.exists():
+            candidates = sorted(stale.glob("DXT_*.zip"))
     if len(candidates) != 1:
         raise SystemExit(
             f"expected exactly one DXT_*.zip under {project}, found "

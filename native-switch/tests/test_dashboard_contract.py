@@ -50,6 +50,13 @@ def main() -> None:
         "RR3_PORT_VERSION (%s) and APP_VERSION (%s) disagree"
         % (header_version.group(1), make_version.group(1)))
     assert "RR3_PORT_VERSION" in ui, "the dashboard does not print the version"
+    version_header = (root / "include" / "rr3" / "version.hpp").read_text(
+        encoding="utf-8")
+    header_version = re.search(r'#define RR3_PORT_VERSION "([^"]+)"', version_header)
+    assert header_version, "version.hpp has no RR3_PORT_VERSION"
+    assert header_version.group(1) == make_version.group(1), (
+        "RR3_PORT_VERSION (%s) and APP_VERSION (%s) disagree"
+        % (header_version.group(1), make_version.group(1)))
     assert main_source.count("consoleExit(nullptr)") == 1
     assert main_source.count("runWindowGraphicsProbe") == 1
     assert main_source.index("runWindowGraphicsProbe") < main_source.index("nativeUiInit()")
