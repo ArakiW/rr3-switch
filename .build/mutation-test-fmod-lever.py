@@ -12,6 +12,7 @@ REL = [
     ("native-switch", "source", "fmod_audio_stub.cpp"),
     ("native-switch", "include", "rr3", "fmod_audio_stub.hpp"),
     ("native-switch", "source", "symbol_resolver.cpp"),
+    ("native-switch", "source", "multi_dso_linker.cpp"),
     ("native-switch", "source", "guest_view_probe.cpp"),
     ("native-switch", "tests", "test_fmod_lever_contract.py"),
     ("tools", "Test-OnEden.ps1"),
@@ -19,6 +20,7 @@ REL = [
     (".build", "run-pinned-round.ps1"),
 ]
 STUB = "native-switch/source/fmod_audio_stub.cpp"
+LINKER = "native-switch/source/multi_dso_linker.cpp"
 HEADER = "native-switch/include/rr3/fmod_audio_stub.hpp"
 RESOLVER = "native-switch/source/symbol_resolver.cpp"
 VIEW = "native-switch/source/guest_view_probe.cpp"
@@ -84,6 +86,30 @@ def mutate(root, name):
         assert old in text, "mutant F did not apply"
         write(path, text.replace(old, """    static int cached = 0; // 0 = not read yet, 1 = the port's shim, 2 = real
     if (true) { return true; }"""))
+    elif name == "G-the-lever-state-is-never-printed":
+        path = os.path.join(root, LINKER)
+        text = read(path)
+        old = '"fmod-bind: lever=%s state=%d cross=%llu host=%llu missing=%llu"'
+        assert old in text, "mutant G did not apply"
+        write(path, text.replace(old, '"fmod-bind: lever=unknown state=0 cross=0 host=0 missing=0"'))
+    elif name == "H-the-relocation-census-is-not-printed":
+        path = os.path.join(root, LINKER)
+        text = read(path)
+        old = '" rel=%llu int=%llu host=%llu cross=%llu weak=%llu patched=%llu verified=%llu"'
+        assert old in text, "mutant H did not apply"
+        write(path, text.replace(old, '"'))
+    elif name == "I-the-boot-diagnostics-are-not-flushed":
+        path = os.path.join(root, LINKER)
+        text = read(path)
+        old = 'rr3::flushGuestBootLog("sdmc:/switch/rr3-native-rehost.guest-view.log");'
+        assert old in text, "mutant I did not apply"
+        write(path, text.replace(old, ""))
+    elif name == "J-the-loader-writes-to-a-second-log-file":
+        path = os.path.join(root, LINKER)
+        text = read(path)
+        old = '"sdmc:/switch/rr3-native-rehost.guest-view.log"'
+        assert old in text, "mutant J did not apply"
+        write(path, text.replace(old, '"sdmc:/switch/rr3-native-rehost/guest-view.log"', 1))
     else:
         raise SystemExit("unknown mutant " + name)
 
@@ -107,7 +133,15 @@ def main():
 
     for name in ("A-self-test-bytes-count-as-the-guests", "B-the-format-is-never-read",
                  "C-census-drops-pcm", "D-census-does-not-read-pcm",
-                 "E-the-lever-withholds-only-half", "F-the-lever-is-always-on"):
+                 "E-the-lever-withholds-only-half", "F-the-lever-is-always-on",
+                 "G-the-lever-state-is-never-printed",
+
+                 "H-the-relocation-census-is-not-printed",
+
+                 "I-the-boot-diagnostics-are-not-flushed",
+                 "J-the-loader-writes-to-a-second-log-file"):
+
+
         tree = os.path.join(base, name)
         build_tree(tree)
         mutate(tree, name)

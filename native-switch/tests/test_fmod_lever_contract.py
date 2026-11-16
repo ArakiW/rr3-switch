@@ -48,6 +48,7 @@ def main():
     stub = (root / "source" / "fmod_audio_stub.cpp").read_text(encoding="utf-8")
     header = (root / "include" / "rr3" / "fmod_audio_stub.hpp").read_text(encoding="utf-8")
     resolver = (root / "source" / "symbol_resolver.cpp").read_text(encoding="utf-8")
+    linker = (root / "source" / "multi_dso_linker.cpp").read_text(encoding="utf-8")
     view = (root / "source" / "guest_view_probe.cpp").read_text(encoding="utf-8")
     census = (root / ".." / "tools" / "Test-OnEden.ps1").resolve().read_text(encoding="utf-8")
     deployer = (root / ".." / ".build" / "deploy-census-conf.ps1").resolve().read_text(encoding="utf-8")
@@ -84,12 +85,23 @@ def main():
     # for it to say "the guest's own library".  A mutant that made it
     # unconditional passed the first version of this test, because nothing
     # here said what the DEFAULT is.
+    #
+    # THE PROPERTY, NOT THE ADDRESS.  The first version of this test pinned
+    # the file reading to ONE function body, so moving the reading into a
+    # helper broke the test without changing any behaviour.  That is the
+    # same mistake this project keeps making with layouts: naming a place
+    # instead of naming a fact.
+    lever_state = body_of(resolver, "int guestFmodLeverState(")
     lever = body_of(resolver, "bool guestFmodUsesRealLibrary(")
-    assert "std::fopen" in lever and "std::fgets" in lever
-    assert 'strstr(line, "fmod=real")' in lever
-    assert "return true" not in lever, \
+    assert "std::fopen" in lever_state and "std::fgets" in lever_state, \
+        "the lever does not read the config file"
+    assert 'strstr(line, "fmod=real")' in lever_state
+    assert "return true" not in lever_state, \
         "the lever can say 'the guest's own FMOD' without reading the key"
-    assert "cached == 2" in lever
+    assert "cached = real ? 2 : 1;" in lever_state
+    assert "guestFmodLeverState() == 2" in lever, \
+        "the predicate does not ask the state that was just read"
+    assert "std::fopen" not in lever, "the config file is read twice"
     # It is consulted ONLY when the key is there: the default path returns
     # the shim's address.
     assert "if (isGuestFmodSymbol(symbol.name) && guestFmodUsesRealLibrary()) {" in resolver
@@ -105,6 +117,43 @@ def main():
     assert "-FmodReal:$FmodReal" in round
     assert "[switch]$FmodReal" in deployer
     assert '$text += "fmod=real' in deployer
+
+    # 6. THE ROUND'S LOG SAYS WHAT THE LEVER DID AND HOW THE RELOCATIONS
+    #    WENT.  Without these two lines a round cannot tell "the switch was
+    #    off" from "the switch was never read", and cannot tell "the
+    #    relocations were applied" from "nobody looked".
+    assert "fmod-bind: lever=%s state=%d" in linker, \
+        "the loader does not print the FMOD lever's state"
+    assert "guestFmodLeverState()" in linker
+    assert "isFmodSymbolName" in linker
+    assert " rel=%llu int=%llu host=%llu cross=%llu weak=%llu patched=%llu verified=%llu" in linker, \
+        "the loader does not print the relocation census"
+
+
+    assert "result.verifiedWrites" in linker
+    # THE PORT HAS ONE LOG FILE, AND THE ROUND ARCHIVES THAT ONE.  A
+    # second path ("rr3-native-rehost/guest-view.log", with a slash) is a
+    # DIFFERENT FILE on the card: the diagnostics go there, the round never
+    # looks there, and the instrument is invisible.  THAT IS WHAT HAPPENED
+    # ONCE, and it cost a whole round.
+    assert "sdmc:/switch/rr3-native-rehost.guest-view.log" in linker
+    assert "sdmc:/switch/rr3-native-rehost/guest-view.log" not in linker, \
+        "the loader writes to a second log file that the round never reads"
+
+    # A boot-time diagnostic that is not flushed may not exist: the line was
+    # lost once, in the buffer, when the handle was closed on a flush error.
+    # The assertion is about POSITION -- the flush comes right after the
+    # line it belongs to -- because "the file contains the word flush" is
+    # not the property.
+    marker = "diag, 201, 0);"
+    position = linker.find(marker)
+    assert position >= 0
+    tail = linker[position:position + 400]
+    assert "flushGuestBootLog" in tail, \
+        "the loader's boot diagnostics are not flushed"
+    assert tail.find("flushGuestBootLog") - position < 260, \
+        "the flush is not next to the line it belongs to"
+
 
     print("PASS: the PCM the guest produces is counted, the numbers reach the "
           "summary, and the FMOD lever is off by default and all-or-nothing")

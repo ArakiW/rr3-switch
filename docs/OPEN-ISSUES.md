@@ -5489,3 +5489,159 @@ pcm_bytes=0`: the port hands the hardware no PCM at all.  The README rows
 (in both languages) are corrected, and they carry the census line the
 numbers come from.
 
+### 9.55 The guest SPINS, it does not hang, and the port's own source already said so
+
+**THE MEASUREMENT THAT CHANGES THE SHAPE OF R1.**  In the round with the
+guest's own FMOD, the Eden log holds:
+
+    Unmapped Read64 @ 0x0000000000000008     516,305
+    Unmapped Read32 @ 0x00000000000001C0     516,305
+    ExceptionRaised                                0
+
+and the SAME log in the shim round (rr3-p1base) holds ZERO of them.  And
+the log says why there is no exception at all:
+
+    -- Cpu.cpuopt_ignore_memory_aborts: true
+
+=> **THE GUEST IS NOT HANGING AND NOT CRASHING.  IT IS SPINNING** on a
+null pointer: it reads offset 0x8 of something that is 0, and offset 0x1C0
+of something that is 0, half a million times, inside the game's own view
+callback.  "The guest waited on a condition variable" was the port's
+cond-wait ledger noticing that the guest's main thread had nothing to do
+while another thread spun.  **THE WAIT WAS A SYMPTOM OF THE SPIN.**
+
+**AND THE PORT'S OWN SOURCE ALREADY DOCUMENTED THIS SHAPE**, in the
+comment at multi_dso_linker.cpp:1587-1592: the real libfmodex walks a DSP
+node list whose head this environment never initialises, the guest spins
+on the null head alternating Read64@+0x8 / Read32@+0x1C0 about 516,000
+times per run, and the same comment records that when the FMOD relocations
+resolved to the real libfmodex (Provider::Cross) "missRel was 0 -- the
+symbols resolved, just not to us".
+
+=> **R1 IS NOT A RELOCATION PROBLEM, AND NOT A LOADER PROBLEM.**  It is a
+problem inside the guest's own FMOD: **the DSP node list is never seeded.**
+The port's loader did its job; the guest's library still wants an
+initialisation this environment does not provide.
+
+**THREE FACTS THE STATIC PASS CORRECTED.**
+1. The constructor at 0x4c068 writes up to offset 38592 -- the object is at
+   least 38608 bytes, and the allocation is 0xa700 = 42752.  The "1972
+   bytes" figure earlier in this file was read off the FIRST field the
+   constructor touched, not the last.
+2. The GOT slot 0x139a80 holds the ADDRESS of the .data global 0x13ac08,
+   whose value is the .bss address 0x146d18.  The vtable itself is at
+   0x135850 in .data.rel.ro, and that is what the constructor writes to
+   [obj+0].  "The global vtable pointer" was a label for a chain of THREE
+   indirections, not one.
+3. .init_array's bytes on disk are ZERO.  The two entries 0x215FC and
+   0x216B8 come from RELATIVE relocations, not from the file.
+
+**AND A NEW HAZARD, WHICH MAY BE THE ONE THAT DECIDES R1.**  300 ABS64 and
+26 GLOB_DAT relocations in libfmodex.so bind to a **STATICALLY LINKED
+libc++abi** (__cxa_pure_virtual, __gxx_personality_v0, the typeinfo and
+the vtables), while the port also loads the APK's own libc++_shared.so for
+the guest.  **TWO C++ ABIs IN ONE PROCESS.**  That is a shape that can
+produce exactly this kind of silent failure: an exception thrown by one
+runtime and caught by the other, or a vtable built by the wrong runtime.
+It is the first candidate that explains "the DSP list head is never
+seeded" from the INSIDE of the library.
+
+**AND THE INSTRUMENT HAD A HOLE, WHICH IS NOW CLOSED.**  The census never
+printed the lever's state (the round's summary said `msFmodReal = none`)
+and it never printed the relocation census, so a round could not PROVE
+that the switch was on, nor that the relocations were applied -- only that
+the behaviour differed.  The loader prints both now, at boot, next to the
+line that already reported the activation gate:
+
+    loader-diag: missRel=... ready=... rel=... int=... host=... cross=... weak=... patched=... verified=...
+    fmod-bind: lever=real|shim|no-config-file state=... cross=... host=... missing=... names=...
+
+The contract test grew two mutants with them (the lever state not printed,
+the relocation census not printed), so a future edit cannot quietly remove
+either line.
+
+**AND THE TEST WAS PINNING A PLACE INSTEAD OF A FACT.**  It asserted that
+the file reading lived in one particular function body, so moving that
+reading into a helper broke the test without changing any behaviour.
+**=> A TEST THAT PINS A PLACE INSTEAD OF A FACT IS THE SAME CLASS OF
+DEFECT AS AN INSTRUMENT THAT READS A LAYOUT INSTEAD OF A MEMORY.**  The
+test now checks the property (the config file is read, the key is looked
+for, the predicate asks the state that was just read) and not the
+address.
+### 9.56 The instrument wrote to the WRONG FILE, and the round read another one
+
+**WHAT THE NEW INSTRUMENT DID ON ITS FIRST TWO ROUNDS: NOTHING VISIBLE.**
+The rounds `rr3-census1` and `rr3-census2` were run to verify the two new
+lines -- the loader's relocation census and the FMOD lever's state -- and
+NEITHER WAS IN THE ROUND'S LOG.  The round was not short of evidence about
+why, and the evidence pointed the wrong way twice:
+
+- the source had the lines, and there is exactly ONE "missRel=" in the
+  file;
+- the deployed NRO carried the new strings ("fmod-bind", "rel=%llu
+  int=%llu", "no-config-file" are all IN the binary that ran);
+- the lines before them were in the log (rebase, cache-flush-done,
+  perm-enforce-done, initDeps-completing) and the lines after them were in
+  the log;
+- only the two lines that came LAST were missing, which is what a lost
+  buffer looks like.
+
+**SO A FLUSH WAS ADDED** (the port's own convention says the loader flushes
+after each of its lines, because a crash takes the buffer with it), and the
+lines were STILL missing.  The flush was right and it stays; it was not the
+cause.
+
+**THE CAUSE: THE LINES WENT TO A SECOND LOG FILE.**  The port has ONE log:
+`sdmc:/switch/rr3-native-rehost.guest-view.log` (the dotted name), and
+that is the file the round archives.  The patch introduced FOUR uses of
+`sdmc:/switch/rr3-native-rehost/guest-view.log` -- with a SLASH -- which
+is a DIFFERENT FILE on the card.  The committed loader had 60 uses of the
+dotted path and ZERO of the slashed one; after the patch it had 4, and all
+four were the new ones.
+
+**AND THE LINE WAS THERE ALL ALONG, IN THE OTHER FILE, WITH THE RIGHT
+NUMBERS:**
+
+    phase=loader-diag: missRel=0 needMiss=0 wxSeg=0 tlsSeg=0 permEnf=1 ready=1
+      rel=145752 int=3026 host=731 cross=8899 weak=37 patched=158445
+      verified=158445
+
+=> 145,752 RELATIVE relocations applied, 3,026 internal, 731 host-provided,
+8,899 cross-image, 37 weak-zero, **158,445 patched and 158,445 verified**,
+and **missRel=0**.  Every write was read back and checked, and no symbol
+was left unresolved.  **THE RELOCATION PATH WAS NEVER THE PROBLEM, AND NOW
+THE LOG SAYS SO IN EVERY ROUND.**
+
+**=> THREE SINKS, NOT ONE.**
+
+    "the instrument wrote"   -> the function was called
+    "the line was on the card" -> it is in SOME file on the card
+    "the round read it"      -> it is in the file the round archives
+
+The first two were true and the third was false, for two whole rounds.
+**=> A NEW DIAGNOSTIC IS NOT DONE UNTIL A ROUND HAS READ IT OUT OF THE
+ARCHIVE**, and the cheapest way to keep that true is to assert the PATH in
+the contract test: the port has one log file, and a second path is a file
+nobody reads.  The test now says so, and a mutant that puts the loader
+back on the second path has to fail.
+
+**AND THE OTHER HALF OF THE ANSWER WAS ALREADY IN THE LOG.**  The census
+that the missing lines were meant to print is not needed to say that these
+rounds behaved like the earlier ones: the same guest spin (516,305 reads of
+a null pointer, zero exceptions) and the same all-zero engine object
+(engraw=00000000,...,rawwords=8).
+
+**AND THE VERIFIED ROUND SAYS IT IN THE ARCHIVE.**  With the path corrected,
+the round `rr3-census3` produced, in the file the round archives:
+
+    phase=loader-diag: missRel=0 needMiss=0 wxSeg=0 tlsSeg=0 permEnf=1
+      ready=1 rel=145752 int=3026 host=731 cross=8899 weak=37
+      patched=158445 verified=158445
+    phase=fmod-bind: lever=real state=2 cross=52 host=0 missing=0
+      uniqueCross=247 uniqueHost=519 names=_ZN4FMOD5Sound11getUserDataEPPv,...
+
+=> THE LEVER WAS ON AND WAS READ (`lever=real state=2`), ALL 52 OF THE
+GUEST'S FMOD SYMBOLS BOUND TO libfmodex.so'S OWN EXPORTS (`cross=52`,
+`host=0`, `missing=0`), AND EVERY RELOCATION WRITE WAS READ BACK AND
+VERIFIED (158,445 of 158,445).  **THE R1 MECHANISM IS NOW MEASURED, NOT
+INFERRED.**

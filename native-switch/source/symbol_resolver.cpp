@@ -2026,12 +2026,25 @@ const HostSymbol kHostSymbols[] = {
 // resolution happens during the guest's relocation, which is early enough
 // for the card to be there, but a missing file must not be cached as
 // "the shim" forever.
-bool guestFmodUsesRealLibrary() {
+// THE LEVER'S STATE, AS THE PORT ACTUALLY READ IT.
+//
+// 0 = the config file could not be read (there is none), 1 = it was read and
+// it says the port's shim, 2 = it was read and it says the guest's own
+// library.
+//
+// WHY A STATE AND NOT A BOOL: the round's log never printed the switch, so a
+// round could not PROVE that the lever was on.  "The port answered nothing
+// for the guest's FMOD symbols" and "the config file was never there" are
+// the same observation from outside, and they are different bugs.
+int guestFmodLeverState() {
     static int cached = 0; // 0 = not read yet, 1 = the port's shim, 2 = real
     if (cached == 0) {
         std::FILE* file = std::fopen("sdmc:/switch/rr3-census.conf", "r");
         if (file == nullptr) {
-            return false;
+            // NOT CACHED ON PURPOSE: a missing file must not be cached as
+            // "the shim", because the card can be written to while the port
+            // is running.
+            return 0;
         }
         char line[128];
         bool real = false;
@@ -2044,7 +2057,11 @@ bool guestFmodUsesRealLibrary() {
         std::fclose(file);
         cached = real ? 2 : 1;
     }
-    return cached == 2;
+    return cached;
+}
+
+bool guestFmodUsesRealLibrary() {
+    return guestFmodLeverState() == 2;
 }
 
 // IS THIS ONE OF THE GUEST'S FMOD SYMBOLS?  The port's table holds them

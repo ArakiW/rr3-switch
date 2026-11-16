@@ -1600,6 +1600,21 @@ bool hostOwnsSymbol(const char* name) {
             std::strcmp(name, "FMOD_System_Create") == 0);
 }
 
+// THE WHOLE GUEST FMOD SYMBOL FAMILY, NOT THE PORT'S TABLE.
+//
+// WHY: the census has to count the symbols that bound to the GUEST'S OWN
+// libfmodex.so, and the port's table holds a subset of the family (the
+// 52 symbols it intercepts).  Counting the family answers the question
+// ("did the guest's own library supply them?") instead of restating the
+// table.
+bool isFmodSymbolName(const char* name) {
+    if (name == nullptr) {
+        return false;
+    }
+    return std::strncmp(name, "_ZN4FMOD", 8) == 0 ||
+           std::strncmp(name, "FMOD_", 5) == 0;
+}
+
 struct LoaderApplyContext {
     ElfLoaderSession* result;
     std::vector<std::string>* hostNames;
@@ -2742,18 +2757,103 @@ ElfLoaderSession loadLinkElfSet(const char* const* paths, size_t pathCount) {
     gLoaderResolutionPlanHash = result.resolutionPlanHash;
     // Diagnostic: log activation conditions.
     {
-        char diag[128];
+        char diag[320];
         __builtin_snprintf(diag, sizeof(diag),
-            "loader-diag: missRel=%llu needMiss=%llu wxSeg=%llu tlsSeg=%llu permEnf=%d ready=%d",
+            "loader-diag: missRel=%llu needMiss=%llu wxSeg=%llu tlsSeg=%llu permEnf=%d ready=%d"
+            " rel=%llu int=%llu host=%llu cross=%llu weak=%llu patched=%llu verified=%llu",
             (unsigned long long)result.missingRelocations,
             (unsigned long long)result.neededMissing,
             (unsigned long long)result.writableExecutableSegments,
             (unsigned long long)result.tlsSegments,
             result.segmentPermissionsEnforced ? 1 : 0,
-            result.activationReady ? 1 : 0);
+            result.activationReady ? 1 : 0,
+            (unsigned long long)result.relativeApplied,
+            (unsigned long long)result.internalApplied,
+            (unsigned long long)result.hostRelocations,
+            (unsigned long long)result.crossRelocations,
+            (unsigned long long)result.weakZeroRelocations,
+            (unsigned long long)result.patchedRelocations,
+            (unsigned long long)result.verifiedWrites);
         appendGuestBootLine(
             "sdmc:/switch/rr3-native-rehost.guest-view.log",
             diag, 201, 0);
+        rr3::flushGuestBootLog("sdmc:/switch/rr3-native-rehost.guest-view.log");
+        // A BOOT-TIME LINE MUST BE ON THE CARD NOW.  The loader's lines
+        // explain what happens NEXT, and the next thing can be a crash that
+        // takes the unflushed buffer with it.  This line was lost once
+        // because it sat in the 64-line buffer: the handle was closed on a
+        // flush error and the buffer went with it, while the lines before it
+        // had already been flushed and survived.  => A DIAGNOSTIC THAT IS
+        // NOT FLUSHED IS A DIAGNOSTIC THAT MAY NOT EXIST.
+    }
+    // THE FMOD SYMBOLS, AND WHERE THEY BOUND.  This is the R1 question in
+    // ONE line: with the lever on, the port must answer NOTHING for the
+    // guest's FMOD symbols and the guest's own libfmodex.so must supply
+    // them.  Without this line, "the port's shim was not used" and "the
+    // switch was never read" are the same observation, and a round cannot
+    // tell them apart.
+    {
+        size_t fmodCross = 0;
+        size_t fmodHost = 0;
+        size_t fmodMissing = 0;
+        for (const std::string& name : crossNames) {
+            if (isFmodSymbolName(name.c_str())) {
+                ++fmodCross;
+            }
+        }
+        for (const std::string& name : hostNames) {
+            if (isFmodSymbolName(name.c_str())) {
+                ++fmodHost;
+            }
+        }
+        for (const std::string& name : missingNames) {
+            if (isFmodSymbolName(name.c_str())) {
+                ++fmodMissing;
+            }
+        }
+        const int lever = guestFmodLeverState();
+        const char* leverName =
+            lever == 2 ? "real" : (lever == 1 ? "shim" : "no-config-file");
+        // A FEW OF THE NAMES, so the log says WHICH library answered.
+        char names[192];
+        names[0] = ' ';
+        size_t used = 0;
+        size_t shown = 0;
+        for (const std::string& name : crossNames) {
+            if (!isFmodSymbolName(name.c_str())) {
+                continue;
+            }
+            if (shown >= 3) {
+                break;
+            }
+            const int written = __builtin_snprintf(
+                names + used, sizeof(names) - used, "%s%s",
+                shown == 0 ? "" : ",", name.c_str());
+            if (written <= 0) {
+                break;
+            }
+            used += static_cast<size_t>(written);
+            ++shown;
+            if (used >= sizeof(names) - 1) {
+                used = sizeof(names) - 1;
+                break;
+            }
+        }
+        char diag[320];
+        __builtin_snprintf(diag, sizeof(diag),
+            "fmod-bind: lever=%s state=%d cross=%llu host=%llu missing=%llu"
+            " uniqueCross=%llu uniqueHost=%llu names=%s",
+            leverName, lever,
+            (unsigned long long)fmodCross,
+            (unsigned long long)fmodHost,
+            (unsigned long long)fmodMissing,
+            (unsigned long long)result.uniqueCrossSymbols,
+            (unsigned long long)result.uniqueHostSymbols,
+            names);
+        appendGuestBootLine(
+            "sdmc:/switch/rr3-native-rehost.guest-view.log",
+            diag, 201, 0);
+        rr3::flushGuestBootLog("sdmc:/switch/rr3-native-rehost.guest-view.log");
     }
     return result;
 }
