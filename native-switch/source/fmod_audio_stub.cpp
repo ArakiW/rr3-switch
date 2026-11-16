@@ -503,7 +503,49 @@ SlResult bufferRegisterCallback(SlSelf, SlBufferCallback callback,
     return kSlSuccess;
 }
 
+// THE BUFFER-QUEUE CELL, REACHABLE FROM THE NAMESPACE rr3 SCOPE BELOW.
+//
+// The device's own functions live in the anonymous namespace; this one
+// lives outside it, so it needs the cell by name.
+const void* fmodAudioStubBufferQueueCell() {
+    return static_cast<const void*>(&gBufferQueueItfCell);
+}
+
 } // namespace
+
+// THE HOST SIDE OF THE DEVICE: THE MIXER'S WAY IN.
+//
+// The guest's own FMOD reaches the device through the virtual OpenSL DSO;
+// the port's shim is in the same process and has no such a door, so this is
+// it.  It goes through bufferEnqueue() on purpose: the PCM counters, the
+// frame count and the buffer callback are then EXACTLY the ones the guest's
+// own bytes would travel, and "the port produced sound" is a number in the
+// round's census rather than an opinion.
+//
+// IT LIVES AT NAMESPACE rr3 SCOPE, NOT IN THE ANONYMOUS NAMESPACE ABOVE:
+// the header declares it with external linkage, and a definition with
+// internal linkage would leave every caller with an undefined symbol.
+uint64_t fmodAudioStubEnqueuePcmInterleaved(const int16_t* frames,
+                                             uint32_t frameCount,
+                                             uint32_t channels) {
+    if (frames == nullptr || frameCount == 0u || channels == 0u) {
+        return 0;
+    }
+    const uint64_t bytes = static_cast<uint64_t>(frameCount) *
+                           static_cast<uint64_t>(channels) * 2u;
+    if (bytes > 0xFFFFFFFFULL) {
+        return 0;
+    }
+    // THE DEVICE'S "SELF" IS THE ADDRESS OF THE INTERFACE CELL, THE SAME
+    // POINTER THE GUEST RECEIVED FROM GetInterface (see the queue branch
+    // above).  Passing the cell itself would not even compile: SlSelf is
+    // void*, and the cell is a const pointer.
+    if (bufferEnqueue(const_cast<SlSelf>(fmodAudioStubBufferQueueCell()),
+                      frames, static_cast<uint32_t>(bytes)) != kSlSuccess) {
+        return 0;
+    }
+    return bytes;
+}
 
 extern "C" {
 const void* SL_IID_VOLUME = &rr3::kGuidVolume;

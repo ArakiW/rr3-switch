@@ -40,6 +40,9 @@ constexpr unsigned int kMaxConnections = 1024;
 constexpr unsigned int kMaxQueue = 256;
 
 rr3::FmodShimStats gStats{};
+// THE PORT'S OWN SELF-TEST IS NOT A GUEST READ.  The self-test asks
+// getOpenState once, and that question must not be counted as the guest's.
+static bool gCountOpenState = true;
 
 // One System, as real FMOD allows exactly one per process.
 FMOD::System gSystem;
@@ -367,18 +370,37 @@ FMOD_RESULT fmodSystemCreateSound(FMOD::System* self, const char* name, unsigned
     created->released = false;
     created->inUse = false;
     created->isStream = false;
-    // READY immediately, deterministically. See the comment on Sound::openState.
+    // READY immediately, deterministically -- AND READY IS 0 IN THE GUEST'S
+    // GENERATION.  See the FMOD_OPENSTATE enum for the measurement.
     created->openState = FMOD_OPENSTATE_READY;
     created->lengthMs = 1000;
-    // Only cbsize/length/fileoffset are read, and only when the caller says
-    // the struct really is at least that big.
+    // THE GUEST'S OWN exinfo FIELDS, AT THE GUEST'S OWN OFFSETS.
+    //
+    // MEASURED: libRealRacing3.so 0xc075ec fills a 216-byte
+    // FMOD_CREATESOUNDEXINFO (numchannels +0x0c, defaultfrequency +0x10,
+    // format +0x14, decodebufferlength +0x18, PCM callback +0x38).
+    //
+    // THE LENGTH IS NOT TAKEN AS MILLISECONDS.  FMOD's exinfo length is a
+    // BYTE count and the port used to copy it straight into lengthMs.  That
+    // was harmless while getLength answered 0 for every type the guest
+    // uses; now that getLength answers the guest's real types, a byte count
+    // would be PUBLISHED AS A MILLISECOND COUNT.  It is kept apart.
     created->reportedCbsize = 0;
+    created->numChannels = 0;
+    created->defaultFrequency = 0;
+    created->format = 0;
+    created->decodeBufferLength = 0;
+    created->pcmReadCallback = nullptr;
     if (exinfo != nullptr) {
         created->reportedCbsize = exinfo->cbsize;
-        if (exinfo->cbsize >= 12U) {
-            if (exinfo->length != 0) {
-                created->lengthMs = exinfo->length;
-            }
+        if (exinfo->cbsize >= 0x20U) {
+            created->numChannels = exinfo->numchannels;
+            created->defaultFrequency = exinfo->defaultfrequency;
+            created->format = exinfo->format;
+            created->decodeBufferLength = exinfo->decodebufferlength;
+        }
+        if (exinfo->cbsize >= 0x40U) {
+            created->pcmReadCallback = exinfo->pcmreadcallback;
         }
     }
     if (name != nullptr) {
@@ -428,15 +450,23 @@ FMOD_RESULT fmodSystemCreateDSP(FMOD::System* self, FMOD_DSP_DESCRIPTION* descri
         return FMOD_ERR_INVALID_HANDLE;
     }
     if (description != nullptr) {
+        // THE DESCRIPTION IS THE GUEST'S, AND IT IS THE ONLY THING THAT
+        // CARRIES THE AUDIO: its read callback is where the game receives
+        // the mixed samples.  The old code logged the name and threw the
+        // rest away, and that is the whole reason the port is silent.
+        created->description = description;
         char details[128];
-        std::snprintf(details, sizeof(details), "name=%s pluginsdk_version=%u",
-                      description->name != nullptr ? description->name : "(null)",
-                      description->pluginsdk_version);
+        std::snprintf(details, sizeof(details),
+                      "name=%.31s version=%u channels=%d read=%p",
+                      description->name, description->version,
+                      description->channels,
+                      reinterpret_cast<void*>(description->read));
         logLine("phase=fmod-shim-createdsp", details);
     }
     *dsp = created;
     return FMOD_OK;
 }
+
 
 FMOD_RESULT fmodSystemCreateChannelGroup(FMOD::System* self, const char* name, FMOD::ChannelGroup** group) {
     (void)name;
@@ -541,15 +571,21 @@ FMOD_RESULT fmodSystemGetSoftwareFormat(FMOD::System* self, int* samplerate, FMO
 }
 
 FMOD_RESULT fmodSystemSetSoftwareFormat(FMOD::System* self, int samplerate, FMOD_SOUND_FORMAT format, int numrawspeakers, int numoutputchannels, FMOD_DSP_RESAMPLER resampler) {
-    if (samplerate > 0) {
-        self->softwareRate = samplerate;
-    }
-    if (format != FMOD_SOUND_FORMAT_NONE) {
-        self->softwareFormat = format;
-    }
-    if (numrawspeakers > 0) {
-        self->softwareChannels = numrawspeakers;
-    }
+    // A REQUEST IS NOT A CAPABILITY.  THE PORT HAS ONE DEVICE AND IT IS
+    // 48000 / 2ch / PCM16.
+    //
+    // MEASURED: the guest reads the format back at 0xc090e0 and returns 0
+    // ONLY IF the rate is 48000 (0xc090f4 `mov w10, #0xbb80`) AND the
+    // format is 2 (0xc09100 `ccmp w8, #2`); otherwise it returns 25.
+    // The old code copied the REQUEST into the state, so a request the port
+    // could not honour would publish a format the guest then rejects.
+    //
+    // The request is kept for the log; the DEVICE's format is what the port
+    // reports.
+    self->requestedRate = samplerate;
+    gStats.requestedRate = samplerate;
+    (void)format;
+    (void)numrawspeakers;
     (void)numoutputchannels;
     self->softwareResampler = resampler;
     return FMOD_OK;
@@ -760,9 +796,15 @@ FMOD_RESULT fmodDSPGetUserData(FMOD::DSP* self, void** userdata) {
     if (userdata == nullptr) {
         return FMOD_ERR_INVALID_HANDLE;
     }
-    *userdata = self->userData; // real round-trip of a real pointer
+    // THE GUEST'S read callback asks its own state for the user data:
+    // state->instance->getUserData().  The guest never called
+    // setUserData() on the DSP -- it put the object in the DESCRIPTION's
+    // userdata field -- so the only honest answer is the description's.
+    *userdata = self->description != nullptr ? self->description->userdata
+                                             : self->userData;
     return FMOD_OK;
 }
+
 
 FMOD_RESULT fmodDSPGetSystemObject(FMOD::DSP* self, FMOD::System** system) {
     if (system == nullptr) {
@@ -805,6 +847,15 @@ FMOD_RESULT fmodSoundGetOpenState(FMOD::Sound* self, FMOD_OPENSTATE* openstate, 
     if (openstate != nullptr) {
         *openstate = self->openState;
     }
+    // THE GATE, COUNTED.  Every question the guest asks, and every question
+    // that was answered READY -- and every one of those is a sound the
+    // guest will actually start (libRealRacing3.so 0xc0568c).
+    if (gCountOpenState) {
+        ++gStats.openStateQueries;
+        if (self->openState == FMOD_OPENSTATE_READY) {
+            ++gStats.openStateReady;
+        }
+    }
     if (truezeroindex != nullptr) {
         *truezeroindex = self->lengthMs;
     }
@@ -821,9 +872,12 @@ FMOD_RESULT fmodSoundGetLength(FMOD::Sound* self, unsigned int* length, unsigned
     if (length == nullptr) {
         return FMOD_OK;
     }
-    // lengthtype 0 is milliseconds; we hold no PCM, so the sample count is 0
-    // rather than a fabricated number.
-    *length = (lengthtype == 0U) ? self->lengthMs : 0U;
+    // THE GUEST'S LENGTH TYPES ARE 1 AND 2, NEVER 0.
+    //
+    // MEASURED: libRealRacing3.so calls getLength with 1 (0xc07d48,
+    // 0xc08aa0) and with 2 (0xc08730).  The port answered only 0, so the
+    // guest ALWAYS GOT LENGTH 0 BACK.
+    *length = (lengthtype <= 2U) ? self->lengthMs : 0U;
     return FMOD_OK;
 }
 
@@ -840,7 +894,9 @@ FMOD_RESULT fmodSoundRelease(FMOD::Sound* self) {
 
 FMOD_RESULT fmodChannelGetPosition(FMOD::Channel* self, unsigned int* position, unsigned int positiontype) {
     if (position != nullptr) {
-        *position = (positiontype == 0U) ? self->positionMs : 0U;
+        // THE GUEST ASKS WITH 1, NEVER 0 (libRealRacing3.so 0xc07d38,
+        // 0xc08ac8), so the old answer was always 0.
+        *position = (positiontype <= 1U) ? self->positionMs : 0U;
     }
     return FMOD_OK;
 }
@@ -1056,14 +1112,24 @@ uint64_t fmodShimSelfTest() {
         passed |= 1ULL << 4;
     }
 
-    FMOD_CREATESOUNDEXINFO info{};
+        FMOD_CREATESOUNDEXINFO info{};
     info.cbsize = sizeof(info);
     info.length = 4321;
     FMOD::Sound* sound = nullptr;
     FMOD_OPENSTATE state = FMOD_OPENSTATE_LOADING;
-    if (fmodSystemCreateSound(&probe, "self-test", 0, &info, &sound) == FMOD_OK &&
+    // THE PORT'S OWN SELF-TEST IS NOT A GUEST READ, so it must not be
+    // counted as one.
+    gCountOpenState = false;
+    const FMOD_RESULT selfTestCreate =
+        fmodSystemCreateSound(&probe, "self-test", 0, &info, &sound);
+    const FMOD_RESULT selfTestState =
+        (sound != nullptr)
+            ? fmodSoundGetOpenState(sound, &state, nullptr, nullptr, nullptr)
+            : FMOD_ERR_INVALID_HANDLE;
+    gCountOpenState = true;
+    if (selfTestCreate == FMOD_OK &&
         sound != nullptr &&
-        fmodSoundGetOpenState(sound, &state, nullptr, nullptr, nullptr) == FMOD_OK &&
+        selfTestState == FMOD_OK &&
         state == FMOD_OPENSTATE_READY) {
         passed |= 1ULL << 5;
     }

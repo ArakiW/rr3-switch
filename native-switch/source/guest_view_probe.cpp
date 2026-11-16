@@ -9080,7 +9080,7 @@ void* frameLoopDriver(void* opaque) {
                 const rr3::FmodAudioStubStats audioStats = rr3::fmodAudioStubStats();
                 std::snprintf(
                     cdiag, sizeof(cdiag),
-                    "frame=%llu lights=%llu race=%llu fmst=0x%llx snd=%llu str=%llu ch=%llu ast=0x%llx arate=%u ach=%u pcm_enq=%u pcm_bytes=%u fmt=%u/%u/%u fmrt=%u census bound=%d viewport=%d,%d,%d,%d"
+                    "frame=%llu lights=%llu race=%llu fmst=0x%llx snd=%llu str=%llu ch=%llu osq=%llu osr=%llu rrate=%d ast=0x%llx arate=%u ach=%u pcm_enq=%u pcm_bytes=%u fmt=%u/%u/%u fmrt=%u census bound=%d viewport=%d,%d,%d,%d"
                     " scene=fbo=%u size=%ux%u binds=%u changes=%u vpChanges=%u"
                     " draws=%u arr=%u"
                     " tt=%llu tr=%llu ts=%llu tp=%llu"
@@ -9107,6 +9107,16 @@ void* frameLoopDriver(void* opaque) {
                     static_cast<unsigned long long>(fmodStats.soundCreates),
                     static_cast<unsigned long long>(fmodStats.streamCreates),
                     static_cast<unsigned long long>(fmodStats.channelsStarted),
+                    // THE OPENSTATE GATE, COUNTED.  osq is every question the
+                    // guest asked the shim about a sound's state; osr is
+                    // every question that was answered READY.  THE NUMBER
+                    // THAT MATTERS IS osr: every one of those is a sound the
+                    // guest was told it may start, and every one of those
+                    // used to be ZERO because the shim answered 3 instead
+                    // of 0 (libRealRacing3.so 0xc0568c).
+                    static_cast<unsigned long long>(fmodStats.openStateQueries),
+                    static_cast<unsigned long long>(fmodStats.openStateReady),
+                    static_cast<int>(fmodStats.requestedRate),
                     // THE AUDIO DEVICE'S OWN SELF-TEST.  It used to live in a
                     // boot log line ("FMOD audio stub selftest=...") that
                     // nobody read, which is how a device with no volume

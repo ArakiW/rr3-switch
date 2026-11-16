@@ -34,13 +34,33 @@ enum FMOD_RESULT {
     FMOD_ERR_CHANNEL_STOLEN = 4,
 };
 
+// THE GUEST'S GENERATION, NOT MODERN FMOD 5.
+//
+// MEASURED FROM THE GUEST BINARY, NOT FROM THIS PORT'S MEMORY OF FMOD.
+// libRealRacing3.so calls FMOD::Sound::getOpenState in exactly ONE place,
+// 0xc05684, and the very next thing it does with the answer is
+//   0xc0568c  cbz w8, 0xc056d4
+// state == 0 takes the branch that calls playSound (0xc0570c); ANY other
+// value takes the "not ready" path that notifies the event system instead
+// (0xc056a4 cmp w9,#0 / 0xc056a8 cset w1,eq passes (state==0) to it).
+//
+// => FOR THIS GUEST, 0 IS "READY TO PLAY".
+//
+// THE PORT USED TO REPORT READY = 3 (modern FMOD 5 numbering).  THAT IS WHY
+// THE PORT HAS PRODUCED NO SOUND AT ALL: the guest asked, the port answered
+// 3, and the guest never took the play branch.  The port's own self-test
+// compared the shim against the port's own constant, so it reported 0xfff
+// while the guest heard nothing -- the instrument was answering the ledger,
+// not the reality.
+//
+// Only READY = 0 is proven by the guest.  Everything else is "not ready" and
+// only has to be NON-ZERO; the guest's own fail-safe default is 2 (it
+// pre-writes 2 into the out-param at 0xc05660), so 2 is a safe "not ready".
 enum FMOD_OPENSTATE {
-    FMOD_OPENSTATE_LOADING = 0,
-    FMOD_OPENSTATE_LOADING_CONNECTED = 1,
-    FMOD_OPENSTATE_LOADING_BUFFERING = 2,
-    FMOD_OPENSTATE_READY = 3,
-    FMOD_OPENSTATE_ERROR = 4,
-    FMOD_OPENSTATE_UNINITIALIZED = 5,
+    FMOD_OPENSTATE_READY = 0,
+    FMOD_OPENSTATE_LOADING = 1,
+    FMOD_OPENSTATE_ERROR = 2,
+    FMOD_OPENSTATE_UNINITIALIZED = 3,
 };
 
 enum FMOD_CHANNEL_CALLBACKTYPE {
@@ -56,15 +76,24 @@ enum FMOD_CHANNEL_CALLBACKTYPE {
     FMOD_CHANNEL_CALLBACK_RESTART = 0x00001000,
 };
 
+// THE GUEST'S GENERATION.
+//
+// MEASURED: libRealRacing3.so 0xc05d6c `mov w1, #2` passes 2 to
+// setSpeakerMode, and at the same time asks for 2 output channels
+// (0xc05e90 `mov w4, #2`).  In the guest's generation 2 IS stereo.
+//
+// The port's modern list had DEFAULT = 0, so ITS 2 meant MONO: the guest's
+// stereo request was recorded as mono, and the port's own default was a
+// different number than the guest's stereo.
 enum FMOD_SPEAKERMODE {
-    FMOD_SPEAKERMODE_DEFAULT = 0,
-    FMOD_SPEAKERMODE_RAW = 1,
-    FMOD_SPEAKERMODE_MONO = 2,
-    FMOD_SPEAKERMODE_STEREO = 3,
-    FMOD_SPEAKERMODE_QUAD = 4,
-    FMOD_SPEAKERMODE_SURROUND = 5,
-    FMOD_SPEAKERMODE_FIVEPOINTONE = 6,
-    FMOD_SPEAKERMODE_SEVENPOINTONE = 7,
+    FMOD_SPEAKERMODE_RAW = 0,
+    FMOD_SPEAKERMODE_MONO = 1,
+    FMOD_SPEAKERMODE_STEREO = 2,
+    FMOD_SPEAKERMODE_QUAD = 3,
+    FMOD_SPEAKERMODE_SURROUND = 4,
+    FMOD_SPEAKERMODE_FIVEPOINTONE = 5,
+    FMOD_SPEAKERMODE_SEVENPOINTONE = 6,
+    FMOD_SPEAKERMODE_SEVENPOINTONE_4 = 7,
 };
 
 enum FMOD_OUTPUTTYPE {
@@ -101,35 +130,45 @@ enum FMOD_DSP_TYPE {
     FMOD_DSP_TYPE_MIXER = 1,
     FMOD_DSP_TYPE_OSCILLATOR = 2,
     FMOD_DSP_TYPE_LOWPASS = 3,
+    // THE GUEST'S GENERATION: THE SAME LIST WITH "FADER" DELETED.
+    //
+    // MEASURED: the guest creates seven DSPs and the type numbers it
+    // passes are 6, 11, 5, 10, 18, 8, 7 (libRealRacing3.so 0xc06a20,
+    // 0xc06aa4, 0xc06ae4, 0xc06b2c, 0xc06b70, 0xc06b98, 0xc06bb8).  In the
+    // guest's generation those are ECHO, PARAMEQ, HIGHPASS, LIMITER,
+    // SFXREVERB, DISTORTION and FLANGE.  The port's list had FADER at 7,
+    // which pushed every later entry up by one, so 5 of the 7 the guest
+    // asks for were the wrong unit: its LIMITER was the port's PARAMEQ,
+    // its SFXREVERB the port's COMPRESSOR, its DISTORTION the port's
+    // FLANGE, its FLANGE the port's FADER.
     FMOD_DSP_TYPE_HIGHPASS = 5,
     FMOD_DSP_TYPE_ECHO = 6,
-    FMOD_DSP_TYPE_FADER = 7,
-    FMOD_DSP_TYPE_FLANGE = 8,
-    FMOD_DSP_TYPE_DISTORTION = 9,
-    FMOD_DSP_TYPE_NORMALIZE = 10,
-    FMOD_DSP_TYPE_LIMITER = 11,
-    FMOD_DSP_TYPE_PARAMEQ = 12,
-    FMOD_DSP_TYPE_PITCHSHIFT = 13,
-    FMOD_DSP_TYPE_CHORUS = 14,
-    FMOD_DSP_TYPE_VSTPLUGIN = 15,
-    FMOD_DSP_TYPE_COMPRESSOR = 18,
-    FMOD_DSP_TYPE_SFXREVERB = 19,
-    FMOD_DSP_TYPE_LOWPASS_SIMPLE = 20,
-    FMOD_DSP_TYPE_DELAY = 21,
-    FMOD_DSP_TYPE_TREMOLO = 22,
-    FMOD_DSP_TYPE_SEND = 24,
-    FMOD_DSP_TYPE_RETURN = 25,
-    FMOD_DSP_TYPE_HIGHPASS_SIMPLE = 26,
-    FMOD_DSP_TYPE_PAN = 27,
-    FMOD_DSP_TYPE_THREE_EQ = 28,
-    FMOD_DSP_TYPE_FFT = 29,
-    FMOD_DSP_TYPE_LOUDNESS_METER = 30,
-    FMOD_DSP_TYPE_ENVELOPEFOLLOWER = 31,
-    FMOD_DSP_TYPE_CONVOLUTIONREVERB = 32,
-    FMOD_DSP_TYPE_CHANNELMIX = 33,
-    FMOD_DSP_TYPE_TRANSCEIVER = 34,
-    FMOD_DSP_TYPE_OBJECTPAN = 35,
-    FMOD_DSP_TYPE_MULTIBAND_EQ = 36,
+    FMOD_DSP_TYPE_FLANGE = 7,
+    FMOD_DSP_TYPE_DISTORTION = 8,
+    FMOD_DSP_TYPE_NORMALIZE = 9,
+    FMOD_DSP_TYPE_LIMITER = 10,
+    FMOD_DSP_TYPE_PARAMEQ = 11,
+    FMOD_DSP_TYPE_PITCHSHIFT = 12,
+    FMOD_DSP_TYPE_CHORUS = 13,
+    FMOD_DSP_TYPE_VSTPLUGIN = 14,
+    FMOD_DSP_TYPE_COMPRESSOR = 17,
+    FMOD_DSP_TYPE_SFXREVERB = 18,
+    FMOD_DSP_TYPE_LOWPASS_SIMPLE = 19,
+    FMOD_DSP_TYPE_DELAY = 20,
+    FMOD_DSP_TYPE_TREMOLO = 21,
+    FMOD_DSP_TYPE_SEND = 23,
+    FMOD_DSP_TYPE_RETURN = 24,
+    FMOD_DSP_TYPE_HIGHPASS_SIMPLE = 25,
+    FMOD_DSP_TYPE_PAN = 26,
+    FMOD_DSP_TYPE_THREE_EQ = 27,
+    FMOD_DSP_TYPE_FFT = 28,
+    FMOD_DSP_TYPE_LOUDNESS_METER = 29,
+    FMOD_DSP_TYPE_ENVELOPEFOLLOWER = 30,
+    FMOD_DSP_TYPE_CONVOLUTIONREVERB = 31,
+    FMOD_DSP_TYPE_CHANNELMIX = 32,
+    FMOD_DSP_TYPE_TRANSCEIVER = 33,
+    FMOD_DSP_TYPE_OBJECTPAN = 34,
+    FMOD_DSP_TYPE_MULTIBAND_EQ = 35,
 };
 
 enum FMOD_CHANNELINDEX {
@@ -143,24 +182,117 @@ struct FMOD_VECTOR {
     float z;
 };
 
-// Only the leading fields are read, and only when the caller's cbsize covers
-// them (offsets 0/4/8 are stable across every FMOD Ex release). The rest is
-// padding so the type is a plausible size; nothing beyond cbsize is touched,
-// because the guest filled this struct with the real FMOD layout, not ours.
+// THE GUEST'S OWN LAYOUT, AT THE GUEST'S OWN OFFSETS.
+//
+// MEASURED FROM libRealRacing3.so: the guest's createSound at 0xc075ec
+// fills a 216-byte struct and passes its address (0xc075dc
+// `add x3, sp, #0x68`).  The fields it actually writes are cbsize
+// at +0x00 (216), numchannels at +0x0c, defaultfrequency at +0x10, format
+// at +0x14, decodebufferlength at +0x18, and a PCM read callback at +0x38.
+//
+// THE PORT'S OLD STRUCT WAS 16 BYTES and put decodebufferlength at +0x0c,
+// WHERE THE GUEST'S numchannels LIVES.  It did not fault -- the guest's
+// cbsize of 216 satisfied the port's "is this struct big enough" guard --
+// it just read the WRONG FIELDS, which is the quieter failure.
+//
+// The size is 0xd8 = 216 so that a guest struct and this one agree on every
+// offset, and so that a cbsize of 216 is accepted without a partial read.
 struct FMOD_CREATESOUNDEXINFO {
-    unsigned int cbsize;
-    unsigned int length;
-    unsigned int fileoffset;
-    unsigned int decodebufferlength;
+    unsigned int cbsize;               // +0x00
+    unsigned int length;               // +0x04
+    unsigned int fileoffset;           // +0x08
+    unsigned int numchannels;          // +0x0c
+    unsigned int defaultfrequency;     // +0x10
+    unsigned int format;               // +0x14
+    unsigned int decodebufferlength;   // +0x18
+    unsigned int initialsubsound;      // +0x1c
+    unsigned int numsubsounds;         // +0x20
+    unsigned int reserved1;            // +0x24
+    unsigned int reserved2;            // +0x28
+    unsigned int reserved3;            // +0x2c
+    unsigned int reserved4;            // +0x30
+    unsigned int reserved5;            // +0x34
+    void* pcmreadcallback;             // +0x38
+    unsigned char reservedTail[152];    // +0x40 .. +0xd7
 };
 
+// THE SIZE IS NOT A CONVENTION.  The guest writes cbsize = 216
+// (libRealRacing3.so 0xc075c0) and passes a struct of that size, so a
+// port struct of a different size reads the guest's fields at the wrong
+// offsets -- silently, because the guest's cbsize still satisfies the
+// port's "is this struct big enough" guard.
+static_assert(sizeof(FMOD_CREATESOUNDEXINFO) == 216,
+              "the guest's FMOD_CREATESOUNDEXINFO is 216 bytes "
+              "(libRealRacing3.so 0xc075c0)");
+
+// THE CALLBACK TYPES, AS FMOD Ex 4.x DEFINES THEM (fmod_dsp.h).  The GUEST'S
+// OWN read callback takes six arguments, which is what fixes the shape:
+// FMOD_RESULT read(FMOD_DSP_STATE* state, float* inbuffer, float* outbuffer,
+//                   unsigned int length, int inchannels, int outchannels).
+typedef int (*FMOD_DSP_CREATECALLBACK)(void* state);
+typedef int (*FMOD_DSP_RELEASECALLBACK)(void* state);
+typedef int (*FMOD_DSP_RESETCALLBACK)(void* state);
+typedef int (*FMOD_DSP_READCALLBACK)(void* state, float* inbuffer,
+                                     float* outbuffer, unsigned int length,
+                                     int inchannels, int outchannels);
+typedef int (*FMOD_DSP_SETPOSITIONCALLBACK)(void* state, unsigned int position);
+typedef int (*FMOD_DSP_SETPARAMCALLBACK)(void* state, int param, float value);
+typedef int (*FMOD_DSP_GETPARAMCALLBACK)(void* state, int param, float* value,
+                                         char* valuestr);
+
+// ---------------------------------------------------------------------------
+// FMOD_DSP_DESCRIPTION, AS THE GUEST BUILDS IT.
+//
+// NOT FMOD Studio 5.  The guest's libfmodex.so is FMOD Ex 4.x, and the GUEST
+// ITSELF fills this struct, so the guest's binary is the authority.
+//
+// MEASURED IN THE GUEST (libRealRacing3.so; the only call site is 0xc05cd4,
+// the PLT stub for _ZN4FMOD6System9createDSPEP20FMOD_DSP_DESCRIPTIONPPNS_3DSPE):
+//
+//   0xc05c6c  strncpy(desc, "decklink", 32) -> the name is an INLINE char[32]
+//                                              at offset 0, NOT a pointer
+//   0xc05ccc  str d0, [desc, #32]            -> version=1, channels=0
+//   0xc05c8c  stp x9, x10, [desc, #40]       -> create@0x28, release@0x30
+//   0xc05cb0  str x8, [desc, #56]            -> reset@0x38
+//   0xc05ca8  stp x9, xzr, [desc, #64]       -> read@0x40 (THE REAL AUDIO
+//                                                CALLBACK), setposition@0x48
+//   0xc05cac  str wzr, [desc, #80]           -> numparameters@0x50
+//   0xc05c84  str q0, [desc, #88]            -> paramdesc@0x58, setparameter
+//                                                @0x60
+//   0xc05c88  str q0, [desc, #104]           -> getparameter@0x68, config@0x70
+//   0xc05cd0  stp xzr, x8, [desc, #120]      -> configwidth@0x78,
+//                                                configheight@0x7C,
+//                                                userdata@0x80
+//
+// AND THE REAL libfmodex.so AGREES: its createDSP copies the description
+// field by field out of exactly these offsets (0x4f3e0-0x4f44c) into a
+// 136-byte (0x88) internal struct, and strcpy's the name out of offset 0
+// (0xb1128).
+//
+// THE SIZE IS THE POINT: 136 bytes with the name INLINE.  The old
+// definition (pluginsdk_version plus a const char* name) was a different
+// library's layout, and it made the port unable to read the guest's own
+// description at all -- which is why the guest's audio callback could never
+// be called.
 struct FMOD_DSP_DESCRIPTION {
-    unsigned int pluginsdk_version;
-    const char* name;
-    unsigned int numinputbuffers;
-    unsigned int numoutputbuffers;
+    char name[32];
+    unsigned int version;
+    int channels;
+    FMOD_DSP_CREATECALLBACK create;
+    FMOD_DSP_RELEASECALLBACK release;
+    FMOD_DSP_RESETCALLBACK reset;
+    FMOD_DSP_READCALLBACK read;
+    FMOD_DSP_SETPOSITIONCALLBACK setposition;
+    int numparameters;
+    void* paramdesc;
+    FMOD_DSP_SETPARAMCALLBACK setparameter;
+    FMOD_DSP_GETPARAMCALLBACK getparameter;
+    void* config;
+    int configwidth;
+    int configheight;
     void* userdata;
 };
+
 
 // The guest imports FMOD_CHANNEL as a distinct named type in the callback
 // signature (_ZN4FMOD7Channel11setCallbackEPF11FMOD_RESULTP12FMOD_CHANNEL25
@@ -219,6 +351,9 @@ public:
     // Shim state. Kept in the object so `this` is always meaningful: no
     // side table, so there is no way for a live handle to lose its state.
     void* userData = nullptr;
+    // THE GUEST'S DESCRIPTION, KEPT.  It is the only thing that
+    // carries the guest's audio callback.
+    FMOD_DSP_DESCRIPTION* description = nullptr;
     System* owner = nullptr;
     // The graph node this DSP was appended as, so release() can unlink it
     // instead of leaving a released node in the walk.
@@ -258,6 +393,13 @@ public:
     bool inUse = false;
     bool released = false;
     unsigned int reportedCbsize = 0;
+    // THE GUEST'S OWN exinfo FIELDS, AT THE GUEST'S OWN OFFSETS.
+    // See FMOD_CREATESOUNDEXINFO and the measurement notes there.
+    unsigned int numChannels = 0;
+    unsigned int defaultFrequency = 0;
+    unsigned int format = 0;
+    unsigned int decodeBufferLength = 0;
+    void* pcmReadCallback = nullptr;
     char name[64] = {0};
 };
 
@@ -311,6 +453,9 @@ public:
     unsigned int dspBufferLength = 1024;
     int dspNumBuffers = 2;
     int softwareRate = 48000;
+    // WHAT THE GUEST LAST ASKED FOR.  The port's device is fixed, so this is
+    // telemetry, not a capability: a request is not a device.
+    int requestedRate = 0;
     FMOD_SOUND_FORMAT softwareFormat = FMOD_SOUND_FORMAT_PCM16;
     int softwareChannels = 2;
     FMOD_DSP_RESAMPLER softwareResampler = FMOD_DSP_RESAMPLER_DEFAULT;
@@ -409,6 +554,17 @@ struct FmodShimStats {
     uint32_t listAppends{};
     uint32_t listUnlinks{};
     uint32_t channelsStarted{};
+    // THE OPENSTATE GATE, COUNTED.  The guest asks getOpenState and takes
+    // its play branch ONLY when the answer is 0 (libRealRacing3.so 0xc0568c
+    // `cbz w8, 0xc056d4`).  openStateQueries is every question and
+    // openStateReady is every question that was answered READY -- and every
+    // one of those is a sound the guest will actually start.
+    uint32_t openStateQueries{};
+    uint32_t openStateReady{};
+    // WHAT THE GUEST LAST ASKED THE MIXER FOR.  The port's device is fixed
+    // at 48000 / 2ch / PCM16, so this is telemetry: it says whether the
+    // guest wanted something the port does not have.
+    int32_t requestedRate{};
     uint32_t callbacksQueued{};
     uint32_t callbacksDelivered{};
     uint32_t callbackDoneDelivered{};

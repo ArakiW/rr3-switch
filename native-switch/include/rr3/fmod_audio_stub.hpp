@@ -60,6 +60,25 @@ FmodAudioStubStats fmodAudioStubStats();
 uint64_t fmodAudioStubSelfTest();
 uint64_t fmodAudioStubSelfTestExpected();
 
+// THE HOST SIDE OF THE DEVICE: THE MIXER'S WAY IN.
+//
+// THE DEVICE IS AN OpenSL ES VIRTUAL DSO: the guest's own FMOD reaches it by
+// dlopen("libOpenSLES.so") and then by calling slCreateEngine.  The port's
+// shim is in the same process and already knows the device, so it needs a
+// door of its own -- and it has to go through the SAME path, so the PCM
+// counters and the buffer callback are the ones the guest's own bytes would
+// travel.
+//
+// WHY IT MATTERS FOR THE MEASUREMENT: "the port produced PCM" then becomes
+// a number in the round's census (pcm_enq / pcm_bytes) instead of an
+// opinion about a code path.
+//
+// The frames are interleaved 16-bit samples.  Returns the number of bytes
+// accepted, or 0 if the device refused them.
+uint64_t fmodAudioStubEnqueuePcmInterleaved(const int16_t* frames,
+                                             uint32_t frameCount,
+                                             uint32_t channels);
+
 // OpenSL ES C entry (silent device). Returns SL_RESULT_SUCCESS with a
 // discard-only engine. Buffers are consumed immediately so mixer threads
 // never block waiting for a missing Android device.

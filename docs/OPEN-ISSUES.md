@@ -1,6 +1,6 @@
-# Real Racing 3 → Nintendo Switch: Open Issues & Handoff
+# Real Racing 3 鈫?Nintendo Switch: Open Issues & Handoff
 
-> Snapshot: 2026-11-04 (emulator: Eden — runs q135 … q144)
+> Snapshot: 2026-11-04 (emulator: Eden 鈥?runs q135 鈥?q144)
 > Repo: `https://github.com/ArakiW/rr3-switch`
 > Machine-readable companions: `docs/FEATURE-MATRIX.md` (feature matrix),
 > `PORT_PROGRESS.md` (chronological log), `tools/README-hardware-test.md` (device install & test guide)
@@ -15,65 +15,65 @@ something (a guest pointer, a mapped page) without checking that it was still
 valid. The fifth one, at 19:45 on 2026-11-03, is fixed in the build described
 below.
 
-**And on 2026-11-04 the port ran a REAL RACE for 4,200 frames** (q142) — the
+**And on 2026-11-04 the port ran a REAL RACE for 4,200 frames** (q142) 鈥?the
 first time any archived round has got that far. That round is what turned the
 remaining work from guesswork into measurement, and it moved the whole
 diagnosis:
 
-* **The race starts on its own** — the port's own red-glove follower presses
+* **The race starts on its own** 鈥?the port's own red-glove follower presses
   the race button at (1105, 695), which is the button the guest scissors every
   frame as `glScissor x=994 y=667 w=187 h=53`. The touch script was never the
   problem.
-* **The pursuit's error was not "a bit off": it swung to ±3 rad (180°)** in
+* **The pursuit's error was not "a bit off": it swung to 卤3 rad (180掳)** in
   63 of 141 samples, while the car was **2 m from the line** with the target
   **20 m ahead**. That is only possible if the car's direction of travel had
-  reversed — and the cause was in the port: the side of the line the
+  reversed 鈥?and the cause was in the port: the side of the line the
   look-ahead point was taken from was **re-decided every frame** from the
   car's instantaneous heading, so a momentary reversal moved the target to the
   other side of the car, the controller saw two flips at once and slammed full
   lock, and the car drove backwards (6,581 units of progress lost between two
   samples). **Fixed**: the direction is now **locked for the race** and decided
   once from a windowed motion vector, and the throttle is let go when the car
-  is facing the wrong way (§2.10). Unit-tested: 22 checks, all ok.
-* **"3–4.5 fps" was the menu phase, not the game.** Every healthy round uses
-  **1.39–1.56 cores of CPU** and the frame rate still varies 4.9× — so the
+  is facing the wrong way (搂2.10). Unit-tested: 22 checks, all ok.
+* **"3鈥?.5 fps" was the menu phase, not the game.** Every healthy round uses
+  **1.39鈥?.56 cores of CPU** and the frame rate still varies 4.9脳 鈥?so the
   difference is **waiting**, not computing. q142, which spent most of its time
-  in the race, did **11.44 fps with a smaller log** (§2.12). The CPU is flat,
-  so the next lever is the wait, and the guest-thread census — the port's own
+  in the race, did **11.44 fps with a smaller log** (搂2.12). The CPU is flat,
+  so the next lever is the wait, and the guest-thread census 鈥?the port's own
   instrument that touches the guest's threads every 4 s, with a kill switch
-  that **has never been run** — is being A/B'd now.
+  that **has never been run** 鈥?is being A/B'd now.
 * **The port's own log was 31 % repetitive** (33,643 `glyph-face` + 31,315
   `map-app` lines, 504 lines/second, one `fflush` each) because both dedup
   tables were smaller than the number of distinct keys. Both are fixed
-  (§2.11). The effect on the frame rate is **not yet measured** — the port's
+  (搂2.11). The effect on the frame rate is **not yet measured** 鈥?the port's
   probes have already been excluded twice by measurement, so this is stated as
   a suspicion and not as a result.
 
-**⇒ ⇒ AND THE MOST IMPORTANT FINDING OF THE ROUND CAME FROM THE USER, NOT
+**鈬?鈬?AND THE MOST IMPORTANT FINDING OF THE ROUND CAME FROM THE USER, NOT
 FROM THE CODE**: *"you never actually let me take over the controls, so of
-course you cannot complete a lap — that is not the car being stuck; those are
+course you cannot complete a lap 鈥?that is not the car being stuck; those are
 two completely different directions."*
 
-**⇒ ⇒ HE WAS RIGHT, AND THE CODE CONFIRMED IT.** Every round this project
+**鈬?鈬?HE WAS RIGHT, AND THE CODE CONFIRMED IT.** Every round this project
 has ever run measured **the port's own autopilot**, because the card's
 `autopilot = 1` and the closed loop owned the steering, the throttle and the
 brake. Worse:
 
-* **`autopilot = 0` did not switch anything** — the setting only governed
+* **`autopilot = 0` did not switch anything** 鈥?the setting only governed
   the physical-controller path, and the script path was overridden by the
   loop with no mode check at all (MEASURED: the control round, card set to
   `autopilot = 0` with the old code, still shows `drive engaged 201/208`);
 * **the shipped package ships the experiment script**, and while a script is
-  active the physical controller is ignored *entirely* — so **on a console
+  active the physical controller is ignored *entirely* 鈥?so **on a console
   the player's own controller was dead**, and the script held the throttle
   down from frame 600;
 * **the scripted path had no instrument at all**, which is why the question
   could not be answered from the logs.
 
-All three are fixed (§2.14), and the first round with the fix shows the
+All three are fixed (搂2.14), and the first round with the fix shows the
 script's own axis reaching the guest with `loop_steered=0`.
 
-**⇒ THE PORT'S OWN OVERHEAD IS NOT THE BLACK SCREEN.** MEASURED (q146, a new
+**鈬?THE PORT'S OWN OVERHEAD IS NOT THE BLACK SCREEN.** MEASURED (q146, a new
 per-frame instrument on the existing census line: `tt` the whole frame, `tr`
 the guest's render call, `tp` the port's own work, `ts` the present):
 
@@ -83,47 +83,46 @@ the guest's render call, `tp` the port's own work, `ts` the present):
 | the guest's render | 99.0 % | 90.2 % |
 | the present | 0.9 % | 8.8 % |
 
-⇒ The menu's slowness on Eden is **the guest's own ARM64 code being
-emulated** — both the guest and the port's Mesa are ARM64 binaries. **⇒
-Eden's 4.8 fps says nothing about the console**, and the console's black
+鈬?The menu's slowness on Eden is **the guest's own ARM64 code being
+emulated** 鈥?both the guest and the port's Mesa are ARM64 binaries. **鈬?Eden's 4.8 fps says nothing about the console**, and the console's black
 screen is much more likely to be the **boot phase**, which the port does
 control.
 
 **Three things are left before delivery**, one of which only the user can do:
 
-1. **Install the newest NRO on the console and boot** (§4.1) — the crash
+1. **Install the newest NRO on the console and boot** (搂4.1) 鈥?the crash
    fixes are only proven on the emulator so far, and the new build carries
    the per-frame instrument that turns the console's black screen into a
    directly answerable question.
-2. **Drive it** — with the input path fixed, the player's controller owns
-   the car. The lap counter is the autopilot's problem (§2.14), not the
+2. **Drive it** 鈥?with the input path fixed, the player's controller owns
+   the car. The lap counter is the autopilot's problem (搂2.14), not the
    port's.
-3. **The splash overflow** (§4.2) — the chain is measured down to the
+3. **The splash overflow** (搂4.2) 鈥?the chain is measured down to the
    engine's own matrix; what is left is which matrix it sets up for the 2D
    pass.
 
 **What this round added, measured:**
 
 * the release archive was **stale** (1480 bytes off the package) and the
-  packager now fingerprints it (§2.8);
+  packager now fingerprints it (搂2.8);
 * the first ten black seconds were **2.6 MB of unnecessary writes**, and the
   pass is now 2.33x faster with the three costs separated for the first time
-  (§4.3);
+  (搂4.3);
 * the port's `renderToTexture()` did not scale the glyphs the way the guest's
-  Java says it must (§2.7) — a real divergence, now fixed, and **measured to
+  Java says it must (搂2.7) 鈥?a real divergence, now fixed, and **measured to
   be unused**: the guest never calls it;
 * **"laps = -1" is not a counter**: the car drove 5.08 % of a lap because
   the pursuit was aiming **behind** the car and the line fit could pick the
-  **mirror** of the track's centre line (§2.9), and because the direction
-  was re-decided **every frame** (§2.10). Both fixed and unit-tested, and
-  the car now reaches **10.35 %** (§2.10);
-* **the player could not drive at all** (§2.14) — the single most important
+  **mirror** of the track's centre line (搂2.9), and because the direction
+  was re-decided **every frame** (搂2.10). Both fixed and unit-tested, and
+  the car now reaches **10.35 %** (搂2.10);
+* **the player could not drive at all** (搂2.14) 鈥?the single most important
   fix of the round, and it came from the user pointing out that the tests
   had never handed the controls over;
 * the **census** (the port's own instrument that samples the guest's threads
-  every 4 s) is **not** the frame-rate lever but costs 9 % of the CPU (§2.12);
+  every 4 s) is **not** the frame-rate lever but costs 9 % of the CPU (搂2.12);
 * the track's spline holds a **racing line** the port was not following, and
-  the port now measures how far the car is from it (§2.13).
+  the port now measures how far the car is from it (搂2.13).
 
 ---
 
@@ -131,23 +130,23 @@ control.
 
 | # | Issue | State | Evidence |
 |---|---|---|---|
-| 1 | Console crash on launch (black screen → Atmosphère "software closed") | **Fixed, awaiting device** | §2.1–§2.6; five crashes, all the same family |
+| 1 | Console crash on launch (black screen 鈫?Atmosph猫re "software closed") | **Fixed, awaiting device** | 搂2.1鈥撀?.6; five crashes, all the same family |
 | 2 | UI missing characters (icons became letters, and too small) | **Fixed, measured** | q124: icons drawn at the game's own size |
-| 3 | Hang (120 s) after opening the icon font | **Fixed, measured** | q123 hang → q124 clean, A/B'd |
+| 3 | Hang (120 s) after opening the icon font | **Fixed, measured** | q123 hang 鈫?q124 clean, A/B'd |
 | 4 | Font cache had only 6 slots (silently dropped faces) | **Fixed** | source + contract test |
 | 5 | `substituted=` log field was always 1 (measured nothing) | **Fixed** | q124 log |
-| 6 | 10,546 loose files on the card; slow to copy / slow to scan | **Fixed** | 10,546 → 186 files, 9.58 GiB |
+| 6 | 10,546 loose files on the card; slow to copy / slow to scan | **Fixed** | 10,546 鈫?186 files, 9.58 GiB |
 | 7 | Installer exit code reported failure; mini profile deleted the manifest | **Fixed** | previous round |
-| 8 | Mapping file truncated at 8 KiB (9,021 B → 8,191 B) | **Fixed** | previous round |
-| 9 | The release archive was stale (1480 B off the package) | **Fixed, measured** | §2.8; fingerprint + rebuild + byte-for-byte join check |
-| 10 | `renderToTexture` did not scale the glyphs (and had no log line) | **Fixed, measured** | §2.7; q133: 0 calls, so no pixel changed — a latent fix |
-| 11 | Splash title overflows the screen (1398 px of the line off-screen) | **Characterised, not fixed** | §2.7 / §4.2; the engine's own matrix overshoots by 1.525× |
-| 12 | First 10 s of black screen before the guest appears | **Largely fixed** | §4.3; q134: 6,628 ms → 2,843 ms, 2.6 MB no longer written |
-| 11 | Pure pursuit cannot hold the line (lap count −1) | **Root cause found and fixed, twice** | §2.9 + §2.10; layer 1: the look-ahead was behind the car (up to 210/210) and the fit could pick the mirror. Layer 2 (found in a REAL race, q142): the side of the line was re-decided every frame, so the target jumped to the car's other side and the controller drove it backwards. Both fixed, unit-tested (22 checks) |
-| 12 | The game never starts a race | **Fixed — and it was never the touch script** | §2.10; the port's own red-glove follower presses the race button at (1105,695), the rectangle the guest scissors every frame. q142 ran 4,200 frames of race |
-| 13 | The black screen (the guest's 83-frame load at 3–4.5 fps) | **Not solved; the rate is a PHASE measurement** | §2.12; 3–4.5 fps is the MENU phase, the race phase does 11.44 fps, and the CPU is flat at 1.39–1.56 cores in every round ⇒ the difference is waiting. The census A/B is running |
-| 14 | The port's own log was 31 % repetitive (504 lines/s, one fflush each) | **Fixed; the frame-rate effect NOT measured** | §2.11; the `glyph-face` dedup table held 8 (face,size) pairs and the guest asks for 7 faces at dozens of sizes, and `map-app` had no dedup at all |
-| 15 | Deliverables (app zip / full package / 4 volumes) + commit | **Rebuilt, and stale again** | §4.5; the NRO in the package, the app zip and on the card are the same file — but every build since has made them stale, so the rebuild has to be the LAST step |
+| 8 | Mapping file truncated at 8 KiB (9,021 B 鈫?8,191 B) | **Fixed** | previous round |
+| 9 | The release archive was stale (1480 B off the package) | **Fixed, measured** | 搂2.8; fingerprint + rebuild + byte-for-byte join check |
+| 10 | `renderToTexture` did not scale the glyphs (and had no log line) | **Fixed, measured** | 搂2.7; q133: 0 calls, so no pixel changed 鈥?a latent fix |
+| 11 | Splash title overflows the screen (1398 px of the line off-screen) | **Characterised, not fixed** | 搂2.7 / 搂4.2; the engine's own matrix overshoots by 1.525脳 |
+| 12 | First 10 s of black screen before the guest appears | **Largely fixed** | 搂4.3; q134: 6,628 ms 鈫?2,843 ms, 2.6 MB no longer written |
+| 11 | Pure pursuit cannot hold the line (lap count 鈭?) | **Root cause found and fixed, twice** | 搂2.9 + 搂2.10; layer 1: the look-ahead was behind the car (up to 210/210) and the fit could pick the mirror. Layer 2 (found in a REAL race, q142): the side of the line was re-decided every frame, so the target jumped to the car's other side and the controller drove it backwards. Both fixed, unit-tested (22 checks) |
+| 12 | The game never starts a race | **Fixed 鈥?and it was never the touch script** | 搂2.10; the port's own red-glove follower presses the race button at (1105,695), the rectangle the guest scissors every frame. q142 ran 4,200 frames of race |
+| 13 | The black screen (the guest's 83-frame load at 3鈥?.5 fps) | **Not solved; the rate is a PHASE measurement** | 搂2.12; 3鈥?.5 fps is the MENU phase, the race phase does 11.44 fps, and the CPU is flat at 1.39鈥?.56 cores in every round 鈬?the difference is waiting. The census A/B is running |
+| 14 | The port's own log was 31 % repetitive (504 lines/s, one fflush each) | **Fixed; the frame-rate effect NOT measured** | 搂2.11; the `glyph-face` dedup table held 8 (face,size) pairs and the guest asks for 7 faces at dozens of sizes, and `map-app` had no dedup at all |
+| 15 | Deliverables (app zip / full package / 4 volumes) + commit | **Rebuilt, and stale again** | 搂4.5; the NRO in the package, the app zip and on the card are the same file 鈥?but every build since has made them stale, so the rebuild has to be the LAST step |
 
 ---
 
@@ -163,32 +162,32 @@ control.
 | | Console log | Emulator log |
 |---|---|---|
 | Size at the crash | 292,710 B / 1,175 lines | 295,222 B at t=10 s |
-| Difference | — | **0.8%** |
+| Difference | 鈥?| **0.8%** |
 
-⇒ The console died at the **same point** as the emulator at t=10 s. Line-by-line
+鈬?The console died at the **same point** as the emulator at t=10 s. Line-by-line
 diff: both logs agree up to `phase=guest-frame-selftest verdict=SELFTEST_PASS`
 (which was the console's last line); the emulator's next lines are
-`phase=census-arm` → `phase=gl-ctx-early`.
+`phase=census-arm` 鈫?`phase=gl-ctx-early`.
 
-⇒ **The console never made a single EGL call.** The cause is
+鈬?**The console never made a single EGL call.** The cause is
 `ensureEarlyGuestGlContext()` at
 `native-switch/source/guest_view_probe.cpp:9904`, which calls
-`eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx)` — a
+`eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx)` 鈥?a
 **surfaceless context**. That is legal on Mesa's software rasteriser and a
 **kernel fault on the console's NVN driver**.
 
 **Fix (remove the reason the probe exists, rather than making it survive)**
 
-* `native-switch/source/gfx/gfx_gles.cpp` — `__wrap_glGetString` answers
+* `native-switch/source/gfx/gfx_gles.cpp` 鈥?`__wrap_glGetString` answers
   **from the host** when `eglGetCurrentContext() == EGL_NO_CONTEXT`:
   `GL_VERSION = "OpenGL ES 3.2 Mesa 20.1.0-rc3"`,
   `GL_RENDERER = "PowerVR Rogue GE8320 (Mesa 20.1.0-rc3)"`,
   `GL_VENDOR = "Imagination Technologies"`, GLSL `OpenGL ES GLSL ES 3.20`.
-  ⚠️ The null backend's `kGlVersion` must **not** be used here: it says
+  鈿狅笍 The null backend's `kGlVersion` must **not** be used here: it says
   `"OpenGL ES 2.0"`, and `major = 2` makes the guest's GL assert guard at
   `0x14851e8` (`major < 3`) **silently return for the rest of the run**.
-* `native-switch/source/gfx/gfx_backend.cpp` — `earlyGlContext` default
-  **true → false** (`glctxearly=1` restores the old behaviour for an A/B).
+* `native-switch/source/gfx/gfx_backend.cpp` 鈥?`earlyGlContext` default
+  **true 鈫?false** (`glctxearly=1` restores the old behaviour for an A/B).
 
 **Measured (q121, archive `20261102-172615-eden-rr3-q121-no-early-gl`)**
 
@@ -198,31 +197,31 @@ phase=view-egl-init-begin -> view-egl-init-ok -> view-egl-surface-ok
    -> view-egl-context-ok -> view-egl-current-ok
 ```
 
-⇒ the first EGL call is now the guest's own windowed surface, which is what the
+鈬?the first EGL call is now the guest's own windowed surface, which is what the
 NVN driver supports.
 
 ---
 
 ### 2.2 Missing characters: the icon font was being drawn as a text face (main fix this round)
 
-**Reported symptom**: the top bar's `MS 500,000` / `RS 22,141,500` — which should
-be the game's **currency icons** — came out as letters, and the wrong size.
+**Reported symptom**: the top bar's `MS 500,000` / `RS 22,141,500` 鈥?which should
+be the game's **currency icons** 鈥?came out as letters, and the wrong size.
 
 **An older conclusion was falsified first** (it was written into the source
 comments and `PORT_PROGRESS.md`; measurement now disproves it):
 
-* ❌ Old claim: *"the guest lays out a whole English paragraph with
-  `r3_symbols.ttf` (the tips text `If you want to race in the real world…`), and
-  the port draws it **2.048× too big** (upem 2048 ÷ 1000)"* → **wrong on every
+* 鉂?Old claim: *"the guest lays out a whole English paragraph with
+  `r3_symbols.ttf` (the tips text `If you want to race in the real world鈥), and
+  the port draws it **2.048脳 too big** (upem 2048 梅 1000)"* 鈫?**wrong on every
   count**.
-* ✅ Measured: the tips paragraph uses `ConduitITCPro-Medium.otf`, opened **1:1**
+* 鉁?Measured: the tips paragraph uses `ConduitITCPro-Medium.otf`, opened **1:1**
   and laid out **1:1**; **2,812 text draws per run, zero substitutions**.
 * **Why the old claim was wrong**: it was read out of a *"six log lines after a
-  marker line"* window. **Six lines is not a request boundary** — the window ran
+  marker line"* window. **Six lines is not a request boundary** 鈥?the window ran
   into the **next** request and attributed its font to the previous one.
   The correct boundary is
-  `jni-utf163` (the string) → `cc-dispatch … init` → `glyph-face` (primary face)
-  → `glyph-face` (fallback) → `glyph-vector init` (the result).
+  `jni-utf163` (the string) 鈫?`cc-dispatch 鈥?init` 鈫?`glyph-face` (primary face)
+  鈫?`glyph-face` (fallback) 鈫?`glyph-vector init` (the result).
 
 **Paired by request boundary, the truth is**:
 
@@ -232,7 +231,7 @@ comments and `PORT_PROGRESS.md`; measurement now disproves it):
   font to a sheet and it is obvious): `U+0029` a trophy, `U+002C` a stack of
   cash, `U+0031` the game's own devil logo, `U+0111` the RR3 logo, `U+0056` a
   shock absorber. The contour counts say it too: `'o'` has **54 contours** and an
-  ink box of 1.671×0.985 em — that is a drawing, not a letter.
+  ink box of 1.671脳0.985 em 鈥?that is a drawing, not a letter.
 * The measured code points and sizes:
 
   | Code point | Size | What it is (measured from the rendered font) |
@@ -250,25 +249,25 @@ comments and `PORT_PROGRESS.md`; measurement now disproves it):
 
 * The port used to answer those requests with `ConduitITCPro-Regular`, so
   `U+00CB` came out as a K with an accent, `U+0111` as a d with a stroke and
-  `U+0056` as a plain `V`; **and every icon was 2.3–5.8× too small** (the icon
-  art is 1.00–6.22 em wide; the letter that replaced it is 0.21–0.52 em):
+  `U+0056` as a plain `V`; **and every icon was 2.3鈥?.8脳 too small** (the icon
+  art is 1.00鈥?.22 em wide; the letter that replaced it is 0.21鈥?.52 em):
 
   | Draw | With the substitution (wrong) | With the real icon font (right) |
   |---|---|---|
-  | U+00CB @17 px | 6 × 13 px | **104 × 17 px** |
-  | U+0031 @175 px | 58 × 112 px | **343 × 487 px** |
-  | U+0056 @105 px | 47 × 68 px | **110 × 97 px** |
+  | U+00CB @17 px | 6 脳 13 px | **104 脳 17 px** |
+  | U+0031 @175 px | 58 脳 112 px | **343 脳 487 px** |
+  | U+0056 @105 px | 47 脳 68 px | **110 脳 97 px** |
 
-  ⇒ **"missing characters" and "the icons are the wrong size" are the same bug.**
+  鈬?**"missing characters" and "the icons are the wrong size" are the same bug.**
 
-**⚠️ Two files share that name, and they are not the same font:**
+**鈿狅笍 Two files share that name, and they are not the same font:**
 
 | Source | Size | sha256 (first 16) | Note |
 |---|---|---|---|
-| `rr3core:/files/.depot/r3_symbols.ttf` | **125,764 B** | `86AA06830C1EBA9D` | **the one the guest really maps** ✔ |
-| `sdmc:/…/.depot/r3_symbols.ttf` | 72,468 B | `1EE7223E3E5B11A8` | the card's loose copy — **a different font** ✘ |
+| `rr3core:/files/.depot/r3_symbols.ttf` | **125,764 B** | `86AA06830C1EBA9D` | **the one the guest really maps** 鉁?|
+| `sdmc:/鈥?.depot/r3_symbols.ttf` | 72,468 B | `1EE7223E3E5B11A8` | the card's loose copy 鈥?**a different font** 鉁?|
 
-They disagree on the glyph at several code points ⇒ **the build gates on the
+They disagree on the glyph at several code points 鈬?**the build gates on the
 size** and refuses the wrong one (a wrong icon font looks like a broken UI and is
 very hard to trace back to the file).
 
@@ -285,7 +284,7 @@ very hard to trace back to the file).
 
 ### 2.3 Hang after opening the icon font: the guest's `sscanf` has no bound
 
-**Symptom**: q123 (`iconfont=1`) — the log stopped at **1.62 MB / 4 frames**, and
+**Symptom**: q123 (`iconfont=1`) 鈥?the log stopped at **1.62 MB / 4 frames**, and
 no new frame appeared for 120 s.
 
 **A/B (same binary, same card, one key in the conf file changed)**
@@ -296,14 +295,14 @@ no new frame appeared for 120 s.
 | q123b | `iconfont=0` (old behaviour) | clean: **3,000 frames / 202,361 log lines / 305 s** |
 | q124 | `iconfont=1` + bounded `sscanf` | clean: **3,120 frames / 35 MB of log / 305 s** |
 
-⇒ The icon font is the **trigger**, but it stepped on an **older** bug.
+鈬?The icon font is the **trigger**, but it stepped on an **older** bug.
 
 **Where it hangs**: the port's sampler reports `pc_img=host-nro pc_off=0x5ea1c0`;
 resolving that offset against the host NRO's symbol table gives
-**`__svfscanf_r`** (newlib's `sscanf`) — and both samples landed inside it.
-⇒ **the guest thread is stuck inside the host libc's `sscanf`.**
+**`__svfscanf_r`** (newlib's `sscanf`) 鈥?and both samples landed inside it.
+鈬?**the guest thread is stuck inside the host libc's `sscanf`.**
 
-**Why**: `symbol_resolver.cpp` has `RR3_BIND(sscanf)` — bound straight to the
+**Why**: `symbol_resolver.cpp` has `RR3_BIND(sscanf)` 鈥?bound straight to the
 host's newlib, so it walks guest memory with **no bound at all**. This is the
 same shape as q89's hang in `_strtoul_l` (that round bounded
 `strtol/strtoul/strtod`; **`sscanf` was the one that was missed**).
@@ -312,7 +311,7 @@ same shape as q89's hang in `_strtoul_l` (that round bounded
 `native-switch/include/rr3/guest_strto.hpp`, `native-switch/source/symbol_resolver.cpp`):
 new `guestSscanf` copies **both the input string and the format string** out
 under a readability check (512-byte cap) and the host parser only ever sees the
-copies. **The log line is written before the parse** — a diagnostic that runs
+copies. **The log line is written before the parse** 鈥?a diagnostic that runs
 after the call is worthless when the call is the thing that never returns.
 
 **The log kept the scene** (1,005 lines):
@@ -323,13 +322,13 @@ phase=guest-scanf-bounded ... input=truncated in_len=512 fmt=ok fmt_len=16
    fmt_text=[%[A-Z0-9_],%d]
 ```
 
-⇒ that input is the guest's **font/shader definition file**
-(`#SEC:MAX_IMAGES:24`, `FFT_FONT_BIGNUMBERS,195`, …) and the format is a
+鈬?that input is the guest's **font/shader definition file**
+(`#SEC:MAX_IMAGES:24`, `FFT_FONT_BIGNUMBERS,195`, 鈥? and the format is a
 **scanset**, `%[A-Z0-9_]`. `in_len=512` means **there is no NUL in those 512
-bytes** ⇒ newlib's scanset keeps matching across unterminated memory until it
-runs into the heap's end — that was the 120 s.
+bytes** 鈬?newlib's scanset keeps matching across unterminated memory until it
+runs into the heap's end 鈥?that was the 120 s.
 
-⇒ The bounded copy caps the scan at 512 bytes **without changing the answer**
+鈬?The bounded copy caps the scan at 512 bytes **without changing the answer**
 (the token itself is far shorter than the window), which is the same rule the
 rest of `guest_strto` follows: **a bound must not change the answer**.
 
@@ -338,21 +337,20 @@ rest of `guest_strto` follows: **a bound must not change the answer**.
 ### 2.4 The font cache had only 6 slots (faces were dropped silently)
 
 `glyph_vector.cpp` had `kFaceSlots = 6`, while the guest names **14** faces
-(`Conduit` ×4, `Eurostile` ×7, `HelveticaNeueBold`, `LCD`, `minion_pro_italic`,
+(`Conduit` 脳4, `Eurostile` 脳7, `HelveticaNeueBold`, `LCD`, `minion_pro_italic`,
 `myriadp0`) **plus the CJK fallback plus the icon font = 16**.
 
 **A short cache does not fail loudly**: `openFace()` returns `nullptr` and the
-text is **silently** drawn with the Conduit fallback — the UI quietly loses the
-face the guest asked for. ⇒ **now 16.**
+text is **silently** drawn with the Conduit fallback 鈥?the UI quietly loses the
+face the guest asked for. 鈬?**now 16.**
 
 ### 2.5 The `substituted=` log field was always 1
 
 It compared the **guest's card path** against the **romfs path**, which never
-match, so every line claimed a substitution — including the lines where the
+match, so every line claimed a substitution 鈥?including the lines where the
 guest's own face was opened verbatim. **A field that is always 1 measures
-nothing.** ⇒ it now compares **file names**; in the q124 log
-`face=romfs:/ui/r3_symbols.ttf substituted=0` ✔
-
+nothing.** 鈬?it now compares **file names**; in the q124 log
+`face=romfs:/ui/r3_symbols.ttf substituted=0` 鉁?
 ### 2.6 The fifth console crash (19:45): a null pointer in the guest, handed over by the port
 
 The console now gets as far as the front end: the guest's image is mapped
@@ -365,10 +363,9 @@ The console now gets as far as the front end: the guest's image is mapped
     far=0x28   esr=0x92000005   (data abort, translation fault, level 1)
 
 `pc` is inside the guest image (0x18361F3000 + 0x1AE4370) and `far` is exactly
-**NULL + 0x28** — the guest dereferenced a null pointer. `lr` is in the host,
-and `addr2line` against the matching `.elf` (base = handler −
-`nm(__libnx_exception_handler)` = 0x87d36f000, lr offset 0x9ee54) says
-`http_post(…){lambda()#1}` → **`deliverServerTime`** → `operator()`.
+**NULL + 0x28** 鈥?the guest dereferenced a null pointer. `lr` is in the host,
+and `addr2line` against the matching `.elf` (base = handler 鈭?`nm(__libnx_exception_handler)` = 0x87d36f000, lr offset 0x9ee54) says
+`http_post(鈥?{lambda()#1}` 鈫?**`deliverServerTime`** 鈫?`operator()`.
 
 So the fault is inside the delivery of the `/time` answer, and the last host
 line before it is the port's own probe:
@@ -378,7 +375,7 @@ line before it is the port's own probe:
 The `cc-srvtime-body` line that follows every successful body delivery is
 **absent**, so the fault is in the header callback.
 
-**Why the port said "unreadable"** — and this is the part that explains every
+**Why the port said "unreadable"** 鈥?and this is the part that explains every
 "the console and the emulator disagree" in the HTTP area:
 
 | | Console | Eden |
@@ -387,8 +384,8 @@ The `cc-srvtime-body` line that follows every successful body delivery is
 | guest worker object | 0x562EA7C4C0 | 0x2113D42280 |
 | distance above the image | **259 GiB** (0x4E2CC44C0) | 122 MB |
 
-`guestReadable()` only accepted `[bias − 4 GiB, bias + 4 GiB)`, so the port
-declared a perfectly good guest object unreadable — **and then handed that
+`guestReadable()` only accepted `[bias 鈭?4 GiB, bias + 4 GiB)`, so the port
+declared a perfectly good guest object unreadable 鈥?**and then handed that
 pointer to the guest's native `headerCallback` anyway.** On Eden the same
 worker is inside the window and the probe prints its vtable.
 
@@ -399,7 +396,7 @@ heap is **above** it, so a symmetric window cannot tell them apart.
 **The fix**
 
 1. `guestReadable()`'s window is now **asymmetric**: the lower bound stays at
-   4 GiB (it is what keeps the probe out of the host's address space — archive
+   4 GiB (it is what keeps the probe out of the host's address space 鈥?archive
    20261021-072048-eden-srvtime4) and the upper bound is 512 GiB, which
    covers the guest's heap on the console.
 2. Every hand-off of `req->callback` to the guest now goes through
@@ -412,11 +409,11 @@ heap is **above** it, so a symmetric window cannot tell them apart.
 
 | Build | `iconfont` | Result |
 |---|---|---|
-| `aa3e2ed0` | 0 (old behaviour) | **3,000 frames / 305 s** — clean |
+| `aa3e2ed0` | 0 (old behaviour) | **3,000 frames / 305 s** 鈥?clean |
 | `f118e3b8` | 1 (icon font on) | **hang**: 4 frames, log stops at 1.62 MB |
-| `249c9f02` (this build) | 1 (icon font on) | **1,560 PNGs / 305 s** — clean |
+| `249c9f02` (this build) | 1 (icon font on) | **1,560 PNGs / 305 s** 鈥?clean |
 
-⇒ the icon font is what exposed the crash, and the worker gate + the
+鈬?the icon font is what exposed the crash, and the worker gate + the
 asymmetric window are what fixed it. The shipping configuration (icon font
 ON) is the one that is measured clean.
 
@@ -424,7 +421,7 @@ Gate: BUILD 0, INPUTS 0, SYMBOLS 0, tests **39/39**.
 
 ---
 
-### 2.7 The splash title overflows the screen — and the port's `renderToTexture` never scaled the glyphs
+### 2.7 The splash title overflows the screen 鈥?and the port's `renderToTexture` never scaled the glyphs
 
 **This is the "Version 1" / "font size is wrong" family. It reproduces on the
 emulator, so it needs no console to investigate.**
@@ -434,33 +431,32 @@ emulator, so it needs no console to investigate.**
 The splash's big line is **guest text**, not artwork:
 
 ```
-jni-utf163  … text=Player ID: CCDI123456789 / CCRR123456789      (40 characters)
-glyph-face  req=…/ConduitITCPro-Bold.otf  size=140.0  substituted=0
+jni-utf163  鈥?text=Player ID: CCDI123456789 / CCRR123456789      (40 characters)
+glyph-face  req=鈥?ConduitITCPro-Bold.otf  size=140.0  substituted=0
 glyph-vector method=init textLen=40 size=140.0 boundsW=2421.0 boundsH=125.0
 glyph-vector method=createTexture boundsW=2421.0 texId=260 texW=4096 texH=128
 ```
 
 The port measures the string at **2421 px**, and the font's ground truth agrees
-with it (`tools/conduit_width_truth.py`: 17,383 font units at upem 1000 ⇒
-**2433.6 px** at size 140; the 0.5 % difference is the ink box vs the advance).
-**⇒ the port measures correctly.**
+with it (`tools/conduit_width_truth.py`: 17,383 font units at upem 1000 鈬?**2433.6 px** at size 140; the 0.5 % difference is the ink box vs the advance).
+**鈬?the port measures correctly.**
 
 Pixel measurement of the rendered frame (`tools/splash_measure.py`, q132
-`frame-000120.png`, 1280×720):
+`frame-000120.png`, 1280脳720):
 
 ```
 band y 271..391 (h=121)  x 257..1279  ->  TOUCHES THE RIGHT EDGE (column 1279)
 ```
 
 The title's ink starts at x=257 and is cut off at the screen edge. 1023 px of
-the 2421 px string are visible ⇒ **~1398 px of the line are off-screen.**
+the 2421 px string are visible 鈬?**~1398 px of the line are off-screen.**
 
 #### Where the engine's idea and the port's idea disagree
 
 The engine put the line's left edge at 257. A string of width *w* centred on a
-1280-px screen starts at `(1280 − w)/2`, so the engine believes the line is
-**~766 px** wide. The same string measured at **size 42 is 719 px** — and the
-guest *also* asks for that size (`glyph-vector … size=42.0 boundsW=719.0`).
+1280-px screen starts at `(1280 鈭?w)/2`, so the engine believes the line is
+**~766 px** wide. The same string measured at **size 42 is 719 px** 鈥?and the
+guest *also* asks for that size (`glyph-vector 鈥?size=42.0 boundsW=719.0`).
 The 2421/766 ratio is **3.16**, and 140/42 is **3.33**.
 
 So the engine laid the line out for the *small* variant and the port drew the
@@ -475,8 +471,7 @@ realracing/GlyphVector.java`):
 
 ```java
 public boolean renderToTexture(int i, int i2, int i3, float f) {
-    …
-    float fWidth = (i2 - (this.m_bounds.width() * f)) * 0.5f;
+    鈥?    float fWidth = (i2 - (this.m_bounds.width() * f)) * 0.5f;
     canvas.translate(fWidth - (rect.left * f),
                      ((f2 - (rect.height() * f)) * 0.5f) - (this.m_bounds.top * f));
     canvas.scale(f, f);                 // <-- the glyphs are scaled by f
@@ -489,16 +484,16 @@ glyphs at their full size:
 
 ```cpp
 const float originX = (w - facade->boundsW * scale) * 0.5f;   // origin used scale
-rasterizeLine(face, …, state->widthScale, originX, originY, …); // glyphs did NOT
+rasterizeLine(face, 鈥? state->widthScale, originX, originY, 鈥?; // glyphs did NOT
 ```
 
-⇒ **text drawn through that path came out 1/f too big** — exactly the 3.2×
+鈬?**text drawn through that path came out 1/f too big** 鈥?exactly the 3.2脳
 disagreement above. Two further divergences from the Java were in the same
 function: the port centred by the **ascent** instead of the **ink box**, and it
 put the **ink-left** where the Java puts the **pen**.
 
 Worse, **that path had no log line at all** (`renderToTexture` never reached
-`guestViewWideLog`), so a wrong answer there was invisible — which is why the
+`guestViewWideLog`), so a wrong answer there was invisible 鈥?which is why the
 icon-font investigation had to walk the whole chain before landing here.
 
 **Fixed 2026-11-03** (`gv_renderToTexture`): the glyphs are rendered at
@@ -507,28 +502,28 @@ is placed at `inkLeft + offsetX * f`. A `glyph-rtt` log line now records every
 call (`texId, w, h, scale, size, boundsW/H, inkW/H, penX, baselineY, text`), so
 the path is observable for the first time.
 
-**MEASURED (q133): the guest NEVER CALLS `renderToTexture`** — 0 `glyph-rtt`
+**MEASURED (q133): the guest NEVER CALLS `renderToTexture`** 鈥?0 `glyph-rtt`
 lines in a 23.5 MB log, and the same 218/214 `text-quad` lines with the same
-33/35 over-wide quads in q132 and q133. **⇒ this fix is a latent contract
+33/35 over-wide quads in q132 and q133. **鈬?this fix is a latent contract
 correction, NOT the cause of the splash overflow, and it did not change a
 single pixel on screen.** It is recorded here because it was a real divergence
 from the guest's Java, and because the reason it took so long to find is the
 one worth keeping: *the path had no log line, so it was invisible.*
 
-**⇒ The remaining lead (measured, not guessed)**: the overflow is in the
+**鈬?The remaining lead (measured, not guessed)**: the overflow is in the
 engine's own matrix, not in the text. The `text-quad` probe records the
 vertex data and the resulting NDC:
 
 ```
-a_Position: v0=(0,1022) … v2=(0,0)                 <- the full-screen quad
-a_Position: v0=(1021,472) … v2=(0,0)
-  ndc= v0=(1.2168,-1.0000) … v2=(-1.2168,-1.0000)  rect=-138,0,1557,720
+a_Position: v0=(0,1022) 鈥?v2=(0,0)                 <- the full-screen quad
+a_Position: v0=(1021,472) 鈥?v2=(0,0)
+  ndc= v0=(1.2168,-1.0000) 鈥?v2=(-1.2168,-1.0000)  rect=-138,0,1557,720
 ```
 
-⇒ a quad whose vertices are 0..1021 px wide comes out **1557 px** wide and
-**starts 138 px off the left edge** — the guest's own matrix overshoots the
+鈬?a quad whose vertices are 0..1021 px wide comes out **1557 px** wide and
+**starts 138 px off the left edge** 鈥?the guest's own matrix overshoots the
 1280-px viewport by 1.525x, symmetrically. Other quads in the same frame map
-1:1 (`a_Position 257..731` → `ndc -0.5984..0.1422`), so the engine uses two
+1:1 (`a_Position 257..731` 鈫?`ndc -0.5984..0.1422`), so the engine uses two
 different matrices. The next reading is which matrix the guest sets up for the
 2D UI pass, and what it derives it from.
 
@@ -536,32 +531,32 @@ different matrices. The next reading is which matrix the guest sets up for the
 
 | Candidate | Measurement | Verdict |
 |---|---|---|
-| The icon font | q123b (`iconfont=0`) and q132 (`iconfont=1`) produce the **identical** `size=140 … boundsW=2421.0` | not the cause |
-| A wrong font FILE | the romfs copy and the guest's own APK copy of `ConduitITCPro-Bold.otf` are the **same 130,400 bytes, same sha256** (`CABB8BE8…`) | not the cause |
-| The screen size | the guest prints `Res base: 1280x720` and `nScreenSize = 1280x720` — the same as the framebuffer | not the cause |
+| The icon font | q123b (`iconfont=0`) and q132 (`iconfont=1`) produce the **identical** `size=140 鈥?boundsW=2421.0` | not the cause |
+| A wrong font FILE | the romfs copy and the guest's own APK copy of `ConduitITCPro-Bold.otf` are the **same 130,400 bytes, same sha256** (`CABB8BE8鈥) | not the cause |
+| The screen size | the guest prints `Res base: 1280x720` and `nScreenSize = 1280x720` 鈥?the same as the framebuffer | not the cause |
 | The device profile | **q61 already measured this**: writing `EXPECTED_SCREEN_*` changed the profile (`changed=2 written=1`) and the font sizes **did not move**; the sizes come from a fixed table (14/28/42/56/70/84/98/140) | not the cause |
 | Another face | `tools/face_width_scan.py` measured the string in all 18 staged faces at size 140: the narrowest is 2367 px, none is ~766 | not the cause |
 
-**⇒ The device profile's `EXPECTED_SCREEN_WIDTH = 480` / `HEIGHT = 320` are a
+**鈬?The device profile's `EXPECTED_SCREEN_WIDTH = 480` / `HEIGHT = 320` are a
 red herring for the font size** (q61), even though they are what the game's
 `AndroidHigh.plist` really contains. The profile is built by the port's own
-settings layer (`settings-profile … base=rr3core:/files/.depot/eds/
-AndroidHigh.plist … bytes=6808/6808 changed=1`), and the guest's own dump
+settings layer (`settings-profile 鈥?base=rr3core:/files/.depot/eds/
+AndroidHigh.plist 鈥?bytes=6808/6808 changed=1`), and the guest's own dump
 confirms it reads `EXPECTED_SCREEN_WIDTH = 480`.
 
 ### 2.8 The release archive was stale: `pack-zip.ps1` reused an existing zip
 
-`tools/…/.build/pack-zip.ps1` had `if (Test-Path $outZip) { … } else { zip }`:
+`tools/鈥?.build/pack-zip.ps1` had `if (Test-Path $outZip) { 鈥?} else { zip }`:
 **an existing archive was reused without checking it against the package.** The
 2026-11-03 repack shipped an archive that was **1480 bytes** off the package:
 
 ```
 README-hardware-test.md   zip=27,062   pkg=29,969   (+2,907)
-switch/rr3-gfx.conf       zip=3,975    pkg=2,548    (−1,427)
+switch/rr3-gfx.conf       zip=3,975    pkg=2,548    (鈭?,427)
 ```
 
 The size gate caught it (`the archive holds 11459500064 bytes but the package
-holds 11459501544`), which is how it was found — but the failure came **after**
+holds 11459501544`), which is how it was found 鈥?but the failure came **after**
 a whole repack cycle.
 
 **Fixed 2026-11-03**: the archive is now fingerprinted against the package it
@@ -571,7 +566,7 @@ a successful build, so an interrupted run leaves none and the next run rebuilds.
 `pack-zip.ps1` also takes a `-Stamp` now (its paths were hard-wired to
 20261102, which is how a repack could write next to the previous day's
 deliverables), and `.build/run-repack.ps1` chains the whole deliverable set in
-one go: archive → parts → app zip → join check.
+one go: archive 鈫?parts 鈫?app zip 鈫?join check.
 
 ---
 
@@ -579,17 +574,17 @@ one go: archive → parts → app zip → join check.
 
 | Old conclusion | Measurement | Why it was wrong |
 |---|---|---|
-| "The guest lays out a whole English paragraph with the symbol font, so the port draws it 2.048× too big" | The paragraph uses Conduit 1:1; 2,812 text draws per run, zero substitutions | a log window that crossed a request boundary ⇒ misattribution |
+| "The guest lays out a whole English paragraph with the symbol font, so the port draws it 2.048脳 too big" | The paragraph uses Conduit 1:1; 2,812 text draws per run, zero substitutions | a log window that crossed a request boundary 鈬?misattribution |
 | "q122's blank dialog was caused by the symbol font" | q122 opened the card's **72,468-byte** file, which is a **different font** | same name, different content |
 | "The icons are half the size because upem 2048 vs 1000" | A ratio does not describe a size error; the real cause was the **face being swapped** (different glyphs entirely) | a ratio mistaken for a size error |
 | "The splash title is 1455 px wide because the symbol font's advance is 10.4 em at size 140" | The string is drawn with **ConduitITCPro-Bold**; the font's real advance for it is 2433.6 px at size 140 (`conduit_width_truth.py`). 1455 px is the width of a *different* element | a number from another measurement |
-| "The splash line is drawn too big because the device profile says EXPECTED_SCREEN 480×320" | **q61 already measured this**: the profile was rewritten (`changed=2 written=1`) and the font sizes did not move. The sizes come from a fixed table | a plausible cause that was already falsified |
+| "The splash line is drawn too big because the device profile says EXPECTED_SCREEN 480脳320" | **q61 already measured this**: the profile was rewritten (`changed=2 written=1`) and the font sizes did not move. The sizes come from a fixed table | a plausible cause that was already falsified |
 | "The splash artwork is scaled too wide" | The overflowing line is **guest text** (`Player ID: CCDI123456789 / CCRR123456789`), measured with a texture id, a bounds width and a pixel band | the artwork was blamed for a text bug |
-| "The port's text probe caps the frame rate (a linear scan per draw)" | The scan was real (up to 4096 entries x ~90,000 draws a frame) and is now a hash, but **q137 with the fix did not get faster** (q134 960 / q136 840 / q137 — frames per 306 s). The PNG capture was measured too, and it is not the cost either | a plausible cause, measured and falsified |
+| "The port's text probe caps the frame rate (a linear scan per draw)" | The scan was real (up to 4096 entries x ~90,000 draws a frame) and is now a hash, but **q137 with the fix did not get faster** (q134 960 / q136 840 / q137 鈥?frames per 306 s). The PNG capture was measured too, and it is not the cost either | a plausible cause, measured and falsified |
 | "The game got 6x slower" | The October round that showed 23 fps spent most of its 1206 s **in the race**; the November rounds spend it in the **menu**. Different phases, so the numbers are not comparable | two different phases compared as if they were the same |
-| "The game runs at 3–4.5 fps" | That was the **menu** phase. MEASURED 2026-11-04 (q142): the same build, the same card and the same ~1.44 cores of CPU produced **4,680 frames in 409 s = 11.44 fps**, because most of that round was **in the race**. The CPU cores are the same in both phases (1.44–1.56 in every healthy round), so the phase difference is a difference in **waiting**, not in computing | one phase's rate was quoted as the game's rate |
-| "The pursuit fix is verified — the last sample's error was 0.0391 rad" | A **single** sample is not a measurement. MEASURED (q142): over the 141 samples the error ranged from **−3.05 to +3.03 rad**, and **63 of 141** samples were more than 1 rad off. The good sample was the tail of a series that had been oscillating | one sample read as the distribution |
-| "The port's own probes cost the frame rate (glyph-face / map-app)" | The volume is real (33,643 + 31,315 lines = **31 %** of a 45 MB log, one `fflush` each) but **no A/B has been run** on the log-volume cut yet, and the port's probes were **already excluded** by two measured A/Bs (PNG capture, glyph-texture hash) | a plausible cause, not yet a measurement — stated as a suspicion, not a result |
+| "The game runs at 3鈥?.5 fps" | That was the **menu** phase. MEASURED 2026-11-04 (q142): the same build, the same card and the same ~1.44 cores of CPU produced **4,680 frames in 409 s = 11.44 fps**, because most of that round was **in the race**. The CPU cores are the same in both phases (1.44鈥?.56 in every healthy round), so the phase difference is a difference in **waiting**, not in computing | one phase's rate was quoted as the game's rate |
+| "The pursuit fix is verified 鈥?the last sample's error was 0.0391 rad" | A **single** sample is not a measurement. MEASURED (q142): over the 141 samples the error ranged from **鈭?.05 to +3.03 rad**, and **63 of 141** samples were more than 1 rad off. The good sample was the tail of a series that had been oscillating | one sample read as the distribution |
+| "The port's own probes cost the frame rate (glyph-face / map-app)" | The volume is real (33,643 + 31,315 lines = **31 %** of a 45 MB log, one `fflush` each) but **no A/B has been run** on the log-volume cut yet, and the port's probes were **already excluded** by two measured A/Bs (PNG capture, glyph-texture hash) | a plausible cause, not yet a measurement 鈥?stated as a suspicion, not a result |
 
 ---
 
@@ -600,14 +595,13 @@ This is the first round in which the game ran a **real race for thousands of
 frames**, so the pursuit could finally be measured instead of inferred.
 
 **The race started on its own.** MEASURED: the port's own red-glove follower
-pressed the race button —
-
+pressed the race button 鈥?
 ```
-phase=ui-press … kind=orange x=1105 y=695 area=8180 w=326 h=45   (frame 420)
+phase=ui-press 鈥?kind=orange x=1105 y=695 area=8180 w=326 h=45   (frame 420)
 ```
 
-— which is the button the guest scissors every frame as
-`glScissor x=994 y=667 w=187 h=53`. **⇒ The race-start path was never the
+鈥?which is the button the guest scissors every frame as
+`glScissor x=994 y=667 w=187 h=53`. **鈬?The race-start path was never the
 touch script.** (The script's own frame-450 tap was still on the card in that
 round, which is why the earlier rounds appeared to start "by accident".)
 
@@ -617,15 +611,15 @@ round, which is why the earlier rounds appeared to start "by accident".)
 |---|---|
 | frames of race | 4,200 |
 | distance covered | 91,810 spline units = **5.08 %** of a lap (the lap is 1,806,336) |
-| pursuit error `perr` | **−3.05 … +3.03 rad** (63 of 141 samples worse than 1 rad) |
-| lateral residual `lres` | ≤ **2.00 m** — the car was ON the line |
-| distance to the look-ahead point | 16–43 m |
+| pursuit error `perr` | **鈭?.05 鈥?+3.03 rad** (63 of 141 samples worse than 1 rad) |
+| lateral residual `lres` | 鈮?**2.00 m** 鈥?the car was ON the line |
+| distance to the look-ahead point | 16鈥?3 m |
 | best / worst | `best=3.98`, `stalls=6`, `flips=3` |
 
-**⇒ The car was on the line and the target was 20 m away, and the error was
-still 180°.** A car 2 m from the line with a target 20 m ahead cannot have a
-180° error: the angle is bounded by `atan(2/20) ≈ 6°`. **⇒ The only way to get
-180° is that the car's own direction of travel had reversed.**
+**鈬?The car was on the line and the target was 20 m away, and the error was
+still 180掳.** A car 2 m from the line with a target 20 m ahead cannot have a
+180掳 error: the angle is bounded by `atan(2/20) 鈮?6掳`. **鈬?The only way to get
+180掳 is that the car's own direction of travel had reversed.**
 
 **And the reason is in the source.** `raceLineTarget()` decided which side of
 the line to take the look-ahead point from **on every single frame**, using
@@ -639,21 +633,21 @@ if (headingX != 0.0 || headingY != 0.0) {
 }
 ```
 
-⇒ the closed loop, all of it visible in q142's samples:
+鈬?the closed loop, all of it visible in q142's samples:
 
 1. the car is nudged and its direction of travel reverses for a moment;
 2. `step` flips, so **the look-ahead point jumps to the other side of the
    car**;
 3. the error the controller sees is now the sum of two flips (the heading's
-   and the target's) — the samples go `+0.44 → −3.05 → +2.99 → −2.73 rad`
+   and the target's) 鈥?the samples go `+0.44 鈫?鈭?.05 鈫?+2.99 鈫?鈭?.73 rad`
    from one 30-frame sample to the next;
-4. the controller saturates the steering (`steer = ±1.0`, full lock) and the
+4. the controller saturates the steering (`steer = 卤1.0`, full lock) and the
    throttle is on;
-5. the car swings past the target, **drives backwards** — q142: it LOST
-   6,581 units of progress between frames 2010 and 2040 — which reverses the
+5. the car swings past the target, **drives backwards** 鈥?q142: it LOST
+   6,581 units of progress between frames 2010 and 2040 鈥?which reverses the
    heading, which repeats step 1.
 
-**⇒ The track does not change direction while the car drives on it, so the
+**鈬?The track does not change direction while the car drives on it, so the
 decision belongs to the RACE, not to the frame.**
 
 **Fixed (this round), in three parts:**
@@ -662,22 +656,21 @@ decision belongs to the RACE, not to the frame.**
    in/out argument: 0 means "not decided yet", and a non-zero value is held
    for the whole race. The caller owns the lock, so the function stays free
    of hidden state and the host self-test can exercise it directly.
-2. **The one decision is made from a WINDOWED motion vector** — the car's
-   displacement over the whole 48-sample position ring — not from the
+2. **The one decision is made from a WINDOWED motion vector** 鈥?the car's
+   displacement over the whole 48-sample position ring 鈥?not from the
    instantaneous heading. A single-frame wobble cannot reverse it. The lock
    is reset when the track changes (`splineGeneration`).
-3. **The throttle is let go when the error is more than ~86°.** A car that is
+3. **The throttle is let go when the error is more than ~86掳.** A car that is
    spun or facing back down the track has to turn around, and full throttle at
    full lock turns a turn-around into a spin. The brake stays off, because the
-   guest reverses only when the brake is held **and** the throttle is let go —
-   and a car that reverses here is the loop above.
+   guest reverses only when the brake is held **and** the throttle is let go 鈥?   and a car that reverses here is the loop above.
 
 **Unit test** (`tests/host/race_line_selftest.cpp`, 22 checks, all ok): three
-new ones prove the lock — *the direction is decided and reported back*, *the
+new ones prove the lock 鈥?*the direction is decided and reported back*, *the
 lock is not changed by a reversed heading*, and *a locked race keeps the
 target on the same side of the car*.
 
-**⇒ MEASURED, in the next round (q143, the same build with the census off):**
+**鈬?MEASURED, in the next round (q143, the same build with the census off):**
 
 | Measure | q142 (before) | q143 (after) |
 |---|---|---|
@@ -686,32 +679,32 @@ target on the same side of the car*.
 | frames of race | 4,200 | **4,770** |
 | stalls | 6 | 4 |
 
-⇒ **The lock works**: the look-ahead point stopped jumping to the other side
+鈬?**The lock works**: the look-ahead point stopped jumping to the other side
 of the car, and the car drove 70 % further around the lap. **And it is not
 enough**: the car still does not finish a lap.
 
-**⇒ AND THE NEXT BOTTLENECK IS NOW VISIBLE, and it is not the pursuit.**
+**鈬?AND THE NEXT BOTTLENECK IS NOW VISIBLE, and it is not the pursuit.**
 MEASURED (q143): the car reached its best at **frame ~1,830** (161,757 units
 = 8.95 %) and then **stopped for good**. From frame ~2,700 to the end of the
 round (2,700 frames) the guest's own **spline node index stood at 319** and
-the distance moved by **10 units per 30 frames** — about 1.3 mm a frame, with
+the distance moved by **10 units per 30 frames** 鈥?about 1.3 mm a frame, with
 the throttle on and the pursuit's error small and steady. **The car is pinned
 against a barrier**, and the port's recovery (which fires 4 times in the whole
 round) does not free it.
 
-⇒ The pursuit's error is now good enough (13 % of samples off, and the car is
+鈬?The pursuit's error is now good enough (13 % of samples off, and the car is
 2 m from the line), so the next thing to fix is the **stuck car**: the
 recovery needs an EXIT rather than a reference-point reset, and the stall
 detector has to notice a car that is pinned while the pursuit keeps asking it
 to turn.
 
-**⇒ FIXED AND MEASURED (q145, the next build).** The discriminator is the
+**鈬?FIXED AND MEASURED (q145, the next build).** The discriminator is the
 car's own **POSITION**, not the progress meter: the progress metric has a
 one-metre granularity, so a car crawling at less than a metre a second and a
 car pressed against a barrier look exactly the same to it. A crawling car's
 position changes; a pinned car's does not. So the test is *"the world
 position has not moved by a metre for 1,200 frames"*, and it also requires
-that the car has **already made progress in this race** — otherwise the start
+that the car has **already made progress in this race** 鈥?otherwise the start
 sequence's hold at the grid is a pinned car too. The recovery then fires at
 most once per 1,200 frames, so it cannot become a recovery loop.
 
@@ -722,18 +715,18 @@ most once per 1,200 frames, so it cannot become a recovery loop.
 | recoveries fired | 4 | **10** |
 | frames in the round | 5,410 | **6,240** |
 
-⇒ **The car is no longer pinned.** The progress curve used to flat-line at
+鈬?**The car is no longer pinned.** The progress curve used to flat-line at
 92,871 for 2,700 frames; it now oscillates and climbs
-(93,872 → 130,177 → 177,324 → 162,471 → 186,921), i.e. the car gets free and
+(93,872 鈫?130,177 鈫?177,324 鈫?162,471 鈫?186,921), i.e. the car gets free and
 drives on.
 
-**⇒ BUT THE LAP COUNTER IS STILL −1, AND NOW THE REASON IS CLEAR.** The car
-is at 10.35 % of a lap and spends **41.5 % of the race in a recovery** — the
+**鈬?BUT THE LAP COUNTER IS STILL 鈭?, AND NOW THE REASON IS CLEAR.** The car
+is at 10.35 % of a lap and spends **41.5 % of the race in a recovery** 鈥?the
 brake was held in **80 of 193 samples** and the recovery fired **10 times**.
 At the rate it makes progress when it is NOT stuck (178 units a frame) a lap
 is ~10,000 frames; at the rate it actually manages it is ~56,000 frames.
-**⇒ The next lever is not the pursuit
-any more, it is the quality of the line following** — the look-ahead distance
+**鈬?The next lever is not the pursuit
+any more, it is the quality of the line following** 鈥?the look-ahead distance
 (20 m), the steering gain, and how much of the track the car can actually
 hold. The car is on the line to within 2 m, but it is still hitting the
 barriers.
@@ -741,7 +734,7 @@ barriers.
 ### 2.11 The port's own log was 31 % repetitive, and the deduplication tables were too small
 
 **Measured 2026-11-04 (q142).** The guest-view log was 45.2 MB / 205,983 lines
-in 409 s — **504 lines a second**, each one an `fprintf` plus an `fflush` on
+in 409 s 鈥?**504 lines a second**, each one an `fprintf` plus an `fflush` on
 the emulated card (the log writer does not `fsync`; that was moved off the
 card in an earlier round). The volume is not the game's: it is the port's own
 probes.
@@ -766,7 +759,7 @@ the (face, size) pair, and `map-app` gets a 2048-slot hash set of the paths
 already reported. The information is kept (every distinct pair and path is
 still logged once); the repetition is gone.
 
-**⇒ What this has NOT yet proved**: that the log volume was costing frame
+**鈬?What this has NOT yet proved**: that the log volume was costing frame
 rate. The port's probes have already been excluded twice by measurement (the
 PNG capture, the glyph-texture hash), and the log writer does not `fsync`. The
 honest statement is that this is a **large, cheap, safe reduction of the
@@ -791,27 +784,27 @@ the same way):
 | q141 | 606 s | 2,280 | 3.76 | 1.56 | 407 | 114.3 MB |
 | **q142** | **409 s** | **4,680** | **11.44** | **1.44** | **122** | **43.1 MB** |
 
-**⇒ Every healthy round uses 1.39–1.56 cores of CPU, and the frame rate
-varies 4.9× across the same builds.** Since the CPU is flat, the extra time
-per frame is **waiting**, not computing. And q142 — the one round that spent
-most of its time **in a race** — is 3× faster than the menu rounds with a
+**鈬?Every healthy round uses 1.39鈥?.56 cores of CPU, and the frame rate
+varies 4.9脳 across the same builds.** Since the CPU is flat, the extra time
+per frame is **waiting**, not computing. And q142 鈥?the one round that spent
+most of its time **in a race** 鈥?is 3脳 faster than the menu rounds with a
 **smaller** log (43.1 MB vs 51.8 MB).
 
-**⇒ Two conclusions, one of them a correction:**
+**鈬?Two conclusions, one of them a correction:**
 
-* the black screen's "3–4.5 fps" is the **menu** phase; the game in a race
+* the black screen's "3鈥?.5 fps" is the **menu** phase; the game in a race
   does 11.4 fps on Eden;
 * **any frame-rate comparison has to name its phase.** The October 23 fps and
   the November 3.9 fps were the same mistake twice.
 
-**⇒ The next measurement is a paired A/B on the one switch that was never
+**鈬?The next measurement is a paired A/B on the one switch that was never
 tried**: the guest-thread census, which sweeps and samples the guest's threads
 every 4 s and has a kill switch (`census=off` in
 `sdmc:/switch/rr3-census.conf`) that **has never been run**. The census
 A/B is running with the pursuit fix in the same build, as two rounds that
 differ in that file and in nothing else.
 
-**⇒ MEASURED (the pair is in: q143 census=off, q144 census=on — the same
+**鈬?MEASURED (the pair is in: q143 census=off, q144 census=on 鈥?the same
 build `330cd54d`, the same card, the same scripts, 405 s each):**
 
 | | census=off | census=on | difference |
@@ -821,36 +814,35 @@ build `330cd54d`, the same card, the same scripts, 405 s each):**
 | CPU cores | 1.299 | 1.416 | **+9.0 %** |
 | CPU seconds | 513.3 | 559.5 | +9.0 % |
 
-**⇒ THE CENSUS IS NOT THE FRAME-RATE LEVER.** +1.3 % of frames is inside the
+**鈬?THE CENSUS IS NOT THE FRAME-RATE LEVER.** +1.3 % of frames is inside the
 noise, and it does not perturb the driving either (the share of samples with
 the look-ahead point behind the car was 13 % with the census off and 14 %
-with it on). What it does cost is **~9 % of the CPU** and ~5 % of the log —
-worth switching off for the console, not worth calling a fix.
+with it on). What it does cost is **~9 % of the CPU** and ~5 % of the log 鈥?worth switching off for the console, not worth calling a fix.
 
-**⇒ AND THE PNG CAPTURE IS EXCLUDED A THIRD TIME, AND CLEANLY.** The probe
-conf says `pngfrom=1300`, and q143's race started at frame 630 — so the
+**鈬?AND THE PNG CAPTURE IS EXCLUDED A THIRD TIME, AND CLEANLY.** The probe
+conf says `pngfrom=1300`, and q143's race started at frame 630 鈥?so the
 **menu** phase, the slow phase, captured **no PNG at all**, and the menu
 still ran at 4.8 fps.
 
-**⇒ THE PHASE SPLIT, measured from the two new rounds** (the race starts at
+**鈬?THE PHASE SPLIT, measured from the two new rounds** (the race starts at
 the frame the guest reports the RaceMetrics object):
 
 | Phase | Frame rate on Eden |
 |---|---|
 | menu (the front end) | **4.8 fps** |
-| race | **15–17 fps** |
+| race | **15鈥?7 fps** |
 
-⇒ **⇒ The next instrument is a per-frame HOST TIMESTAMP**, because the frame
+鈬?**鈬?The next instrument is a per-frame HOST TIMESTAMP**, because the frame
 rate is now known to be phase-dependent while the CPU is flat, and nothing
 in the logs says *what* the frame is waiting for. The three candidates that
 remain are the guest's own 2D UI work (1,200 controls in the tree, 82 face
 opens a second, 76 asset resolutions a second), the port's per-frame control
 walk, and the host's own present path.
 
-**⇒ ⇒ AND THE INSTRUMENT ANSWERED IT (q146).** The port's per-frame census
-line now carries the frame's three costs — `tt` (the whole frame), `tr` (the
+**鈬?鈬?AND THE INSTRUMENT ANSWERED IT (q146).** The port's per-frame census
+line now carries the frame's three costs 鈥?`tt` (the whole frame), `tr` (the
 guest's render call), `tp` (the port's own work) and `ts` (the present,
-`eglSwapBuffers`) — on the **existing** line, so the instrument costs no
+`eglSwapBuffers`) 鈥?on the **existing** line, so the instrument costs no
 extra log writes and cannot change the thing it measures.
 
 | | menu phase (630 frames) | race phase (6,278 frames) |
@@ -861,29 +853,29 @@ extra log writes and cannot change the thing it measures.
 | of which: the present | 0.9 % | 8.8 % |
 | implied frame rate (median) | **9.3 fps** | **34.5 fps** |
 
-**⇒ THE PORT IS NOT WHAT MAKES THE MENU SLOW.** Its own per-frame work is
+**鈬?THE PORT IS NOT WHAT MAKES THE MENU SLOW.** Its own per-frame work is
 0.6 ms out of a 546 ms frame. And the frame time is not spread out: **37 of
 1,767 frames took more than a second, and those 37 frames are 69 % of the
-run's frame time** (271.3 s of 395.9 s). The longest was 49.9 s — and it
+run's frame time** (271.3 s of 395.9 s). The longest was 49.9 s 鈥?and it
 holds 502 string-to-number conversions, 49 path resolutions and 15 stats:
 **the guest loading and parsing assets inside its own render call**. The
 port's own work in that frame was **1 ms**.
 
-**⇒ AND IT IS NOT THE PORT'S FILESYSTEM LAYER EITHER**: the bulk-read path
+**鈬?AND IT IS NOT THE PORT'S FILESYSTEM LAYER EITHER**: the bulk-read path
 served the 4.2 MB base asset list in **10 ms** (421 MB/s), and the whole
 run's bulk reads were 5 calls and **25 ms**.
 
-**⇒ ⇒ SO THE MENU'S SLOWNESS ON EDEN IS THE GUEST'S OWN ARM64 CODE BEING
+**鈬?鈬?SO THE MENU'S SLOWNESS ON EDEN IS THE GUEST'S OWN ARM64 CODE BEING
 EMULATED.** Both the guest *and* the port's Mesa are ARM64 binaries, so on
 Eden both of them run through an x86 emulator; on a console they are native.
-**⇒ Eden's 4.8 fps is a statement about Eden, not a forecast of the console.**
+**鈬?Eden's 4.8 fps is a statement about Eden, not a forecast of the console.**
 The console's black screen is therefore much more likely to be the **boot
-phase** — which the port does control — than the frame rate. The boot
+phase** 鈥?which the port does control 鈥?than the frame rate. The boot
 phase's own cost is already measured: the asset-list rewrite is 0 bytes
 written and 2,843 ms, and what is left is reading 1235 lists and 386 cached
 files on *every* boot, which a cache key could skip entirely.
 
-**⇒ ⇒ AND THE INSTRUMENT IS WHAT THE CONSOLE NEEDS.** With `tt/tr/ts/tp` in
+**鈬?鈬?AND THE INSTRUMENT IS WHAT THE CONSOLE NEEDS.** With `tt/tr/ts/tp` in
 the console's own log, the console's black screen becomes a DIRECTLY
 answerable question: is the long frame the guest's own work or the port's?
 Eden could not answer that, because Eden's guest is emulated and the
@@ -894,16 +886,16 @@ console's is not.
 **Measured 2026-11-04 (Spa, from the port's own `spline-open` line):**
 
 ```
-phase=spline-open … chunks=3
+phase=spline-open 鈥?chunks=3
   | centre_spline nodes=441 loop=112270.0 spanX=27466 spanY=28797
   | start_spline   nodes=882 loop=112030.5 spanX=27439 spanY=28797
   | ai_spline      nodes=882 loop=111197.5 spanX=27299 spanY=28921
 ```
 
-**⇒ The file holds THREE lines, and the port follows the wrong one.**
+**鈬?The file holds THREE lines, and the port follows the wrong one.**
 `centre_spline` is the geometric middle of the track. `ai_spline` is the line
-the AI cars drive — the **racing line** — and it is **67.0 m shorter a lap**
-(7,016.9 m → 6,949.8 m), because it cuts the corners.
+the AI cars drive 鈥?the **racing line** 鈥?and it is **67.0 m shorter a lap**
+(7,016.9 m 鈫?6,949.8 m), because it cuts the corners.
 
 **How far apart are they** (`tools/spline_chunks.py`, the same container
 format the port decodes):
@@ -914,34 +906,34 @@ format the port decodes):
 | p90 | **4.62 m** |
 | max | **8.25 m** |
 
-**⇒ And the car is on the CENTRE line, not the racing line.** The port's own
-`lres` (the lateral residual to the line it is following) is **≤ 2.01 m** in
-every sample of q145 — so the car is on the centre line, and the centre line
-is 2–8 m from the racing line. A car following the centre line drives on the
+**鈬?And the car is on the CENTRE line, not the racing line.** The port's own
+`lres` (the lateral residual to the line it is following) is **鈮?2.01 m** in
+every sample of q145 鈥?so the car is on the centre line, and the centre line
+is 2鈥? m from the racing line. A car following the centre line drives on the
 **outside** of every corner.
 
-**⇒ That is a candidate explanation for the ten barrier hits a race** — and
+**鈬?That is a candidate explanation for the ten barrier hits a race** 鈥?and
 the car spends **41.5 %** of the race in a recovery (the brake held in 80 of
 193 samples). But it is a **hypothesis**, and it was measured wrong once
 already: a first attempt to re-derive the transform in Python gave a residual
-of **19.22 m** where the port's own fit gives **≤ 2.01 m**, so that
+of **19.22 m** where the port's own fit gives **鈮?2.01 m**, so that
 analysis's numbers were void and were thrown away rather than reported.
 
-**⇒ So the port now MEASURES it instead of arguing about it.** Two
+**鈬?So the port now MEASURES it instead of arguing about it.** Two
 instruments, both pure instrumentation, no change to the driving:
 
-* **`rres`** — the car's distance from the `ai_spline` chunk, in the same
+* **`rres`** 鈥?the car's distance from the `ai_spline` chunk, in the same
   frame and with the same transform as the line the car IS following
   (`raceLineDistanceToChunk()` in `source/race_line.cpp`). If `rres` sits at
-  2–8 m while the car is running, it is on the wrong line and switching the
+  2鈥? m while the car is running, it is on the wrong line and switching the
   chunk is the fix. If `rres` is near zero, it is already on the racing line
   and the barrier hits have some other cause.
-* **the frame's three costs** — `tt` (the whole frame), `tr` (the guest's
+* **the frame's three costs** 鈥?`tt` (the whole frame), `tr` (the guest's
   render call), `tp` (the port's own work) and `ts` (the present,
   `eglSwapBuffers`), on the existing per-frame census line, so the
   instrument costs no extra log writes.
 
-**⇒ MEASURED (q146, the port's own `rres`):**
+**鈬?MEASURED (q146, the port's own `rres`):**
 
 ```
 frame=5640  line=1  lres=1.97  rres=10.50
@@ -950,38 +942,38 @@ frame=5700  line=1  lres=1.97  rres= 9.17
 frame=5730  line=1  lres=1.97  rres=11.38
 ```
 
-⇒ **The car was 1.97 m from the centre line and 9–11 m from the racing
+鈬?**The car was 1.97 m from the centre line and 9鈥?1 m from the racing
 line.** It was on the wrong line, and the distance is bigger than the
-centre↔racing deviation measured in the stored frame (2.92 m median),
+centre鈫攔acing deviation measured in the stored frame (2.92 m median),
 because the car's path also contains its reversals and its excursions off
 the line, so its *instantaneous* distance from the centre line is larger
-than the fit's mean residual. **⇒ The switch is worth making.**
+than the fit's mean residual. **鈬?The switch is worth making.**
 
-**⇒ THE SWITCHING IS NOT A ONE-LINE CHANGE, and the reason is the fit.** The
+**鈬?THE SWITCHING IS NOT A ONE-LINE CHANGE, and the reason is the fit.** The
 fit aligns the centre line onto the car's path, so the moment the car drives
 the racing line the fit would follow it there and **pull the racing line
-with it** — the two would swap places and the car would drive the centre
+with it** 鈥?the two would swap places and the car would drive the centre
 line again, offset by up to 8 m. The transform is a property of the TRACK,
 not of where the car is, so:
 
-* the **fit** keeps using `centre_spline` — it is the reference that says
+* the **fit** keeps using `centre_spline` 鈥?it is the reference that says
   where the track IS;
 * the **target** moves to `ai_spline` when the file has one;
 * the **transform is LOCKED** once the fit settles (the same variant and an
   offset that moved less than a metre), and released when the track changes.
 
-**⇒ MEASURED (q147, with the switch on):** `rres` went from 9–11 m to
-**0.32 m** — the car really was on the racing line — and the time spent
+**鈬?MEASURED (q147, with the switch on):** `rres` went from 9鈥?1 m to
+**0.32 m** 鈥?the car really was on the racing line 鈥?and the time spent
 reversing fell from **41.5 % to 13.7 %** of the race (three times fewer
 barrier hits). **BUT the net lap progress went from 10.35 % to 5.14 %**,
-because the pursuit's error became a constant **0.7 rad (40°)**: a 20 m
+because the pursuit's error became a constant **0.7 rad (40掳)**: a 20 m
 look-ahead overshoots the racing line's sharper apexes, so the car crabbed
 along the line instead of driving it.
 
-**⇒ ⇒ SO THE SWITCH IS REVERTED for now, and the reason is NOT that the
+**鈬?鈬?SO THE SWITCH IS REVERTED for now, and the reason is NOT that the
 racing line is wrong.** It is that the look-ahead has to be tuned for the
-racing line before the switch is worth having — and that tuning is the
-AUTOPILOT's problem, which is a different problem (§2.14). The `rres`
+racing line before the switch is worth having 鈥?and that tuning is the
+AUTOPILOT's problem, which is a different problem (搂2.14). The `rres`
 instrument stays, so the autopilot's line quality is measurable from now on.
 
 ### 2.14 THE AUTOPILOT AND THE PORT ARE TWO DIFFERENT QUESTIONS
@@ -1001,21 +993,21 @@ assist the human owns every control they are touching, and the loop fills
 manual the port does not touch the car at all
 ```
 
-**⇒ ⇒ SO EVERY MEASUREMENT OF "THE LAP COUNTER" SO FAR HAS BEEN A
+**鈬?鈬?SO EVERY MEASUREMENT OF "THE LAP COUNTER" SO FAR HAS BEEN A
 MEASUREMENT OF THE AUTOPILOT'S DRIVING.** The car could not complete a lap
-because the port's own pure-pursuit controller cannot drive a lap — which is
+because the port's own pure-pursuit controller cannot drive a lap 鈥?which is
 a quality problem in ONE optional feature, and says nothing about whether
 the port is PLAYABLE. The two were being measured as if they were one thing.
 
-**⇒ AND THE HUMAN PATH HAS NEVER BEEN PROVEN TO MOVE THE CAR AT ALL.** The
+**鈬?AND THE HUMAN PATH HAS NEVER BEEN PROVEN TO MOVE THE CAR AT ALL.** The
 port has the mapping (`rr3-gamepad.txt`: 22 bindings, the guest's own button
 and axis ordinals) and the scripted pad (`rr3-pad.txt`, the timeline that
 injects `lx=`, `rt=`, `b=` at given frames), and the shipped pad script
-holds the accelerator from frame 600 — but with `autopilot = 1` the guest's
+holds the accelerator from frame 600 鈥?but with `autopilot = 1` the guest's
 steering axis was overwritten by the loop every single frame. **Nobody ever
 checked whether the human's stick reaches the car.**
 
-**⇒ ⇒ SO THE MEASUREMENT IS NOW THE HUMAN ONE**, and it is three separate
+**鈬?鈬?SO THE MEASUREMENT IS NOW THE HUMAN ONE**, and it is three separate
 observations in one round (`autopilot = 0`, the card's pad script becomes a
 weave that holds the accelerator and alternates the steering axis):
 
@@ -1025,19 +1017,19 @@ weave that holds the accelerator and alternates the steering axis):
 | 2 | does the human's throttle reach the car? | the guest's own car speed rising while BTN_A is held |
 | 3 | does the human's steering reach the car? | the car's path curving when `lx` changes |
 
-**⇒ ⇒ AND IF THEY DO, THE SHIPPED DEFAULT CHANGES.** A game port in which
+**鈬?鈬?AND IF THEY DO, THE SHIPPED DEFAULT CHANGES.** A game port in which
 the port drives the car and ignores the human is not a playable port, so
 `autopilot = 0` (the human drives) is the shipping default and `auto` is the
-opt-in attract mode — **but only after the human path is measured**, because
+opt-in attract mode 鈥?**but only after the human path is measured**, because
 shipping `manual` on an unproven input path would make the console
 unplayable in a different way.
 
-⇒ The new files: `native-switch/card/rr3-pad-manual.txt` (the weave),
+鈬?The new files: `native-switch/card/rr3-pad-manual.txt` (the weave),
 `.build/deploy-manual-control.ps1` (the card switch, with a backup so it can
 be undone) and `.build/run-manual-round.ps1` (the gate, the switch and the
 round, in that order).
 
-**⇒ ⇒ AND THE CODE SAYS THE SAME THING, IN THREE PLACES.** The port has TWO
+**鈬?鈬?AND THE CODE SAYS THE SAME THING, IN THREE PLACES.** The port has TWO
 input paths, and the split was not where anyone would guess:
 
 ```cpp
@@ -1065,29 +1057,29 @@ if (scriptDrives) {
    }
    ```
 
-   ⇒ **With `autopilot = 0` the port still wrote its own steering into the
+   鈬?**With `autopilot = 0` the port still wrote its own steering into the
    script's axis and forced its own throttle.** The setting was a switch that
    did not switch anything on the path the experiments actually used.
 
 2. **THE SHIPPED PACKAGE SHIPS THE EXPERIMENT SCRIPT, AND IT BLOCKED THE
    PLAYER.** `rr3-pad.txt` is in the release tree, and while a script is
-   active the physical controller is ignored *entirely*. ⇒ **On a console
+   active the physical controller is ignored *entirely*. 鈬?**On a console
    with the shipped package, the player's own controller was dead.** The
    script owned every button and every axis.
 
-3. **THE SCRIPTED PATH HAD NO INSTRUMENT.** `logGamepadState()` — the line
-   that reports what was asked for against what the guest got — was only
-   called on the physical path. ⇒ A round whose script drove the guest had
+3. **THE SCRIPTED PATH HAD NO INSTRUMENT.** `logGamepadState()` 鈥?the line
+   that reports what was asked for against what the guest got 鈥?was only
+   called on the physical path. 鈬?A round whose script drove the guest had
    **no instrument at all**, which is exactly why "did the human's input
    reach the car?" could not be answered.
 
-**⇒ ALL THREE ARE FIXED:**
+**鈬?ALL THREE ARE FIXED:**
 
 * the `autopilot` mode now governs **both** paths: `auto` the loop owns the
   car, `assist` the human wins on every control they are actually using,
   `manual` the port does not touch the car at all;
 * **the script yields to the human**: it drives only while nobody is using a
-  physical controller — a stick off its deadzone, a trigger pulled, a button
+  physical controller 鈥?a stick off its deadzone, a trigger pulled, a button
   held. Inside an emulator there is no controller, so every experiment keeps
   working exactly as before; on a console the player's stick takes over the
   moment it moves;
@@ -1095,7 +1087,7 @@ if (scriptDrives) {
   script asked for, what the guest got, whether the closed loop overrode the
   steering, and whether a physical controller took over.
 
-**⇒ ⇒ AND MEASURED (q149, the card at `autopilot = 0`, the weave script
+**鈬?鈬?AND MEASURED (q149, the card at `autopilot = 0`, the weave script
 holding the accelerator and alternating the steering axis):**
 
 ```
@@ -1106,12 +1098,12 @@ f= 900 mode=0 lx_script=0.500 lx_guest=0.500 btn=0x0001 loop_steered=0 phys=0
 f=7200 mode=0 lx_script=0.000 lx_guest=0.000 btn=0x0001 loop_steered=0 phys=0
 ```
 
-⇒ **In every one of the 24 samples the axis the script asked for is the axis
+鈬?**In every one of the 24 samples the axis the script asked for is the axis
 the guest got, the accelerator is the accelerator, and the closed loop did
 NOT overwrite either.** Under the old code that value was the autopilot's
 steering and nothing in the log said so.
 
-**⇒ ⇒ AND THE CAR ANSWERED.** The guest's own distance and speed, with the
+**鈬?鈬?AND THE CAR ANSWERED.** The guest's own distance and speed, with the
 human's input as the only source of control:
 
 ```
@@ -1121,22 +1113,22 @@ f=960  total= 20910  speed= 5879
 f=1290 total= 58924  speed= 6464
 ```
 
-and the step between samples **alternates between ~1.5 m and ~23–33 m** — the
+and the step between samples **alternates between ~1.5 m and ~23鈥?3 m** 鈥?the
 car is accelerating on the straights and scrubbing on the turns, i.e. the
 **steering axis is reaching the car and turning it**.
 
-⇒ **⇒ THE PORT IS PLAYABLE. The lap counter's −1 was the AUTOPILOT's
+鈬?**鈬?THE PORT IS PLAYABLE. The lap counter's 鈭? was the AUTOPILOT's
 quality problem, and the autopilot is an attract mode, not the game.**
 
-**⇒ ⇒ SO THE SHIPPING DEFAULT CHANGES.** The release tree now ships
+**鈬?鈬?SO THE SHIPPING DEFAULT CHANGES.** The release tree now ships
 `autopilot = 0` (the player owns the car) and a `rr3-pad.txt` with **no
-events** — the console's file must not hold the accelerator, because a held
+events** 鈥?the console's file must not hold the accelerator, because a held
 accelerator takes the throttle away from the player again. The experiment
 scripts (`rr3-pad-manual.txt`, the weave, and `rr3-pad-autopilot.txt`, the
 confirm-then-throttle one) stay in the repository and are NOT in the
 packager's list.
 
-**⇒ AND THE SHIPPED DEFAULT IS ONLY HONEST ONCE THE PATH IS MEASURED**,
+**鈬?AND THE SHIPPED DEFAULT IS ONLY HONEST ONCE THE PATH IS MEASURED**,
 which is what q149 did.
 
 ---
@@ -1152,10 +1144,10 @@ port reads it. MEASURED in the best archived round (q11, 1206 s, 27,720
 frames):
 
 ```
-phase=race-metrics … ok=1 lapsOk=1 lapsWhy=none … laps=-1 topspeed=7742
+phase=race-metrics 鈥?ok=1 lapsOk=1 lapsWhy=none 鈥?laps=-1 topspeed=7742
 ```
 
-⇒ **the guest itself reports `laps = -1`, at 77 m/s (279 km/h).** The port is
+鈬?**the guest itself reports `laps = -1`, at 77 m/s (279 km/h).** The port is
 not miscounting; the car never crosses the line.
 
 **THE SCALE IS CALIBRATED** from three rounds that agree exactly: one lap is
@@ -1163,30 +1155,30 @@ not miscounting; the car never crosses the line.
 best distance ever was **208,864 units = 11.6 % of a lap** (q11); most rounds
 stopped at **125,841 units = 7.0 %**.
 
-**⇒ The real symptom is "the car drives 7-12 % of a lap and then stops", not
+**鈬?The real symptom is "the car drives 7-12 % of a lap and then stops", not
 "the counter is wrong".** A census of all 153 archived rounds
 (`tools/lap_census.py`) found **no round that ever reported a completed lap**.
 
 ### Why the car stops: the pursuit was aiming BACKWARDS
 
 The port's pure-pursuit controller aims at a look-ahead point on the fitted
-racing line (`raceLineTarget`). The engine's own error — the signed angle
-from the car's heading to that point — is logged per sample. MEASURED over
+racing line (`raceLineTarget`). The engine's own error 鈥?the signed angle
+from the car's heading to that point 鈥?is logged per sample. MEASURED over
 the archived rounds (`tools/pursuit_convergence.py`):
 
-| round | pursuit ON | target BEHIND the car (error ≈ 180°) |
+| round | pursuit ON | target BEHIND the car (error 鈮?180掳) |
 |---|---|---|
 | q119 | 210 | **210 (100 %)** |
 | q121 | 113 | 71 (62.8 %) |
 | q116 | 133 | 21 (15.8 %) |
 | q115 | 4 | 3 (75 %) |
 
-⇒ **the look-ahead point was behind the car, so the controller steered the
+鈬?**the look-ahead point was behind the car, so the controller steered the
 wrong way, the car left the track at the first corner, and the recovery
-deadlock (no progress → reverse → no heading → no pursuit) took over.**
+deadlock (no progress 鈫?reverse 鈫?no heading 鈫?no pursuit) took over.**
 
 **WHY THE TARGET WAS BEHIND: the residual cannot tell a curve from its mirror
-image.** The fit searches 8 axis variants × a scale grid and keeps the
+image.** The fit searches 8 axis variants 脳 a scale grid and keeps the
 smallest residual; over the 48 metres of the car's own path, a curve and its
 reflection agree to within centimetres, so the MIRROR can win. And the fit
 says nothing about the DIRECTION, because a closed loop traversed backwards
@@ -1194,115 +1186,112 @@ has the same shape. The fitted variant also **changed mid-run** (q121 saw six
 different values in one round), and every change moved the look-ahead point
 to the mirror image: a full-lock steering kick in the wrong direction.
 
-⇒ Two defects, both fixed:
+鈬?Two defects, both fixed:
 
-1. **The look-ahead direction** — `raceLineTarget()` walked the spline's node
+1. **The look-ahead direction** 鈥?`raceLineTarget()` walked the spline's node
    order, which does not necessarily run the way the car drives. It now takes
    the car's heading and walks the way the car is going. The unit test
    (`tests/host/race_line_selftest.cpp`) proves it: the same call with the
    opposite heading puts the target on the opposite side of the car.
-2. **The variant** — the fit now applies a **handedness test**: the car's own
+2. **The variant** 鈥?the fit now applies a **handedness test**: the car's own
    path is part of the line, so the line bends the way the car bends, and a
    mirror bends the other way. The mirrored candidates are dropped. If the
-   test rejects everything, the unfiltered winner is used — the line is then
+   test rejects everything, the unfiltered winner is used 鈥?the line is then
    exactly as good as it was before, and no worse.
 
-**⇒ The next measurement is the one that decides it**: the pursuit's error
-should sit near zero instead of at 180°, and the car's distance should pass
+**鈬?The next measurement is the one that decides it**: the pursuit's error
+should sit near zero instead of at 180掳, and the car's distance should pass
 12 % of a lap.
 
 ### A measurement that was WRONG and is recorded so it is not repeated
 
 A first version of the convergence analysis compared the MAGNITUDE of the
-error and concluded "the steering makes it worse" — and that conclusion was
-an artefact of the **angle wrapping at ±π**. The wrap-aware fit
-(`tools/pursuit_slope.py`) gives `d(error) = −0.340 × steer` (R² = 0.166) for
+error and concluded "the steering makes it worse" 鈥?and that conclusion was
+an artefact of the **angle wrapping at 卤蟺**. The wrap-aware fit
+(`tools/pursuit_slope.py`) gives `d(error) = 鈭?.340 脳 steer` (R虏 = 0.166) for
 the same data: the sign was RIGHT all along. The wrap is why the raw
 comparison said the opposite.
 
 ### What blocks the measurement: the race never starts
 
-MEASURED (q135, 611 s, 2400 frames): the game goes splash → menu → race
-intro cinematic → **"select car"** → black → back to the menu. The race
+MEASURED (q135, 611 s, 2400 frames): the game goes splash 鈫?menu 鈫?race
+intro cinematic 鈫?**"select car"** 鈫?black 鈫?back to the menu. The race
 metrics object is never found, so there is no race to count laps in.
 
 **THE COORDINATE WAS NEVER WRONG.** MEASURED (q138): the guest scissors the
 race button every frame as `glScissor x=994 y=667 w=187 h=53`, so the orange
 button is at (994..1181, 667..720), centre about (1087, 693). The script's
 coordinate (1114, 698) is inside it, and the tap was delivered and **accepted**
-by the guest (`touch-inject … guest{gx=1114 gy=698 down=1}`).
+by the guest (`touch-inject 鈥?guest{gx=1114 gy=698 down=1}`).
 
 **THE FRAME WAS WRONG, and that is the whole story.** The taps are frame
 indexed and the race button's tap sits at script frame **5500**; the menu
-phase runs at about **3–4.5 fps**, so a 600 s round only reaches frame ~2700
+phase runs at about **3鈥?.5 fps**, so a 600 s round only reaches frame ~2700
 and the script's last entry (frame 13440) needs about **80 minutes**. The tap
 that starts the race therefore never fired.
 
-⇒ Fixed by putting the tap where the button is actually up. The screen
+鈬?Fixed by putting the tap where the button is actually up. The screen
 timeline (the `ui-ctl` lines) shows the game **cycling** through the
-car-select screen — 360..660, 780..1080, 1380..1470, 1890..2160, 2340..2580 —
-with gaps where no screen is up at all, and a tap in a gap does nothing. The
+car-select screen 鈥?360..660, 780..1080, 1380..1470, 1890..2160, 2340..2580 鈥?with gaps where no screen is up at all, and a tap in a gap does nothing. The
 shipped script has **one** tap, at frame 450: MEASURED (q138) the race starts on
 its own at about frame 510, so a later tap would land in the race screen and
 press whatever is there.
 
-**⇒ The taps that land DURING a race are not harmless.** The round with the
+**鈬?The taps that land DURING a race are not harmless.** The round with the
 taps spread over the whole run (q139) stopped at 600 frames, while the same
 build with one tap (q138, 2760 frames) and the same taps without the pursuit
 fix (q140, 2640 frames) both ran to the end.
 
-**⇒ AND THE RACE DID START, ONCE, FOR THE FIRST TIME** (q138, frame 510):
+**鈬?AND THE RACE DID START, ONCE, FOR THE FIRST TIME** (q138, frame 510):
 
 ```
-phase=race-state … gm_ok=1 metrics=1
+phase=race-state 鈥?gm_ok=1 metrics=1
     cls=27RuleSetModifier_RaceMetrics vptr_ok=1 mres=0x3f mfail=none
     laps=4294967295 lapd=1314816 snode=433 thr=1
 ```
 
-⇒ the guest's own RaceMetrics object was found and its members resolved, for
+鈬?the guest's own RaceMetrics object was found and its members resolved, for
 the first time in any archived round, and the throttle was on. **But that
-sample has `line=0 lres=0 perr=0 pur=0 drive=0`** — the line is not fitted
-yet and the pursuit has not taken over. **⇒ The pursuit fix is unit-tested but
+sample has `line=0 lres=0 perr=0 pur=0 drive=0`** 鈥?the line is not fitted
+yet and the pursuit has not taken over. **鈬?The pursuit fix is unit-tested but
 NOT yet measured in a race.** That is the next measurement, and it needs a
 round where the race runs for more than a few hundred frames.
 
-**⇒ THE PRINCIPLED WAY, still open**: the port can press a control by the id
+**鈬?THE PRINCIPLED WAY, still open**: the port can press a control by the id
 the guest itself gives it (`rr3-ui.txt`, no frame budget). The race button's
-id has not been read out yet, because **the `ui-ctl` log line is truncated** —
-it carries 1193 controls and only 44 fit, so the button was never in the log.
+id has not been read out yet, because **the `ui-ctl` log line is truncated** 鈥?it carries 1193 controls and only 44 fit, so the button was never in the log.
 
 ---
 
 ## 4. Still open / not started (in priority order)
 
-### 4.1 P0 — Verify the crash fixes on the console (needs the user)
+### 4.1 P0 鈥?Verify the crash fixes on the console (needs the user)
 
 **The console has been sent five logs so far and every one of them found a
-crash** (§2.1–§2.6). The newest build has all five fixes in it; it has been
+crash** (搂2.1鈥撀?.6). The newest build has all five fixes in it; it has been
 run on the emulator (q132, gate 39/39) but **not on the console**.
 
 **Install the newest NRO and boot.** The build output is
 `native-switch/rr3-native-rehost.nro`; the hash of the build that went to the
-emulator card was `249c9f02…`. **Keep the `.elf` of every NRO you send to the
-console** — the crash reports only resolve against the exact build.
+emulator card was `249c9f02鈥. **Keep the `.elf` of every NRO you send to the
+console** 鈥?the crash reports only resolve against the exact build.
 
 Please send back:
 
 1. `sdmc:/switch/rr3-native-rehost.guest-view.log`
-2. **`sdmc:/switch/rr3-native-rehost.crash-early.txt`** — the early-crash
+2. **`sdmc:/switch/rr3-native-rehost.crash-early.txt`** 鈥?the early-crash
    register dump (it is what found crash #5)
 3. the **newest** `sdmc:/atmosphere/crash_reports/*.log`, if one was written
 4. what was on screen and roughly after how many seconds it closed
-5. how it was launched (Album applet / holding R on a game / a forwarder) —
-   that decides the heap size
+5. how it was launched (Album applet / holding R on a game / a forwarder) 鈥?   that decides the heap size
 
 **How to read the result**
 
 | Last log line | Meaning |
 |---|---|
-| `cc-worker-dead` | the guest had already released the worker; the delivery was dropped instead of faulting — the fix worked |
+| `cc-worker-dead` | the guest had already released the worker; the delivery was dropped instead of faulting 鈥?the fix worked |
 | `cc-srvtime: header delivered, completed with status 200` | the /time answer landed; the guest is past the 19:45 crash |
-| `view-egl-surface-ok` → `context-ok` → `current-ok` | the EGL sequence is fine (it has been fine since crash #4) |
+| `view-egl-surface-ok` 鈫?`context-ok` 鈫?`current-ok` | the EGL sequence is fine (it has been fine since crash #4) |
 | anything else | the `crash-early.txt` dump plus `addr2line` against the matching `.elf` names the function directly |
 
 **The recipe that works** (it is how crash #5 was located):
@@ -1316,36 +1305,36 @@ $B/aarch64-none-elf-addr2line -f -C -i -e native-switch/rr3-native-rehost.elf 0x
 
 > The earlier console logs ended at
 > `phase=guest-frame-selftest verdict=SELFTEST_PASS`, and `teardown-repair.log`
-> ended at `verdict=TEARDOWN_REPAIR_PASS` — the startup self-tests themselves
+> ended at `verdict=TEARDOWN_REPAIR_PASS` 鈥?the startup self-tests themselves
 > passed every time. The crashes were always **after** the self-tests.
 
-### 4.2 P1 — The splash's "Version 1" is clipped off the right edge
+### 4.2 P1 鈥?The splash's "Version 1" is clipped off the right edge
 
-**Re-characterised on 2026-11-03 — the full chain is in §2.7.** The line that
+**Re-characterised on 2026-11-03 鈥?the full chain is in 搂2.7.** The line that
 overflows is **guest text**, not artwork:
 
 ```
 "Player ID: CCDI123456789 / CCRR123456789"   (40 characters, Conduit Bold, size 140)
 ```
 
-⇒ the port measures it at 2421 px (ground truth 2433.6 px — the port is right),
+鈬?the port measures it at 2421 px (ground truth 2433.6 px 鈥?the port is right),
 the engine puts its left edge at 257, and the 1280-px screen cuts it at the
 right edge with ~1398 px of the line off-screen.
 
 The **"Version 1" wordmark itself** is still not in any `text=` line and not in
-the port's source, so *that* string does come out of the splash artwork — but
+the port's source, so *that* string does come out of the splash artwork 鈥?but
 the artwork is not the cause of the overflow: the neighbouring guest text
 overflows in exactly the same way, and it is the guest text that was measured.
 
 **What was fixed**: the port's `renderToTexture()` did not scale the glyphs by
 the guest's scale factor, so text drawn through that path came out 1/f too big
-(§2.7). That path had **no log line at all**, which is why this took a whole
+(搂2.7). That path had **no log line at all**, which is why this took a whole
 chain of measurements to find.
 
 **What is still open**: whether the splash line's *size request* (140, the
 largest entry of the guest's fixed table 14/28/42/56/70/84/98/140) is what the
 game intends on a 1280-px screen. The guest asks for the same string at
-**size 42** as well (719 px — that one fits), and the engine's own layout put
+**size 42** as well (719 px 鈥?that one fits), and the engine's own layout put
 the large one where a ~766-px line would go. The next reading is the
 `glyph-rtt` log line and the `text-quad` geometry of the two variants; if the
 engine still draws the large one after the `renderToTexture` fix, the
@@ -1353,12 +1342,12 @@ remaining lever is the **view size** (`view=WxH` in `rr3-screen.txt`), which
 also moves the guest's layout and therefore the touch script's pixel
 coordinates.
 
-### 4.3 P2 — The first 10 seconds are black
+### 4.3 P2 鈥?The first 10 seconds are black
 
-**Largely fixed on 2026-11-03 (q134) — see the numbers below.** What was left is
+**Largely fixed on 2026-11-03 (q134) 鈥?see the numbers below.** What was left is
 the port's own Chinese loading screen, which is off (`nofb=1`) because it fights
 the guest's EGL surface for the same NWindow. Enabling it requires the
-framebuffer and the guest's surface to stop fighting — **separate piece of
+framebuffer and the guest's surface to stop fighting 鈥?**separate piece of
 work**.
 
 **The guest's own asset-list rewrite was the black screen's real cost.**
@@ -1371,7 +1360,7 @@ assetlist-rewrite-all        lists_touched=386 lists_written=386
 ```
 
 386 of 1235 lists are rewritten, 2.6 MB is written, and the write is **a
-temporary file, a remove and a rename per list** — three filesystem metadata
+temporary file, a remove and a rename per list** 鈥?three filesystem metadata
 operations on a slow card. On the console that is 33..41 s of black screen.
 
 **Fixed (q134): the pass now compares the content it would write with the
@@ -1385,7 +1374,7 @@ assetlist-rewrite-all  lists_touched=386 lists_written=0 lists_unchanged=386
   read_ms=564 rewrite_ms=5 write_ms=0
 ```
 
-⇒ **6,628 ms → 2,843 ms on Eden (2.33x), and 2,610,656 bytes are no longer
+鈬?**6,628 ms 鈫?2,843 ms on Eden (2.33x), and 2,610,656 bytes are no longer
 written.** The three costs are now separated in the log for the first time:
 **reading the 1235 source lists is 564 ms, rewriting them is 5 ms, and the
 writing was the other ~6,000 ms.** On the console, where the write is 5..6x
@@ -1393,12 +1382,12 @@ slower than Eden's, that is the bulk of the 33..41 s.
 
 **What is left**: the pass still reads 1235 lists and 386 cached files on every
 boot (~2.8 s on Eden). The GUI base list already has a cache key for exactly
-this (`assetlist-rewrite-gui … cached=1 key=…`); the same key could cover the
+this (`assetlist-rewrite-gui 鈥?cached=1 key=鈥); the same key could cover the
 whole pass and skip it entirely on an unchanged card.
 
-### 4.4 P3 — Pure pursuit cannot hold the line (lap count −1)
+### 4.4 P3 鈥?Pure pursuit cannot hold the line (lap count 鈭?)
 
-**Re-characterised twice — §2.9 (layer 1) and §2.10 (layer 2, found in a real
+**Re-characterised twice 鈥?搂2.9 (layer 1) and 搂2.10 (layer 2, found in a real
 race). It is NOT a gain to tune.**
 
 The symptom is that the car drives a few per cent of a lap and then stops; the
@@ -1406,52 +1395,52 @@ guest's own lap counter says `-1` because the car never crosses the line.
 
 | Layer | Defect | Status |
 |---|---|---|
-| 1 | the look-ahead point was **behind the car** (up to 210 of 210 samples) | fixed — the direction follows the car's heading |
-| 1 | the line fit could pick the **mirror** of the centre line (the residual cannot tell a curve from its reflection) | fixed — the fit now applies a handedness test, with a fallback to the unfiltered winner |
-| 2 | the side of the line the target was taken from was **re-decided every frame** from the car's instantaneous heading | fixed — the direction is **locked for the race** and decided once from a windowed motion vector |
+| 1 | the look-ahead point was **behind the car** (up to 210 of 210 samples) | fixed 鈥?the direction follows the car's heading |
+| 1 | the line fit could pick the **mirror** of the centre line (the residual cannot tell a curve from its reflection) | fixed 鈥?the fit now applies a handedness test, with a fallback to the unfiltered winner |
+| 2 | the side of the line the target was taken from was **re-decided every frame** from the car's instantaneous heading | fixed 鈥?the direction is **locked for the race** and decided once from a windowed motion vector |
 
 **MEASURED in the first real race (q142, 4,200 frames of race):** the car
 reached **5.08 %** of a lap and stopped; the pursuit error swung between
-**−3.05 and +3.03 rad** in 63 of 141 samples; the lateral residual was
-**≤ 2.00 m** and the target was **16–43 m** away. That combination is only
-possible if the car's direction of travel had reversed — and the port was
-making it reverse (§2.10).
+**鈭?.05 and +3.03 rad** in 63 of 141 samples; the lateral residual was
+**鈮?2.00 m** and the target was **16鈥?3 m** away. That combination is only
+possible if the car's direction of travel had reversed 鈥?and the port was
+making it reverse (搂2.10).
 
-**⇒ The measurement that decides it is running**: `perr` should stay inside
-±1 rad for the whole race instead of swinging to ±3, and the distance should
+**鈬?The measurement that decides it is running**: `perr` should stay inside
+卤1 rad for the whole race instead of swinging to 卤3, and the distance should
 pass the 5.08 % it stopped at.
 
 **MEASURED (q143, the next round):** the look-ahead point stopped jumping to
-the other side of the car — **45 % → 13 %** of the samples had the target
-behind it — and the car drove **70 % further** (5.08 % → 8.65 % of a lap).
-**⇒ The pursuit is no longer the bottleneck.**
+the other side of the car 鈥?**45 % 鈫?13 %** of the samples had the target
+behind it 鈥?and the car drove **70 % further** (5.08 % 鈫?8.65 % of a lap).
+**鈬?The pursuit is no longer the bottleneck.**
 
-**⇒ THE BOTTLENECK WAS A STUCK CAR, and it is fixed (q145).** MEASURED (q143):
+**鈬?THE BOTTLENECK WAS A STUCK CAR, and it is fixed (q145).** MEASURED (q143):
 the car reached its best at frame ~1,830 and then stopped for good. From frame
 ~2,700 to the end of the round the guest's own **spline node index stood at
 319** and the distance moved by **10 units per 30 frames** (~1.3 mm a frame),
 with the throttle on and the pursuit's error small and steady. The car was
-**pinned against a barrier**, and the recovery — which fires 4 times in the
-whole round — did not free it, because the stall test does not recover a car
+**pinned against a barrier**, and the recovery 鈥?which fires 4 times in the
+whole round 鈥?did not free it, because the stall test does not recover a car
 that is **on the racing line** (the rule from q117: "a car on the line that
 is not advancing is being HELD or it is CRAWLING"), and the pinned car's
-lateral residual was 2.07 m — inside the 3 m exemption.
+lateral residual was 2.07 m 鈥?inside the 3 m exemption.
 
 **FIXED (q145)**: the discriminator is the car's own **position**, not the
 progress meter. MEASURED: the race grew from 4,770 to **5,760 frames**, the
 distance from 8.65 % to **10.35 %** of a lap, and the recoveries from 4 to
-**10** — the car gets free and drives on instead of flat-lining.
+**10** 鈥?the car gets free and drives on instead of flat-lining.
 
-⇒ **The lap counter is still −1, and now the reason is clear**: the car
+鈬?**The lap counter is still 鈭?, and now the reason is clear**: the car
 spends **41.5 % of the race in a recovery** (the brake held in 80 of 193
 samples; the recovery fired 10 times). At the rate it makes
 progress when it is not stuck (178 units a frame) a lap is ~10,000 frames; at
-the rate it actually manages, ~56,000. **⇒ The next lever is the quality of
-the line following** — the look-ahead distance (20 m), the steering gain, and
+the rate it actually manages, ~56,000. **鈬?The next lever is the quality of
+the line following** 鈥?the look-ahead distance (20 m), the steering gain, and
 how much of the track the car can hold. The car is on the line to within 2 m
 and still hits the barriers.
 
-⇒ The **recovery needs an EXIT**, not a reference-point reset — resetting
+鈬?The **recovery needs an EXIT**, not a reference-point reset 鈥?resetting
 makes the car spin on the spot (already noted, and now the blocking item).
 
 Known directions (**none done yet**):
@@ -1459,17 +1448,17 @@ Known directions (**none done yet**):
 * `steergain` / look-ahead point: steering gain and the aim point need to be
   tuned per corner;
 
-### 4.5 P4 — Deliverables and commit (**rebuilt on 2026-11-04**)
+### 4.5 P4 鈥?Deliverables and commit (**rebuilt on 2026-11-04**)
 
 | Artefact | Size | Notes |
 |---|---|---|
 | `dist/rr3-switch-20261104/` | 190 files / 10.67 GiB | the card tree is **185 files / 9.58 GiB** |
 | `dist/rr3-switch-app-20261104.zip` | 45.4 MiB | app only, 18 entries |
 | `dist/rr3-switch-20261104.zip` | 7.89 GiB | 237 entries = 190 files + 46 directories |
-| `dist/parts-20261104/*.001…004` | 2 + 2 + 2 + 1.89 GiB | concatenated = the archive **byte for byte** |
+| `dist/parts-20261104/*.001鈥?04` | 2 + 2 + 2 + 1.89 GiB | concatenated = the archive **byte for byte** |
 
 * **The NRO in the package, in the app zip and on the emulator card are all
-  the same file** — `5515158395016D65…` — and `.build/rebuild-deliverables.ps1`
+  the same file** 鈥?`5515158395016D65鈥 鈥?and `.build/rebuild-deliverables.ps1`
   PROVES it (it hashes all three and refuses to finish if they differ). The
   build is **byte-reproducible**: the gate rebuilds it from the same tree and
   gets the same sha256.
@@ -1479,12 +1468,12 @@ Known directions (**none done yet**):
 * **THE SHIPPING INPUTS ARE CHECKED, NOT ASSUMED.** The rebuild refuses to
   finish unless the package's `rr3-gamepad.txt` and `rr3-pad.txt` are
   byte-for-byte the repository's copies, the gamepad file says
-  `autopilot = 0` — **the player owns the car** — and the pad file has **no
+  `autopilot = 0` 鈥?**the player owns the car** 鈥?and the pad file has **no
   event lines**, because a shipped script that holds the accelerator takes the
   throttle away from the player.
 * **THE PACKAGER USED TO REVERSE ITS OWN RULE.** Its comment said the
   control scripts come from the repository, but its ORDER copied the card's
-  copies over them — and the card carried the *experiment* pad script, so
+  copies over them 鈥?and the card carried the *experiment* pad script, so
   the release tree would have shipped a script that holds the throttle. The
   order is fixed (the repository's copies go last) and the check above stops
   it from coming back.
@@ -1501,12 +1490,12 @@ Known directions (**none done yet**):
   changed) -- rebuilding" and rebuilt it. The fingerprint is only written
   after a successful build, so an interrupted run never leaves one.
 * The 20261103 deliverables were removed (they carried an older NRO).
-* **`git commit` must use `-F <file>`** — `-m` and `-F` are mutually
+* **`git commit` must use `-F <file>`** 鈥?`-m` and `-F` are mutually
   exclusive.
 * **THE BUILD IS BYTE-REPRODUCIBLE.** MEASURED (2026-11-04): the gate rebuilds
   the NRO from the same tree and gets **the same sha256**
-  (`5515158395016D65…`). That is what makes the four-way cross-proof
-  (§4.5) meaningful: the NRO in the package, in the app zip, on the card and
+  (`5515158395016D65鈥). That is what makes the four-way cross-proof
+  (搂4.5) meaningful: the NRO in the package, in the app zip, on the card and
   in the build output are not four copies of "something like the build", they
   are the same file, and any rebuild from the same commit reproduces it.
 
@@ -1519,22 +1508,22 @@ Known directions (**none done yet**):
 | Faces the guest names | 16 (14 + CJK + icon) | `rr3-font-report.json` + log |
 | Symbol-font requests / run | **18, every one a single character** | q123b log |
 | Text draws / run (zero substitutions) | 2,812 | q123b log |
-| Icon size error with the substitution | 2.3–5.8× too small | `font_truth.py` / `icon_change.py` |
-| Two files named `r3_symbols.ttf` | 125,764 B (right) / 72,468 B (wrong) | sha256 `86AA0683…` / `1EE7223E…` |
+| Icon size error with the substitution | 2.3鈥?.8脳 too small | `font_truth.py` / `icon_change.py` |
+| Two files named `r3_symbols.ttf` | 125,764 B (right) / 72,468 B (wrong) | sha256 `86AA0683鈥 / `1EE7223E鈥 |
 | `sscanf` calls / run | 1,069 (1,005 of them with a truncated input) | q124 log |
-| q123 (hang) | 4 frames / log stops at 1.62 MB | `20261103-011044-…q123-icon-font` |
-| q123b (control, clean) | 3,000 frames / 305 s / 202,361 lines | `20261103-011940-…q123b-iconfont-off` |
-| q124 (after the fix, clean) | 3,120 frames / 305 s / 35 MB | `20261103-012508-…q124-iconfont-scanfbounded` |
+| q123 (hang) | 4 frames / log stops at 1.62 MB | `20261103-011044-鈥123-icon-font` |
+| q123b (control, clean) | 3,000 frames / 305 s / 202,361 lines | `20261103-011940-鈥123b-iconfont-off` |
+| q124 (after the fix, clean) | 3,120 frames / 305 s / 35 MB | `20261103-012508-鈥124-iconfont-scanfbounded` |
 | Files on the card | **186** (was 10,546) | `make-package-v2.ps1` |
 | Size on the card | **9.58 GiB** (was 11.21 GiB) | same |
 | Files actually read in a full run | 133 (.depot 92 + cache 30 + doc 10 + .nomedia 1) | read-chain measurement |
 | Splash line: guest text | `"Player ID: CCDI123456789 / CCRR123456789"`, 40 chars | q133 log |
-| … its size request | 140 (the largest entry of the fixed table 14/28/42/56/70/84/98/140) | q133 log |
-| … the port's measurement | 2421 px | q133 log |
-| … the font's ground truth | 2433.6 px (17,383 units at upem 1000) | `tools/conduit_width_truth.py` |
-| … on screen | ink x 257..1279, right edge touched ⇒ ~1398 px off-screen | `tools/splash_measure.py` |
-| … what the engine thought | ~766 px (it centred that width) | from the ink's left edge |
-| The engine's own matrix | 0..1021 px of vertices → 1557 px on screen (−138..1419) | `text-quad` probe |
+| 鈥?its size request | 140 (the largest entry of the fixed table 14/28/42/56/70/84/98/140) | q133 log |
+| 鈥?the port's measurement | 2421 px | q133 log |
+| 鈥?the font's ground truth | 2433.6 px (17,383 units at upem 1000) | `tools/conduit_width_truth.py` |
+| 鈥?on screen | ink x 257..1279, right edge touched 鈬?~1398 px off-screen | `tools/splash_measure.py` |
+| 鈥?what the engine thought | ~766 px (it centred that width) | from the ink's left edge |
+| The engine's own matrix | 0..1021 px of vertices 鈫?1557 px on screen (鈭?38..1419) | `text-quad` probe |
 | Asset-list rewrite, before | 386 of 1235 lists, 2,610,656 B written, 6,628 ms | q132 log |
 | Asset-list rewrite, after | **0 written, 386 unchanged, 2,843 ms** (read 564 / rewrite 5 / write 0) | q134 log |
 | `renderToTexture` calls by the guest | **0** (in a 23.5 MB log) | q133 log |
@@ -1544,29 +1533,29 @@ Known directions (**none done yet**):
 | The guest's own lap reading | `laps=-1` with `ok=1 lapsWhy=none` | q11 race-metrics |
 | The pursuit's target BEHIND the car | up to **210 of 210** samples | `tools/pursuit_convergence.py` |
 | The fitted line's variant changing mid-run | 6 different values in one round | q121 |
-| The guest's load finishes at | **frame 83** (⇒ the black screen is 83 frames) | `tools/load_split.py` |
-| The menu phase's frame rate | **3–4.5 fps** — and that is the MENU phase, not the game (§2.12) | q135 / q138 / q140 / q141 |
+| The guest's load finishes at | **frame 83** (鈬?the black screen is 83 frames) | `tools/load_split.py` |
+| The menu phase's frame rate | **3鈥?.5 fps** 鈥?and that is the MENU phase, not the game (搂2.12) | q135 / q138 / q140 / q141 |
 | The race phase's frame rate | **11.44 fps** (4,680 frames / 409 s) | q142 |
-| CPU cores, every healthy round | **1.39–1.56** — flat, so the frame-rate spread is WAITING | q132..q142 |
-| The touch script's race-start tap | **withdrawn** — the port's own red-glove follower presses the race button at (1105, 695) | q142 `ui-press` |
+| CPU cores, every healthy round | **1.39鈥?.56** 鈥?flat, so the frame-rate spread is WAITING | q132..q142 |
+| The touch script's race-start tap | **withdrawn** 鈥?the port's own red-glove follower presses the race button at (1105, 695) | q142 `ui-press` |
 | A race, end to end | **4,200 frames** of race, 141 pursuit samples | q142 |
-| … how far the car got | 91,810 units = **5.08 %** of a lap | q142 `tools/race_progress.py` |
-| … the pursuit error over that race | **−3.05 … +3.03 rad**, 63 of 141 samples worse than 1 rad | q142 `tools/race_progress.py` |
-| … the lateral residual | ≤ **2.00 m** (the car WAS on the line) | q142 |
-| … progress lost to the loop | **6,581 units** between frames 2010 and 2040 — the car drove backwards | q142 |
+| 鈥?how far the car got | 91,810 units = **5.08 %** of a lap | q142 `tools/race_progress.py` |
+| 鈥?the pursuit error over that race | **鈭?.05 鈥?+3.03 rad**, 63 of 141 samples worse than 1 rad | q142 `tools/race_progress.py` |
+| 鈥?the lateral residual | 鈮?**2.00 m** (the car WAS on the line) | q142 |
+| 鈥?progress lost to the loop | **6,581 units** between frames 2010 and 2040 鈥?the car drove backwards | q142 |
 | The guest-view log, old build | 45.2 MB / **205,983 lines** / 409 s = 504 lines a second | q142 |
-| … of which repetitive | `glyph-face` 33,643 + `map-app` 31,315 = **31 %** | q142 |
-| … `glyph-face` dedup table | **8** slots for 7 faces × dozens of sizes ⇒ thrashing | q142 |
-| The guest-view log, after the dedup fix | 34.1 MB / **165,107 lines** at the same wall clock (**−20 %**) | q143 |
-| The census A/B (the switch that had never been run) | frames **+1.3 %** (noise), CPU **+9.0 %**, log **+5.2 %** ⇒ **not** the frame-rate lever | q143 vs q144 |
-| The menu phase's frame rate | **4.8 fps** (the race phase does 15–17 fps) | q143 |
-| The PNG capture in the menu phase | **none** (`pngfrom=1300`, the race starts at frame 630) ⇒ the PNG capture is excluded again, cleanly | q143 |
-| The pursuit fix, measured | target behind the car **45 % → 13 %**, distance **5.08 % → 8.65 %** of a lap | q142 → q143 |
-| The pinned-car fix, measured | race frames **4,770 → 5,760**, distance **8.65 % → 10.35 %**, recoveries **4 → 10** | q143 → q145 |
+| 鈥?of which repetitive | `glyph-face` 33,643 + `map-app` 31,315 = **31 %** | q142 |
+| 鈥?`glyph-face` dedup table | **8** slots for 7 faces 脳 dozens of sizes 鈬?thrashing | q142 |
+| The guest-view log, after the dedup fix | 34.1 MB / **165,107 lines** at the same wall clock (**鈭?0 %**) | q143 |
+| The census A/B (the switch that had never been run) | frames **+1.3 %** (noise), CPU **+9.0 %**, log **+5.2 %** 鈬?**not** the frame-rate lever | q143 vs q144 |
+| The menu phase's frame rate | **4.8 fps** (the race phase does 15鈥?7 fps) | q143 |
+| The PNG capture in the menu phase | **none** (`pngfrom=1300`, the race starts at frame 630) 鈬?the PNG capture is excluded again, cleanly | q143 |
+| The pursuit fix, measured | target behind the car **45 % 鈫?13 %**, distance **5.08 % 鈫?8.65 %** of a lap | q142 鈫?q143 |
+| The pinned-car fix, measured | race frames **4,770 鈫?5,760**, distance **8.65 % 鈫?10.35 %**, recoveries **4 鈫?10** | q143 鈫?q145 |
 | The car's best distance ever | **186,921 units = 10.35 %** of a lap | q145 |
-| The race button's rectangle | `(994,667,187,53)` — the guest scissors it every frame | q138 |
+| The race button's rectangle | `(994,667,187,53)` 鈥?the guest scissors it every frame | q138 |
 | The first round where the guest's RaceMetrics was found | q138 frame 510: `gm_ok=1 metrics=1 vptr_ok=1 thr=1` | q138 |
-| Rounds that stopped early because a tap landed in the race | q139 (600 frames) vs q138 2760 / q140 2640 | q138–q140 |
+| Rounds that stopped early because a tap landed in the race | q139 (600 frames) vs q138 2760 / q140 2640 | q138鈥搎140 |
 | The port's own glyph-texture lookup | was a linear scan of up to 4096 entries **per draw** (~90,000 draws a frame) | `gfx_text_probe.cpp` |
 
 ---
@@ -1624,14 +1613,14 @@ python 'E:\AI\RealRacing3-switch\.build\nro_sym.py' 0x5ea1c0 # host PC offset ->
   and `guest_view_probe.cpp` are CRLF (patch them with a Python script using
   `newline=''`, not with a line-oriented editor); `race_state_probe.cpp`,
   `race_metrics_probe.cpp` and `glyph_vector.cpp` are LF.
-* One Eden run at a time — check
+* One Eden run at a time 鈥?check
   `Get-Process -Name eden,eden-cli,eden-rr3,eden-rr3-cli` first.
 * Deletions on Windows: `Remove-Item` (recursive or single file) and `rm` with a
   variable are blocked by policy. Use `rm -- "<absolute literal path>"` (it goes
   through mavis-trash and is recoverable).
 * When a conclusion is about the guest, the log field it rests on must be a value
   **read out of the guest**, not inferred.
-* A hang and a regression look identical from the inside ⇒ **re-run the same
+* A hang and a regression look identical from the inside 鈬?**re-run the same
   binary** to tell them apart before changing code.
 ---
 
@@ -1765,7 +1754,7 @@ signalled, the waiter was not yet inside the wait (or had just come out of
 it), and the notification was dropped on the floor.  The guest then sat in
 the wait forever with nothing else to wake it.
 
-⇒ The bridge now counts the signals itself (`ObjectSlot::signalEpoch`), and
+鈬?The bridge now counts the signals itself (`ObjectSlot::signalEpoch`), and
 the waiter checks the epoch before every wait: if the epoch moved since the
 last look, the signal was for THIS waiter and the wait returns immediately
 instead of blocking again.  The bridge's condvar now behaves like a
@@ -1904,7 +1893,7 @@ published binary behaves identically to the committed source; the difference
 is that the binary contains more than the commit says it does, which is a
 bookkeeping problem, not a behaviour one.
 
-⇒ The clean-loader work is either finished and verified, or reverted.  It is
+鈬?The clean-loader work is either finished and verified, or reverted.  It is
 not left half in a release.
 
 ### The Antigravity CLI review of the no-context observer
@@ -2049,7 +2038,7 @@ metrics object, so the two conditions are circular:
     the car must move for the metrics to be live
     the port only drives when the metrics are live
 
-⇒ The round measured NOTHING about the pursuit.  The old report printed
+鈬?The round measured NOTHING about the pursuit.  The old report printed
 `progress: max=0.000` and stopped there, which reads like a result ("the
 adaptive look-ahead is worthless") and is in fact a report of a round that
 failed to start.  `pursuit-report.py` now answers three questions in this
@@ -2076,13 +2065,13 @@ silently worthless.  This was caught by reading the archive, not by the
 harness: the archived `run-summary.txt` said the NRO was 53,694,961 bytes
 when the round had been told to run a 53,690,865-byte one.
 
-⇒ `run-pinned-round.ps1` grew a `-Nro` parameter that puts the chosen NRO on
+鈬?`run-pinned-round.ps1` grew a `-Nro` parameter that puts the chosen NRO on
 the card AFTER both copies, passes `-NoDeploy` to `Test-OnEden.ps1`, and
 then VERIFIES the card's sha256 against the chosen file and refuses to start
 if they differ.  The A/B script resolves one NRO and hashes it once, and
 every cell runs that file.
 
-⇒ The general rule: **an experiment that cannot say which binary it ran is
+鈬?The general rule: **an experiment that cannot say which binary it ran is
 not an experiment.**  The archive now carries the hash, the harness asserts
 it, and the report says which configuration was in force.
 
@@ -2104,7 +2093,7 @@ but it never accumulated the DISTANCE it walked.  It returned
 The consequence is not a small error.  The angle at the point where the
 threshold is crossed is always between 0.35 rad and roughly 0.5 rad, so
 `accumulated * 8.0` is always between 2.8 and 4.0, and the clamp is
-`[4.0, 20.0]`.  ⇒ **The old "adaptive" look-ahead was a constant 4 metres
+`[4.0, 20.0]`.  鈬?**The old "adaptive" look-ahead was a constant 4 metres
 everywhere.**  Measured on a synthetic track:
 
     straight, before a corner      4.00 m      (correct: 20.00 m)
@@ -2118,12 +2107,12 @@ where the steering noise lives, and it did not shorten at all as a corner
 came up -- which is the failure q147 measured (a long look-ahead into a
 corner is a steering command tens of degrees wrong).
 
-⇒ The law is now the arc length: the distance at which the road ahead has
+鈬?The law is now the arc length: the distance at which the road ahead has
 turned by the threshold, clamped to `[4, 20]` metres.  On a constant-radius
 corner of radius R that is `0.35 * R`, which is the closed form the comment
 promised, and it is the distance that actually bounds the pursuit error.
 
-⇒ `native-switch/tests/host/race_line_selftest.cpp` now pins the law with a
+鈬?`native-switch/tests/host/race_line_selftest.cpp` now pins the law with a
 synthetic track of KNOWN shape: a straight, a corner of known radius, two
 corners of different radius, and a straight that ends in a corner.  The
 assertions are that a straight gets the maximum, that a corner gets
@@ -2153,7 +2142,7 @@ variable each, the same card and the same assets:
                    the guest never reaches the race  metrics live NEVER
                    4920 frames                   2040 frames
 
-**⇒ AND THEN THE 2x2 WAS FOUND TO BE CONFOUNDED, AND THE CONCLUSION CHANGED
+**鈬?AND THEN THE 2x2 WAS FOUND TO BE CONFOUNDED, AND THE CONCLUSION CHANGED
 AGAIN.**
 
 Read the four cells as a table and one thing stands out: `m2`, `m3` and a
@@ -2162,7 +2151,7 @@ builds and two different census settings, the same number, to the draw.
 That is not a coincidence and it is not a race condition; it is the same
 deterministic stop.
 
-**⇒ THE GUEST PERSISTS ITS OWN STATE, AND THE ROUNDS RAN IN ORDER.**
+**鈬?THE GUEST PERSISTS ITS OWN STATE, AND THE ROUNDS RAN IN ORDER.**
 
 `m1` was the FIRST round of the day and it was the only one that reached
 the race.  It also ended a race, and the guest paid out a reward, and the
@@ -2180,7 +2169,7 @@ the TRACER's own decoding, not the game's: the frames render Chinese
 correctly, so the port's text pipeline is fine and only the tracer's
 UTF-16-to-text step is wrong.)
 
-**⇒ WHY A HELD BUTTON CANNOT DISMISS IT.**  The autopilot pad script is a
+**鈬?WHY A HELD BUTTON CANNOT DISMISS IT.**  The autopilot pad script is a
 state timeline, and its third line is:
 
     [at 600] lx=0 ly=0 rx=0 ry=0 lt=0 rt=0 b=0x001
@@ -2191,7 +2180,7 @@ TRANSITION once the popup is up, and a modal dialog that waits for a press
 waits forever.  (`m1` was unaffected because its popup appeared at the END
 of its race, when nothing more was needed from the script.)
 
-**⇒ SO THE 2x2'S CELLS WERE NOT COMPARABLE, and the FIRST TWO READINGS OF
+**鈬?SO THE 2x2'S CELLS WERE NOT COMPARABLE, and the FIRST TWO READINGS OF
 IT WERE BOTH WRONG.**  The first reading blamed the November 9th code; the
 third cell (m3) corrected that to "the census"; and the draw counts
 corrected it again to "the guest's persisted state, and the order the
@@ -2241,7 +2230,7 @@ Two faults in one function, and the November 9th build has both:
      remembered, and the next waiter consumes exactly one of them and
      returns without waiting at all.**
 
-**⇒ AND THE CENSUS WAS COVERING FOR THE BUG.**  The census pauses and
+**鈬?AND THE CENSUS WAS COVERING FOR THE BUG.**  The census pauses and
 resumes every guest thread every 500 ms, and that perturbation is enough to
 close the lost-wakeup window most of the time -- so the guest ran "by
 luck", at the price of 7,071 thread pauses per sweep.  Turning the census
@@ -2265,7 +2254,7 @@ exactly once, and the waiters are never released; the port gives up after
 guest's own predicate loop decides what to do next.  This is the shape of a
 starved worker pool, and it is consistent with the race never starting.
 
-**⇒ THIS IS THE SAME FAULT AS 9.5, IN THE OTHER DIRECTION.**  Here the
+**鈬?THIS IS THE SAME FAULT AS 9.5, IN THE OTHER DIRECTION.**  Here the
 condvar was signalled ONCE for FOUR waiters; in m2 it was signalled ZERO
 times.  Both are the same underlying thing: the host condvar has no
 memory, so the bridge has to keep the signal itself, and until it does,
@@ -2282,7 +2271,7 @@ failed.
                                               6120 frames in 406 s
                                               start lights 7, race screen 10
 
-**⇒ CONFIRMED: the held confirm button was what wedged the guest, and the
+**鈬?CONFIRMED: the held confirm button was what wedged the guest, and the
 popup was what the confirm button could not dismiss.**
 
 And v3 is the FIRST round that measured the pursuit with the new
@@ -2293,7 +2282,7 @@ instruments:
     progress          : last 7367
     raceline          : {'centre_spline': 145}
 
-**⇒ THE ADAPTIVE LOOK-AHEAD IS MEASURING FOR THE FIRST TIME, AND IT IS
+**鈬?THE ADAPTIVE LOOK-AHEAD IS MEASURING FOR THE FIRST TIME, AND IT IS
 VARYING.**  The corrected law gives 20 m on a straight and shortens towards
 the corner; the median of 8.71 m over the round is what that looks like.
 The old law would have printed 4.00 m for every single sample.
@@ -2330,7 +2319,7 @@ Three things, and the third is the bug:
      the controller chased a point behind the car at full lock in both
      directions.
 
-**⇒ THE FIX: the flip recovery now inverts the direction lock as well.**
+**鈬?THE FIX: the flip recovery now inverts the direction lock as well.**
 
 This is NOT "re-deciding the direction every frame", which is what q142
 measured and rejected: the flip carries a 600 frame hysteresis, fires only
@@ -2420,12 +2409,12 @@ per championship group, and every one of them carries the SAME pressable:
                   ENDURANCE_GRAND_TOURING, EURO_TRACK_MASTERS, FORMULA_E,
                   SUPERCARS, SUPERTROFEO
 
-**⇒ THE MANUFACTURER CUPS ARE THE ONES THAT WEDGE.**  They have no
+**鈬?THE MANUFACTURER CUPS ARE THE ONES THAT WEDGE.**  They have no
 streamable card, and they are exactly the groups whose assets are not on the
 card: the guest's own log says the assets are fine ("Asset download skipped -
 all files up to date!"), and the stuck screen's progress bar reads 0 %.
 
-**⇒ SO THE TABLE IS SHORT AND IT IS EVIDENCE, NOT A GUESS:**
+**鈬?SO THE TABLE IS SHORT AND IT IS EVIDENCE, NOT A GUESS:**
 
     on EventMapScreen, if MAP_EVENT_CARD_STREAM is present:
         press MAP_EVENT_CARD_BTN          -> a raceable event
@@ -2435,7 +2424,7 @@ all files up to date!"), and the stuck screen's progress bar reads 0 %.
         the event is locked; EVENT_LOCKED_BTN and
         EVENT_LOCKED_BTN_COST_CURRENCY are its cost, so do not press it
 
-**⇒ AND THE ARCHIVES CONFIRM THE IDS.**  The screen name is in the probe's
+**鈬?AND THE ARCHIVES CONFIRM THE IDS.**  The screen name is in the probe's
 own line, so an archive says which group the guest was on:
 
     v3 (raced)   ui-ctl-br screen=EventMapScreen ... MAP_EVENT_CARD_STREAM
@@ -2445,7 +2434,7 @@ own line, so an archive says which group the guest was on:
                  ... MAP_EVENT_CARD_RACETEAM_FRAME ... ICON_GOLD
                  and NO MAP_EVENT_CARD_STREAM
 
-**⇒ THE LESSON, WHICH IS THE SAME ONE THE WHOLE PROJECT KEEPS PAYING FOR: a
+**鈬?THE LESSON, WHICH IS THE SAME ONE THE WHOLE PROJECT KEEPS PAYING FOR: a
 frame-based input script cannot express "press the button that means go",
 and it cannot express "do not press anything on this screen".  It can only
 press A a number of times, and the number of times that works is a
@@ -2484,7 +2473,7 @@ which the guest's own .gui files put on `MainMenu` and `RaceStartScreen`
 and NOWHERE on the event map.  So the request was pressing nothing, and
 the event map was navigated by the script's blind button count instead.
 
-**⇒ THE FIX IS ONE CARD FILE, NOT A NEW BUILD:**
+**鈬?THE FIX IS ONE CARD FILE, NOT A NEW BUILD:**
 
     rr3-ui.txt:
         MAP_EVENT_CARD_BTN      the pressable event card, on EVERY group
@@ -2494,7 +2483,7 @@ the event map was navigated by the script's blind button count instead.
 `.build/deploy-ui-requests.ps1` writes it and installs the HELD pad script
 beside it.
 
-**⇒ AND ROUND v5, WITH NOTHING ELSE CHANGED, IS THE PROOF:**
+**鈬?AND ROUND v5, WITH NOTHING ELSE CHANGED, IS THE PROOF:**
 
     v5   the held script + the semantic requests, census off, the same build
 
@@ -2503,13 +2492,13 @@ beside it.
         flips 1, stalls 0                   (v3 was flips 7, stalls 5)
         rres median 6.27 m                  (v3 was 9.60 m)
 
-**⇒ TWO FIXES ARE IN THAT ONE NUMBER.**  The semantic requests are what put
+**鈬?TWO FIXES ARE IN THAT ONE NUMBER.**  The semantic requests are what put
 the guest in a race that the pursuit can be measured in, and the flip fix --
 which inverts the direction lock together with the steering sign, because a
 car going the wrong way round the track means the track's direction is the
 other way -- is what took the stalls from 5 to 0 and the flips from 7 to 1.
 
-**⇒ AND WHAT IS STILL WRONG IS NOW MEASURABLE RATHER THAN MYSTERIOUS.**  The
+**鈬?AND WHAT IS STILL WRONG IS NOW MEASURABLE RATHER THAN MYSTERIOUS.**  The
 lap progress still ends negative (the car still turns round at the end), and
 the `dir=` and `mot=` fields are in the log, so the next question is a
 measurement and not a theory.
@@ -2525,7 +2514,7 @@ could not.
     f=2940           dir=-1  la=4.47   sdist=-20658        total 74964 -> 50141
     f=3030           dir=1   la=4.48   perr=+0.43         steer=-0.85  flips=1
 
-**⇒ READ IT BACKWARDS, BECAUSE THE FAULT IS EARLIER THAN THE DIRECTION.**
+**鈬?READ IT BACKWARDS, BECAUSE THE FAULT IS EARLIER THAN THE DIRECTION.**
 
   1. **FOR 360 FRAMES THE PORT HAD NO TARGET AT ALL** (`la=0.00` means
      `raceLineTargetAdaptive()` returned false).  It refuses to aim at a car
@@ -2534,7 +2523,7 @@ could not.
      those 360 frames, so the car was barely moving: it was off the line,
      probably against a barrier, and the port was steering it with a
      0.05-sized correction because it had nothing to aim at.
-     **⇒ THE RACE WAS LOST BEFORE THE PURSUIT EVER STEERED IT.**
+     **鈬?THE RACE WAS LOST BEFORE THE PURSUIT EVER STEERED IT.**
   2. **THE DIRECTION LOCK WAS DECIDED AT f=2760, IN THE MIDDLE OF THAT
      MESS**, and it was decided as **-1**, while the car's own travel
      direction was `mot=0.967,-0.255`.  So the look-ahead point went on the
@@ -2543,12 +2532,12 @@ could not.
   3. **THE CAR REVERSED** at f=2940: `sdist` went negative and `total` fell
      from 74964 to 50141.
   4. **THE FLIP RECOVERY CORRECTED IT** at f=3030: `flips=1` and the lock
-     went back to `dir=1`, with the steering following.  **⇒ The fix in
+     went back to `dir=1`, with the steering following.  **鈬?The fix in
      9.8 WORKS: the lock and the steering sign are now corrected together.**
      But it took the 600 frame hysteresis to do it, and by then the car was
      already going the wrong way.
 
-**⇒ SO THERE ARE TWO FAULTS, AND THE SECOND ONE IS THE INTERESTING ONE.**
+**鈬?SO THERE ARE TWO FAULTS, AND THE SECOND ONE IS THE INTERESTING ONE.**
 
   * the pursuit does not engage early enough (the 25 m guard means the car
     is unguided through the opening of the race), and
@@ -2556,7 +2545,7 @@ could not.
     travel direction with the spline's node order, at a moment when the car
     is in a state where that comparison is not trustworthy.
 
-**⇒ AND THE ROBUST ANSWER IS THE GUEST'S OWN TRUTH, NOT OUR GEOMETRY.**
+**鈬?AND THE ROBUST ANSWER IS THE GUEST'S OWN TRUTH, NOT OUR GEOMETRY.**
 The guest already knows which way round the track it is: it publishes the
 car's SPLINE NODE (`snode`) and its signed position along the track
 (`total`).  **So the direction round the track is measurable directly from
@@ -2565,22 +2554,22 @@ moves -- instead of being inferred from a comparison between the car's
 heading and the polyline's neighbours, which is a MIRROR-SENSITIVE
 inference made at a moment when the car may be facing any direction at all.**
 
-**⇒ AND THIS IS THE SAME RULE THE PROJECT KEEPS LEARNING, IN A NEW PLACE:**
+**鈬?AND THIS IS THE SAME RULE THE PROJECT KEEPS LEARNING, IN A NEW PLACE:**
 the direction round a closed track cannot be told from a residual, and it
 cannot be told from a single sample of a car that is out of control.  It has
 to come from the thing that knows, and that thing is the guest.
 
 ### 9.13 The four-cell A/B, and the number that was wrong
 
-**⇒ FIRST, THE INSTRUMENT WAS LYING AGAIN.**  The report printed the
+**鈬?FIRST, THE INSTRUMENT WAS LYING AGAIN.**  The report printed the
 guest's `prog` member under the name "progress".  The project's own record
 says "The car's best distance ever | 186,921 units = 10.35 % of a lap |
 q145", and q145's last race-state line reads `total=186921 ... prog=9799`.
-**⇒ The lap progress is `total`, the guest's total spline distance, and the
+**鈬?The lap progress is `total`, the guest's total spline distance, and the
 number that matters is its MAXIMUM over the round.**  The report now prints
 both, named, and `.build/lap-progress.py` prints the comparable table.
 
-**⇒ THE FOUR CELLS (2026-11-09, the same build, the same card, the same
+**鈬?THE FOUR CELLS (2026-11-09, the same build, the same card, the same
 binary, the guest's save restored before each one):**
 
     cell                          best total   % of a lap   rres   flips  stalls
@@ -2591,7 +2580,7 @@ binary, the guest's save restored before each one):**
     ------------------------------------------------------------------
     q145 (2026-11-04, the reference) 186,921     10.35 %      0.32     7      10
 
-**⇒ THREE THINGS COME OUT OF IT, AND ONLY THE FIRST IS COMFORTABLE.**
+**鈬?THREE THINGS COME OUT OF IT, AND ONLY THE FIRST IS COMFORTABLE.**
 
   1. **THE PURSUIT IS REPEATABLY MEASURABLE NOW.**  All four cells reached
      the race, with the normal 7 start lights and 10 race screens, the
@@ -2608,22 +2597,22 @@ binary, the guest's save restored before each one):**
   3. **THE ADAPTIVE LAW AND THE FIXED LAW BARELY DIFFER ON THIS TRACK.**
      `la` has median 20.00 m in ALL FOUR cells -- identical -- because most
      of the road ahead is straight and the law only shortens the look-ahead
-     in the corners.  **⇒ This A/B could not have separated the two laws
+     in the corners.  **鈬?This A/B could not have separated the two laws
      even if the pursuit were perfect, and it did not.**  The spread
      between the four cells (3.16 % to 4.10 %) is of the same order as
      the difference between them, with one round per cell.
 
-**⇒ AND THE PRIME SUSPECT FOR (2) IS THE FLIP'S OWN CRITERION.**  The flip
+**鈬?AND THE PRIME SUSPECT FOR (2) IS THE FLIP'S OWN CRITERION.**  The flip
 recovery inverts the steering sign when the rate stays negative.  The rate
 is a 120 frame window, and **the recovery reverses the car ON PURPOSE**, so
-the recovery's own reverse drives the rate negative.  **⇒ The flip can
+the recovery's own reverse drives the rate negative.  **鈬?The flip can
 fire on the recovery's signal, and inverting the direction LOCK on that
 signal puts the look-ahead point on the wrong side of the car -- the one
 thing the lock exists to prevent.**  The lock inversion is therefore
 DISABLED, with the reason recorded in the code, and the next round measures
 whether the distance comes back.
 
-**⇒ AND THE NEXT QUESTION AFTER THAT IS NOT THE LOOK-AHEAD LAW AT ALL.**  It
+**鈬?AND THE NEXT QUESTION AFTER THAT IS NOT THE LOOK-AHEAD LAW AT ALL.**  It
 is the pursuit's ENGAGEMENT: the port refuses to aim at a car more than 25 m
 from the fitted line, so the car spends the opening of the race unguided
 (9.12), and the direction lock is decided from a geometric comparison at a
@@ -2646,12 +2635,12 @@ navigation).
     the four A/B cells, for scale
          3.16 % ... 4.10 %
 
-**⇒ 4.16 % AGAINST 3.84 % IS INSIDE THE NOISE BAND OF THE FOUR CELLS, so
+**鈬?4.16 % AGAINST 3.84 % IS INSIDE THE NOISE BAND OF THE FOUR CELLS, so
 THE INVERSION IS NOT THE REGRESSION.**  The hypothesis was killed by the
 experiment that was run to confirm it, and the inversion stays off until
 its criterion can be rebuilt on something the recovery cannot poison.
 
-**⇒ AND THE ONE REMAINING SHAPE IN THE LOG IS MORE INTERESTING THAN THE
+**鈬?AND THE ONE REMAINING SHAPE IN THE LOG IS MORE INTERESTING THAN THE
 ONE THAT WAS SUSPECTED.**
 
     m6   the best total is reached at FRAME 1890 -- 450 frames after the
@@ -2664,7 +2653,7 @@ And the race itself starts much later today: the metrics object goes live
 at frame 1440, against frame 540 in q145, so the guest spends 900 frames
 more in the front end before there is a race to drive.
 
-**⇒ SO THE REMAINING DIFFERENCES BETWEEN q145 AND A TODAY'S CELL ARE THESE
+**鈬?SO THE REMAINING DIFFERENCES BETWEEN q145 AND A TODAY'S CELL ARE THESE
 FOUR, AND NONE OF THEM HAS BEEN ISOLATED YET:**
 
   1. the census: ON in q145, OFF in every 2026-11-09 round;
@@ -2676,26 +2665,26 @@ FOUR, AND NONE OF THEM HAS BEEN ISOLATED YET:**
   3. the cond-wait change (9.5);
   4. the clean loader (the asset fallback chain and the console release).
 
-**⇒ THE CHEAPEST NEXT DISCRIMINATOR IS (2), and it costs no build: take
+**鈬?THE CHEAPEST NEXT DISCRIMINATOR IS (2), and it costs no build: take
 MAP_EVENT_CARD_BTN out of rr3-ui.txt, so the guest is navigated by the blind
 A press exactly as it was in q145, and rerun the same cell.**  If the
 distance comes back, the port's own navigation was changing which event
 raced; if it does not, (1) is next.
 
-**⇒ AND THE LESSON IS THE SAME ONE THE FLIP WAS, ONE LEVEL UP: the thing
+**鈬?AND THE LESSON IS THE SAME ONE THE FLIP WAS, ONE LEVEL UP: the thing
 that changed between two measurements is not necessarily the thing that
 broke them, and the way to find out is to put the old thing back and
 measure, not to reason about it.**
 
 ### 9.15 The port's own navigation is the variable, and the instrument lied AGAIN
 
-**⇒ THE INSTRUMENT, THIRD TIME.**  `total` is SIGNED: the guest publishes the
+**鈬?THE INSTRUMENT, THIRD TIME.**  `total` is SIGNED: the guest publishes the
 car's position along the track and it goes negative when the car drives
 backwards, so the raw uint32 WRAPS.  The comparison table was taking the max
 of the UNSIGNED value, so a wrapped negative -- the car going backwards --
 looked like the best result of the round.  It is now signed.
 
-**⇒ AND THE ROUND THAT SETTLES THE NAVIGATION.**  The cheapest possible
+**鈬?AND THE ROUND THAT SETTLES THE NAVIGATION.**  The cheapest possible
 discriminator: take MAP_EVENT_CARD_BTN out of rr3-ui.txt, so the port taps
 NOTHING on the event map and the guest is navigated by the pad script's blind
 confirm press, exactly as in q145.  Same build, same card, the guest's save
@@ -2708,19 +2697,19 @@ restored, same configuration (centre line, constant 20 m).
     m6    the port taps MAP_EVENT_CARD_BTN       race starts at frame 1440
                                                   best total    75,141 = 4.16 %
 
-**⇒ SO THE PORT'S OWN NAVIGATION IS A VARIABLE, AND IT CHANGED WHEN THE
+**鈬?SO THE PORT'S OWN NAVIGATION IS A VARIABLE, AND IT CHANGED WHEN THE
 RACE STARTED.**  With the blind navigation the race starts on the SAME
 frame as q145 -- 540 -- and with the port tapping the card it starts 900
 frames later.  The port's tap selects whatever card is under the guest's
 red glove, which is not necessarily the card the blind press used.
 
-**⇒ AND THE PURSUIT'S OWN FAULT IS NOW ISOLATED FROM THE NAVIGATION.**
+**鈬?AND THE PURSUIT'S OWN FAULT IS NOW ISOLATED FROM THE NAVIGATION.**
 In m7 the race starts exactly where q145's did, and the car still drove
 backwards.  So the remaining distance from 10.35 % is NOT the navigation and
 NOT the lock inversion (9.14).  What is left is the pursuit's own behaviour,
 the census, the cond-wait change and the clean loader.
 
-**⇒ ⇒ AND THE NEXT ROUND IS THE CENSUS, WITH THE RACE NOW STARTING ON THE
+**鈬?鈬?AND THE NEXT ROUND IS THE CENSUS, WITH THE RACE NOW STARTING ON THE
 SAME FRAME AS q145:** the same blind navigation with the census ON.  If the
 distance comes back, the census is the variable -- and that would be the
 third time the census has been blamed and the second time it has been
@@ -2755,13 +2744,13 @@ and for the magenta car itself:
       card=.../.depot/gui_assets/2048x1536/.../sprites.android.atlas present=0
       source=.../.depot/assets_2048x1536/.../sprites.android.atlas
 
-**⇒ THE FILE IS FOUND, THE DIGEST IS PUBLISHED, THE SERVED DIGEST MATCHES
+**鈬?THE FILE IS FOUND, THE DIGEST IS PUBLISHED, THE SERVED DIGEST MATCHES
 THE PUBLISHED ONE (agree=1, found=1), AND THE GUEST ASKS FOR EXACTLY THAT
 DIGEST.**  And no texture failed to LOAD: every "unable to load file" line
 in the round was counted by extension and there is not one texture among
 them.
 
-**⇒ SO THE TEXTURE IS CORRECTLY SERVED AND THE FAULT IS DOWNSTREAM OF
+**鈬?SO THE TEXTURE IS CORRECTLY SERVED AND THE FAULT IS DOWNSTREAM OF
 THAT.**  What is left is the part the port cannot currently see:
 
   (a) THE TEXTURE UPLOAD IS REJECTED BY THE DRIVER.  The guest's atlases
@@ -2775,18 +2764,18 @@ THAT.**  What is left is the part the port cannot currently see:
       GL_COMPILE_STATUS or GL_LINK_STATUS, and never reads the driver's
       info log.
 
-**⇒ (a) AND (b) ARE THE TWO THINGS THE PORT CANNOT CURRENTLY TELL APART,
+**鈬?(a) AND (b) ARE THE TWO THINGS THE PORT CANNOT CURRENTLY TELL APART,
 and that is the whole problem: the instrument does not exist.**  So the
 work is an instrument first -- read the shader status and the upload error
 after every guest call that can fail, and report only failures, with a
 budget -- and a fix second, if the fault is findable from the source.
 
-**⇒ AND THE LESSON, WHICH IS THE THIRD TIME THIS PROJECT HAS PAID IT IN
+**鈬?AND THE LESSON, WHICH IS THE THIRD TIME THIS PROJECT HAS PAID IT IN
 ONE WEEK: a count taken from a log is only as good as the fields that were
 actually read.**  Three readings of the same rounds were wrong in a row --
 the 2x2 (the cells were not comparable), the flip hypothesis (killed by its
 own experiment), and this one (the counter read a field and ignored the rest
-of the line).  **⇒ PRINT THE WHOLE LINE, NOT A FIELD OF IT, AND GREP FOR
+of the line).  **鈬?PRINT THE WHOLE LINE, NOT A FIELD OF IT, AND GREP FOR
 WHAT THE LINE SAYS, NOT FOR A SUBSTRING OF IT.**
 
 ### 9.17 The magenta rival cars: block layout corruption vs format advertising and delivery
@@ -2877,7 +2866,7 @@ takes the first one that EXISTS.
   11,155 `*.dds.z` entries in `tracks` + `vehicles-mid`, every single one is
   `.dxt.dds.z`.
 
-⇒ **So a car whose assets are in the loose `.depot` gets its PVR/ETC spelling
+鈬?**So a car whose assets are in the loose `.depot` gets its PVR/ETC spelling
 and renders correctly; a car that exists ONLY in the volumes falls through to
 the DXT spelling.**  That is exactly the split the symptom shows: the 82 cars
 the card has are fine, and the DTM rivals -- which the card does not have --
@@ -2890,11 +2879,11 @@ phase=ctex-upload ordinal=10 ... internal=0x83f1(DXT1_RGBA) err=0x0 recent_file=
 ```
 The guest uploads each texture with the internal format that matches the
 FourCC inside the file it was given (DXT5 file -> 0x83F3, DXT1 file -> 0x83F1),
-and every upload reports `err=0x0`.  ⇒ **H1 (the alias chain answered a
+and every upload reports `err=0x0`.  鈬?**H1 (the alias chain answered a
 format-specific request with another format's bytes) and H2 (the asset-list
 rewrite and the guest's format decision disagreed) are DEAD.**
 
-⇒ **WHAT IS LEFT IS THE GPU'S OWN DECODE.**  The bytes are good (the CPU
+鈬?**WHAT IS LEFT IS THE GPU'S OWN DECODE.**  The bytes are good (the CPU
 decodes them into a normal grey car, mean RGB 125,122,126, zero green-zeroed
 pixels) and the guest hands them over in the right format with no GL error --
 and the result on screen is the same texture with its GREEN CHANNEL ZEROED.
@@ -2954,7 +2943,7 @@ key.
   here, which a framebuffer DOES accept, so this is a real verdict and not a
   "not measured" one.
 
-⇒ **Same bytes, same game, same shader, one switch: the GPU's S3TC decode is
+鈬?**Same bytes, same game, same shader, one switch: the GPU's S3TC decode is
 what turned a grey car into a magenta one.**
 
 ### 9.19 The software DXT path broke the event card, and why "the internal format says DXT" is not enough
@@ -2972,7 +2961,7 @@ a PVR texture -- and the guest uploads it under an S3TC internal format.  The
 software path took "the internal format is 0x83F1, so these bytes are DXT1"
 and decoded PVR bytes as DXT blocks, which is what turns an image into noise.
 
-⇒ **THE INTERNAL FORMAT PROVES NOTHING.  THE FILE DOES.**  The port already
+鈬?**THE INTERNAL FORMAT PROVES NOTHING.  THE FILE DOES.**  The port already
 knows what it handed over: the served-texture ring records the FourCC of every
 texture it serves, and the software path now decodes ONLY when that record
 says DXT1 (for 0x83F0/0x83F1) or DXT5 (for 0x83F3).  Anything else -- a PVR
@@ -2987,7 +2976,7 @@ atlas, an ETC1 texture, no record at all -- goes to the GPU exactly as before.
    corruption was not noticed until the menu was compared frame by frame.
    **A FIX THAT IS VERIFIED IN ONE SCENE IS NOT VERIFIED.**
 
-⇒ **THE RULE THIS ADDS:** a port-side change to how a texture is delivered has
+鈬?**THE RULE THIS ADDS:** a port-side change to how a texture is delivered has
 to be compared in EVERY kind of screen that uses a texture -- menu, race, HUD
 -- and the delivery decision has to be made from the FILE the port served, not
 from a parameter the guest passed.
@@ -3000,13 +2989,13 @@ startup and uploads them hundreds of frames later, so by the time the menu
 draws, the ring holds some other texture entirely.  **"THE TEXTURE I SERVED
 MOST RECENTLY" IS NOT "THE TEXTURE BEING UPLOADED".**
 
-⇒ **SO THE SWITCH IS OFF BY DEFAULT (`swdxt=0`) AND THE FIX IS NOT YET
+鈬?**SO THE SWITCH IS OFF BY DEFAULT (`swdxt=0`) AND THE FIX IS NOT YET
 SHIPPED AS A DEFAULT.**  The mechanism is proved -- with the switch on, the
 read-back says the GPU returns the CPU's own pixels unchanged
 (`match=1 sw=1`, eight textures) -- but the port cannot yet tell WHICH upload
 belongs to WHICH file it served.
 
-⇒ **WHAT THE SAFE FIX LOOKS LIKE, AND WHY IT IS THE NEXT PIECE OF WORK:** do
+鈬?**WHAT THE SAFE FIX LOOKS LIKE, AND WHY IT IS THE NEXT PIECE OF WORK:** do
 not decide at upload time at all.  Re-encode AT SERVE TIME: when the port
 serves a `.dds.z` whose DDS says DXT1/DXT5, decode it, write an UNCOMPRESSED
 DDS header and the RGBA pixels, and publish the new size and md5 in the asset
@@ -3040,20 +3029,20 @@ something else (`ttss.2.dat.bak`, `webimage_cache`, `asset_list_base.txtCache.tx
 the `assets_2048x1536/...` directories).  So it is not a write that the port
 blocks -- the file simply is not there.
 
-⇒ **⇒ IT IS A FILE THE APP GENERATES IN ITS OWN FILES DIRECTORY ON FIRST RUN**
+鈬?**鈬?IT IS A FILE THE APP GENERATES IN ITS OWN FILES DIRECTORY ON FIRST RUN**
 (the name says it: LOCAL styles, next to a pre-baked set for every series), and
 every copy we have came from the APK or from a data pack, neither of which
 carries it.  **THE ONLY PLACE IT EXISTS IS THE ANDROID DEVICE THAT HAS RUN
 THE GAME.**
 
-⇒ **WHAT CLOSES IT:** copy it off the phone, into the card, where the port's
+鈬?**WHAT CLOSES IT:** copy it off the phone, into the card, where the port's
 third candidate (the same path on the SD card) will find it:
 ```
 Android/data/com.ea.gp.fifteen15.fnhd/files/.depot/gui/processed/LocalStyles.gui
 Android/data/com.ea.gp.fifteen15.fnhd/files/.depot/gui/processed/LocalStyles_480x320.gui
   ->  sdmc:/switch/rr3-native-rehost/.depot/gui/processed/
 ```
-⇒ **THE LESSON:** a content set assembled from an APK and from data packs is
+鈬?**THE LESSON:** a content set assembled from an APK and from data packs is
 not the same as the content set a device has after the game has run on it.
 **THE MISSING FILES ARE THE ONES THE APP GENERATES, AND ONLY THE DEVICE HAS
 THEM.**
@@ -3066,7 +3055,7 @@ The card's loose `.depot` carries the pvr/etc spellings for the 82 cars it
 has; the seven external volumes were built from the DXT pack, which carries
 ONLY the dxt spelling.  A car the card does not have therefore fell through
 to dxt -- and Mesa's S3TC decode zeroes the green channel of that texture.
-**⇒ THE MAGENTA IS NOT A BUG IN THE PORT.  IT IS THE WRONG PACK ON THE CARD.**
+**鈬?THE MAGENTA IS NOT A BUG IN THE PORT.  IT IS THE WRONG PACK ON THE CARD.**
 
 **WHY THE DXT PATH IS WRONG AND THE ETC PATH IS NOT (measured):**
 - dxt: the guest uploads it with `internal=0x83f1/0x83f3` and it arrives on
@@ -3120,7 +3109,7 @@ worst frame holds 590 pink pixels and they are (255,77,181) -- the
 advertising billboard, whose green channel is 77 -- where the magenta rivals
 were (255,4,255) and (192,4,192), a green channel of FOUR.
 
-⇒ **EVERY car texture is uploaded as ETC1 now, so Mesa's broken S3TC decode
+鈬?**EVERY car texture is uploaded as ETC1 now, so Mesa's broken S3TC decode
 is out of the picture for the cars, and the front end is still the DXT one
 that boots.**  The volumes are also smaller than the ones they replace
 (gui-hd 1,443,906,568 against 1,663,784,980 bytes), so the card gained space.
@@ -3171,7 +3160,7 @@ against the reference round's 186,921 (10.35 %).
    (flips=9, stalls=7), and the car never came back: the pursuit could not
    come back either, because the line was still refused.
 
-⇒ **THE 25 m GUARD WAS THE ONLY THING THAT COULD HAVE STEERED THE CAR BACK
+鈬?**THE 25 m GUARD WAS THE ONLY THING THAT COULD HAVE STEERED THE CAR BACK
 ONTO THE TRACK, AND IT WAS THE THING THAT PREVENTED IT.**
 
 **THE FIX:** the line keeps the car.  Between "on the line" (25 m) and "not on
@@ -3208,13 +3197,13 @@ It did not settle the question, and the log says why:
   (the hard limit is 250 m) and kept the guest's own target, which is why the
   pursuit was still off (`pur=0`).
 
-⇒ **So the change cannot make things worse** -- a line that is 13 km away is
+鈬?**So the change cannot make things worse** -- a line that is 13 km away is
 refused, not aimed at -- **but the layer UNDER it is the real one: the fitted
 chunk does not follow the car.**  The line is fitted once, on the chunk that
 was current then; when the car is on another part of the track the nearest
 point of that line is kilometres away, and the port is left with nothing.
 
-⇒ **THE NEXT PIECE OF WORK IS THE CHUNK, NOT THE GUARD:** the fitted chunk
+鈬?**THE NEXT PIECE OF WORK IS THE CHUNK, NOT THE GUARD:** the fitted chunk
 has to follow the car -- the guest's own `snode` says which node the car is
 on, and the chunk boundaries are in the spline -- so that "the nearest point
 of the line" is always metres away and not kilometres.  Until that is done,
@@ -3254,14 +3243,14 @@ against the round before it (hybrid1), whose last sample had `ctdist=13215.19`
 -- the fitted chunk 13 km from the car, the pursuit off (pur=0), flips=9,
 stalls=7 and a final total of 89,623.
 
-⇒ **THE TARGET IS NOW METRES AWAY INSTEAD OF KILOMETRES** (`ctdist` 10.45 m,
+鈬?**THE TARGET IS NOW METRES AWAY INSTEAD OF KILOMETRES** (`ctdist` 10.45 m,
 16.49 m, 38.66 m against 13,215 m), the pursuit is on for 150 of 193 samples,
 the flips are down from 9 to 6 and the lap progress is up from 89,623 to
 94,034.  The new `cchunk` field on the race-state line reports the car's
 distance to the chunk the target came from, so the "the line was fitted on the
 wrong chunk" case is visible from now on instead of having to be inferred.
 
-⇒ **WHAT IS STILL MISSING:** seven stalls and a lap progress of 94,034 against
+鈬?**WHAT IS STILL MISSING:** seven stalls and a lap progress of 94,034 against
 the reference round's 186,921.  The line is now the right one and the target
 is sane, so the remaining loss is in the CONTROL, not in the geometry: the
 error still swings to +/-2.4 rad (the car is spun or facing back down the
@@ -3270,7 +3259,7 @@ measurement is the error's cause: whether the car is facing the wrong way
 (the direction lock) or simply too far off the line to recover at this
 throttle.**
 
-⇒ **AND THE PORT-SIDE EXPERIMENT IS KEPT, OFF BY DEFAULT:** `swdxt=1` still
+鈬?**AND THE PORT-SIDE EXPERIMENT IS KEPT, OFF BY DEFAULT:** `swdxt=1` still
 decodes DXT on the CPU (9.19 proved the mechanism and proved that the port
 cannot attribute an upload to the file it served).  It is the tool to use if a
 future pack ships a texture format the GPU cannot decode and there is no
@@ -3306,7 +3295,7 @@ on in 150 of 193 samples), `flips` (9 -> 6), `stalls` (7) and `total` (94,034)
 was sound.  The chunk picker's own new field was the one field the round
 could not see.
 
-**⇒ ⇒ AND THE FIX IS NOW MEASURED (round `chunk2`, the instrument fixed):**
+**鈬?鈬?AND THE FIX IS NOW MEASURED (round `chunk2`, the instrument fixed):**
 
     f=3390  dir=1  mot=-1.000,-0.007  cchunk= 4.80  perr= 1.775  pur=1  total=66106  ctdist=19.80  flips=2  stalls=3  steer=-1.000  thr=0  brk=1
     f=3870  dir=1  mot=-1.000,-0.007  cchunk= 4.80  perr= 1.518  pur=1  total=71949  ctdist=17.92  flips=2  stalls=5  steer=-1.000  thr=0  brk=1
@@ -3324,7 +3313,7 @@ could not see.
 * `brk=1` at the same time and `steer=-1.000`: **the recovery is braking at
   full lock.**  A brake plus a full lock is a spin.
 
-**⇒ ⇒ THE CAUSAL CHAIN, EVERY LINK MEASURED:**
+**鈬?鈬?THE CAUSAL CHAIN, EVERY LINK MEASURED:**
 
 1. The aim point is behind the car, so the pursuit holds full lock.
 2. The car ends up driving backwards down the track.
@@ -3345,13 +3334,13 @@ could not see.
 between "the pursuit drives badly" and "the pursuit cannot recover", and it is
 why the round ends with the car creeping in circles instead of a lap.
 
-**⇒ ⇒ AND THE STALL TEST'S EXEMPTION IS NOT A LIVE MEASUREMENT:**
+**鈬?鈬?AND THE STALL TEST'S EXEMPTION IS NOT A LIVE MEASUREMENT:**
 `lineResidual` is assigned the FIT's residual (a constant, 1.22 to 3.88 m in
 this round), so "the car is on the line" is a constant boolean for the whole
 race instead of the current distance to the line.  The discrimination the
 comment claims is not the one the code makes.
 
-**⇒ ⇒ AND THE PICTURE SAYS IT TOO.**  The archived frame `frame-005600.png`
+**鈬?鈬?AND THE PICTURE SAYS IT TOO.**  The archived frame `frame-005600.png`
 of round `chunk2` shows the guest's own message, "hold the brake to reverse",
 over the player's car, which is nose-first into the barrier.
 
@@ -3363,13 +3352,13 @@ pixels scanned.**
     EXACT (255,0,255)   : 0
     green<=12, r,b>=128 : 0  (0.00000% of all pixels)
 
-**⇒ ⇒ AND THE FRAME LOOKS RIGHT.**  `frame-001600.png` is the front end:
+**鈬?鈬?AND THE FRAME LOOKS RIGHT.**  `frame-001600.png` is the front end:
 the Chinese UI renders ("Season 5 Championship", "reach player level 4 to
 unlock the championship"), the Porsche 911 RSR promo car is red and white with
 its sponsor decals, the track thumbnail car is painted, the currency bar and
 the bottom navigation are all there.  **No magenta car, anywhere.**
 
-**⇒ ⇒ AND THE SAME FRAME SET SAYS WHERE THE HUD GAP IS.**  The FRONT END is
+**鈬?鈬?AND THE SAME FRAME SET SAYS WHERE THE HUD GAP IS.**  The FRONT END is
 fully styled -- it has its own styles -- while the IN-RACE HUD
 (`frame-005600.png`) is EMPTY: a pause button, a camera button and one icon,
 and no speedometer, no gear, no lap counter, no position, no minimap.  That is
@@ -3393,7 +3382,7 @@ definition this project measures against, with the state of each line on
 | 7 | The AI opponents look right | a screenshot of the race | **PARTLY DONE**: the cars that are visible in the archived frames are correctly textured; no round has yet reached the event with a full grid of rivals in frame |
 | 8 | The port does not freeze on hardware | the `rr3-native-rehost.guest-boot.progress` file on the card | **AWAITING THE USER**: v0.22.8 (the condvar fix) has not been re-tested on the console |
 
-**⇒ ⇒ SO THE PORT'S OWN WORK IS ALMOST DONE AND THE REMAINING GAPS ARE
+**鈬?鈬?SO THE PORT'S OWN WORK IS ALMOST DONE AND THE REMAINING GAPS ARE
 THREE:** the lap (section 9.24, the pursuit's control law), the two HUD files
 (only an Android device has them), and the controller binding plus the
 hardware re-test (only the user can do those).
@@ -3404,7 +3393,7 @@ hardware re-test (only the user can do those).
 script holding the accelerator and alternating the steering axis, the port's
 closed loop switched off).**
 
-**⇒ ⇒ THE INPUT REACHES THE GUEST, EVERY SAMPLE (24 of 24):**
+**鈬?鈬?THE INPUT REACHES THE GUEST, EVERY SAMPLE (24 of 24):**
 
     f= 900  mode=0 path=script lx_script=0.500 lx_guest=0.500 buttons=0x0001 loop_steered=0 physical_active=0
     f=1200  mode=0 path=script lx_script=0.500 lx_guest=0.500 buttons=0x0001 loop_steered=0 physical_active=0
@@ -3416,10 +3405,10 @@ received, and they are equal in every sample.  `loop_steered=0`: the port's
 own closed loop did NOT overwrite the human's axis.  `buttons=0x0001`: the
 guest's BTN_A, the accelerator, is held.
 
-**⇒ ⇒ THE PORT DID NOT TOUCH THE CAR AT ALL:** all 25 `npad-heartbeat` lines
+**鈬?鈬?THE PORT DID NOT TOUCH THE CAR AT ALL:** all 25 `npad-heartbeat` lines
 carry `autopilot_injected=0`.
 
-**⇒ ⇒ AND THE CAR RESPONDS TO IT:**
+**鈬?鈬?AND THE CAR RESPONDS TO IT:**
 
     f= 630  total=     0  rate=  0.00
     f= 720  total=  5663  rate= 32.58
@@ -3431,20 +3420,20 @@ progress rate reaches 181.23 units per frame.  The lap is 1,171,456 units, so
 the rate is about 84 km/h.  **The throttle reaches the car and the car
 really drives.**
 
-**⇒ ⇒ THE FRAME SHOWS IT:** `frames/frame-000600.png` is the start at
+**鈬?鈬?THE FRAME SHOWS IT:** `frames/frame-000600.png` is the start at
 Hockenheim: the player's black Mercedes SLS AMG with its wheels, brake discs,
 rear wing and AMG decals, the pit building with its HOCKENHEIMRING signs and
 the sponsor boards, the start lights lit, the grid painted on the asphalt,
 and an ORANGE rival car in the background.  **Every one of them is textured
 correctly.**
 
-**⇒ ⇒ SO WHAT IS ACTUALLY BROKEN IS THE AUTOPILOT, NOT THE GAME.**  The
+**鈬?鈬?SO WHAT IS ACTUALLY BROKEN IS THE AUTOPILOT, NOT THE GAME.**  The
 autopilot's best measured round reached 15.96 % of a lap; the human path
 reaches a racing speed in the first ten seconds of the same race.  The
 pursuit's failure (section 9.24) is a defect in the port's own measurement
 harness and its attract mode, NOT in the game's playability.
 
-**⇒ ⇒ AND THE TWO REMAINING GAPS FOR THE HUMAN ARE EXACTLY THE TWO THE USER
+**鈬?鈬?AND THE TWO REMAINING GAPS FOR THE HUMAN ARE EXACTLY THE TWO THE USER
 HAS TO CLOSE:** the in-race HUD's two style files (only an Android device has
 them), and the controller binding -- in Eden the port sees an idle emulated
 Pro Controller (`state=npad-idle`, `seen_press=0`, `buttons=0x0` in all 25
@@ -3456,7 +3445,7 @@ heartbeats) because the host controller is bound to no player.
 point, the along-track flip criterion, the along-track stuck test and the
 recovery's ownership of the wheel.**
 
-**⇒ ⇒ THE ERROR CAME DOWN BY A FACTOR OF FOUR:**
+**鈬?鈬?THE ERROR CAME DOWN BY A FACTOR OF FOUR:**
 
     round chunk2:  perr = 1.5 to 2.9 rad (86 to 166 degrees), steadily
     round chunk3:  perr = -0.49 to -2.52 rad, and -0.53 (30 degrees) for the
@@ -3464,7 +3453,7 @@ recovery's ownership of the wheel.**
 
 and the stall counter went 7 (chunk1) -> 6 (chunk2) -> 3 (chunk3).
 
-**⇒ ⇒ AND THE NEW INSTRUMENT SHOWS WHY IT IS STILL NOT A LAP.**  The last
+**鈬?鈬?AND THE NEW INSTRUMENT SHOWS WHY IT IS STILL NOT A LAP.**  The last
 pursuit phase of the round, every 30 frames:
 
     f     perr     along    pdist   fdelta   total   steer  thr brk owner     flips stalls
@@ -3475,7 +3464,7 @@ pursuit phase of the round, every 30 frames:
     5190  -0.4892   123.85    9.47    0.00   34501   0.978   1  0  pursuit     3     3
     5340  -0.5307   123.87    9.50    0.00   34507   1.000   1  0  pursuit     3     3
 
-**⇒ ⇒ THREE THINGS ARE NOW MEASURED THAT WERE NOT BEFORE.**
+**鈬?鈬?THREE THINGS ARE NOW MEASURED THAT WERE NOT BEFORE.**
 
 1. **THE CAR CAN SIT STILL WITH THE PURSUIT AT FULL LOCK AND THE THROTTLE ON,
    AND NOTHING CATCHES IT IN TIME.**  From f=5190 the along-track coordinate is
@@ -3485,7 +3474,7 @@ pursuit phase of the round, every 30 frames:
    -- the thing that unjams a car -- is not being applied.  The limit-cycle
    detector needs an error above 1.40 rad and this state has 0.53 rad, so it
    does not fire; the stuck test needs 600 frames (18.2 s) of no along-track
-   progress, and the round ended before that.  **⇒ THE CRITERION FOR "THE
+   progress, and the round ended before that.  **鈬?THE CRITERION FOR "THE
    PURSUIT MUST YIELD" HAS TO BE "THE CAR IS NOT ADVANCING", NOT "THE ERROR IS
    LARGE".**  A car pinned against a barrier with a 30 degree error is still
    pinned.
@@ -3496,7 +3485,7 @@ pursuit phase of the round, every 30 frames:
    132.11, with the car in the same place.  The flip criterion's window
    therefore saw a +100 m "progress" it never made, and `fdelta` printed
    205.21 m -- a delta no car on that track covers in 360 frames.
-   **⇒ THE RING HAS TO BE CLEARED WHEN THE CHUNK CHANGES**, or the criterion
+   **鈬?THE RING HAS TO BE CLEARED WHEN THE CHUNK CHANGES**, or the criterion
    has to be measured on a chunk-independent quantity (the guest's own signed
    distance along ITS spline).
 
@@ -3507,7 +3496,7 @@ pursuit phase of the round, every 30 frames:
    round the same fact was invisible: `lineResidual` held the FIT's residual,
    a constant.
 
-**⇒ ⇒ SO THE NEXT ITERATION HAS A SPEC, AND IT IS TWO ITEMS:** the pursuit
+**鈬?鈬?SO THE NEXT ITERATION HAS A SPEC, AND IT IS TWO ITEMS:** the pursuit
 yields when the car is not advancing (whatever the error is), and the flip
 criterion's window is cleared when the chunk changes.
 
@@ -3531,16 +3520,16 @@ and the WHOLE run (the boot and the loading phase dominate it):
 
     tt = 125.82 ms  tr = 121.54 ms  ts = 3.80 ms   tp = 0.47 ms
 
-**⇒ ⇒ SO THE GAME RUNS AT 22.9 FPS IN A RACE AND AT ABOUT 8.8 FPS WHILE IT
+**鈬?鈬?SO THE GAME RUNS AT 22.9 FPS IN A RACE AND AT ABOUT 8.8 FPS WHILE IT
 IS LOADING**, and the round's own average (5,280 frames in 406 s = 13.0 fps)
 is the average of those two, not a third thing.
 
-**⇒ ⇒ AND 90 % OF THE FRAME IS INSIDE THE GUEST'S RENDER CALL.**  The port's
+**鈬?鈬?AND 90 % OF THE FRAME IS INSIDE THE GUEST'S RENDER CALL.**  The port's
 own work outside it is 0.37 ms.  The guest's render call is where the port's
 per-call work happens, because the guest reaches the port through JNI, through
 the GL wrappers and through the filesystem resolver.
 
-**⇒ ⇒ THE PORT WRITES 42 LOG LINES PER FRAME, AND EVERY ONE OF THEM IS ONE
+**鈬?鈬?THE PORT WRITES 42 LOG LINES PER FRAME, AND EVERY ONE OF THEM IS ONE
 fprintf PLUS ONE fflush ON THE CARD.**  Round chunk3: 223,677 lines for 5,280
 frames.
 
@@ -3557,13 +3546,13 @@ itself still happens on every request, in `resolveAssetLocalFile()`
 (guest_filesystem.cpp:5112), which maps the path and touches the card every
 time.
 
-**⇒ ⇒ AND THE PACE WAS WRONG, WHICH IS THE FIRST FIX.**  The frame loop slept
+**鈬?鈬?AND THE PACE WAS WRONG, WHICH IS THE FIRST FIX.**  The frame loop slept
 a FIXED 16.67 ms AFTER the work (guest_view_probe.cpp:9988), so the frame
 PERIOD was the work PLUS a whole frame: every millisecond of the guest's own
 work was paid for twice, and 43.6 ms of work produced a 60.3 ms frame
 (16.6 fps) instead of the 22.9 fps the work alone allows.
 
-**⇒ ⇒ THE SLEEP IS NOW THE REMAINDER OF THE BUDGET**, so the period is
+**鈬?鈬?THE SLEEP IS NOW THE REMAINDER OF THE BUDGET**, so the period is
 max(work, 16.67 ms): the port runs at 60 Hz whenever the work fits in the
 budget, and an idle frame still sleeps the whole budget, so the front end does
 not spin either.  The budget is converted from nanoseconds to
@@ -3571,7 +3560,7 @@ not spin either.  The budget is converted from nanoseconds to
 (the tick counter runs at 19.2 MHz and `svcSleepThread` takes nanoseconds), and
 mixing them would make the budget 19.2 times too long.
 
-**⇒ ⇒ WHAT 60 FPS NEEDS, WITH THE NUMBERS:**
+**鈬?鈬?WHAT 60 FPS NEEDS, WITH THE NUMBERS:**
 
     now                43.6 ms of work   => 22.9 fps after the pacing fix
     - the per-call log lines (42 per frame)  => the log stops being the cost
@@ -3580,7 +3569,7 @@ mixing them would make the budget 19.2 times too long.
     ---------------------------------------------
     16.67 ms of work   => 60 fps
 
-**⇒ ⇒ AND THE HONEST CEILING ON THE EMULATOR:** the present alone is 3.9 ms
+**鈬?鈬?AND THE HONEST CEILING ON THE EMULATOR:** the present alone is 3.9 ms
 there, and the guest's own simulation is not the port's to optimise.  So
 Eden's realistic target is 35-40 fps, and the 60 fps figure is a CONSOLE
 target -- the same port overhead, but NVN's present instead of the
@@ -3602,7 +3591,7 @@ The same frame ranges, computed by the same script (.build/frame-stats.py):
 and `fps1` never got past frame 1855, so it never reached the race phase that
 `chunk3` measured at 43.6 ms.
 
-**⇒ ⇒ THAT LOOKS LIKE A REGRESSION, AND IT IS NOT ONE.**  The pacing change
+**鈬?鈬?THAT LOOKS LIKE A REGRESSION, AND IT IS NOT ONE.**  The pacing change
 (the sleep is now the remainder of the 16.67 ms budget) can only affect a
 frame whose WORK is under 16.67 ms; a frame that takes longer than the budget
 gets no sleep either way, before or after.  So the change's SCOPE is exactly
@@ -3615,14 +3604,14 @@ Even if every one of those 50 frames had become 16.67 ms faster, the whole
 round would have saved 0.83 s out of 408 s -- **0.2 %**.  A 0.2 % effect
 cannot explain a 2-3x difference.
 
-**⇒ ⇒ SO THE DIFFERENCE IS THE GUEST'S LOADING PHASE, AND IT VARIES.**  Both
+**鈬?鈬?SO THE DIFFERENCE IS THE GUEST'S LOADING PHASE, AND IT VARIES.**  Both
 rounds contain a single enormous frame -- 51,155 ms in chunk3 and 54,511 ms in
 fps1 -- which is the guest's cloud/login wait, and the loading phase around it
 runs anywhere between 96 ms and 597 ms a frame depending on the round.  A
 single round is NOT a comparison of a build change: it is a comparison of a
 build change AND the round's luck.
 
-**⇒ ⇒ THE TECHNIQUE, WHICH IS THE GENERAL PART:** when a change appears to
+**鈬?鈬?THE TECHNIQUE, WHICH IS THE GENERAL PART:** when a change appears to
 have made things worse, COUNT THE SAMPLES THE CHANGE CAN TOUCH.  If the
 change's scope is arithmetic -- a few frames, a few calls, one branch -- then
 its maximum possible effect can be computed, and a measurement outside that
@@ -3630,7 +3619,7 @@ bound clears the change without needing another round.  Only if the measured
 effect is INSIDE the bound does the change become the suspect, and only then is
 a control round worth running.
 
-**⇒ ⇒ AND THE CONSEQUENCE FOR 60 FPS IS THE SAME ARITHMETIC.**  The frame's
+**鈬?鈬?AND THE CONSEQUENCE FOR 60 FPS IS THE SAME ARITHMETIC.**  The frame's
 work is 43.6 ms, of which the port's own work outside the guest's render call
 is 0.37 ms and the rest is inside it -- the guest's own simulation plus the
 port's per-call work (42 log lines a frame, 4.8 path resolutions a frame, a
@@ -3656,19 +3645,19 @@ and the race phase (frames > 2500):
     fps2:    tt median 37.0 ms   p25 32.0 ms   jni median 21.0 ms
                                         fs median 0.0 ms
 
-**⇒ ⇒ THE SWITCH WORKS: THE PER-CALL LINES ARE GONE.**  The phases that used
+**鈬?鈬?THE SWITCH WORKS: THE PER-CALL LINES ARE GONE.**  The phases that used
 to dominate the log are not there any more -- chunk3's top six were scissor
 (37,583), map-app (25,403), cc-dispatch (20,978), jni-void (20,976),
 jni-utf163 (20,685) and cc-dispatch-bool (11,267); fps2's top six are
 guest-scanf-bounded (17,553), served-digest (7,847), open-ok (7,399),
 fs-candidate (4,002), guest-log-any (3,999) and guest-free-seq (3,586).
 
-**⇒ ⇒ AND THE FRAME TIME DID NOT MOVE: 35.0 ms -> 37.0 ms median, which is
+**鈬?鈬?AND THE FRAME TIME DID NOT MOVE: 35.0 ms -> 37.0 ms median, which is
 INSIDE the round-to-round variance of the loading phase.**  So the 42 log
 lines a frame were NOT the dominant cost, and the honest conclusion is that
 removing them buys nothing measurable on its own.
 
-**⇒ ⇒ WHAT THE INSTRUMENT SAYS IS THE COST: THE PORT'S JNI SERVICE PATH.**
+**鈬?鈬?WHAT THE INSTRUMENT SAYS IS THE COST: THE PORT'S JNI SERVICE PATH.**
 `jni` -- the time inside the port's JNI dispatch entry points -- is 21 ms in
 the race phase, against a 37 ms frame.  `fs` -- the time inside the asset
 resolution itself -- is 0 ms, because the cache is serving the repeated
@@ -3678,14 +3667,14 @@ those calls (and the remaining per-frame lines -- served-digest, open-ok,
 fs-candidate, guest-scanf-bounded -- are the asset-service logs, still 16
 lines a frame, still one fprintf plus one fflush each).
 
-**⇒ ⇒ SO 60 FPS NEEDS THE NEXT TWO THINGS, IN THIS ORDER:**
+**鈬?鈬?SO 60 FPS NEEDS THE NEXT TWO THINGS, IN THIS ORDER:**
 1. the asset-SERVICE logs go behind the same switch (they are not per-call
    lines, they are per-request lines, and there are 16 of them a frame);
 2. the cache must stop touching the card on every hit -- it revalidates with
    `::stat` per hit, which is a card touch per request -- and the JNI
    service path's 21 ms has to be accounted for request by request.
 
-**⇒ ⇒ AND THE CEILING IS NOW HONEST:** with the port's own service work at
+**鈬?鈬?AND THE CEILING IS NOW HONEST:** with the port's own service work at
 21 ms of a 37 ms frame, 16.67 ms is unreachable until that 21 ms comes down.
 The guest's own drawing is what is left after it, and that part is not the
 port's to optimise.
@@ -3695,7 +3684,7 @@ port's to optimise.
 **MEASURED 2026-11-10 (round chunk3), and both defects are in the pursuit's own
 criteria.**
 
-**⇒ ⇒ DEFECT 1: THE CRITERION WAS "THE ERROR IS LARGE", AND A PINNED CAR HAS
+**鈬?鈬?DEFECT 1: THE CRITERION WAS "THE ERROR IS LARGE", AND A PINNED CAR HAS
 A SMALL ERROR.**  The last pursuit phase of the round:
 
     f     perr     along    pdist   total   steer  thr brk owner
@@ -3708,18 +3697,18 @@ with the throttle on and NO recovery (brk = 0).  The limit-cycle detector
 needed an error above 1.40 rad, this state has 0.53 rad, so it never fired and
 the car stayed pinned for the rest of the round.
 
-**⇒ ⇒ A CAR PINNED AGAINST A BARRIER WITH A 30 DEGREE ERROR IS STILL PINNED.**
+**鈬?鈬?A CAR PINNED AGAINST A BARRIER WITH A 30 DEGREE ERROR IS STILL PINNED.**
 So the criterion is now the car's own PROGRESS ALONG THE TRACK: the pursuit
 gives the wheel to the recovery when the car advanced less than **1.0 m in the
 last 120 frames** (3.6 s), and the old error condition is kept as an
 ADDITIONAL trigger rather than as the only one.
 
-**⇒ ⇒ AND THE THRESHOLD IS A DISTANCE, NOT A TIME, BECAUSE THAT IS WHAT
+**鈬?鈬?AND THE THRESHOLD IS A DISTANCE, NOT A TIME, BECAUSE THAT IS WHAT
 SEPARATES "STUCK" FROM "CRAWLING".**  The pinned car measured above advanced
 0.02 m in 3.6 s; a car crawling along a barrier at 0.3 m/s covers 1.08 m in
 the same window.  A time would not separate them -- the same 3.6 s is both.
 
-**⇒ ⇒ DEFECT 2: THE ALONG-TRACK COORDINATE IS A PROPERTY OF ITS CHUNK, AND
+**鈬?鈬?DEFECT 2: THE ALONG-TRACK COORDINATE IS A PROPERTY OF ITS CHUNK, AND
 THE WINDOW WAS NOT CLEARED WHEN THE CHUNK CHANGED.**  MEASURED (round chunk3):
 the coordinate jumped from 32.26 to 132.11 with the car in the same place --
 the chunk picker had moved to another chunk -- and the flip criterion's window
@@ -3731,7 +3720,7 @@ So the sample now carries the chunk the coordinate was measured on
 CLEARED whenever the chunk changes: the ring, the anchor and the stuck timer
 all restart, and the criteria begin again from the new chunk.
 
-**⇒ ⇒ AND THE NEW SIGNAL IS ON THE RECORD**, because a criterion that is not
+**鈬?鈬?AND THE NEW SIGNAL IS ON THE RECORD**, because a criterion that is not
 logged is a criterion nobody can check:
 
     tchunk=  the chunk the along-track coordinate belongs to
@@ -3754,14 +3743,14 @@ cache broke the front end.  That was wrong, and the frames say so.**
     fps2    + percall switch + instrument                0     0   143    0   2640
     yield1  + the pursuit's yield criterion             0     0   137    0   2640
 
-The first reading of that table is "the front end broke in fps2".  **⇒ ⇒ AND
+The first reading of that table is "the front end broke in fps2".  **鈬?鈬?AND
 THE FRAMES SAY OTHERWISE:** `frames/frame-000340.png` of round yield1 shows
 the front end fully drawn -- the "choose event" screen, the three daily-race
 cards with the Audi R8, the orange McLaren and the Nissan GT-R, every one of
 them textured correctly and not one of them magenta, and the UI automation's
 own red glove marker on the first card.  **THE GAME WAS FINE.**
 
-**⇒ ⇒ SO WHAT READS ZERO IS THE CENSUS, AND THE REASON IS THAT IT COUNTS THE
+**鈬?鈬?SO WHAT READS ZERO IS THE CENSUS, AND THE REASON IS THAT IT COUNTS THE
 PORT'S OWN TRACE.**  `tools/Test-OnEden.ps1` counts the main-menu layout in
 the guest-view log's text:
 
@@ -3769,7 +3758,7 @@ the guest-view log's text:
         $guestText, 'gui/processed/main_menu/main_menu_twosquare\.gui').Count
 
 and that trace is the path-resolution log, which the `percall` switch turns
-off.  **⇒ ⇒ AND THE PORT'S OWN FRONT END NAVIGATION READS THE SAME TRACE**,
+off.  **鈬?鈬?AND THE PORT'S OWN FRONT END NAVIGATION READS THE SAME TRACE**,
 so with the switch off the port cannot tell which screen the guest is on, it
 stops navigating, the guest sits in the event map, and it starts asking for
 the same assets over and over:
@@ -3777,12 +3766,12 @@ the same assets over and over:
     phase                  chunk3    yield1    per frame (chunk3 -> yield1)
     guest-scanf-bounded      1,005    14,297     0.19  ->  5.42
 
-**⇒ ⇒ WHICH IS ALSO WHY fps2's FRAME TIME DID NOT MOVE.**  The per-call lines
+**鈬?鈬?WHICH IS ALSO WHY fps2's FRAME TIME DID NOT MOVE.**  The per-call lines
 went away and the asset-service lines went UP by twenty-eight times, because
 the guest was stuck asking for the same thing.  The frame was slow for a
 completely different reason than the one the switch was meant to fix.
 
-**⇒ ⇒ SO TWO RULES, AND THE SECOND ONE IS THE GENERAL ONE:**
+**鈬?鈬?SO TWO RULES, AND THE SECOND ONE IS THE GENERAL ONE:**
 1. **THE PORT'S OWN INSTRUMENTS MUST NOT BE SWITCHED OFF.**  The census reads
    the path trace; the front end navigation reads the path trace.  A switch
    that silences the port's eyes silences the port's ability to drive the
@@ -3795,7 +3784,7 @@ completely different reason than the one the switch was meant to fix.
    it turns it into a LIE.  A census counter must read a counter the port
    keeps, not a string the port may stop writing.
 
-**⇒ ⇒ AND THE CACHE IS CLEARED OF THE CHARGE.**  The build logs say the
+**鈬?鈬?AND THE CACHE IS CLEARED OF THE CHARGE.**  The build logs say the
 incremental build did not recompile `guest_filesystem.cpp` for fps2 or yield1
 (`build-fps2.log` and `build-pursuit-yield.log` mention it zero times), so
 **neither of those rounds contained the cache at all**.  The cache is still
@@ -3811,42 +3800,42 @@ guest state, the same 400 s, differing only in the `percall` key on the card.**
     fps5          0         3    27   481    0      0      2520     6.3
     percall1      1         7    40   183   10      7      1055    15.2
 
-**⇒ ⇒ WITH THE LOGGING OFF THE GUEST NEVER GETS PAST THE EVENT MAP.**  With
+**鈬?鈬?WITH THE LOGGING OFF THE GUEST NEVER GETS PAST THE EVENT MAP.**  With
 it on, the same build reaches the race (race screen 10, start lights 7) in
 1,055 frames -- the fastest loading of any round.
 
-**⇒ ⇒ AND THE GAME IS NOT BROKEN WITH THE LOGGING OFF.**  The frames of the
+**鈬?鈬?AND THE GAME IS NOT BROKEN WITH THE LOGGING OFF.**  The frames of the
 percall = 0 rounds show the front end fully drawn and correctly textured
 (yield1/frames/frame-000340.png: the "choose event" screen with the Audi R8,
-the McLaren and the GT-R cards, every texture right).  **⇒ ⇒ SO IT IS NOT THE
+the McLaren and the GT-R cards, every texture right).  **鈬?鈬?SO IT IS NOT THE
 GAME THAT BREAKS; IT IS THE PORT THAT STOPS DRIVING.**  The front end
 navigation presses controls by name and position, and it is not reading the
 log to do it -- so the coupling is in the TIMING: the guest's progress and the
 port's cadence are entangled, and the port writes 42 lines a frame.
 
-**⇒ ⇒ AND NONE OF THE SWITCH'S SITES CHANGES WHAT THE GUEST RECEIVES.**  All
+**鈬?鈬?AND NONE OF THE SWITCH'S SITES CHANGES WHAT THE GUEST RECEIVES.**  All
 eight of them are in LOG functions (`logWatchedOpen`, `logStatLayout`,
 `logStatPath`, `guestViewNoteAndroidLog`, `logRefusal`, `perCallLogAllow` and
 two `if (gfxPerCallLog() && ...)` probes that only decide whether to PROBE).
 So the switch does not change a single byte the guest reads; it changes WHEN
 the port writes, and that is enough to change whether the guest gets anywhere.
 
-**⇒ ⇒ SO THE PLAN FOR 60 FPS CHANGES, AND THIS IS THE POINT OF THE ROUND:**
+**鈬?鈬?SO THE PLAN FOR 60 FPS CHANGES, AND THIS IS THE POINT OF THE ROUND:**
 "turn the per-call logging off" was the plan, and it is WRONG.  It does not
 buy a frame rate -- the rounds that "won" with it off never reached a race, so
 they never measured a race's frame time -- and it costs the port its ability
-to drive the guest.  **⇒ ⇒ THE DEFAULT IS THEREFORE BACK ON (`percall = 1`),
+to drive the guest.  **鈬?鈬?THE DEFAULT IS THEREFORE BACK ON (`percall = 1`),
 and the work becomes: make the lines CHEAP without making them LESS
 FREQUENT.**
 
     the lines stay (the cadence is load-bearing)
     the writes do not (RAM buffering, flushed in bulk)
 
-**⇒ ⇒ AND THE SAME RULE GOVERNS THE RESOLUTION CACHE.**  Its hit path was
+**鈬?鈬?AND THE SAME RULE GOVERNS THE RESOLUTION CACHE.**  Its hit path was
 writing a line per hit, which is the repetition the dedup existed to stop: the
 asset-service phases went from 0.19-0.48 lines a frame (chunk3) to 1.17-5.42
 (yield1), and the guest's own requests went with them (guest-scanf-bounded:
-1,005 -> 14,297).  **⇒ ⇒ SO A CACHE MUST NOT ADD A WRITE PER HIT EITHER** --
+1,005 -> 14,297).  **鈬?鈬?SO A CACHE MUST NOT ADD A WRITE PER HIT EITHER** --
 the same rule, the same reason.
 
 ### 9.36 The log's card write was the guest's CPU lifeline, and it has a replacement
@@ -3859,14 +3848,14 @@ card, the same guest state, the same 400 s.**
     percall1   per-line flush + the new instrument                 10        7     1055       206.7
     yield2     BUFFERED log + an explicit 2 ms yield, percall = 0  36       27     2280        52.9
 
-**⇒ ⇒ THREE NUMBERS, AND THEY SAY EXACTLY WHAT HAPPENS.**
+**鈬?鈬?THREE NUMBERS, AND THEY SAY EXACTLY WHAT HAPPENS.**
 
 1. **THE CARD WRITE WAS THE GUEST'S CPU LIFELINE.**  The port's per-call log
    wrote 42 lines a frame and flushed each one onto the card.  A card write
    WAITS, and the CPU is free during the wait -- and the guest is
    multi-threaded (a loader thread, a render thread, the Cloudcell workers),
    so that wait was how the guest's other threads got any time at all.
-   **⇒ ⇒ REMOVING THE WRITES SPEEDS THE PORT UP AND STARVES THE GUEST**, and
+   **鈬?鈬?REMOVING THE WRITES SPEEDS THE PORT UP AND STARVES THE GUEST**, and
    that is exactly what the four rounds with `percall = 0` showed: the guest
    never got past the event map (race screen 0), with the front end itself
    drawn perfectly (yield1/frames/frame-000340.png).
@@ -3885,16 +3874,16 @@ card, the same guest state, the same 400 s.**
    chunk3.  So the logging can be off, the port does not need the card write
    to feed the guest, and the default is `percall = 0` again.
 
-**⇒ ⇒ AND THE PER-CALL LOGGING WAS NOT THE WHOLE COST EITHER.**  The round
+**鈬?鈬?AND THE PER-CALL LOGGING WAS NOT THE WHOLE COST EITHER.**  The round
 that added the new instrument (percall1) wrote **206.7 lines a frame** --
 five times chunk3 -- and its race frame was 144.5 ms against chunk3's 35.0 ms.
-**⇒ ⇒ SO THE NEXT TARGET IS NAMED BY THE SAME MEASUREMENT: 52.9 lines a frame
+**鈬?鈬?SO THE NEXT TARGET IS NAMED BY THE SAME MEASUREMENT: 52.9 lines a frame
 remain, and they are the ASSET-SERVICE lines** (served-digest, open-ok,
 fs-candidate, guest-scanf-bounded, guest-log-any, guest-free-seq) -- not
 per-call lines, and not gated yet.  They are the instrument that says which
 candidate answered, and they are the next thing to make cheap.
 
-**⇒ ⇒ AND THE RULE, IN ONE LINE: a diagnostic that is load-bearing must be
+**鈬?鈬?AND THE RULE, IN ONE LINE: a diagnostic that is load-bearing must be
 made CHEAP, not REMOVED.**  The per-call log was load-bearing (it was the
 guest's CPU lifeline), so it was made cheap -- buffered -- and its cadence
 was replaced by an explicit yield.  The cache was load-bearing in the same
@@ -3910,35 +3899,35 @@ way.
     yield2            15                75               300          36     27
     slim1              1                 5               152           1      1
 
-**⇒ ⇒ THE THINNING CUT THE LOG AND BLINDED THE CENSUS**, because the census
+**鈬?鈬?THE THINNING CUT THE LOG AND BLINDED THE CENSUS**, because the census
 COUNTS THE LOG'S TEXT (`tools/Test-OnEden.ps1` counts
 'gui/processed/main_menu/main_menu_twosquare.gui' in the guest-view log), and
 the thinned trace no longer contains the repeated main-menu opens the count
-depends on.  **⇒ ⇒ SO THE THINNING IS REVERTED.**
+depends on.  **鈬?鈬?SO THE THINNING IS REVERTED.**
 
-**⇒ ⇒ AND THE FIX IT NAMED IS THE ONE THIS PROJECT KEEPS RE-ARRIVING AT: a
+**鈬?鈬?AND THE FIX IT NAMED IS THE ONE THIS PROJECT KEEPS RE-ARRIVING AT: a
 measurement that reads a STRING out of the log is only as good as the log it
 reads.**  Every census counter in `Test-OnEden.ps1` is a regex over the
 guest-view log, so any change to what the port writes turns the counter into a
-lie.  **⇒ ⇒ THE CENSUS MUST READ A COUNTER THE PORT KEEPS.**  The port
+lie.  **鈬?鈬?THE CENSUS MUST READ A COUNTER THE PORT KEEPS.**  The port
 already counts path resolutions (`paths=` on the race-state line, added with
 this round); the counters the census wants are the next step, and then the
 trace can be thinned for real.
 
-**⇒ ⇒ AND THE WARNING TAIL IS A PRE-EXISTING CLASS.**  MEASURED 2026-11-10:
+**鈬?鈬?AND THE WARNING TAIL IS A PRE-EXISTING CLASS.**  MEASURED 2026-11-10:
 `guest_filesystem.cpp` had not been fully recompiled since the incremental
 build was introduced, so its `-Wformat-truncation=` warnings were invisible --
 they are all the same thing (a guest-supplied path or error string formatted
 into a fixed buffer that is a little too small) and they surface one by one as
 the file is touched.  Twenty-four are fixed, with explicit precisions and one
 `ino_t` truncation (a value written into a 16-bit field, which the compiler
-had been reporting since before this session).  **⇒ ⇒ A TAIL REMAINS, AND IT IS
+had been reporting since before this session).  **鈬?鈬?A TAIL REMAINS, AND IT IS
 DIAGNOSTIC-ONLY**: a truncated log line, not a byte the guest receives.  It is
 listed here rather than hidden, because a build that is clean for the files you
 touched and dirty for the file you did not is exactly how the "the build is
 warning free" claim got wrong in the first place.
 
-**⇒ ⇒ AND THE RULE THAT PRODUCED ALL OF IT:** a diagnostic that is
+**鈬?鈬?AND THE RULE THAT PRODUCED ALL OF IT:** a diagnostic that is
 load-bearing must be made CHEAP, not REMOVED; and a measurement that reads a
 string out of a log must be moved onto a counter before the log is allowed to
 change.
@@ -3958,19 +3947,19 @@ two rounds of the SAME binary.**
       jnioth  median 2.0   mean 315.8             jnioth  median 8.0   mean 153.6
     fs    median   1.0 ms                        fs    median  0.0 ms
 
-**⇒ ⇒ THE PORT'S OWN BOOKKEEPING IS NO LONGER THE FRAME.**  With the log
+**鈬?鈬?THE PORT'S OWN BOOKKEEPING IS NO LONGER THE FRAME.**  With the log
 buffered and the frame loop yielding, the port's JNI dispatch is 8 ms of a
 68 ms frame and the asset resolution is 0 ms (the cache serves it).  The
 texture, string and file paths are all 0 ms -- **the 21 ms that section 9.31
 named was never in those paths.**
 
-**⇒ ⇒ AND THE REST IS THE GUEST'S RENDER CALL AND THE GL SUBMISSION PATH.**
+**鈬?鈬?AND THE REST IS THE GUEST'S RENDER CALL AND THE GL SUBMISSION PATH.**
 The guest issues about 330 draw calls a frame (the census's `draws=`), and the
 frame's remaining 60 ms over 330 calls is about 180 microseconds per call --
 which is NOT the cost of the guest's own simulation, it is the cost of a GL
 submission through the port's wrappers and the emulator's Mesa.
 
-**⇒ ⇒ SO THE 60 FPS TARGET SPLITS IN TWO, AND ONLY ONE OF THEM IS OURS:**
+**鈬?鈬?SO THE 60 FPS TARGET SPLITS IN TWO, AND ONLY ONE OF THEM IS OURS:**
 * **ON THE CONSOLE**, the same GL path goes to NVN instead of Mesa, and the
   console's CPU is much faster.  So 60 fps is plausible there, and it is the
   CONSOLE that has to measure it.
@@ -3979,7 +3968,7 @@ submission through the port's wrappers and the emulator's Mesa.
   little: **35-40 fps is the realistic Eden target, and the emulator cannot
   show the number the user asked for.**
 
-**⇒ ⇒ AND THE MEASUREMENT THE CONSOLE HAS TO MAKE:** the same census line, on
+**鈬?鈬?AND THE MEASUREMENT THE CONSOLE HAS TO MAKE:** the same census line, on
 the console, with the same race phase -- `tt` against the 16.67 ms budget,
 and `jni` against the port's share of it.  The instrument is already on the
 card; what it needs is the console's numbers.
@@ -3989,7 +3978,7 @@ card; what it needs is the console's numbers.
 **MEASURED 2026-11-10, rounds census2 (AA_LEVEL = 4) and aa0 (AA_LEVEL = 0),
 the same binary, the same card, the same guest state.**
 
-**⇒ ⇒ THE CENSUS READS THE PORT'S COUNTERS NOW.**  The port counts the
+**鈬?鈬?THE CENSUS READS THE PORT'S COUNTERS NOW.**  The port counts the
 resolution EVENTS for the main menu's layout and for the two-square panel, and
 the census line carries them (`gui=`, `twosq=`):
 
@@ -4000,14 +3989,14 @@ so the counter measures the same thing, and the measurement no longer depends
 on what the port writes.  The census script reads the counters and falls back
 to the text only for an older log.
 
-**⇒ ⇒ AND THE TRACE CAN BE THINNED FOR REAL.**  With the census off the log's
+**鈬?鈬?AND THE TRACE CAN BE THINNED FOR REAL.**  With the census off the log's
 text, the path trace is written only for the `gui/processed/` subtree and the
 rest is counted:
 
     yield2   124,464 log lines   52.9 per frame
     census2   15,755 log lines    7.3 per frame
 
-**⇒ ⇒ AND THE ANTI-ALIASING HYPOTHESIS IS REFUSED BY THE MEASUREMENT.**  The
+**鈬?鈬?AND THE ANTI-ALIASING HYPOTHESIS IS REFUSED BY THE MEASUREMENT.**  The
 card was running `AA_LEVEL = 4` (four samples per pixel), which looked like
 the obvious lever on the guest's rasterisation.  Turning it off did NOT make
 the frame faster:
@@ -4016,22 +4005,22 @@ the frame faster:
     census2          4        72.0 ms      8.0 ms      164.2 ms    43.8 ms
     aa0              0        83.0 ms      0.0 ms      221.3 ms    10.3 ms
 
-**⇒ ⇒ SO THE FRAME'S REMAINING COST IS THE GUEST'S OWN WORK** -- the Java and
+**鈬?鈬?SO THE FRAME'S REMAINING COST IS THE GUEST'S OWN WORK** -- the Java and
 C++ method bodies that run inside the JNI dispatch (`jnioth`), which the port
 cannot change -- and the emulator's GL path on top of it.  The port's own
 share is now about a millisecond a frame (`tp` 0.4 ms, `fs` 0 ms).
 
-**⇒ ⇒ ⇒ THE COMPLETE ANSWER TO "SIXTY FRAMES":**
+**鈬?鈬?鈬?THE COMPLETE ANSWER TO "SIXTY FRAMES":**
 1. **THE PORT IS OUT OF THE WAY.**  Its own work went from tens of
    milliseconds a frame (42 blocking card writes) to about one.
 2. **WHAT IS LEFT IS THE GUEST'S**, and two candidate levers were MEASURED and
    both refused: the per-call logging (already removed, and the guest
    starved without it) and the anti-aliasing level (no effect).
-3. **⇒ ⇒ SO 60 FPS IS A CONSOLE MEASUREMENT AND NOT AN EDEN ONE.**  Eden's
+3. **鈬?鈬?SO 60 FPS IS A CONSOLE MEASUREMENT AND NOT AN EDEN ONE.**  Eden's
    GL path is the emulator's, and the guest's own per-frame work runs on the
    emulator's CPU.  The instrument that can answer it is already on the card:
    the census line's `tt` against the 16.67 ms budget, and `jni` for the
-   port's share of it.  **⇒ ⇒ AND THE CONSOLE'S ANSWER IS THE NUMBER THAT
+   port's share of it.  **鈬?鈬?AND THE CONSOLE'S ANSWER IS THE NUMBER THAT
    DECIDES WHETHER THE GAME SHIPS AT 60.**
 
 ### 9.40 Three levers measured, three refused, and what that leaves
@@ -4047,7 +4036,7 @@ same guest state, 400 s each.**  The race phase's frame time (`tt` median):
     fx0        twelve guest quality knobs OFF                     70.0 ms   31.0
     view960    the guest's view 1280x720 -> 960x640 (and fx off)   77.0 ms   33.0
 
-**⇒ ⇒ THE THREE LEVERS, AND WHAT EACH ONE MEASURED:**
+**鈬?鈬?THE THREE LEVERS, AND WHAT EACH ONE MEASURED:**
 1. **THE PER-CALL LOGGING.**  Turning it off does not buy a frame rate; it
    starves the guest (four rounds that never got past the event map), because
    the card write's wait was the guest's CPU.  It was made CHEAP instead
@@ -4063,23 +4052,23 @@ same guest state, 400 s each.**  The race phase's frame time (`tt` median):
 4. **THE GUEST'S RESOLUTION.**  1280x720 -> 960x640 (half the pixels) did not
    make the frame faster either (72 -> 77 ms).  Refused.
 
-**⇒ ⇒ ⇒ SO WHAT IS LEFT IS THE GUEST'S OWN ENGINE AND THE EMULATOR'S GL
+**鈬?鈬?鈬?SO WHAT IS LEFT IS THE GUEST'S OWN ENGINE AND THE EMULATOR'S GL
 PATH, AND NEITHER IS THE PORT'S.**  The port's own share of a frame is now
-about a millisecond (`tp` 0.4 ms, `fs` 0 ms, the log buffered).  **⇒ ⇒ AND
+about a millisecond (`tp` 0.4 ms, `fs` 0 ms, the log buffered).  **鈬?鈬?AND
 THAT IS THE POINT OF THE FOUR ROUNDS: THERE IS NO HIDDEN OVERHEAD LEFT IN
 THE PORT.**  The 60-170 ms that a frame still costs in Eden is the guest's
 engine running on the emulator's CPU through the emulator's Mesa.
 
-**⇒ ⇒ ⇒ ⇒ SO 60 FPS IS A CONSOLE MEASUREMENT AND NOT AN EDEN ONE.**  The
+**鈬?鈬?鈬?鈬?SO 60 FPS IS A CONSOLE MEASUREMENT AND NOT AN EDEN ONE.**  The
 instrument that can answer it is already on the card -- the census line's `tt`
 against the 16.67 ms budget -- and the emulator's numbers are a reference,
 not a verdict.
 
-**⇒ ⇒ AND THE CARD'S SETTINGS ARE BACK WHERE THEY BELONG.**  The three
+**鈬?鈬?AND THE CARD'S SETTINGS ARE BACK WHERE THEY BELONG.**  The three
 experiments wrote to the card's `rr3-settings.txt` and `rr3-screen.txt`, and
 one of them damaged a file, so both were restored from the repository's
 shipping copies (sha256 verified) rather than by editing the damaged ones.
-**⇒ ⇒ ⇒ AND THE LESSON IS THE SAME ONE THE PROJECT KEEPS MEETING: A
+**鈬?鈬?鈬?AND THE LESSON IS THE SAME ONE THE PROJECT KEEPS MEETING: A
 MEASUREMENT THAT READS A STRING OUT OF A LOG MUST BE MOVED ONTO A COUNTER
 BEFORE THE LOG MAY CHANGE -- AND A FILE THAT IS EDITED BY SCRIPT MUST BE
 RESTORED FROM ITS SOURCE, NOT REPAIRED BY ANOTHER SCRIPT.**
@@ -4097,7 +4086,7 @@ both wrong readings came from the same mistake: reading the ESR's exception
 class out of the wrong field.  Section 9.46 is the measurement that ended
 the search.**
 
-**=> ⇒ ⇒ ⇒ ⇒ AND THE FAULT IS NOT A SPAL, AND NOT A POINTER AUTHENTICATION
+**=> 鈬?鈬?鈬?鈬?AND THE FAULT IS NOT A SPAL, AND NOT A POINTER AUTHENTICATION
 FAILURE.**  `esr=0x92000005`; the exception class is
 `(esr >> 26) & 0x3f` = **0x24 = "Data Abort from a lower Exception level"**
 (the AArch64 form).  For that class the ISS holds a 64-bit data-abort status
@@ -4112,7 +4101,7 @@ message and into this section.  The crash dump itself now decodes its own
 ESR (see the `fault_class` line in section 9.46), so the next console run
 cannot be misread this way again.
 
-**=> ⇒ ⇒ AND THE pc IS IN THE PORT'S OWN IMAGE AFTER ALL -- the first version of
+**=> 鈬?鈬?AND THE pc IS IN THE PORT'S OWN IMAGE AFTER ALL -- the first version of
 this section put it in a guest image, and that was wrong, but it was wrong
 for a reason that is now gone.**  The argument it used ("a SPAL
 needs a pointer-authentication check, and the port's code has almost none")
@@ -4133,7 +4122,7 @@ instruction right after it is the load that faulted.  **SO THE FAULT IS THE
 PORT'S OWN DIAGNOSTIC READING A GUEST ADDRESS THAT WAS NOT MAPPED YET.**
 Section 9.46 has the whole chain.
 
-**=> ⇒ ⇒ ⇒ AND THE GUEST'S CODE IS POINTER-AUTHENTICATED -- TRUE, AND NOT
+**=> 鈬?鈬?鈬?AND THE GUEST'S CODE IS POINTER-AUTHENTICATED -- TRUE, AND NOT
 THE CAUSE.**  The APK's `libc++_shared.so` carries **1328 `paciasp` and 1372
 `autiasp`** (`libRealRacing3.so`: 2; `libfmodex.so`: 0), so the guest signs
 and authenticates pointers on every function entry and exit.  That is a real
@@ -4142,7 +4131,7 @@ guest's own authentication does matter -- but **it is not what the
 2026-11-10 crash was.**  The crash was an unmapped read, before any
 authentication was involved.
 
-**=> ⇒ ⇒ AND "IT CRASHED IN THE LOADER" WAS ALSO UNSOUND.**  `appendGuestBootLine`
+**=> 鈬?鈬?AND "IT CRASHED IN THE LOADER" WAS ALSO UNSOUND.**  `appendGuestBootLine`
 opens the log in APPEND mode, so the log's last line can be the PREVIOUS
 session's tail: the loader's first line only appears once it starts
 mapping.  So "the last line is `gl-ctx-early ... disabled by conf`, and the
@@ -4156,7 +4145,7 @@ next statement is `loadLinkElfSet()`" does not place the crash.
   last is `pass=1 expected=1 checks_passed=38 checks_failed=0` -- the port's
   own stack-unwinding self-test, which PASSED.  The crash is after it.
 
-**=> ⇒ ⇒ SO BOTH SIDES GET AN INSTRUMENT, AND THE NEXT CONSOLE RUN ANSWERS
+**=> 鈬?鈬?SO BOTH SIDES GET AN INSTRUMENT, AND THE NEXT CONSOLE RUN ANSWERS
 THE QUESTION IN THE FILE THE USER ALREADY ATTACHES.**
 
 1. **THE LOADER SAYS IT ITSELF, AND ITS LINES REACH THE CARD.**
@@ -4168,7 +4157,7 @@ THE QUESTION IN THE FILE THE USER ALREADY ATTACHES.**
    the difference between "the loader broke" and "the guest is
    authenticated and the port is not".  The budget is 320 lines and the
    budget says so when it runs out.
-   **⇒ AND EVERY ONE OF THOSE LINES IS FLUSHED IMMEDIATELY.**  The log's
+   **鈬?AND EVERY ONE OF THOSE LINES IS FLUSHED IMMEDIATELY.**  The log's
    normal policy is 64 lines and a bulk flush, which is right for the frame
    loop and WRONG here: these lines are written once, at boot, and the thing
    they exist to explain is a crash -- so a crash inside the loader would
@@ -4180,7 +4169,7 @@ THE QUESTION IN THE FILE THE USER ALREADY ATTACHES.**
    the DSO and the offset, or `port-nro+0x...`, or `unmapped`.  One line
    each, written before the process goes down.
 
-**=> ⇒ ⇒ ⇒ THE NEXT CONSOLE RUN NAMES THE FAILING DSO AND SEGMENT, SAYS
+**=> 鈬?鈬?鈬?THE NEXT CONSOLE RUN NAMES THE FAILING DSO AND SEGMENT, SAYS
 WHETHER THE GUEST'S CODE IS PAC-COMPILED, AND SAYS WHOSE CODE THE FAULTING
 pc IS IN -- all in the guest-view log and the crash file the user already
 attaches.**
@@ -4211,11 +4200,11 @@ phases describes neither.
     slim1            render  1877     30       40       95        37        0         8        197/1877  10%
     slim1            loading  501    104      181      808       168        0         8         17/501    3%
 
-**=> ⇒ ⇒ `tp` -- THE PORT'S OWN COST -- IS ZERO IN EVERY ROUND AND EVERY
+**=> 鈬?鈬?`tp` -- THE PORT'S OWN COST -- IS ZERO IN EVERY ROUND AND EVERY
 PHASE.**  The port adds nothing measurable to the frame.  The frame is the
 guest's own render (`tr` = 37-40 ms) plus the emulator's own overhead.
 
-**=> ⇒ ⇒ SO THE PORT SIDE OF THE 60 FPS QUESTION IS CLOSED, AND THE REST OF
+**=> 鈬?鈬?SO THE PORT SIDE OF THE 60 FPS QUESTION IS CLOSED, AND THE REST OF
 THE QUESTION IS NOT.**  On Eden the guest renders in 37-40 ms; on a real
 Maxwell GPU it will be much cheaper, and only a console measurement says by
 how much.  **THE ONLY HONEST 60 FPS CRITERION IS THE `tt=` OF A CONSOLE
@@ -4230,12 +4219,12 @@ slim1 / yield2 / pcall1buf -- a quarter of a 400-second round -- and in the
 SAME rounds the resolution cache's counters never moved ONCE (max hit 0,
 max miss 0, over every census line with `fs > 0`).
 
-**=> ⇒ ⇒ THE CACHE IS ON THE WRONG FUNCTION.**  The 1024-entry cache is on
+**=> 鈬?鈬?THE CACHE IS ON THE WRONG FUNCTION.**  The 1024-entry cache is on
 `resolveAssetLocalFile()`, the BOOT-time list builder.  The hot path is
 `resolvePath()`, which the guest's own asset requests go through.  So the
 cache has never once answered a request.
 
-**=> ⇒ ⇒ AND UNTIL THE TIME IS SPLIT, "THE CACHE DOES NOT HELP" AND "THE
+**=> 鈬?鈬?AND UNTIL THE TIME IS SPLIT, "THE CACHE DOES NOT HELP" AND "THE
 CACHE IS IN THE WRONG FUNCTION" ARE THE SAME SENTENCE WITH OPPOSITE FIXES.**
 So the census now prints `fsr=` -- the resolution inside the service -- next
 to `fs=`, and `fs - fsr` is the I/O.  One round says which.
@@ -4256,7 +4245,7 @@ lights went 7 (chunk1..chunk3) -> 19 (fps1) -> 27 (yield2) -> **1** (slim1,
 census2, aa0, fx0, view960) -> 2 (pcall1buf, and the fresh loaderdiag1
 round).  The obvious reading is a regression in the port.
 
-**=> ⇒ ⇒ BUT `run-pinned-round.ps1` SNAPSHOTS THE GUEST'S STATE AND NEVER
+**=> 鈬?鈬?BUT `run-pinned-round.ps1` SNAPSHOTS THE GUEST'S STATE AND NEVER
 RESTORES IT.**  It takes a snapshot under the round's own name before the
 round starts, so every round begins from whatever the PREVIOUS round left
 behind.  And the guest persists: it advances to the NEXT EVENT after each
@@ -4264,7 +4253,7 @@ race, and it writes its popups into the save.  So each round inherited its
 predecessor's progress -- which is the same trap the project has already
 paid for once ("a 2x2 with one uncontrolled cell is not a 2x2").
 
-**=> ⇒ ⇒ SO THE RACE-COUNT COLLAPSE CANNOT BE ATTRIBUTED TO CODE YET.**
+**=> 鈬?鈬?SO THE RACE-COUNT COLLAPSE CANNOT BE ATTRIBUTED TO CODE YET.**
 The controlled experiment is now defined and cheap:
 `.build/guest-state.ps1 -Restore -Tag yield2` (that snapshot exists, and it
 is the state that produced 27 start lights and 36 race screens), then the
@@ -4298,11 +4287,11 @@ and the card's loose tree carries exactly that file, 522,565 bytes.  Every
 OTHER detailmap on the card is `.etc.dds.z`; this one, and only this one,
 is `.rgb.pvr.z`.
 
-**=> ⇒ ⇒ SO THE SHIPPED SPELLING AND THE PROBED SPELLINGS DISAGREE FOR THIS
+**=> 鈬?鈬?SO THE SHIPPED SPELLING AND THE PROBED SPELLINGS DISAGREE FOR THIS
 ONE LEAF, AND THE PORT ANSWERS ENOENT FOR ALL FOUR.**  The whole round
 logged **46,789 `stat-path` failures with errno=2**.
 
-**=> ⇒ ⇒ THIS IS NOT YET ATTRIBUTED, AND IT IS NOT YET FIXED.**  What is
+**=> 鈬?鈬?THIS IS NOT YET ATTRIBUTED, AND IT IS NOT YET FIXED.**  What is
 NOT the cause: the list is correct, the file is on the card, and the port
 routes the path to the right volumes.  What is open: whether the guest
 walks a format list that the port's published list is supposed to extend,
@@ -4343,7 +4332,7 @@ Hamilton 44, Alonso 14 -- with correct liveries, correct numbers and
 correct names, the race's leaderboard on the right, and the race's Chinese
 title at the bottom left.
 
-**=> ⇒ ⇒ AND THE HUD IS NOT GREY BLOCKS ON THESE SCREENS.**  The HUD text
+**=> 鈬?鈬?AND THE HUD IS NOT GREY BLOCKS ON THESE SCREENS.**  The HUD text
 renders, the leaderboard renders, the Chinese renders.  Whatever the grey
 and white blocks complaint was about, it is not about these screens -- which
 means the `LocalStyles*.gui` files are still worth copying (README 10.6),
@@ -4357,7 +4346,7 @@ game draws its Chinese correctly on screen -- but the port's log line for it
 arrives as GBK mojibake.  So the mojibake is the PORT'S log encoding, not the
 game's text, and the frames are the proof.
 
-**=> ⇒ ⇒ ⇒ SO THE HONEST ANSWER TO "HOW FAR FROM PLAYABLE" IS:**  the front
+**=> 鈬?鈬?鈬?SO THE HONEST ANSWER TO "HOW FAR FROM PLAYABLE" IS:**  the front
 end, the car showroom, the race grid, the textures and the Chinese text all
 work.  What is left is the part that has not been measured on the target:
 the console crash (section 9.41), the player's own driving, the controller
@@ -4373,7 +4362,7 @@ binding, and the console's frame time.
 meta found" (the Chinese installers phrase it as "content metadata not
 found").**
 
-**=> ⇒ ⇒ AND THE FIRST PACKAGE WAS NOT AN NSP.**  It was a PFS0 with two
+**=> 鈬?鈬?AND THE FIRST PACKAGE WAS NOT AN NSP.**  It was a PFS0 with two
 entries, `exefs/main` (the NSO) and `exefs/main.npdm` (the meta).  That is
 an EXEFS IMAGE.  **An NSP that an installer accepts carries THREE NCAs:**
 
@@ -4383,12 +4372,12 @@ an EXEFS IMAGE.  **An NSP that an installer accepts carries THREE NCAs:**
 
 and the third one is exactly what the installer says it cannot find.
 
-**=> ⇒ ⇒ ⇒ AND WHY THE FIRST PACKAGE HAD NO Meta NCA IS A FACTORY RULE, NOT
+**=> 鈬?鈬?鈬?AND WHY THE FIRST PACKAGE HAD NO Meta NCA IS A FACTORY RULE, NOT
 A BUG:** `npdmtool` can only produce the NPDM, `elf2nso` only the NSO, and
 neither of them can produce an NCA.  The tool that does is the packer, and it
 needs a keyset.
 
-**=> ⇒ ⇒ ⇒ ⇒ SO THE PACKAGE NOW GOES THROUGH TWO STAGES, BOTH OF THEM
+**=> 鈬?鈬?鈬?鈬?SO THE PACKAGE NOW GOES THROUGH TWO STAGES, BOTH OF THEM
 ALREADY ON THIS MACHINE.**
 
 *Stage 1 -- the official Nintendo SDK 18.3.1 (E:\AI\Nintendo SDK
@@ -4408,19 +4397,19 @@ meta's digest: `08f4edbaa1ee42b3c310469e6f5ad633b6fb8fb02dbdd3e84f07dcb3855c319c
 
     hacbrewpack --keyset <the user's own keyset> --keygeneration 1 ...
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ AND THE FORK'S ONE-LINE FIX IS EXACTLY THIS BUG.**  The
+**=> 鈬?鈬?鈬?鈬?鈬?AND THE FORK'S ONE-LINE FIX IS EXACTLY THIS BUG.**  The
 fork's `cnmt.c` computes the content meta's digest over the CNMT BODY -- the
 header, the extended header and the content records -- so the last 32 bytes
 are SHA256 of the first 160.  Upstream hashes only part of it, the digest
 does not match what the installer recomputes, and the installer reports the
-content metadata as missing.  **⇒ ⇒ ⇒ ⇒ ⇒ ⇒ THE ERROR THE USER HIT WAS THE
+content metadata as missing.  **鈬?鈬?鈬?鈬?鈬?鈬?THE ERROR THE USER HIT WAS THE
 DIGEST, NOT THE MISSING FILE.**
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE PACKAGE IS CHECKED, NOT ASSUMED.**  The packing
+**=> 鈬?鈬?鈬?鈬?鈬?鈬?AND THE PACKAGE IS CHECKED, NOT ASSUMED.**  The packing
 script reads the container back and refuses to report success unless it holds
 exactly three entries and one of them is a `.cnmt.nca`.
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ WHAT IS AND IS NOT IN IT: the executable, its meta and the
+**=> 鈬?鈬?鈬?鈬?鈬?鈬?WHAT IS AND IS NOT IN IT: the executable, its meta and the
 control.  NOT the game's data -- the seven volumes and the .depot tree,
 about 11.8 GiB -- which has never been in the executable and is still copied
 onto the card separately.**
@@ -4444,12 +4433,12 @@ level 1".  WITH WnR = 0, THE FAULTING ACCESS WAS A READ.**  This subsection
 used to say the class was SPAL.  It is not: SPAL is EC 0x0C.  Section 9.41
 has the full correction and section 9.46 has the fault.
 
-**=> ⇒ ⇒ ⇒ ⇒ AND `pc = lr + 4` IS NOT A POINTER-AUTHENTICATION SIGNATURE,
+**=> 鈬?鈬?鈬?鈬?AND `pc = lr + 4` IS NOT A POINTER-AUTHENTICATION SIGNATURE,
 IT IS A CALL'S RETURN ADDRESS.**  With the correct build attributed (section
 9.46), `lr` is the return address of the call to `guestImageContains()` and
 `pc` is the load that follows it.
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ AND `fault_tpidr_el0` IS A RED HERRING FOR THIS CRASH.**
+**=> 鈬?鈬?鈬?鈬?鈬?AND `fault_tpidr_el0` IS A RED HERRING FOR THIS CRASH.**
 It is 1,200 bytes above the stack pointer, inside the stack frame, and the
 port's `GuestTlsScope` does point TPIDR_EL0 at a stack block -- but that is
 beside the point: **the fault was an unmapped read, and no pointer
@@ -4461,7 +4450,7 @@ fake TCB would break the guest's own TLS layout (`GuestTlsScope` exists
 because Bionic puts the stack canary at +0x28), so that "small fix" would
 have traded one crash for a different one.
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE FAULT'S OWN ADDRESS SAYS WHAT WAS WRONG.**
+**=> 鈬?鈬?鈬?鈬?鈬?鈬?鈬?AND THE FAULT'S OWN ADDRESS SAYS WHAT WAS WRONG.**
 `far - bias = 0x1F6D5D0`, which is the port's own constant
 `kAssetSingletonElfVa` -- a guest virtual address -- and `bias` was
 `0x59a29c1000`, a RESERVED CodeMemory address, not a mapped one.  **=> THE
@@ -4486,18 +4475,17 @@ binary as `loaderdiag1` for the same 400 seconds.
     loaderdiag1    inherited        B (9543C130) 168    2       2   88   13385
     ctl1           RESTORED yield2  B (9543C130) 167    2       2   88   13385
 
-**=> ⇒ ⇒ AND THE STATE IS NOT THE VARIABLE.**  ctl1 put the SAME binary
+**=> 鈬?鈬?AND THE STATE IS NOT THE VARIABLE.**  ctl1 put the SAME binary
 back on the state that produced 27, and it came back at 2/2 -- the same
 numbers as the round that inherited a drifted save.  **=> THE COLLAPSE IS
 NOT THE SAVE.**
 
-**=> ⇒ ⇒ ⇒ SO IT IS THE OTHER HALF OF THE A/B: the binary, or the logging
+**=> 鈬?鈬?鈬?SO IT IS THE OTHER HALF OF THE A/B: the binary, or the logging
 switch that moved with it** (`loaderdiag1` and `ctl1` ran with `percall=1`,
-13,385 guest-scanf lines; `yield2` ran with `percall=0`, zero).  **=> ⇒ ⇒ ⇒ ⇒
-AND THE PATH TRACE COLLAPSED IN THE SAME WINDOW** -- from 108,419 lines
+13,385 guest-scanf lines; `yield2` ran with `percall=0`, zero).  **=> 鈬?鈬?鈬?鈬?AND THE PATH TRACE COLLAPSED IN THE SAME WINDOW** -- from 108,419 lines
 (105,150 of them asset paths) to 80 -- when `logResolvedPathOnce()` was
 thinned to `gui/processed/` only, and section 9.33 already recorded that the
-port's own front-end navigation reads that trace.  **⇒ THE NEXT EXPERIMENT WAS
+port's own front-end navigation reads that trace.  **鈬?THE NEXT EXPERIMENT WAS
 ONE VARIABLE: the same binary with the trace restored.**  **=> AND THAT
 EXPERIMENT WAS THE WRONG QUESTION, AND SECTION 9.47 SHOWS WHY: THE NUMBER
 WAS COUNTING THE PORT'S OWN LOG LINES, SO RESTORING THE TRACE WOULD HAVE
@@ -4511,7 +4499,7 @@ RESTORED THE COUNT WITHOUT CHANGING WHAT WAS COUNTED.**
     NSP       5,411,032 bytes   (the artifact that installs)
     gap     -48,345,369 bytes   (-47.6 MB of the NRO)
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE GAP WAS NOT PACKAGING OVERHEAD.  IT WAS A
+**=> 鈬?鈬?鈬?鈬?鈬?鈬?AND THE GAP WAS NOT PACKAGING OVERHEAD.  IT WAS A
 MISSING SECTION.**  The packing script called the packer with `--noromfs`, so
 the Program NCA carried only the ExeFS.  **MEASURED: the tree that was left
 out is 44,948,780 bytes over 35 files**, and it is not decoration:
@@ -4524,16 +4512,16 @@ out is 44,948,780 bytes over 35 files**, and it is not decoration:
     romfs/libc++_shared.so                1,014,704
     ... 29 more files
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE PORT CANNOT START WITHOUT IT.**
+**=> 鈬?鈬?鈬?鈬?鈬?鈬?鈬?AND THE PORT CANNOT START WITHOUT IT.**
 `main.cpp` opens `"romfs:/libc++_shared.so"` with NO card fallback
 (main.cpp:887), and `multi_dso_linker.cpp`'s `loadImage()` opens the path it
-is given with a plain `fopen`.  **=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ SO THE PACKAGE
+is given with a plain `fopen`.  **=> 鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?SO THE PACKAGE
 COULD NOT EVEN LOAD THE GUEST.**  The card also carries copies of the
 guest's libraries and the faces (measured on the Eden card:
 `libRealRacing3.so`, `libfmodex.so`, `libNimble.so`, `ui/`, `original/`),
 but `libc++_shared.so` is NOT among them -- it lives in the RomFS only.
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ THE FIX IS ONE FLAG.**  The packer already knew
+**=> 鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?THE FIX IS ONE FLAG.**  The packer already knew
 how: `--romfsdir` puts the tree in the Program NCA's SECOND section, wrapped
 in IVFC and encrypted, next to the ExeFS in section 0.  `npdm.c` does not
 touch it -- the section is described by the NCA's own fs header, not by the
@@ -4541,7 +4529,7 @@ NPDM -- and the NPDM the SDK generates has no romfs descriptor at all
 (measured: the staged `main.npdm` is 1,604 bytes and contains exactly one
 `META` magic, at offset 0).
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE RESULT, MEASURED ON THE PACKAGE THAT
+**=> 鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?AND THE RESULT, MEASURED ON THE PACKAGE THAT
 WAS ABOUT TO BE PUBLISHED** (tools/verify-nsp-romfs.py decrypts the artifact
 itself: AES-256-XTS over the header with Nintendo's own tweak, AES-128-ECB
 over the key area, AES-128-CTR over the sections, then IVFC level 5):
@@ -4555,14 +4543,14 @@ over the key area, AES-128-CTR over the sections, then IVFC level 5):
     romfs image        44,951,852   IVFC levels=7
     in the NSP             35 files  44,948,780 bytes  IDENTICAL to the reference
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE COMPARISON IS AGAINST THE TREE
+**=> 鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?AND THE COMPARISON IS AGAINST THE TREE
 AND AGAINST THE NRO's OWN IMAGE**, not against a number typed by hand:
 `native-switch/romfs/` (35 files) and `native-switch/rr3.romfs` (the image
 the NRO embeds) are both parsed with the same reader and must match the
 package file for file and byte for byte.  **=> A PACKAGE THAT IS THE RIGHT
 SIZE BUT THE WRONG TREE STILL FAILS.**
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE PORT NOW COVERS THE LOADER'S
+**=> 鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?AND THE PORT NOW COVERS THE LOADER'S
 BEHAVIOUR TOO.**  libnx's `romfsMountSelf()` documents the two launch paths:
 an NRO mounts the image embedded in the NRO, and **an NSO behaves like
 `romfsMountFromCurrentProcess`**, which is the process's DATA storage.
@@ -4573,15 +4561,15 @@ RUNS `romfsInit()` FIRST AND, ONLY IF THAT FAILS, MOUNTS THE CARD'S COPY OF
 THE SAME IMAGE** (`romfsMountFromFsdev("sdmc:/switch/rr3-native-rehost/
 rr3.romfs", 0, "romfs")`).  The NRO path is bit-for-bit unchanged.
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE PORT SAYS WHICH ROMFS IT
+**=> 鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?AND THE PORT SAYS WHICH ROMFS IT
 GOT**, in the guest-view log (`romfs-src`, ordinal 315: `source=embedded` /
 `source=card` / `source=none`) and in the boot line (`RomFS=........ (card)`).
-**=> ⇒ THAT LINE IS THE FIRST THING TO READ WHEN AN INSTALLED NSP DOES NOT
+**=> 鈬?THAT LINE IS THE FIRST THING TO READ WHEN AN INSTALLED NSP DOES NOT
 START.**  A debug flag, `debug-force-card-romfs.flag` on the card, skips the
 embedded mount so the card path can be exercised on the emulator without an
 NSP install -- the same shape as the other `debug-*.flag` files.
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ NOT PROVEN YET: the NSP's OWN
+**=> 鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?NOT PROVEN YET: the NSP's OWN
 launch on hardware.**  What is proven here is that the package carries the
 whole tree, that the port can reach the same tree from the card when the
 loader does not surface the NCA's section, and that the NRO path is
@@ -4597,32 +4585,32 @@ with the SAME settings (`-Seconds 400 -CensusOff`), and the only difference
 was `debug-force-card-romfs.flag` on the card: the port skipped
 `romfsInit()` and mounted the card's `rr3.romfs` instead.
 
-**=> ⇒ ⇒ ⇒ ⇒ AND THE PORT SAID WHICH ONE IT GOT, IN THE LOG:**
+**=> 鈬?鈬?鈬?鈬?AND THE PORT SAID WHICH ONE IT GOT, IN THE LOG:**
 
     phase=romfs-src ordinal=315 target=0000000000000002 source=card forced=1
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ AND THE ROUND CAME OUT THE SAME AS THE EMBEDDED ONE:**
+**=> 鈬?鈬?鈬?鈬?鈬?AND THE ROUND CAME OUT THE SAME AS THE EMBEDDED ONE:**
 
     round        romfs          lights  race  frames  pixels lit
     ctl1         embedded           2     2      --          --
     romfscard1   card (forced)      2     2    2040   921549/921600
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ THE CARD-MOUNTED IMAGE IS THE TREE, NOT A SUBSTITUTE FOR
+**=> 鈬?鈬?鈬?鈬?鈬?鈬?鈬?THE CARD-MOUNTED IMAGE IS THE TREE, NOT A SUBSTITUTE FOR
 IT.**  The guest's own libraries loaded from it, and the captured frame shows
 the guest's own Simplified-Chinese daily-reward dialog, drawn with the face
 that lives in the RomFS:
 
 ```
-您的每日奖励
-收集
+鎮ㄧ殑姣忔棩濂栧姳
+鏀堕泦
 ```
 
 `md5 mismatch` was 0, `TrackDesc::load failures` was 0, and the
 start-lights and race counts are IDENTICAL to the embedded round (2 and 2).
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ SO THE TREE THAT COMES OFF THE CARD IS THE
+**=> 鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?SO THE TREE THAT COMES OFF THE CARD IS THE
 TREE THAT WAS EMBEDDED -- which is what the NSP now carries.**
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THIS IS THE MEASUREMENT THAT SETTLES
+**=> 鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?AND THIS IS THE MEASUREMENT THAT SETTLES
 THE NSP'S SELF-SUFFICIENCY WITHOUT GUESSING.**  If the loader surfaces the
 Program NCA's RomFS partition as the process's data storage, the port uses
 the NSP's own copy (`romfs-src target=1 source=embedded`).  If it does not,
@@ -4634,7 +4622,7 @@ WORK, AND THE PACKAGE CARRIES THE TREE EITHER WAY.**
 **MEASURED 2026-11-10 (the console), and re-measured 2026-11-16 by
 reproducing the exact build the console ran.**
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE FIRST THING THAT WAS WRONG WAS THE
+**=> 鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?AND THE FIRST THING THAT WAS WRONG WAS THE
 EXCEPTION CLASS ITSELF.**  `esr=0x92000005`.  ARMv8-A puts the exception
 class in ESR[31:26]:
 
@@ -4649,7 +4637,7 @@ THE READING THAT WAS WRITTEN INTO THE CODE, INTO A COMMIT MESSAGE AND INTO
 THE DOCS.**  It was also the reading that sent a whole investigation after
 TPIDR_EL0 and PAC keys.  Sections 9.41 and 9.44.2 now say so.
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE pc IS THE PORT'S OWN CODE, AND THE
+**=> 鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?AND THE pc IS THE PORT'S OWN CODE, AND THE
 PROOF IS AN ADDR2LINE AGAINST THE EXACT BINARY.**  The crash dump format
 proves the console ran the tree of commit `a5ba9487` (the dump has no
 `pc_attribution=` field, and that field arrived in `e06c2a35` on 2026-11-11).
@@ -4661,12 +4649,12 @@ That commit was rebuilt:
                         native-switch/source/pthread_bridge.cpp:5881
     lr  static 0x836f0 -> native-switch/source/pthread_bridge.cpp:5872
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND `lr = pc - 4` IS THE SMOKING GUN, IN
+**=> 鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?AND `lr = pc - 4` IS THE SMOKING GUN, IN
 THE GOOD SENSE.**  Line 5872 is the guard that CALLS `guestImageContains()`,
 and the instruction right after the call is the load that faulted.  The crash
 is the port's own diagnostic, in the port's own code, reading a guest address.
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE FAULTING ADDRESS IS A GUEST
+**=> 鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?AND THE FAULTING ADDRESS IS A GUEST
 VIRTUAL ADDRESS.**  `far = 0x59a492e5d0`, `x25 = 0x59a29c1000`, and
 
     far - x25 = 0x1F6D5D0
@@ -4684,7 +4672,7 @@ exactly, so x27 was the base register of the faulting load.  The code:
     const uintptr_t obj =
         *reinterpret_cast<const volatile uintptr_t*>(slot);   // 5881: faulted
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE ROOT CAUSE IS A HALF-OPEN
+**=> 鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?AND THE ROOT CAUSE IS A HALF-OPEN
 GATE.**  `guestImageContains()` (`multi_dso_linker.cpp`) answers "is this guest
 virtual address inside the guest image?" by folding the runtime address back
 to a guest vaddr and testing it against the ELF's PT_LOAD table.  **=> IT
@@ -4698,21 +4686,21 @@ The mapping is made later, in `mapProcessCodeImages()`, and THAT is what sets
 and `:1454`).  Between the two, `reserveSegmentedTargets()` has already set
 `image.executableLinkBase = targetBase` -- a RESERVED CodeMemory address with
 no backing -- so `loadBias()` is non-zero and points at memory that does not
-exist.  **=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ THERE IS A WINDOW IN
+exist.  **=> 鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?THERE IS A WINDOW IN
 WHICH THE PORT PUBLISHES A USABLE-LOOKING GUEST BIAS AND HAS NOT MAPPED THE
 IMAGE YET, AND EVERY READER OF A GUEST ADDRESS IN THAT WINDOW FAULTS.**
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THAT WINDOW IS WIDE
+**=> 鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?AND THAT WINDOW IS WIDE
 ENOUGH TO CATCH THE REAPER.**  The detached-thread reaper starts during boot
 and ticks every second; the console's dry load of the 32 MiB image is slow,
 so the reaper's first tick lands right in the middle of the loader's work.
 **=> THE 2026-11-03 CRASH WAS THE OTHER HALF OF THE SAME BUG**: there
 `biasNow == 0`, so the slot was the raw ELF VA `0x1f6d5d0`, unmapped on
 hardware, and Eden happened to map it.  That half was fixed with the
-`biasNow == 0` check.  **=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ THIS
+`biasNow == 0` check.  **=> 鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?THIS
 HALF -- THE BIAS IS SET BUT THE IMAGE IS NOT MAPPED -- WAS NOT.**
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND `guestImageContains()` IS
+**=> 鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?AND `guestImageContains()` IS
 THE ONE GATE EVERY GUEST READ GOES THROUGH, WHICH IS WHY ONE FIX IS ENOUGH:**
 
     native-switch/source/pthread_bridge.cpp:5872   (the crash site)
@@ -4721,14 +4709,14 @@ THE ONE GATE EVERY GUEST READ GOES THROUGH, WHICH IS WHY ONE FIX IS ENOUGH:**
     native-switch/source/race_state_probe.cpp:305,318,347
     native-switch/source/guest_action.cpp:230
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE SAME WINDOW ALSO
+**=> 鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?AND THE SAME WINDOW ALSO
 POISONED OTHER THINGS.**  `guest_teardown_repair.cpp` LATCHES the bias on its
 first read; a pre-mapping bias latched there would have been wrong for the
 rest of the run.  `ui_control_probe.cpp` computes `bias + kGuestTextEndVa` and
 compares against it.  All of them get the same fail-closed answer once the
 bias is gated on the mapping.
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE FIX IS ONE PREDICATE,
+**=> 鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?AND THE FIX IS ONE PREDICATE,
 MADE HONEST.**
 
     guestImageContains()          -> false unless the image is MAPPED
@@ -4738,7 +4726,7 @@ Both now say "the bytes are there", not "the address is in the ELF".  The
 loader itself is unaffected: it uses `image.loadBias()` directly, never
 `resolveMainImageLoadBias()`.
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE NEXT CONSOLE DUMP
+**=> 鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?AND THE NEXT CONSOLE DUMP
 SAYS SO ITSELF.**  The crash file now carries:
 
 | field | what it answers |
@@ -4748,7 +4736,7 @@ SAYS SO ITSELF.**  The crash file now carries:
 | `main_image_mapped` | 1 or 0 -- was the guest image mapped when it faulted?  **A 0 here is the whole bug in one field.** |
 | `pc_attribution` / `lr_attribution` | the pc and lr, already there since 2026-11-11 |
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND THE JIT PROBE WAS NOT
+**=> 鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?AND THE JIT PROBE WAS NOT
 THE CRASH, DESPITE LOOKING LIKE IT.**  The image-sized JIT probe
 (`captureImageSizedJitProbe`, 34,377,728 bytes) SUCCEEDED on that console:
 the log carries `step=image-jit-probe-done bytes=34377728 create=00000000
@@ -4760,7 +4748,7 @@ flushed one by one, so the absence of a loader line means the crash came
 BEFORE the loader's first one.  That is what put the crash between the probe
 and the loader, and it is where it turned out to be.
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ AND WHAT IS STILL OPEN.**
+**=> 鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?AND WHAT IS STILL OPEN.**
 The guest's `libc++_shared.so` really does run 1328 `paciasp` + 1372
 `autiasp`, and the port's `GuestTlsScope` really does point TPIDR_EL0 at a
 stack block; if a real SPAL ever shows up in a dump (EC 0x0C), THAT is where
@@ -4769,8 +4757,7 @@ fix.  The 27-to-2 start-lights collapse was NOT a game regression -- section
 9.47 shows the census was counting the port's own log lines -- and the 211
 compiler warnings are still open and untouched by this.
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒
-**AND THE ANTIGRAVITY CLI REVIEW OF THE FIX FOUND THREE REAL DEFECTS IN IT.**
+**=> 鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?**AND THE ANTIGRAVITY CLI REVIEW OF THE FIX FOUND THREE REAL DEFECTS IN IT.**
 The change was reviewed adversarially by the Antigravity CLI
 (`gemini-3.8-flash-high`) against a written brief, and three of its findings
 were right:
@@ -4792,8 +4779,7 @@ were right:
 3. **THE SEGMENTED MAPPING PATH WAS REPORTED AS MAPPED AFTER ITS FIRST
    RANGE.**  It now requires every range.
 
-**=> ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒ ⇒
-**AND ONE OF THE REVIEW'S OWN FINDINGS WAS WRONG, WHICH IS ALSO WORTH
+**=> 鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?鈬?**AND ONE OF THE REVIEW'S OWN FINDINGS WAS WRONG, WHICH IS ALSO WORTH
 RECORDING.**  It said the instruction-abort exception classes were 0x20 and
 0x21 and that 0x13 / 0x16 / 0x17 / 0x18 were something else.  It is the
 other way round: **0x13 is "Instruction Abort from a lower Exception level"**
@@ -5686,3 +5672,208 @@ produces the 6.5 MiB NRO variant; **neither carries the game data**.
 numbers above came from the release that was downloaded back and checked
 file by file; the sentence they contradicted came from an intention.
 **THE INTENTION WAS NEVER THE MEASUREMENT.**
+### 9.58 The port is silent because FOUR links are broken, and the guest's own audio callback is one of them
+
+**THIS IS THE AUDIO CHAIN, END TO END, AS MEASURED.**  The guest's audio
+reaches the hardware through five hops, and the port breaks four of them:
+
+    game -> FMOD API (intercepted)      OK      the 52 symbols are answered
+         -> the file is decoded          BROKEN  the shim keeps the NAME and
+                                               never opens the file
+         -> the voices are mixed         BROKEN  update() has no mixer
+         -> the guest's DSP read cb      BROKEN  the description was thrown
+                                               away, so the callback is
+                                               never found, let alone called
+         -> AudioTrack.write             BROKEN  the stub drops the bytes and
+                                               returns 0
+         -> the OpenSL device            OK      but it never receives anything
+
+**THE MEASURED FACTS BEHIND EACH HOP.**
+
+1. **THE AUDIO IS MP3.**  The game's own files are on the card as
+   `.depot/audio/music/*.mp3` (the engine sounds are the decompressed
+   `.depot` files).  The guest hands FMOD a PATH: the shim's createSound
+   stores `name` and opens nothing.
+2. **THE GUEST'S DSP IS THE MIX OUTPUT, AND IT IS NOT "decklink".**  The
+   only createDSP call site in the game is 0xc05cd4, and the description it
+   builds is named "decklink" -- which is FMOD's Blackmagic capture plugin
+   name, reused here as the game's output unit.  Its `read` callback
+   (description offset 0x40, the game's function at 0xc059dc) is the real
+   audio callback: it copies the MIXED float samples out of `inbuffer`,
+   converts them to int16 (x32767) into its own ring buffer at
+   userdata+0x10, and every 1921 samples calls the game's own callback
+   (userdata+0x1E10) to push them at the OS.
+3. **SO THE PORT'S MIXER HAS AN ADDRESSEE: THE GUEST.**  The guest's read
+   callback expects the mixer to hand it float samples; it does not decode
+   anything itself.  **=> THE PORT MUST DECODE THE MP3 AND MIX IT, AND THEN
+   CALL THE GUEST'S OWN CALLBACK WITH THE RESULT.**  That is why the
+   port's shim can produce sound WITHOUT re-implementing the game's audio
+   layer: the game's own layer is right there, behind one callback.
+4. **THE AUDIOTRACK STUB DROPS THE BYTES.**  `audio_write` returns 0 and
+   discards the array.  Even with a perfect mixer, the guest's samples would
+   end there.  The device already has the counters that would show it
+   (`pcm_enq` / `pcm_bytes` in the census), so the fix is to forward.
+
+**AND THE ABI WAS WRONG, WHICH IS WHY LINK 3 COULD NOT BE FIXED YET.**  The
+port's `FMOD_DSP_DESCRIPTION` was `pluginsdk_version` plus a `const char*
+name` -- a different FMOD generation's layout.  The guest's libfmodex.so is
+FMOD Ex 4.x, and the guest fills the struct itself:
+
+    offset  field           the guest's evidence
+    0x00    name[32]        strncpy(desc, "decklink", 32)  @0xc05c6c
+    0x20    version         8-byte store                   @0xc05ccc
+    0x24    channels        8-byte store                   @0xc05ccc
+    0x28    create          stp x9, x10                    @0xc05c8c
+    0x30    release         stp x9, x10                    @0xc05c8c
+    0x38    reset           str x8                         @0xc05cb0
+    0x40    read            stp x9, xzr                    @0xc05ca8
+    0x48    setposition     stp x9, xzr                    @0xc05ca8
+    0x50    numparameters   str wzr                        @0xc05cac
+    0x58    paramdesc       str q0                         @0xc05c84
+    0x60    setparameter    str q0                         @0xc05c84
+    0x68    getparameter    str q0                         @0xc05c88
+    0x70    config          str q0                         @0xc05c88
+    0x78    configwidth     stp xzr, x8                    @0xc05cd0
+    0x7C    configheight    stp xzr, x8                    @0xc05cd0
+    0x80    userdata        stp xzr, x8                    @0xc05cd0
+
+136 bytes, the name INLINE.  The real libfmodex.so agrees: it copies the
+description out of exactly these offsets into a 136-byte internal struct
+(0x4f3e0-0x4f44c) and strcpy's the name out of offset 0 (0xb1128).
+
+**=> WITH THE OLD DEFINITION THE PORT COULD NOT EVEN READ THE GUEST'S
+DESCRIPTION, LET ALONE CALL THE CALLBACK IN IT.**  The struct is now
+correct, the description is kept, and getUserData answers with the
+description's userdata (which is how the guest's read callback finds its
+own state).
+
+**THE NEXT TWO STEPS ARE THEREFORE SPECIFIED, NOT GUESSED:**
+
+1. **THE DECODER.**  The port needs an MP3 decoder for the game's files
+   (a single-header decoder is the obvious shape).  The shim's createSound
+   already has the path; it has to open it and decode it.
+2. **THE MIXER.**  update() has to mix the playing voices into a float
+   buffer of the software format (48000 Hz, PCM16, 2 channels, 1024
+   samples) and call the guest's read callback with it.  The device's new
+   host-side door (`fmodAudioStubEnqueuePcmInterleaved`) takes the same
+   bytes the guest's own push would deliver, so the census's `pcm_enq` /
+   `pcm_bytes` become the acceptance signal: **they go above zero when
+   sound is actually flowing.**
+
+### 9.59 THE PORT'S FMOD CONSTANTS WERE A GENERATION OFF, AND THE OPENSTATE GATE WAS CLOSED
+
+**MEASURED 2026-11-17 (Eden, the `abi-fix1` round).**
+
+#### 9.59.1 The R1 lever is the regression, and the previous root cause was wrong
+
+The previous round concluded that "FMOD_System_Create returns NULL".  That was
+**refuted by measurement**: the pass-through observer installed on
+`FMOD_System_Create` was never entered, so **the guest never calls it**.  The
+guest's only 51 other FMOD imports bound to the guest's own libfmodex.so
+(`fmod-bind: lever=real state=2 cross=51 host=1 missing=0`), and the guest
+then hung.
+
+The A/B that separates "the lever" from "the guest state" is now closed:
+
+| round | NRO | lever | main menu | census frames | sounds/stream/channels |
+|---|---|---|---|---|---|
+| `p1base` | D9FBC5236846 | shim | 15 | (reached the frame loop) | 200/1/625 |
+| `p1real` | **D9FBC5236846 (same)** | **real** | 0 | 0 | 0/0/0 |
+| `levershim-current` | 0D9ED17433C2 | shim | 15 | 1720 | 117/1/30 |
+| `fmodreal-obs` | 0D9ED17433C2 | **real** | 0 | 0 | 0/0/0 |
+
+`p1base` and `p1real` ran **the same binary**; only the lever and the guest
+state differed, and the same binary with the shim lever reaches the menu.  So
+**`fmod=real` is what breaks the guest**, not the state.
+
+#### 9.59.2 What actually entered libfmodex
+
+libfmodex.so has **two** init_array entries and the port calls them from the
+rebase path (`phase=rebase: img=2 ... init0=<base>+0x215fc ctors=2
+ctor0ok=1`).  `0x215fc` constructs a global, System-shaped object whose
+first word is the vtable at file vaddr `0x135850` (`.data.rel.ro`, no RTTI
+in this build) and whose sub-object at `+0x38` carries `1.0f / 44100.0f /
+128` and `{1.0f, 10000.0f, 360.0f, 360.0f}` - a mixer/output description.
+**The crash is that object being CONSTRUCTED AT VIRTUAL ADDRESS 0**, with its
+memory-pool pointer (`+0x50`) left NULL, followed by the endless
+`Read64@0x8` / `Read32@0x1C0` alternation (516,305 each).
+
+**The rebase path is NOT the differentiator**: the shim round has the same
+`init0`, the same `ctors=2` and the same `ctor0ok=1`.  So the difference
+is the **symbol binding**, not the constructor.
+
+#### 9.59.3 The guest's FMOD is NOT modern FMOD 5, and the port was written against modern FMOD 5
+
+The oracle is the guest's own binary.  Every constant below is proven by a
+guest instruction:
+
+| what | the guest | the port had | consequence |
+|---|---|---|---|
+| `FMOD_OPENSTATE_READY` | **0** (`0xc0568c cbz w8, 0xc056d4` takes the branch that calls playSound) | **3** | **the guest never took the play branch => NOT ONE SOUND WAS EVER PLAYED** |
+| `FMOD_SPEAKERMODE_STEREO` | **2** (`0xc05d6c mov w1,#2` with 2 output channels) | 3 | stereo recorded as mono |
+| `FMOD_DSP_TYPE` | 5,6,7,8,10,11,18 = HIGHPASS,ECHO,FLANGE,DISTORTION,LIMITER,PARAMEQ,SFXREVERB (`0xc06a20`..`0xc06bb8`) | 5 of the 7 wrong (the port's list had an extra FADER at 7) | the wrong DSP unit |
+| `FMOD_CREATESOUNDEXINFO` | **216 bytes**, numchannels +0x0c, defaultfrequency +0x10, format +0x14, decodebufferlength +0x18, PCM callback +0x38 (`0xc075dc`) | 16 bytes, decodebufferlength at +0x0c | the port read the WRONG FIELDS, silently |
+| `getLength` type | **1 and 2** (`0xc07d48`, `0xc08730`, `0xc08aa0`) | 0 only | the guest always got length 0 |
+| `getPosition` type | **1** (`0xc07d38`, `0xc08ac8`) | 0 only | the guest always got position 0 |
+| software format | the guest **asserts rate == 48000 AND format == 2** (`0xc090f4 mov w10,#0xbb80`, `0xc09100 ccmp w8,#2`) and returns 25 otherwise | the port copied the guest's REQUEST into the state | a request the port cannot honour published a format the guest then rejects |
+
+**The port's own self-test compared the shim against the PORT'S OWN constants**,
+so it reported `fmst=0xfff` - every check passed - while the guest heard
+nothing.  That is the "the instrument answers the ledger, not the reality"
+shape, in a new place.
+
+#### 9.59.4 The fix, and what the round measured
+
+The enums are re-based to the guest's generation, the exinfo struct is the
+guest's 216-byte layout (with a `static_assert` on the size), the length and
+position types are the guest's, and the software format is the DEVICE's
+(48000 / PCM16 / 2ch) instead of whatever the guest asked for.
+
+The measurement is now in the census, where a round reads it:
+
+```
+osq=2 osr=2 rrate=24000
+```
+
+* `osq=2` - the guest asked the shim about a sound's state twice.
+* `osr=2` - **both were answered READY (0)**, so both took the play branch.
+  **The old build had no such counter, so "0 back then" is DERIVED, not
+  read**: the guest's branch is taken only for 0 (`0xc0568c`) and the old
+  shim answered 3, so the gate could not have been passed.  The measured
+  fact is the 2.
+* `rrate=24000` - **the guest asks the mixer for 24000 Hz**, and the guest's
+  own check demands 48000.  The old code took the request; the new code keeps
+  the device's format.  This was a second, independent silent killer, and it
+  is now measured instead of assumed.
+
+Contract: `native-switch/tests/test_fmod_guest_abi_contract.py` (reads the
+code with comments and strings masked, computes the struct offsets itself,
+and pins the numbers the guest proves).  Mutation matrix:
+`.build/mutation-test-fmod-guest-abi.py`, **8 of 8 mutants caught**.
+
+#### 9.59.5 What is still missing, stated exactly
+
+The gate is open and the guest starts sounds (`ch` went 30 -> 32, `str`
+1 -> 2).  **But the port still delivers `pcm_enq=0 pcm_bytes=0`**, because:
+
+1. the shim has **no mixer** and produces no PCM, and
+2. the port has **no audio output backend at all** - there is no `audout`,
+   no `audren`, no `nn::audio` anywhere in `native-switch/`.
+
+The libnx 4.12.0 ground truth for the missing backend is now taken:
+`audoutInitialize()` / `audoutOpenAudioOut(nameIn, nameOut, rateIn, chIn,
+&rateOut, &chOut, &format, &state)` / `audoutStartAudioOut()` /
+`audoutAppendAudioOutBuffer()` / `audoutGetReleasedAudioOutBuffer()` /
+`audoutGetAudioOutPlayedSampleCount()`, with `audoutGetSampleRate()` =
+48000, `audoutGetChannelCount()` = 2, `audoutGetPcmFormat()` = Int16.
+The sample buffer must be **0x1000-aligned**; there are **no buffer tags**, so
+released buffers must be matched by pointer identity; `audren` in this
+libnx is the old raw node-graph API, so **audout is the right primitive**;
+and Eden's binary does implement the audout service (`IAudioOut`,
+`OpenAudioOut`, `AcquireAudioOutBufferAvailableEvent`), although whether it
+produces AUDIBLE output is unverified.
+
+**The two remaining links are therefore specified, not guessed:**
+the **mixer** (which the guest's `pcmreadcallback` at exinfo+0x38 and the
+`OPENUSER` mode 0x490 path feed) and the **audout sink**.  Until both exist,
+the honest release statement stays: **the port plays no sound yet.**
