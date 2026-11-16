@@ -68,6 +68,12 @@ MUTANTS = [
         "    self->requestedRate = samplerate;\n    self->softwareRate = samplerate;",
     ),
     (
+        "I-the-openstate-loses-the-librarys-seventh-member",
+        HPP,
+        r"    FMOD_OPENSTATE_UNINITIALIZED = 5,\n    FMOD_OPENSTATE_MAX = 6,",
+        "    FMOD_OPENSTATE_UNINITIALIZED = 5,",
+    ),
+    (
         "H-the-census-loses-the-gate-counter",
         PROBE,
         r"osq=%llu osr=%llu ",

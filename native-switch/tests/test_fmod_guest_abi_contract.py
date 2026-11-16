@@ -243,6 +243,18 @@ else:
     for name, value in openstate.items():
         if name != "FMOD_OPENSTATE_READY" and value == 0:
             fail(f"{name} must not be 0: 0 is the guest's READY value")
+    # THE SHAPE: the guest proves READY == 0, and the guest's own
+    # libfmodex.so proves its public openstate has SEVEN values (it
+    # compares an openstate against 6, and its public value is the raw
+    # internal field value with no mapping table).  Seven distinct values
+    # 0..6 with READY at the front is the only shape that satisfies both.
+    if sorted(openstate.values()) != [0, 1, 2, 3, 4, 5, 6]:
+        fail(
+            "FMOD_OPENSTATE must have the seven distinct values 0..6 with "
+            "READY at 0 (the guest proves READY == 0; the library's public "
+            "openstate has a member valued 6); the port has "
+            f"{sorted(openstate.values())}"
+        )
 
 create_sound = body_of(cpp, "FMOD_RESULT fmodSystemCreateSound")
 if create_sound is None:

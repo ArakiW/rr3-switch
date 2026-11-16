@@ -53,14 +53,31 @@ enum FMOD_RESULT {
 // while the guest heard nothing -- the instrument was answering the ledger,
 // not the reality.
 //
-// Only READY = 0 is proven by the guest.  Everything else is "not ready" and
-// only has to be NON-ZERO; the guest's own fail-safe default is 2 (it
-// pre-writes 2 into the out-param at 0xc05660), so 2 is a safe "not ready".
+// THE SHAPE, FROM TWO INDEPENDENT PROOFS.
+//
+// 1. READY == 0 is proven by the GUEST: 0xc0568c takes the play branch only
+//    for 0 (see above).
+// 2. THE LIBRARY'S PUBLIC openstate HAS SEVEN VALUES, 0..6: the guest's own
+//    libfmodex.so (FMODEx/4.44.65) compares an openstate against 6 at a
+//    call site, and its public value is the RAW internal field value with
+//    NO mapping table -- so 6 is a member of the public enum.
+//
+// => The only shape that satisfies both is seven members with READY at the
+//    front.  FMOD's relative order of the other five has never changed, so
+//    the assignment below is DERIVED, not invented.
+//
+// WHAT THE GUEST ACTUALLY DISTINGUISHES: only 0 against everything else.
+// The port only ever REPORTS READY, so the other six numbers are never
+// exchanged with the guest -- and the port's shim and the guest's own
+// library are never mixed (the FMOD lever is all-or-nothing).
 enum FMOD_OPENSTATE {
     FMOD_OPENSTATE_READY = 0,
     FMOD_OPENSTATE_LOADING = 1,
-    FMOD_OPENSTATE_ERROR = 2,
-    FMOD_OPENSTATE_UNINITIALIZED = 3,
+    FMOD_OPENSTATE_LOADING_CONNECTED = 2,
+    FMOD_OPENSTATE_LOADING_BUFFERING = 3,
+    FMOD_OPENSTATE_ERROR = 4,
+    FMOD_OPENSTATE_UNINITIALIZED = 5,
+    FMOD_OPENSTATE_MAX = 6,
 };
 
 enum FMOD_CHANNEL_CALLBACKTYPE {
