@@ -823,8 +823,9 @@ int main(int argc, char** argv) {
                 rr3::statBionicModeForLog() == 0 ? "7f" : "ff",
                 rr3::statBionicModeForLog());
     const uint64_t fmodAudioSelfTest = rr3::fmodAudioStubSelfTest();
-    bootPrintf("FMOD audio stub selftest=%02llx expected=3f silent device, no audible claim\n",
-                static_cast<unsigned long long>(fmodAudioSelfTest));
+    bootPrintf("FMOD audio stub selftest=%02llx expected=%02llx silent device, no audible claim\n",
+                static_cast<unsigned long long>(fmodAudioSelfTest),
+                static_cast<unsigned long long>(rr3::fmodAudioStubSelfTestExpected()));
     // Guest frame reader: proves the assembly stub in guest_frame_probe_stub.s
     // captures the CALLER's x29 and not its own. expected=1. It runs on the
     // boot thread before any guest thread exists, so a failure here means the

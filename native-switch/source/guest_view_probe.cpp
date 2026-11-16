@@ -1,6 +1,7 @@
 #include "rr3/jni_bridge.hpp"
 #include "rr3/guest_filesystem.hpp"
 #include "rr3/fmod_shim.hpp"
+#include "rr3/fmod_audio_stub.hpp"
 
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
@@ -9075,9 +9076,10 @@ void* frameLoopDriver(void* opaque) {
                 }
                 // THE FMOD SHIM'S STATE, read once per census line.
                 const rr3::FmodShimStats fmodStats = rr3::fmodShimStats();
+                const rr3::FmodAudioStubStats audioStats = rr3::fmodAudioStubStats();
                 std::snprintf(
                     cdiag, sizeof(cdiag),
-                    "frame=%llu lights=%llu race=%llu fmst=0x%llx snd=%llu str=%llu ch=%llu census bound=%d viewport=%d,%d,%d,%d"
+                    "frame=%llu lights=%llu race=%llu fmst=0x%llx snd=%llu str=%llu ch=%llu ast=0x%llx arate=%u ach=%u census bound=%d viewport=%d,%d,%d,%d"
                     " scene=fbo=%u size=%ux%u binds=%u changes=%u vpChanges=%u"
                     " draws=%u arr=%u"
                     " tt=%llu tr=%llu ts=%llu tp=%llu"
@@ -9104,6 +9106,14 @@ void* frameLoopDriver(void* opaque) {
                     static_cast<unsigned long long>(fmodStats.soundCreates),
                     static_cast<unsigned long long>(fmodStats.streamCreates),
                     static_cast<unsigned long long>(fmodStats.channelsStarted),
+                    // THE AUDIO DEVICE'S OWN SELF-TEST.  It used to live in a
+                    // boot log line ("FMOD audio stub selftest=...") that
+                    // nobody read, which is how a device with no volume
+                    // interface and two missing IIDs survived for the whole
+                    // life of the port.  The number is in the census now.
+                    static_cast<unsigned long long>(audioStats.selfTestBits),
+                    static_cast<unsigned int>(audioStats.deviceSampleRate),
+                    static_cast<unsigned int>(audioStats.deviceChannels),
                     static_cast<int>(g_hdBoundAfterRender),
                     static_cast<int>(g_hdViewportAfterRender[0]),
                     static_cast<int>(g_hdViewportAfterRender[1]),

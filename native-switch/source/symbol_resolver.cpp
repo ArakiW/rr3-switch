@@ -55,6 +55,9 @@ extern const void* SL_IID_ENGINE;
 extern const void* SL_IID_PLAY;
 extern const void* SL_IID_BUFFERQUEUE;
 extern const void* SL_IID_ANDROIDSIMPLEBUFFERQUEUE;
+extern const void* SL_IID_VOLUME;
+extern const void* SL_IID_ANDROIDCONFIGURATION;
+extern const void* SL_IID_RECORD;
 }
 
 namespace rr3 {
@@ -1791,6 +1794,11 @@ const HostSymbol kHostSymbols[] = {
     RR3_SHIM("SL_IID_PLAY", SL_IID_PLAY),
     RR3_SHIM("SL_IID_BUFFERQUEUE", SL_IID_BUFFERQUEUE),
     RR3_SHIM("SL_IID_ANDROIDSIMPLEBUFFERQUEUE", SL_IID_ANDROIDSIMPLEBUFFERQUEUE),
+    // THE IIDS THE GUEST'S OWN FMOD LOOKS UP AND THE PORT DID NOT HAVE.
+    // MEASURED 2026-11-16 from the strings inside libfmodex.so.
+    RR3_SHIM("SL_IID_VOLUME", SL_IID_VOLUME),
+    RR3_SHIM("SL_IID_ANDROIDCONFIGURATION", SL_IID_ANDROIDCONFIGURATION),
+    RR3_SHIM("SL_IID_RECORD", SL_IID_RECORD),
     // FMOD Ex object model. The guest imports 52 FMOD symbols (51 Itanium-
     // mangled members plus FMOD_System_Create); every one is implemented in
     // source/fmod_shim.cpp with real, non-null objects whose DSP node lists are

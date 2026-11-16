@@ -21,6 +21,12 @@ struct FmodAudioStubStats {
     uint32_t playRequested{};
     // Always 0. There is no Horizon Android audio device behind this stub.
     uint32_t audible{};
+    // The device's own format: what it would produce if it produced
+    // anything.  It matches what the guest's FMOD asks the port for.
+    uint32_t deviceSampleRate{};
+    uint32_t deviceChannels{};
+    // The device's self-test bits, kept so a reader can see them later.
+    uint32_t selfTestBits{};
 };
 
 FmodAudioStubStats fmodAudioStubStats();
@@ -32,7 +38,17 @@ FmodAudioStubStats fmodAudioStubStats();
 //  bit3 Enqueue discards without blocking and without claiming audible output
 //  bit4 AAudio stream create returns a clear unavailable error
 //  bit5 Virtual OpenSL / AAudio dlopen handles resolve entry points
+//  bit6 the volume interface answers, and the device reports a LIVE level
+//  bit7 the Android configuration interface reports the device's format
+//  bit8 the virtual libOpenSLES.so exports every symbol the guest's real
+//       FMOD looks up (MEASURED from the strings inside libfmodex.so)
+//  bit9 an IID the object does not have is an EXPLICIT failure
+//
+// THE EXPECTED MASK IS A FUNCTION, NOT A LITERAL: the boot log prints it
+// next to the value, so a new check cannot leave the printed expectation
+// behind.
 uint64_t fmodAudioStubSelfTest();
+uint64_t fmodAudioStubSelfTestExpected();
 
 // OpenSL ES C entry (silent device). Returns SL_RESULT_SUCCESS with a
 // discard-only engine. Buffers are consumed immediately so mixer threads

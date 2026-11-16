@@ -761,6 +761,12 @@ $summary = [ordered]@{
     msFmodSounds        = 0   # sounds the guest asked the port for
     msFmodStreams       = 0   # streams the guest asked the port for
     msFmodChannels      = 0   # channels the guest started
+    # THE AUDIO DEVICE'S SELF-TEST.  ast is the device's own bits (want
+    # 0x3ff: every check the device makes about itself) and arate/ach are
+    # the format it would produce.  It was a boot log line nobody read.
+    msAudioSelfTest     = '000'
+    msAudioRate         = 0
+    msAudioChannels     = 0
     msRaceHud           = 0   # "Reload HUD planes" (the race HUD was built)
     msRaceObjective     = 0   # the race-only objective text
     msAstFilesOnCard    = 0   # *.ast on the card: the physical proof the .ast round trip works
@@ -1033,6 +1039,19 @@ if ($guestLogArchived -eq 'archived') {
             $summary.msFmodChannels = [int]$fmodCh[$fmodCh.Count - 1].Groups[1].Value
         }
     }
+    # THE AUDIO DEVICE'S SELF-TEST, read out of the census line.
+    $audioBits = [regex]::Matches($censusText, ' ast=0x([0-9a-fA-F]+)')
+    $audioRate = [regex]::Matches($censusText, ' arate=(\d+)')
+    $audioCh = [regex]::Matches($censusText, ' ach=(\d+)')
+    if ($audioBits.Count -gt 0) {
+        $summary.msAudioSelfTest = $audioBits[$audioBits.Count - 1].Groups[1].Value
+        if ($audioRate.Count -gt 0) {
+            $summary.msAudioRate = [int]$audioRate[$audioRate.Count - 1].Groups[1].Value
+        }
+        if ($audioCh.Count -gt 0) {
+            $summary.msAudioChannels = [int]$audioCh[$audioCh.Count - 1].Groups[1].Value
+        }
+    }
     $summary.msRaceHud     = [regex]::Matches($guestText, 'Reload HUD planes').Count
     # The race-only objective text is CHINESE, so it is written as \u escapes:
     # PowerShell 5.1 reads a BOM-less file as ANSI, and a literal Chinese
@@ -1161,6 +1180,8 @@ $runSummaryPath = Join-Path $archive 'run-summary.txt'
     ('  race markers in the log  {0} start lights / {1} race screen (the text count; it measures the path trace, not the game)' -f $summary.msStartLightsText, $summary.msRaceScreenText)
     ('  FMOD shim self-test     0x{0}   (want 0xfff: every check the shim makes about itself)' -f $summary.msFmodSelfTest)
     ('  FMOD sounds/streams/ch  {0}/{1}/{2}   (the guest asked the port for this many sounds, streams and channels)' -f $summary.msFmodSounds, $summary.msFmodStreams, $summary.msFmodChannels)
+    ('  audio device self-test  0x{0}   (want 0x3ff: every check the OpenSL device makes about itself)' -f $summary.msAudioSelfTest)
+    ('  audio device format     {0} Hz / {1} ch   (what the device would produce)' -f $summary.msAudioRate, $summary.msAudioChannels)
     ('  race marker: HUD string  {0}   ("Reload HUD planes" -- the guest RENDERS this debug string during a race; it is a race marker, NOT evidence that the HUD was built)' -f $summary.msRaceHud)
     ('  race marker: objective   {0}   (the localised objective string in the guest log; a race marker, and a cross-check that the text pipeline works)' -f $summary.msRaceObjective)
     ''

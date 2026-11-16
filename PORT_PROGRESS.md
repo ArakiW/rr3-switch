@@ -14383,3 +14383,40 @@ the shim's safety net (real objects, self-linked sentinels) goes with it.
 `bufferEnqueues`/`pcmBytes` going from 0 to >0, which is provable on
 Eden -- with P2 (the port consumes) and P3 (the hardware plays) after it.
 Full reasoning: docs/OPEN-ISSUES.md section 9.49.
+
+### 2026-11-16 The OpenSL device, completed: it is now the device the guest's FMOD asks for
+
+**THE ORACLE IS THE GUEST'S OWN LIBRARY.**  The strings inside
+`libfmodex.so` name exactly what it looks up for an audio backend:
+`slCreateEngine` plus five `SL_IID_*` symbols, and **no AAudio symbol at
+all**.  The port's virtual `libOpenSLES.so` exported four of the five IIDs
+-- **`SL_IID_ANDROIDCONFIGURATION` (the one that carries the device's
+sample rate and channel count) and `SL_IID_RECORD` were missing**.
+
+**AND THE SHAPE OF THE ANSWERS WAS WORSE THAN THE MISSING NAMES.**  There
+was **no volume interface**; an unknown IID got the **buffer queue's
+vtable** (so a `GetInterface(SL_IID_VOLUME)` read a garbage level -- and a
+mixer that reads zero virtualises its voices away: the guest's own log says
+`FMOD_ZERO_VOLUME_VIRTUALISATION`); and the engine answered every unknown
+IID with itself.  **=> AN INTERFACE QUERY MUST ANSWER WITH THE RIGHT
+INTERFACE OR WITH AN EXPLICIT FAILURE, NEVER WITH SOMETHING ELSE.**
+
+**NOW.**  The device has the volume interface (live level by default), the
+Android configuration interface (48000 Hz / 2 ch), the two missing exports, and
+two IID-driven `GetInterface` paths that fail explicitly.  Its self-test
+grew from six checks to ten with a **derived** expectation (the boot log
+used to print a hardcoded "expected=3f"), and the bits are in the census as
+`ast=0x%llx` so nobody has to go looking in a log.
+
+**MEASURED** (round `rr3-opensldev1`): **audio device self-test 0x3ff** (want 0x3ff),
+format 48000 Hz / 2 ch.  The contract test reads the guest's own lookup list
+out of the binary and requires the port to answer every name in it, so a
+guest that starts asking for something new fails the gate instead of the
+runtime; it is mutation-tested (six ways of breaking the property, all six
+caught).
+
+**WHAT IS STILL OPEN.**  The device is ready; the interception is not.  The
+52 FMOD interceptions come out together or not at all, and the decisive
+measurement is P1: does the guest's real FMOD enqueue PCM into this device?
+Only after that does the audren output question arise.  Full reasoning:
+docs/OPEN-ISSUES.md section 9.50.

@@ -1,0 +1,58 @@
+THE OPENSL DEVICE IS NOW THE DEVICE THE GUEST'S FMOD ASKS FOR
+
+The guest's real audio library was measured, and the port's OpenSL device
+did not match it.
+
+THE ORACLE IS THE GUEST'S OWN LIBRARY.  The strings inside libfmodex.so
+name exactly what it looks up when it needs an audio backend:
+
+    slCreateEngine
+    SL_IID_ENGINE  SL_IID_PLAY  SL_IID_ANDROIDSIMPLEBUFFERQUEUE
+    SL_IID_ANDROIDCONFIGURATION  SL_IID_RECORD
+
+No AAudio symbol at all.  And the port's virtual libOpenSLES.so exported
+FOUR of the five IIDs: SL_IID_ANDROIDCONFIGURATION and SL_IID_RECORD were
+missing.  The first one is the important one -- it carries the device's
+sample rate and channel count, so a backend that cannot hand it over
+cannot be told what to produce.
+
+THE SHAPE OF THE ANSWERS WAS WORSE THAN THE MISSING NAMES.
+
+  * there was NO volume interface, and a mixer reads the device's volume
+    to decide whether the device is live;
+  * an unknown IID got the BUFFER QUEUE's vtable, so a
+    GetInterface(SL_IID_VOLUME) read a garbage level out of it -- and a
+    mixer that reads zero virtualises its voices away, which is what
+    "FMOD_ZERO_VOLUME_VIRTUALISATION" in the guest's own log looks like;
+  * the engine answered every unknown IID with itself.
+
+THE RULE ALL THREE BREAK: AN INTERFACE QUERY MUST ANSWER WITH THE RIGHT
+INTERFACE OR WITH AN EXPLICIT FAILURE, NEVER WITH SOMETHING ELSE.  A stub
+that returns "something" instead of "nothing" is worse than one that
+fails, because the caller cannot tell.
+
+WHAT WAS DONE.  The device now has the volume interface (level in
+millibels and volume as a float, reporting a LIVE level by default), the
+Android configuration interface (48000 Hz, 2 channels, 1024-byte buffers --
+what the guest's FMOD asks the port for), the two missing IID exports, and
+two GetInterface paths that are IID-driven and fail explicitly on
+anything they do not have.
+
+AND THE DEVICE'S SELF-TEST GREW FROM SIX CHECKS TO TEN, WITH A DERIVED
+EXPECTATION.  The boot log used to print a hardcoded "expected=3f"; the
+expectation is a function now, and the bits are in the census as ast=0x%llx
+next to the device's format -- because a self-test that lives in a log line
+nobody reads is not a self-test.
+
+The contract test reads the guest's own lookup list out of the binary and
+requires the port to answer every name in it, so a guest that starts
+asking for something new fails the gate instead of the runtime.  It is
+mutation-tested: six ways of breaking the property, all six caught.
+
+WHAT IS STILL OPEN.  The device is ready; the interception is not.  The
+52 FMOD interceptions come out together or not at all, and the decisive
+measurement is P1: does the guest's real FMOD enqueue PCM into this
+device?  Only after that does the audren output question arise, because
+the PCM has to exist before it can be played.
+
+docs/OPEN-ISSUES.md section 9.50 has the whole chain.
