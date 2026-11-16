@@ -767,6 +767,17 @@ $summary = [ordered]@{
     msAudioSelfTest     = '000'
     msAudioRate         = 0
     msAudioChannels     = 0
+    # THE P1 NUMBERS: what the guest enqueued into the audio device, and the
+    # format it asked for.  fmrt says WHICH FMOD is in use: 0 = the port's
+    # shim (every released build), 1 = the guest's own libfmodex.so.
+    msPcmEnqueues       = 0
+    msPcmBytes          = 0
+    msPcmFormat         = '(none)'
+    msFmodReal          = 'none'
+    # WHETHER THE CENSUS RAN AT ALL.  Without it there is no measurement,
+    # and a measurement that did not happen must not print as a zero.
+    msCensusSeen        = $false
+    msCensusLines       = 0
     msRaceHud           = 0   # "Reload HUD planes" (the race HUD was built)
     msRaceObjective     = 0   # the race-only objective text
     msAstFilesOnCard    = 0   # *.ast on the card: the physical proof the .ast round trip works
@@ -1052,6 +1063,21 @@ if ($guestLogArchived -eq 'archived') {
             $summary.msAudioChannels = [int]$audioCh[$audioCh.Count - 1].Groups[1].Value
         }
     }
+    $pcmEnq = [regex]::Matches($censusText, ' pcm_enq=(\d+)')
+    $pcmBytes = [regex]::Matches($censusText, ' pcm_bytes=(\d+)')
+    $pcmFormat = [regex]::Matches($censusText, ' fmt=(\d+)/(\d+)/(\d+)')
+    $fmodReal = [regex]::Matches($censusText, ' fmrt=(\d+)')
+    $summary.msCensusLines = $censusLines.Count
+    if ($censusLines.Count -gt 0) {
+        $summary.msCensusSeen = $true
+    }
+    if ($pcmEnq.Count -gt 0) {
+        $summary.msPcmEnqueues = [int]$pcmEnq[$pcmEnq.Count - 1].Groups[1].Value
+        $summary.msPcmBytes = [int]$pcmBytes[$pcmBytes.Count - 1].Groups[1].Value
+        $last = $pcmFormat[$pcmFormat.Count - 1]
+        $summary.msPcmFormat = '{0} Hz / {1} ch / {2} bit' -f $last.Groups[1].Value, $last.Groups[2].Value, $last.Groups[3].Value
+        $summary.msFmodReal = [int]$fmodReal[$fmodReal.Count - 1].Groups[1].Value
+    }
     $summary.msRaceHud     = [regex]::Matches($guestText, 'Reload HUD planes').Count
     # The race-only objective text is CHINESE, so it is written as \u escapes:
     # PowerShell 5.1 reads a BOM-less file as ANSI, and a literal Chinese
@@ -1182,6 +1208,10 @@ $runSummaryPath = Join-Path $archive 'run-summary.txt'
     ('  FMOD sounds/streams/ch  {0}/{1}/{2}   (the guest asked the port for this many sounds, streams and channels)' -f $summary.msFmodSounds, $summary.msFmodStreams, $summary.msFmodChannels)
     ('  audio device self-test  0x{0}   (want 0x3ff: every check the OpenSL device makes about itself)' -f $summary.msAudioSelfTest)
     ('  audio device format     {0} Hz / {1} ch   (what the device would produce)' -f $summary.msAudioRate, $summary.msAudioChannels)
+    ('  census lines             {0}   (the port own census; 0 means the guest never reached the frame loop, so there is NO measurement)' -f $summary.msCensusLines)
+    ('  PCM enqueued            {0}   (what the guest handed the audio device)' -f $(if ($summary.msCensusSeen) { '{0} enqueues / {1} bytes' -f $summary.msPcmEnqueues, $summary.msPcmBytes } else { 'NOT MEASURED (no census line)' }))
+    ('  PCM format asked         {0}   (the guest own SLDataFormat)' -f $(if ($summary.msCensusSeen) { $summary.msPcmFormat } else { 'NOT MEASURED (no census line)' }))
+    ('  FMOD in use              {0}   (0 = the port own shim, 1 = the guest own libfmodex.so)' -f $(if ($summary.msCensusSeen) { $summary.msFmodReal } else { 'NOT MEASURED (no census line)' }))
     ('  race marker: HUD string  {0}   ("Reload HUD planes" -- the guest RENDERS this debug string during a race; it is a race marker, NOT evidence that the HUD was built)' -f $summary.msRaceHud)
     ('  race marker: objective   {0}   (the localised objective string in the guest log; a race marker, and a cross-check that the text pipeline works)' -f $summary.msRaceObjective)
     ''

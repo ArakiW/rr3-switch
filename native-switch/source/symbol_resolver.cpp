@@ -2008,6 +2008,55 @@ const HostSymbol kHostSymbols[] = {
 
 } // namespace
 
+// THE FMOD LEVER.
+//
+// "fmod=real" in sdmc:/switch/rr3-census.conf makes the port STOP
+// answering the guest's FMOD symbols, so the guest's own libfmodex.so
+// provides them -- which is R1, the one experiment that decides whether
+// the guest can produce sound at all.
+//
+// THE DEFAULT IS THE PORT'S SHIM.  That is what every released build does,
+// and this file's default must not change: the port's shim is what makes
+// the guest's audio code paths work at all today.  The switch only turns
+// the experiment on, and it turns it on for ALL of the guest's FMOD
+// symbols at once -- a partial withholding would recreate the
+// mixed-layout failure the shim exists to end.
+//
+// THE FILE IS READ ONCE, AND ONLY IF IT CAN BE READ: the first symbol
+// resolution happens during the guest's relocation, which is early enough
+// for the card to be there, but a missing file must not be cached as
+// "the shim" forever.
+bool guestFmodUsesRealLibrary() {
+    static int cached = 0; // 0 = not read yet, 1 = the port's shim, 2 = real
+    if (cached == 0) {
+        std::FILE* file = std::fopen("sdmc:/switch/rr3-census.conf", "r");
+        if (file == nullptr) {
+            return false;
+        }
+        char line[128];
+        bool real = false;
+        while (std::fgets(line, sizeof(line), file) != nullptr) {
+            if (std::strstr(line, "fmod=real") != nullptr) {
+                real = true;
+                break;
+            }
+        }
+        std::fclose(file);
+        cached = real ? 2 : 1;
+    }
+    return cached == 2;
+}
+
+// IS THIS ONE OF THE GUEST'S FMOD SYMBOLS?  The port's table holds them
+// under their mangled names (_ZN4FMOD...) plus FMOD_System_Create.
+bool isGuestFmodSymbol(const char* name) {
+    if (name == nullptr) {
+        return false;
+    }
+    return std::strncmp(name, "_ZN4FMOD", 8) == 0 ||
+        std::strncmp(name, "FMOD_", 5) == 0;
+}
+
 uintptr_t resolveHostSymbol(const char* name) {
     if (name == nullptr) {
         return 0;
@@ -2018,6 +2067,13 @@ uintptr_t resolveHostSymbol(const char* name) {
     censusArm();
     for (const HostSymbol& symbol : kHostSymbols) {
         if (std::strcmp(symbol.name, name) == 0) {
+            // THE LEVER, AT THE ONE PLACE THE INTERCEPTION HAPPENS.  With
+            // "fmod=real" on the card the port answers nothing for the
+            // guest's FMOD symbols, and the guest's own libfmodex.so
+            // provides them.
+            if (isGuestFmodSymbol(symbol.name) && guestFmodUsesRealLibrary()) {
+                return 0;
+            }
             return symbol.address;
         }
     }

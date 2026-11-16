@@ -19,7 +19,12 @@
 # Usage: powershell -File .build\deploy-census-conf.ps1 [-Off]
 
 param(
-    [switch]$Off
+    [switch]$Off,
+    # THE FMOD LEVER.  With it, the port stops answering the guest's FMOD
+    # symbols and the guest's own libfmodex.so provides them -- the R1
+    # experiment, as a file on the card.  THE DEFAULT IS OFF, so a released
+    # build behaves exactly as it did before.
+    [switch]$FmodReal
 )
 
 $ErrorActionPreference = 'Stop'
@@ -31,6 +36,9 @@ if ($Off) {
 }
 else {
     $text = "census=on`n"
+}
+if ($FmodReal) {
+    $text += "fmod=real`n"
 }
 
 [System.IO.File]::WriteAllText($card, $text, (New-Object System.Text.UTF8Encoding($false)))

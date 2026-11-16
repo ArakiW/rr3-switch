@@ -27,6 +27,16 @@ struct FmodAudioStubStats {
     uint32_t deviceChannels{};
     // The device's self-test bits, kept so a reader can see them later.
     uint32_t selfTestBits{};
+    // THE PCM THE GUEST ENQUEUED.  This is the P1 measurement: does the
+    // guest's own FMOD produce sound for this device to carry?  The
+    // device's self-test bytes are excluded.
+    uint32_t pcmEnqueues{};
+    uint32_t pcmBytes{};
+    uint32_t pcmFrames{};
+    // THE FORMAT THE GUEST ASKED FOR, read out of its SLDataFormat.
+    uint32_t formatRate{};
+    uint32_t formatChannels{};
+    uint32_t formatBits{};
 };
 
 FmodAudioStubStats fmodAudioStubStats();

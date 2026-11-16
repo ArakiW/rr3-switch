@@ -1,0 +1,68 @@
+THE P1 ANSWER IS NO, AND IT IS NOW AN A/B WITH A FILE ON THE CARD
+
+P1 is the question "does the guest produce PCM for the audio device".  It
+is the first of the three layers (P1 the guest produces, P2 the port
+consumes, P3 the hardware plays), and it decides whether R1 is worth doing
+at all.
+
+THE LEVER.  The FMOD interceptions are applied by NAME LOOKUP during the
+guest's relocation, so a runtime switch can withhold them: "fmod=real" in
+sdmc:/switch/rr3-census.conf makes the port stop answering the guest's
+FMOD symbols, and the guest's own libfmodex.so provides them instead.
+
+THE DEFAULT IS THE PORT'S SHIM -- what every released build does -- so the
+two rounds differ in exactly one thing and the experiment needs no rebuild.
+The lever withholds ALL of the guest's FMOD symbols at once, because a
+partial withholding recreates the mixed-layout failure the shim exists to
+end.  A round can turn it on with -FmodReal.
+
+THE INSTRUMENT.  The device counts what the guest enqueues (pcm_enq,
+pcm_bytes) and reads the format the guest asked for out of its SLDataFormat
+(fmt), and the round's summary prints them next to fmrt, which says WHICH
+FMOD was in use.  The device's own self-test bytes are excluded, so the
+number is the guest's.
+
+MEASURED, SAME BUILD (identical nro sha256), SAME SAVE, ONE VARIABLE.
+
+  cell A, the port's shim: the round ran to the end -- frames 13080, guest
+    log 60,605,298 B / 242,201 lines, start lights 6 / race 9, md5 mismatch
+    0 -- and PCM enqueued 0 enqueues / 0 bytes, because the guest's audio
+    path IS the port's API model.
+
+  cell B, the guest's own libfmodex.so: THE GUEST STOPPED AT ABOUT 18
+    SECONDS.  Frames 0, no census line at all, guest log 511,410 B / 3,132
+    lines, and Eden's own log spans 18.1 s instead of 405.7 s.
+
+WHERE IT STOPPED, TO THE WORD -- the port's reaper, 385 times:
+
+  phase=reaper-asset-singleton ... asset=2109232e98/0/NULL-FIRST-WORD
+      eng=210921e688 f8=0 vt=0 table=0 t0=00000000 t1=00000000
+
+THE GUEST'S FMOD ENGINE OBJECT IS ALL ZEROS: no vtable, no DSP list head.
+The guest spun on it.  That is exactly what the shim's header describes,
+so the shim was the fix for this and not paranoia.
+
+P1 IS ZERO IN BOTH CELLS FOR DIFFERENT REASONS: in cell A there is no PCM
+to count, in cell B the guest never got far enough to ask.  The answer is
+not "the guest cannot produce PCM"; it is "the guest's own FMOD does not
+come up in the port's environment".
+
+AND THE INSTRUMENT HAD THE SAME DEFECT AS THE THING IT MEASURES.  With no
+census line, the summary printed "PCM enqueued 0 enqueues / 0 bytes" and
+"FMOD in use 0", because those fields default to zero: A MISSING
+MEASUREMENT READ AS A MEASURED ZERO.  The summary now prints the census
+line count and says NOT MEASURED when the census never ran.
+
+THE NEXT QUESTION IS NOW SPECIFIC: not "can R1 work" but "why does the real
+FMOD_System_Create return an object with no vtable and no list head" --
+its constructors, its allocator, its own thread, or a JNI call it makes
+during create.  That is a read-only reverse-engineering question.
+
+The contract test covers the instrument and the lever, and it is
+mutation-tested: six ways of breaking the property, all six caught.  Two of
+the mutants were things the first version of the test did NOT catch -- one
+that made the device's self-test bytes count as the guest's, and one that
+turned the lever permanently on -- so the test now asserts the default is
+OFF by reading the lever's body.
+
+docs/OPEN-ISSUES.md section 9.51 has both rounds side by side.

@@ -2,6 +2,7 @@
 #include "rr3/guest_filesystem.hpp"
 #include "rr3/fmod_shim.hpp"
 #include "rr3/fmod_audio_stub.hpp"
+#include "rr3/symbol_resolver.hpp"
 
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
@@ -9079,7 +9080,7 @@ void* frameLoopDriver(void* opaque) {
                 const rr3::FmodAudioStubStats audioStats = rr3::fmodAudioStubStats();
                 std::snprintf(
                     cdiag, sizeof(cdiag),
-                    "frame=%llu lights=%llu race=%llu fmst=0x%llx snd=%llu str=%llu ch=%llu ast=0x%llx arate=%u ach=%u census bound=%d viewport=%d,%d,%d,%d"
+                    "frame=%llu lights=%llu race=%llu fmst=0x%llx snd=%llu str=%llu ch=%llu ast=0x%llx arate=%u ach=%u pcm_enq=%u pcm_bytes=%u fmt=%u/%u/%u fmrt=%u census bound=%d viewport=%d,%d,%d,%d"
                     " scene=fbo=%u size=%ux%u binds=%u changes=%u vpChanges=%u"
                     " draws=%u arr=%u"
                     " tt=%llu tr=%llu ts=%llu tp=%llu"
@@ -9114,6 +9115,18 @@ void* frameLoopDriver(void* opaque) {
                     static_cast<unsigned long long>(audioStats.selfTestBits),
                     static_cast<unsigned int>(audioStats.deviceSampleRate),
                     static_cast<unsigned int>(audioStats.deviceChannels),
+                    // THE P1 NUMBERS: what the guest enqueued into the audio
+                    // device, and the format it asked for.  With the FMOD
+                    // lever on (fmrt=1) this is the guest's OWN FMOD's
+                    // output -- the answer to "can the guest make sound".
+                    static_cast<unsigned int>(audioStats.pcmEnqueues),
+                    static_cast<unsigned int>(audioStats.pcmBytes),
+                    static_cast<unsigned int>(audioStats.formatRate),
+                    static_cast<unsigned int>(audioStats.formatChannels),
+                    static_cast<unsigned int>(audioStats.formatBits),
+                    // AND WHICH FMOD IS IN USE: 0 = the port's shim (every
+                    // released build), 1 = the guest's own libfmodex.so.
+                    static_cast<unsigned int>(rr3::guestFmodUsesRealLibrary() ? 1 : 0),
                     static_cast<int>(g_hdBoundAfterRender),
                     static_cast<int>(g_hdViewportAfterRender[0]),
                     static_cast<int>(g_hdViewportAfterRender[1]),

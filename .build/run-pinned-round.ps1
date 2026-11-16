@@ -16,6 +16,9 @@ param(
     [string]$Tag = 'q145-pinned',
     [int]$Seconds = 400,
     [switch]$CensusOff,
+    # THE FMOD LEVER (R1): the guest's own libfmodex.so provides the FMOD
+    # API instead of the port's shim.  See .build/deploy-census-conf.ps1.
+    [switch]$FmodReal,
     # The NRO that must actually RUN, when it is not the current build.
     #
     # WHY THIS EXISTS.  MEASURED 2026-11-09: an A/B that deployed an OLD NRO
@@ -45,10 +48,10 @@ Assert-EdenIdle
 
 Write-Host '=== census conf ==='
 if ($CensusOff) {
-    & (Join-Path $root '.build\deploy-census-conf.ps1') -Off
+    & (Join-Path $root '.build\deploy-census-conf.ps1') -Off -FmodReal:$FmodReal
 }
 else {
-    & (Join-Path $root '.build\deploy-census-conf.ps1')
+    & (Join-Path $root '.build\deploy-census-conf.ps1') -FmodReal:$FmodReal
 }
 
 # THE GUEST'S STATE IS KEPT PER ROUND.

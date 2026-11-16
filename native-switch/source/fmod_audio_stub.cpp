@@ -76,6 +76,10 @@ FmodAudioStubStats gStats{};
 // which is exactly where nobody looks.  The census asks for them every
 // frame, so they have to live here.
 uint64_t gSelfTestBits = 0;
+
+// TRUE WHILE THE DEVICE'S OWN SELF-TEST RUNS, so the self-test's bytes do
+// not count as the guest's.
+bool gInSelfTest = false;
 uint32_t gPlayState = 1; // SL_PLAYSTATE_STOPPED
 
 // THE DEVICE'S OWN STATE.  The volume defaults to a LIVE level: a backend
@@ -95,6 +99,19 @@ constexpr int32_t kDeviceChannelCount = 2;
 constexpr int32_t kDeviceBufferSize = 1024;
 constexpr int32_t kDeviceOutputChannelCount = 2;
 constexpr int32_t kDevicePerformanceMode = 0;
+
+// SLDataFormat_PCM: WHAT THE GUEST ASKS THE DEVICE TO PRODUCE.  It is the
+// first argument of CreateAudioPlayer's engineInfo, and it is how a backend
+// learns the format -- so it is also how the port learns what to expect.
+struct SlDataFormatPcm {
+    uint32_t formatType;   // SL_DATAFORMAT_PCM
+    uint32_t numChannels;
+    uint32_t sampleRate;
+    uint32_t bitsPerSample;
+    uint32_t containerSize;
+    uint32_t channelMask;
+    uint32_t endianness;
+};
 
 // OpenSL COM model: SLObjectItf is `const struct SLObjectItf_ * const *`.
 // The guest object is the address of a cell that holds a vtable pointer.
@@ -306,10 +323,19 @@ SlResult engineCreateOutputMix(SlSelf, void** mix, uint32_t, const void*,
     return kSlSuccess;
 }
 
-SlResult engineCreateAudioPlayer(SlSelf, void** player, void*, void*,
+SlResult engineCreateAudioPlayer(SlSelf, void** player, void*, void* engineInfo,
                                  uint32_t, const void*, const void*) {
     if (player == nullptr) return kSlParameterInvalid;
     ++gStats.playerCreates;
+    // THE FORMAT THE GUEST ASKED FOR.  This is where a backend learns what
+    // to produce, and it is the P1 measurement's other half: the bytes the
+    // guest enqueues, and the format it enqueues them in.
+    if (engineInfo != nullptr) {
+        const auto* format = static_cast<const SlDataFormatPcm*>(engineInfo);
+        gStats.formatChannels = format->numChannels;
+        gStats.formatRate = format->sampleRate;
+        gStats.formatBits = format->bitsPerSample;
+    }
     *player = const_cast<void*>(static_cast<const void*>(&gPlayerObjectCell));
     return kSlSuccess;
 }
@@ -368,6 +394,18 @@ SlResult bufferEnqueue(SlSelf, const void* buffer, uint32_t size) {
     (void)buffer;
     (void)size;
     ++gStats.bufferEnqueues;
+    // THE PCM COUNT -- THE P1 MEASUREMENT.  Does the guest's own FMOD
+    // produce sound for this device to carry?  The self-test's own bytes are
+    // excluded, so the number is the GUEST's.
+    if (!gInSelfTest) {
+        ++gStats.pcmEnqueues;
+        gStats.pcmBytes += size;
+        uint32_t bytesPerFrame = gStats.formatChannels * (gStats.formatBits / 8u);
+        if (bytesPerFrame == 0u) {
+            bytesPerFrame = 4u; // 16-bit stereo
+        }
+        gStats.pcmFrames += size / bytesPerFrame;
+    }
     if (gBufferCallback != nullptr) {
         ++gStats.bufferCallbacks;
         gBufferCallback(
@@ -747,7 +785,9 @@ uint64_t runAudioStubSelfTest() {
 }
 
 uint64_t fmodAudioStubSelfTest() {
+    gInSelfTest = true;
     const uint64_t passed = runAudioStubSelfTest();
+    gInSelfTest = false;
     gSelfTestBits = passed;
     return passed;
 }
