@@ -1,0 +1,63 @@
+THE REVIEW FOUND THREE REAL DEFECTS IN THE FIX, AND THEY ARE FIXED TOO
+
+The measurement fix (the census counts the port's counters, not the log's
+text) was reviewed adversarially before it shipped, and the review was
+right about three things that the fix got wrong.
+
+1. THE COUNTERS WERE IN THE WRONG PLACE.  They were counted in
+   logResolvedPathOnce(), which ONE resolver branch calls: the guest reaches
+   the same files through six other branches (afterPackageFiles,
+   afterPackageRootDepot, the ".depot/" prefix rule, the asset-relative
+   rule, the device-path fall-through) and those resolved the files
+   WITHOUT counting them.  So the counter measured "requests that arrived in
+   the app-root spelling" while the census and the docs said "requests".
+   The archive cannot falsify the old placement: every branch produces the
+   same rr3core:/files/.depot/... spelling, so the trace cannot say which
+   branch ran.
+
+   The counters are counted in resolvePath() now -- the ONE place every
+   path takes, since resolvePathImpl() is called from nowhere else -- on
+   the RESOLVED path, so every branch is counted the same way.  The
+   resolution counter (paths= on the race-state line) and the two
+   front-end layout counters moved with them: they had the same defect and
+   the same fix, and leaving them behind would have left two counters in
+   one place and two in another, which is how the next confusion starts.
+
+2. THE CONTRACT TEST PROTECTED ONE OF THE FIVE WAYS TO BREAK THE
+   PROPERTY.  It was mutation-tested: five mutations of the property, and
+   the test caught ONE.  It is mutation-tested again -- seven mutations,
+   all seven caught -- and it now also checks its own extractor, so a
+   broken extractor fails the test instead of passing it vacuously.  The
+   harness is .build/mutation-test-race-markers.py.
+
+3. THE DOCUMENT HAD THE BOUND BACKWARDS.  It said "30 is a lower bound on
+   the races".  Every race needs at least one start-lights request, so
+   requests >= races: the number is an UPPER bound, and it is EQUAL to the
+   number of races only if the guest asks for that layout exactly once per
+   race, which was asserted, not measured.  The "the game was racing
+   continuously" reading did not survive the next round either, so the
+   section now says what the number is: THE GUEST ASKED FOR THAT LAYOUT N
+   TIMES.
+
+AND THE REVIEW ALSO FOUND THAT THE LOG IS NOT A FILE OF LINES.  Two
+writers, two locks, two buffers, one file: the census line and the
+watchdog line can be SPLIT, and MEASURED: one spliced census line per
+round, in every archive.  The two race numbers sat at the END of the
+census line -- the one place a split can separate a number from its line.
+They are at the HEAD now, next to frame=%llu, and the round census reads
+only the COMPLETE census lines (the ones that begin with its own phase).
+The census also says WHERE each number came from (the port's counter, or
+the old text fallback) and WHEN it was sampled (the frame), because the
+last census line is a SAMPLE: the line is written every 60 frames and the
+guest's threads keep resolving after the last frame.
+
+AND THE GATE NOW READS THE HARNESS.  A change to the round census's print
+block put an apostrophe inside a single-quoted PowerShell string, and the
+parse error surfaced twelve minutes later, in the middle of an Eden round,
+after the build and the deploy had already happened.  The gate parses
+every PowerShell script the round runs, before it runs them.
+
+MEASURED: the two numbers the census prints now come from the port's
+counters and move with the game, while the old text count stays at 2 in
+every round -- the instrument's signature, and the whole reason the fix
+exists.  docs/OPEN-ISSUES.md section 9.47 has the full chain.

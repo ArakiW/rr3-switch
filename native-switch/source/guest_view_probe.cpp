@@ -9074,14 +9074,25 @@ void* frameLoopDriver(void* opaque) {
                 }
                 std::snprintf(
                     cdiag, sizeof(cdiag),
-                    "frame=%llu census bound=%d viewport=%d,%d,%d,%d"
+                    "frame=%llu lights=%llu race=%llu census bound=%d viewport=%d,%d,%d,%d"
                     " scene=fbo=%u size=%ux%u binds=%u changes=%u vpChanges=%u"
                     " draws=%u arr=%u"
                     " tt=%llu tr=%llu ts=%llu tp=%llu"
                     " jni=%llu jnitex=%llu jnistr=%llu jnifile=%llu jnioth=%llu"
                     " fs=%llu fsr=%llu fshit=%llu fsmiss=%llu"
-                    " gui=%llu twosq=%llu lights=%llu race=%llu",
+                    " gui=%llu twosq=%llu",
                     static_cast<unsigned long long>(frames),
+                    // THE TWO RACE NUMBERS COME FIRST, ON PURPOSE.  The log
+                    // file is written by two threads into one file, so a
+                    // line can be SPLIT: the head keeps its "phase=..."
+                    // prefix and the tail loses it.  MEASURED: exactly one
+                    // spliced census line per round, in every archive.  The
+                    // fields at the END of a line are the ones a split can
+                    // separate from their line, so the two numbers the
+                    // census reads are at the HEAD, where a split cannot
+                    // take them away.
+                    static_cast<unsigned long long>(rr3::guestStartLightsOpens()),
+                    static_cast<unsigned long long>(rr3::guestRaceScreenOpens()),
                     static_cast<int>(g_hdBoundAfterRender),
                     static_cast<int>(g_hdViewportAfterRender[0]),
                     static_cast<int>(g_hdViewportAfterRender[1]),
@@ -9097,9 +9108,7 @@ void* frameLoopDriver(void* opaque) {
                     // THE CENSUS'S COUNTERS, read by the round's census instead
                     // of a regex over this log's text (docs/OPEN-ISSUES.md 9.37).
                     static_cast<unsigned long long>(rr3::guestGuiLayoutOpens()),
-                    static_cast<unsigned long long>(rr3::guestGuiTwosquareOpens()),
-                    static_cast<unsigned long long>(rr3::guestStartLightsOpens()),
-                    static_cast<unsigned long long>(rr3::guestRaceScreenOpens()));
+                    static_cast<unsigned long long>(rr3::guestGuiTwosquareOpens()));
                 appendGuestBootLine(
                     "sdmc:/switch/rr3-native-rehost.guest-view.log",
                     "guest-frame-census", 249, 0, cdiag);

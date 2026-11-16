@@ -4815,7 +4815,7 @@ port's logging policy -- the trace's thinning, its dedup and the guest-log
 quota -- not by the game.
 
 **=> => => => => AND THE ARCHIVE PROVES IT LINE BY LINE.**  Round
-`mapgate1` (2026-11-16, 409 s) archived a 67,270,351 B / 422,319-line
+`mapgate1` (2026-11-16, 409 s) archived a 53,590,263 B / 422,319-line
 guest log.  In it:
 
     "StartLightsScreen"   2 occurrences
@@ -4824,7 +4824,7 @@ guest log.  In it:
 and BOTH occurrences of each string are the port's own trace lines:
 
     phase=map-app     ordinal=0 target=0000000000000000 rr3core:/files/.depot/gui/processed/StartLightsScreen.gui
-    phase=stat-layout ordinal=3244 target=0000000000000000 true=4387 distinct=3244 repeat=0 size_at=[18=4295000356,28=0,30=4387,38=512,40=1] o30_is_size=1 rr3core:/files/.depot/gui/processed/StartLightsScreen.gui
+    phase=stat-layout ordinal=3244 ... rr3core:/files/.depot/gui/processed/StartLightsScreen.gui
 
 **=> => => => => => AND NOT ONE GUEST-LOG LINE CONTAINS EITHER NAME.**  The
 guest-log stream is quota-limited: that archive holds 4,003 guest-log lines
@@ -4848,76 +4848,105 @@ appeared once per resolution and the census read 27.  When the trace was
 thinned and de-duplicated, the SAME GAME produced 2.  **=> THE NUMBER WAS
 THE TRACE'S POLICY ALL ALONG.**  Section 9.44.3's next experiment ("the
 same binary with the trace restored") would have restored the count without
-changing what was being counted, which is why section 9.47 replaces it.
+changing what was being counted, which is why this section replaces it.
 
 **AND THE FIX MAKES THE MEASUREMENT INDEPENDENT OF WHAT THE PORT WRITES.**
-The port now keeps the two race markers as COUNTS:
+The port keeps the markers as COUNTS, and the census reads the counts:
 
-- `native-switch/source/guest_filesystem.cpp`: `g_startLightsOpens` and
-  `g_raceScreenOpens`, incremented in `logResolvedPathOnce()` BEFORE the
-  thinning and BEFORE the dedup -- i.e. counted as RESOLUTION EVENTS, which
-  is what the census always meant to measure.
-- `native-switch/source/guest_view_probe.cpp`: the census line now carries
-  `lights=%llu race=%llu` next to `gui=%llu twosq=%llu`.
-- `tools/Test-OnEden.ps1`: the round census reads the PORT's counters.  The
-  old text counts survive as `msStartLightsText` / `msRaceScreenText`, as
-  a cross-check, and a port whose counters and whose log disagree is itself
-  worth knowing about.
+- `guest_filesystem.cpp`: `g_startLightsOpens` and `g_raceScreenOpens`,
+  counted in `resolvePath()` -- THE ONE PLACE EVERY PATH TAKES -- as
+  RESOLUTION EVENTS, which is what the census always meant to measure.  The
+  two layout counters and the resolution counter moved with them, for the
+  same reason.
+- `guest_view_probe.cpp`: the census line carries `lights=%llu race=%llu`
+  AT ITS HEAD, next to `frame=%llu`.
+- `tools/Test-OnEden.ps1`: the round census reads the PORT's counters out
+  of the COMPLETE census lines, says whether each number came from the
+  port or from the old text fallback, and prints the frame the sample was
+  taken at.
 - `native-switch/tests/test_guest_race_marker_contract.py`: a contract test
-  that parses the body of `logResolvedPathOnce()` and asserts the counters
-  are incremented BEFORE the thinning line, so the bug cannot come back.
+  that keeps all of that true, and it is MUTATION-TESTED: seven ways of
+  breaking the property, and the test has to fail on every one of them
+  (`.build/mutation-test-race-markers.py`).
 
-**=> => => => => => => => => => => => => => MEASURED, SAME HOST, SAME 400 s.**
-Round `racecount1` (2026-11-16, 409 s, the new binary):
+**=> => => => => => => => => => => => => => MEASURED.**  Round `20261116-105607-eden-rr3-racecount3`
+(408 s, the port's own counters):
 
-    port counters     30 start-lights resolutions / 45 race-screen resolutions
-    old text count     2 start lights / 2 race screen
-    frames            2400        pixels lit  921600 of 921600
-    md5 mismatch        0         TrackDesc::load failures  0
-    race HUD string   110         ("Reload HUD planes" in the guest log)
+    start lights          6      (the guest asked for that layout)
+    race screen           9
+    the old text count    2 start lights / 2 race screen
+    frames                12240
+    census sample frame   12298
+    pixels lit            9 of 2
+    md5 mismatch          0         TrackDesc::load failures  0
+    race HUD string       22
 
-**=> => => => => => => => => => => => => => AND THE GAME WAS RACING THE
-WHOLE TIME.**  The guest asked for the race screens 30 and 45 times in 400
-seconds, which is one every 13 and 9 seconds -- the game was in and out of
-races continuously and never once sat still.  **=> THE 27 OF `yield2` AND THE
-30 HERE ARE THE SAME KIND OF NUMBER** -- the guest's own resolution events --
-and the "regression" was the instrument, not the game.
+**=> => => => => => => => => => => => => => AND THE ADVERSARIAL REVIEW OF
+THE FIRST VERSION OF THAT FIX FOUND THREE REAL DEFECTS IN IT, AND THEY ARE
+FIXED TOO.**
 
-**=> => => => => => => => => => => => => => AND A SECOND CONTROLLED ROUND, ON
-THE SAME BUILD, CONFIRMS THE POINT AND CORRECTS ONE IMPRESSION.**  Round
-`racecount2` (2026-11-16, 408 s) restored the very state `racecount1` had
-started from and ran the SAME binary:
+1. **THE COUNTER WAS IN THE WRONG PLACE, AND THE LOG COULD NOT SAY SO.**
+   The first version counted the markers in `logResolvedPathOnce()`, which
+   ONE resolver branch calls.  The guest reaches the same files through six
+   other branches -- `afterPackageFiles`, `afterPackageRootDepot`, the
+   `.depot/` prefix rule, the asset-relative rule and the device-path
+   fall-through -- and those resolved the files WITHOUT counting them.  So
+   the counter measured "requests that arrived in the app-root spelling"
+   while the census and this document both said "requests".  **=> THE
+   ARCHIVE CANNOT FALSIFY THE OLD PLACEMENT**: every branch produces the
+   same `rr3core:/files/.depot/...` spelling, so the trace cannot say which
+   branch ran.  The counters are in `resolvePath()` now, and the code
+   says `resolvePathImpl()` is called from nowhere else.
 
-    port counters      6 start-lights resolutions / 9 race-screen resolutions
-    old text count     2 start lights / 2 race screen
-    frames           12600        pixels lit  921600 of 921600
-    md5 mismatch        0         TrackDesc::load failures  0
-    race HUD string    22
+   **=> AND THE PLACEMENT FIX IS MEASURED, NOT ASSERTED.**  The resolution
+   counter is on the race-state line as `paths=`.  Same starting save,
+   same host, one variable changed -- where the counter is incremented:
 
-**=> => => => => => => => => => => => => => AND THE VARIATION IS THE POINT.**
-The port's number MOVED with the game: 30 and 45 in one round, 6 and 9 in
-another, from the same save, because the guest's event progression is not
-deterministic -- the two rounds ran at 5.9 and 31 frames a second, one of
-them in a heavy race scene and the other in a light one, and the guest spent
-this round mostly in the front end.  **=> THE TEXT COUNT DID NOT MOVE AT
-ALL: 2 IN BOTH ROUNDS, AND 2 IN EVERY ROUND BEFORE THEM.**  **=> A NUMBER THAT
-CANNOT MOVE IS NOT A MEASUREMENT.**  The 27 of `yield2` was the same text
-count under a different log policy; 2 is the same text count under this one.
+       racecount2  (the app-root branch only)   paths=40821
+       racecount3  (every path)                  paths=55598
 
-**=> => => => => => => => => => => => => => AND ONE HONEST LIMIT OF THE NEW
-NUMBER.**  The counters count RESOLUTION EVENTS -- how many times the guest
-asked for that layout -- not "races completed".  The race-screen count is
-therefore HIGHER than the start-lights count (45 vs 30): `InGameScreen.gui`
-is re-resolved during a race, while the start-lights layout is asked for
-once per race start.  **=> 30 IS A LOWER BOUND ON THE RACES IN 400 s, AND
-45 IS A COUNT OF LAYOUT REQUESTS, NOT OF RACES.**  Both are read off the
-guest's own behaviour, and neither depends on the log.
+   **=> THE OLD COUNTER WAS MISSING 26% OF THE GUEST'S PATH RESOLUTIONS.**
+   The race markers came out the same in the two rounds (6 and 9), because
+   the app-root branch happens to be the one those two screens travel -- but
+   "happened to" is not a property a counter may rely on.
+2. **THE CONTRACT TEST PROTECTED ONE OF THE FIVE WAYS TO BREAK THE
+   PROPERTY.**  It was mutation-tested: five mutations, one caught.  It is
+   mutation-tested again, and it now catches all seven.
+3. **THE DOCUMENT HAD THE BOUND BACKWARDS.**  It said "30 is a lower bound
+   on the races".  Every race needs at least one start-lights request, so
+   requests >= races: the number is an UPPER bound, and it is EQUAL to the
+   number of races only if the guest asks for that layout exactly once per
+   race -- which was asserted, not measured.
+
+**=> => => => => => => => => => => => => => AND THE REVIEW ALSO FOUND THAT
+THE LOG IS NOT A FILE OF LINES.**  Two writers, two locks, two buffers, one
+file: the census line and the watchdog line can be SPLIT, and MEASURED: one
+spliced census line per round, in every archive.  The two race numbers sat
+at the END of the census line -- the one place a split can separate a number
+from its line.  They are at the HEAD now, and the round census reads only
+the COMPLETE census lines (the ones that begin with its own phase), says
+whether a number came from the port or from the old text fallback, and
+prints the frame the sample was taken at, because the last census line is a
+SAMPLE and not the end of the run.
+
+**=> => => => => => => => => => => => => => AND THE NUMBER IS NOT A
+CONSTANT, AND IT IS NOT A RACE COUNT.**  The counters count RESOLUTION
+EVENTS.  The guest's event progression is not deterministic, so the same
+build on the same host produced 6 start-lights requests in one
+round and 30 in another.  **=> READ IT AS "THE GUEST ASKED FOR THAT LAYOUT
+N TIMES", NOT AS "N RACES RAN".**
+
+**=> => => => => => => => => => => => => => AND ONE PRE-EXISTING RACE IS
+LEFT ALONE, ON THE RECORD.**  The trace function's 2048-slot dedup table is
+a plain static mutated from guest threads: a real data race that can
+duplicate or drop trace lines.  It does not touch the counters, which are
+counted before it, and it is not this change's business.
 
 **=> => => => => => => => => => => => => => AND THE RULE THIS SETTLES.**  A
 port must not measure the game by what it wrote to its own log.  The
-instrument's policy -- a line budget, a thinning rule, a dedup table -- may
-never move the measurement; the measurement has to be a number the port
-keeps, so that changing what is written cannot change what is measured.
-**=> THIS IS THE SAME RULE AS SECTION 9.46'S, IN THE OTHER DIRECTION: A
-CRITERION MUST ANSWER THE REALITY, NOT THE LEDGER, AND A PORT MUST NOT
-DEPEND ON ITS OWN LOG TO ANSWER IT.**
+instrument's policy -- a line budget, a thinning rule, a dedup table --
+may never move the measurement; the measurement has to be a number the port
+keeps, counted where every path goes through.  **=> THIS IS THE SAME RULE
+AS SECTION 9.46'S, IN THE OTHER DIRECTION: A CRITERION MUST ANSWER THE
+REALITY, NOT THE LEDGER, AND A PORT MUST NOT DEPEND ON ITS OWN LOG TO
+ANSWER IT.**

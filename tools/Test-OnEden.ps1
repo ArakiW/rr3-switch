@@ -740,10 +740,19 @@ $summary = [ordered]@{
     # reads exactly the same value in a race (164 samples) and out of one
     # (102 samples). It is a live-looking number that carries no information
     # about the visible screen, so it is not used as a criterion here.
-    msStartLights       = 0   # the race's start sequence, counted by the PORT
-    msRaceScreen        = 0   # the race itself, counted by the PORT
+    msStartLights       = 0   # the race's start sequence
+    msRaceScreen        = 0   # the race itself
     msStartLightsText   = 0   # the same, counted in the log's text (cross-check)
     msRaceScreenText    = 0   # the same, counted in the log's text (cross-check)
+    # WHERE EACH NUMBER CAME FROM.  "port" is the port's own counter; "text"
+    # is the old regex over the log, which measures the LOG'S POLICY and is
+    # only used for an archive written by an older binary.  The summary
+    # prints it, so a number can never wear the wrong label.
+    msRaceMarkerSource  = 'none'
+    msFrontEndSource    = 'none'
+    # The frame the census sampled the counters at: the counters grow, and
+    # the last line in the log is a SAMPLE of them, not the end of the run.
+    msCensusFrame       = 0
     msRaceHud           = 0   # "Reload HUD planes" (the race HUD was built)
     msRaceObjective     = 0   # the race-only objective text
     msAstFilesOnCard    = 0   # *.ast on the card: the physical proof the .ast round trip works
@@ -924,19 +933,36 @@ if ($guestLogArchived -eq 'archived') {
     # lines, which the dedup and the trace's thinness both change.
     # The LAST field of the line has no trailing space, so the pattern must not
     # demand one: ' twosq=(\d+)(?:\s|$)'.
-    $portGuiOpens = [regex]::Matches($guestText, ' gui=(\d+) ')
-    $portTwosquare = [regex]::Matches($guestText, ' twosq=(\d+)(?:\s|$)')
+    # ONLY THE CENSUS'S OWN COMPLETE LINES.  The log file is written by two
+    # threads into one file, so a line can be SPLIT: the head keeps its
+    # "phase=..." prefix and the tail loses it.  MEASURED: exactly one
+    # spliced census line per round, in every archive.  A regex over the
+    # whole text would happily read the fields of a spliced TAIL -- which
+    # belongs to no line at all -- so the census takes the COMPLETE lines
+    # only: the ones that begin with its own phase.
+    $censusLines = [regex]::Matches($guestText, '(?m)^phase=guest-frame-census[^\r\n]*')
+    $censusText = ''
+    if ($censusLines.Count -gt 0) {
+        $censusText = [string]::Join("\n", ($censusLines | ForEach-Object { $_.Value }))
+    }
+    $portGuiOpens = [regex]::Matches($censusText, ' gui=(\d+)(?: |\r?$)')
+    $portTwosquare = [regex]::Matches($censusText, ' twosq=(\d+)(?: |\r?$)')
     if ($portGuiOpens.Count -gt 0 -and $portTwosquare.Count -gt 0) {
         # The LAST value is the final count: the counter grows.
         $summary.msMainMenuLayouts = [int]$portGuiOpens[$portGuiOpens.Count - 1].Groups[1].Value
         $summary.msTwosquare = [int]$portTwosquare[$portTwosquare.Count - 1].Groups[1].Value
+        $summary.msFrontEndSource = 'port'
     }
     else {
-        # An older log, without the counters: fall back to the text.
+        # An older log, without the counters: fall back to the text.  The
+        # summary says WHICH it used: the text count is the log-policy
+        # number that section 9.47 exists to retire, and it must never be
+        # printed under the port's label.
         $summary.msTwosquare = [regex]::Matches(
             $guestText, 'gui/processed/main_menu/main_menu_twosquare\.gui').Count
         $summary.msMainMenuLayouts = [regex]::Matches(
             $guestText, 'gui/processed/main_menu/').Count
+        $summary.msFrontEndSource = 'text'
     }
     $summary.msEventMapScreen  = [regex]::Matches($guestText, 'EventMapScreen').Count
     # The race markers. A race screen, the start lights and the race HUD are
@@ -952,19 +978,35 @@ if ($guestLogArchived -eq 'archived') {
     # thinned (docs/OPEN-ISSUES.md section 9.47).  The old counts are kept
     # below as a cross-check, because a port whose counters and whose log
     # disagree is itself worth knowing about.
-    $portStartLights = [regex]::Matches($guestText, ' lights=(\d+)(?:\s|$)')
-    $portRaceScreen = [regex]::Matches($guestText, ' race=(\d+)(?:\s|$)')
+    $portStartLights = [regex]::Matches($censusText, ' lights=(\d+)(?: |\r?$)')
+    $portRaceScreen = [regex]::Matches($censusText, ' race=(\d+)(?: |\r?$)')
     $summary.msStartLightsText = [regex]::Matches($guestText, 'StartLightsScreen').Count
     $summary.msRaceScreenText = [regex]::Matches($guestText, 'InGameScreen').Count
     if ($portStartLights.Count -gt 0 -and $portRaceScreen.Count -gt 0) {
         # The LAST value is the final count: the counter grows.
         $summary.msStartLights = [int]$portStartLights[$portStartLights.Count - 1].Groups[1].Value
         $summary.msRaceScreen = [int]$portRaceScreen[$portRaceScreen.Count - 1].Groups[1].Value
+        $summary.msRaceMarkerSource = 'port'
+        # WHEN the sample was taken.  The census line is written every 60
+        # frames, so the counters are a SAMPLE: the guest's threads keep
+        # resolving after the last frame, and the log can also lose its last
+        # lines when the run is cut short.  Printing the frame the sample
+        # was taken at makes the age of the number visible instead of
+        # implied.
+        $lastCensus = $censusLines[$censusLines.Count - 1].Value
+        $censusFrame = [regex]::Match($lastCensus, ' frame=(\d+)')
+        if ($censusFrame.Success) {
+            $summary.msCensusFrame = [int]$censusFrame.Groups[1].Value
+        }
     }
     else {
-        # An older log, without the counters: fall back to the text.
+        # An older log, without the counters: fall back to the text, and
+        # LABEL it as the text count.  The text count is the log-policy
+        # number that section 9.47 exists to retire; printing it under the
+        # port's label is how it would have gone on looking healthy.
         $summary.msStartLights = $summary.msStartLightsText
         $summary.msRaceScreen = $summary.msRaceScreenText
+        $summary.msRaceMarkerSource = 'text'
     }
     $summary.msRaceHud     = [regex]::Matches($guestText, 'Reload HUD planes').Count
     # The race-only objective text is CHINESE, so it is written as \u escapes:
@@ -1085,11 +1127,12 @@ $runSummaryPath = Join-Path $archive 'run-summary.txt'
     ('  stat(22)                 {0}   (want 0)' -f $summary.msStat22)
     ('  asset lists added        {0}' -f $summary.msAssetListsAdded)
     ('  .ast files on the card   {0}   (want > 0 when assets were downloaded)' -f $summary.msAstFilesOnCard)
-    ('  front-end layout opened  {0}   ("gui/processed/main_menu/main_menu_twosquare.gui" in the PORT trace -- want > 0 for the main menu panel)' -f $summary.msTwosquare)
-    ('  main menu layouts open   {0}   (gui/processed/main_menu/ -- want > 0 once the front end is up)' -f $summary.msMainMenuLayouts)
+    ('  front-end layout opened  {0}   (the guest asked for the two-square panel; counted by the {1} -- want > 0 for the main menu panel)' -f $summary.msTwosquare, $summary.msFrontEndSource)
+    ('  main menu layouts open   {0}   (the guest asked for a main-menu layout; counted by the {1} -- want > 0 once the front end is up)' -f $summary.msMainMenuLayouts, $summary.msFrontEndSource)
     ('  EventMapScreen           {0}   (want > 0 for the front end)' -f $summary.msEventMapScreen)
-    ('  start lights             {0}   (the race start sequence, counted by the PORT)' -f $summary.msStartLights)
-    ('  race screen              {0}   (the race itself, counted by the PORT; want > 0 to be IN a race)' -f $summary.msRaceScreen)
+    ('  start lights             {0}   (the race start sequence, counted by the {1})' -f $summary.msStartLights, $summary.msRaceMarkerSource)
+    ('  race screen              {0}   (the race itself, counted by the {1}; want > 0 to be IN a race)' -f $summary.msRaceScreen, $summary.msRaceMarkerSource)
+    ('  census sample frame      {0}   (the frame the counters were sampled at; the guest keeps working after the last frame)' -f $summary.msCensusFrame)
     ('  race markers in the log  {0} start lights / {1} race screen (the text count; it measures the path trace, not the game)' -f $summary.msStartLightsText, $summary.msRaceScreenText)
     ('  race marker: HUD string  {0}   ("Reload HUD planes" -- the guest RENDERS this debug string during a race; it is a race marker, NOT evidence that the HUD was built)' -f $summary.msRaceHud)
     ('  race marker: objective   {0}   (the localised objective string in the guest log; a race marker, and a cross-check that the text pipeline works)' -f $summary.msRaceObjective)

@@ -252,32 +252,27 @@ void logResolvedPathOnce(const char* path) {
     if (path == nullptr || path[0] == '\0') {
         return;
     }
-    // THE NUMBER OF RESOLUTIONS, so the information survives even when the
-    // trace is thinned one day.  It is on the race-state line as `paths=`.
-    __atomic_add_fetch(&g_resolvedPathCount, 1ULL, __ATOMIC_RELAXED);
-    // THE CENSUS'S COUNTERS: how many times the guest asked for the main
-    // menu's layout, and for the two-square panel inside it.  Counted BEFORE
-    // the dedup below, because the dedup applies to the LOG and these count
-    // EVENTS -- which is what the census meant to measure.
-    if (std::strstr(path, "gui/processed/main_menu/") != nullptr) {
-        __atomic_add_fetch(&g_guiLayoutOpens, 1ULL, __ATOMIC_RELAXED);
-        if (std::strstr(path, "main_menu_twosquare.gui") != nullptr) {
-            __atomic_add_fetch(&g_guiTwosquareOpens, 1ULL, __ATOMIC_RELAXED);
-        }
-    }
-    // THE RACE MARKERS, COUNTED HERE -- before the thinning below and before
-    // the dedup -- so the number cannot depend on what the port writes to the
-    // log.  The census used to count the STRINGS in the log, and the only
-    // occurrences left in it are the port's own path-trace lines: the race
-    // screens are requested LATE, so after the dedup table filled up their
-    // paths were never written and the count collapsed.  That is the whole
-    // 27-to-2 story.  See docs/OPEN-ISSUES.md section 9.47.
-    if (std::strstr(path, "gui/processed/StartLightsScreen.gui") != nullptr) {
-        __atomic_add_fetch(&g_startLightsOpens, 1ULL, __ATOMIC_RELAXED);
-    }
-    if (std::strstr(path, "gui/processed/InGameScreen.gui") != nullptr) {
-        __atomic_add_fetch(&g_raceScreenOpens, 1ULL, __ATOMIC_RELAXED);
-    }
+    // THE NUMBER OF RESOLUTIONS IS NOT COUNTED HERE EITHER, FOR THE SAME
+    // REASON THE CENSUS'S COUNTERS ARE NOT: this function is called from ONE
+    // resolver branch, so the number here was the number of resolutions
+    // that arrived in the app-root spelling.  It is counted in
+    // resolvePath() now, and it is still on the race-state line as
+    // `paths=`.
+    // THE CENSUS'S COUNTERS ARE NOT COUNTED HERE, AND THAT IS A FIX.
+    //
+    // They used to be counted here, and this function is called from ONE
+    // resolver branch (mapAppRootToContent()).  The guest reaches the same
+    // files through six other branches -- afterPackageFiles,
+    // afterPackageRootDepot, the ".depot/" prefix rule, the asset-relative
+    // rule and the device-path fall-through -- and those resolved the files
+    // WITHOUT counting them.  So the counter measured "requests that
+    // arrived in the app-root spelling", not "requests", while the census
+    // and the docs both said the second thing.  The difference is invisible
+    // in the log: every branch produces the same rr3core:/files/.depot/...
+    // spelling, so the trace cannot say which branch ran.
+    //
+    // The counters live in resolvePath() now, the ONE place every path
+    // takes.  See docs/OPEN-ISSUES.md section 9.47.
     // ⇒ ⇒ AND THE TRACE IS NOW THINNED TO THE PART THE CENSUS READS.
     //
     // MEASURED 2026-11-10 (round yield2): 108,418 of the round's 124,464 log
@@ -2223,6 +2218,51 @@ bool resolvePath(const char* path, bool writing, Resolution& resolution) {
     // and only a split says whether the cost is the routing or the I/O.
     ScopedFsResolveTimer resolveTimer;
     const bool resolved = resolvePathImpl(path, writing, resolution);
+    // THE CENSUS'S COUNTERS, COUNTED HERE, IN THE ONE PLACE EVERY PATH TAKES.
+    //
+    // WHY HERE.  resolvePath() is the wrapper every caller uses --
+    // resolvePathImpl() is called from nowhere else -- so this is the ONE
+    // place every path takes.  The trace function is NOT: it is called from
+    // one resolver branch only, and the guest reaches the same files
+    // through six more that resolved them without counting.  A counter in
+    // the trace therefore measured "requests in one spelling".
+    //
+    // WHAT IT COUNTS.  RESOLUTION EVENTS -- the guest asked for that path.
+    // The counters are read by the round census instead of a regex over the
+    // log's text, because the log's text is governed by the port's own
+    // policy: the gui/processed/ thinning, the 2048-slot dedup, and the
+    // guest-log quota of 4000 lines.  That is what made "27 start lights"
+    // become "2" without the game changing.  A measurement that depends on
+    // what the port writes is not a measurement.
+    //
+    // WHY THE RESOLVED PATH.  Every branch of the resolver ends at the same
+    // device spelling (rr3core:/files/.depot/gui/processed/...), so the
+    // marker is found the same way whichever branch ran.  When the
+    // resolution FAILED the requested path is the only one there is.
+    if (path != nullptr && path[0] != ' ') {
+        // THE NUMBER OF RESOLUTIONS, so the information survives even when
+        // the trace is thinned one day.  It is on the race-state line as
+        // `paths=`.  Counted here for the same reason as the census's
+        // counters: this is the one place every path takes.
+        __atomic_add_fetch(&g_resolvedPathCount, 1ULL, __ATOMIC_RELAXED);
+    }
+    {
+        const char* counted = resolved ? resolution.primary : path;
+        if (counted != nullptr && counted[0] != ' ') {
+            if (std::strstr(counted, "gui/processed/main_menu/") != nullptr) {
+                __atomic_add_fetch(&g_guiLayoutOpens, 1ULL, __ATOMIC_RELAXED);
+                if (std::strstr(counted, "main_menu_twosquare.gui") != nullptr) {
+                    __atomic_add_fetch(&g_guiTwosquareOpens, 1ULL, __ATOMIC_RELAXED);
+                }
+            }
+            if (std::strstr(counted, "gui/processed/StartLightsScreen.gui") != nullptr) {
+                __atomic_add_fetch(&g_startLightsOpens, 1ULL, __ATOMIC_RELAXED);
+            }
+            if (std::strstr(counted, "gui/processed/InGameScreen.gui") != nullptr) {
+                __atomic_add_fetch(&g_raceScreenOpens, 1ULL, __ATOMIC_RELAXED);
+            }
+        }
+    }
     if (resolved && !writing) {
         // THE GUEST'S DEVICE PROFILE, WITH THE CARD'S SETTINGS APPLIED.
         //

@@ -14271,3 +14271,40 @@ counters, against the old text count of 2 / 2; frames 2400, pixels lit
 string 110.  The guest asked for the race screens every 9 to 13 seconds for
 the whole round -- **the game was racing continuously and the "regression"
 was the instrument.**  Full reasoning: docs/OPEN-ISSUES.md section 9.47.
+
+### 2026-11-16 The 27-to-2 start-lights collapse was the CENSUS, and the fix
+was reviewed adversarially before it shipped
+
+**WHAT WAS MEASURED.**  The round census counted the strings
+"StartLightsScreen" and "InGameScreen" anywhere in the guest-view log.  The
+only occurrences of those strings left in the log are the port's OWN path
+trace lines, and their number is set by the trace's policy (the
+gui/processed/ thinning and a 2048-slot dedup with no eviction) and by the
+guest-log quota of 4000 lines.  The archived round `mapgate1` log
+(67 MB, 422,319 lines) holds exactly 2 of each, both of them
+`phase=map-app` / `phase=stat-layout` lines, and the guest-log ordinal
+ends at EXACTLY 4000.  **=> THE NUMBER MEASURED THE LOG, NOT THE GAME.**
+
+**THE FIX.**  The port counts the race markers as RESOLUTION EVENTS, in
+`resolvePath()` -- the one place every path takes -- and the round census
+reads the port's counters out of the COMPLETE census lines.
+
+**AND THE ADVERSARIAL REVIEW FOUND THREE REAL DEFECTS IN THAT FIRST
+FIX.**  The counters were in the trace function, which ONE resolver branch
+calls, so they measured "requests in one spelling"; the contract test
+caught only one of the five ways to break the property (it is
+mutation-tested now: seven ways, all seven caught); and the log is written
+by two threads into one file, so a line can be SPLIT, and the two numbers
+sat at the END of the census line -- exactly where a split can take them
+away.  All three are fixed.  The same counter flaw was found and fixed for
+the resolution counter and the two front-end layout counters.
+
+**WHAT IT MEASURES NOW.**  Round `rr3-racecount3` (408 s, the same starting save as
+the round before it, which changed only the counter's placement):
+**6 start-lights requests / 9 race-screen requests** from the port's
+counters, against the old text count of **2 / 2**; frames 12240, pixels lit
+9 of 2, md5 mismatch 0.  Read it as "the guest asked for that layout N
+times", not "N races ran": the counters are resolution events and the
+guest's event progression is not deterministic.  What does NOT move is the
+text count -- 2 in every round, which is the instrument's signature.
+Full reasoning: docs/OPEN-ISSUES.md section 9.47.
