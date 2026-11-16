@@ -146,13 +146,17 @@ phase=guest-scanf-bounded ... input=truncated in_len=512 fmt=ok fmt_len=16
 
 ### 0.4 你要做的
 
-**如果卡上已经有数据卷**：从 [Release](https://github.com/ArakiW/rr3-switch/releases/tag/v0.22.8) 下
-`rr3-switch-app-20261109.zip`（**6.5 MiB**，一个文件），
-解包，把 `switch\` 里的东西覆盖到卡根即可。**不要删 `switch/rr3-gfx.conf`。**
+**装 NSP（推荐）**：从 [Release](https://github.com/ArakiW/rr3-switch/releases/latest) 下
+`rr3-native-rehost.nsp`（v0.22.14 是 50,535,128 字节），用 NSP 安装器装上
+（Tinfoil / Awoo / NSz，或 hbloader + sigpatches）。装完它就是一个「游戏」，从主菜单直接点开。
 
-**这个包里没有 EA 的任何东西**——NRO 内嵌的 RomFS 只有三个文件（本项目自己的 libc++、
-OFL 授权的中文引导字体、和那份字体的许可说明）。所以你**还要自己把游戏的内容放上去**：
+**不想装 NSP**：同一个 Release 里的 `rr3-switch-app-*.zip`（约 94 MiB：NRO + romfs + 卡片脚本），
+解包，把 `switch\` 里的东西覆盖到卡根即可，再用 Homebrew Launcher 启动。
+**不要删 `switch/rr3-gfx.conf`。**
 
+**包里已经有的**：客机运行时、界面字体、`.depot` 文本（NSP 的 RomFS 实测 35 个文件 / 44,948,780 字节）。
+**包里没有的**：**游戏数据**——那 7 个数据卷要你自己准备（见 §1.0 与 §10.8）。
+所以下面这些**只有用 NRO 变体（干净构建）时才需要**你自己放：
 ```
 sdmc:/switch/rr3-native-rehost/
   libRealRacing3.so          ← 你的应用副本里的客机运行时
@@ -244,10 +248,12 @@ lr=0x87d40de54    ← 宿主：deliverServerTime
 
 ### 1.0 先把游戏的内容放上去（发布包里没有这些）
 
-从 v0.22.8 起，**发布包不含任何 EA 材料**（NRO 内嵌的 RomFS 只有三个文件：本项目自己的
-libc++、OFL 授权的中文引导字体、和那份字体的许可说明）。所以下面这些要**你自己**从
-你自己的应用副本里取出来，放到卡的 `sdmc:/switch/rr3-native-rehost/` 旁边：
+**包里没有的是游戏数据**：那 7 个数据卷（贴图、赛道、车、音频）任何发布包里都没有，
+要你自己用数据包做（§10.8）。客机运行时、界面字体和 `.depot` 文本则**随 NSP 一起发布**
+（NSP 的 RomFS 实测 35 个文件 / 44,948,780 字节）。
 
+**如果你用的是 NRO 变体**（干净构建的 NRO，或者卡上没装 NSP），
+下面这些要**你自己**从你自己的应用副本里取出来，放到卡的 `sdmc:/switch/rr3-native-rehost/` 旁边：
 ```
 libRealRacing3.so        客机运行时（应用副本 lib/arm64-v8a/ 里）
 libNimble.so              同上

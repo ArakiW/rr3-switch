@@ -48,44 +48,64 @@ The full status of every item is in
 
 ## Installing it
 
-1. Download the latest zip (**about 6.5 MB**) from
+1. Download the **NSP** from
    [Releases](https://github.com/ArakiW/rr3-switch/releases/latest)
-2. Unpack it and copy the contents of `switch\` over the root of your card
-3. **The package carries no game content.** Take the guest runtime, the UI
-   faces and the `.depot` text out of your own copy of the application and put
-   them next to the NRO, in `sdmc:/switch/rr3-native-rehost/` -- that is where
-   the port looks for them.
-4. Launch it from Homebrew Launcher
+   (v0.22.14 is 50,535,128 bytes)
+2. Install it with an NSP installer (Tinfoil / Awoo / NSz, or hbloader with
+   sigpatches).  It installs as a title: open it straight from the Home menu
+3. **The game's data is not in the package.**  The seven data volumes are
+   yours to build from a data pack -- see "Data volumes" below and
+   **[tools/README-hardware-test.md](tools/README-hardware-test.md)** §10.8
+4. If you would rather not install an NSP, take `rr3-switch-app-*.zip` from
+   the same release (about 94 MiB: the NRO, the romfs tree and the card
+   control files), unpack it over the root of your card and launch it from
+   Homebrew Launcher
 5. Once you are in a race, **press A once** to dismiss the guest's tutorial dialog
 6. Right trigger / A is the throttle, left stick steers
 
-The full procedure — which files to place, the split volumes, the small-card
-variant, and which logs to send back — is in
+**What the package holds and what it does not** (measured on the v0.22.14
+NSP): the guest runtime (`libRealRacing3.so`, `libfmodex.so`,
+`libNimble.so`), the interface faces and the `.depot` text ARE in the
+package (35 files over 44,948,780 bytes in the RomFS); **the game data (the
+seven data volumes) is NOT** -- that is yours to build.  See
+[NOTICE.md](NOTICE.md).
+
+The full procedure -- which files to place, the split volumes, the small-card
+variant, and which logs to send back -- is in
 **[tools/README-hardware-test.md](tools/README-hardware-test.md)**.
 
-By default **you drive**. To watch the port drive instead, change
+By default **you drive**.  To watch the port drive instead, change
 `autopilot = 0` to `1` in `rr3-gamepad.txt`.
 
 ## Building
 
 ```powershell
-powershell -File tools\Build-NativeSwitch.ps1              # build (full)
+powershell -File tools\Build-NativeSwitch.ps1              # build (full: the guest runtime goes into the RomFS too)
 powershell -File tools\Build-NativeSwitch.ps1 -CleanLoader  # build (clean: no EA material in the RomFS)
 powershell -File .build\gate.ps1                           # build + self-checks
 ```
 
 Needs devkitPro's devkitA64 and libnx.
 
-**The clean build** (`-CleanLoader`) is the one to publish: its RomFS holds
-only what this project owns (libc++, the OFL Chinese bootstrap face and that
-face's licence), and the game's own files go on the card, put there by the
-user. The default build stages them into the RomFS instead, so nothing from
-the game has to live in this repository either way.
+**Two builds, two release shapes, and the difference spelled out:**
+
+- The **clean build** (`-CleanLoader`) stages only what this project owns
+  into the RomFS (libc++, the OFL Chinese bootstrap face and that face's
+  licence), and the guest's own files are then found on the card, put there
+  by the user.  That NRO variant measures 6.5 MiB.
+- The **default build** stages the guest runtime, the interface faces and the
+  `.depot` text into the RomFS as well.  **The NSP that is published now is
+  the default build**, because the packaging script requires the guest
+  binary to be in the RomFS -- without it the NSP does not start.
+
+**Neither release carries the game data**: the seven data volumes are the
+user's, built from their own data pack.
 
 ## What was fixed recently
 
-- **The published package can carry no EA material at all**: 6.5 MiB, and the
-  NRO is measured to contain no EA file's bytes.
+- **The NRO has a clean variant**: the `-CleanLoader` build measures 6.5 MiB
+  and the RomFS is measured to contain no EA file's bytes (the NSP that is
+  published now is the default build -- see "Building" above).
 - **The car belongs to the player now.** The switch used to govern only the
   controller path, so a console player's stick was dead.
 - **The pursuit direction is no longer re-decided every frame**, so the car no
@@ -149,8 +169,11 @@ dist/                   packaged deliverables
 The port is released under the **MIT Licence** (see [LICENSE](LICENSE)); the
 third-party components and their terms are listed in [NOTICE.md](NOTICE.md).
 The game itself is © Electronic Arts; the repository contains none of its
-content and **neither does the published package** -- the game's files go on
-the card, taken by the user from their own copy of the application.
+content.  **The published NSP carries the guest runtime** (`libRealRacing3.so`
+and the rest, taken by the user from their own copy of the application) **and
+not the game data** -- the seven data volumes are built by the user from their
+own data pack.  See [NOTICE.md](NOTICE.md).
+
 
 ## Acknowledgements
 

@@ -34,13 +34,18 @@
 
 ## 怎么装
 
-1. 去 [Releases](https://github.com/ArakiW/rr3-switch/releases/latest) 下最新的 zip（**约 6.5 MB**）
-2. 解压，把 `switch\` 里的东西覆盖到卡根目录
-3. **发布包不含游戏的内容**——从你自己的应用副本里取出客机运行时、界面字体和 `.depot` 文本，
-   放到卡的 `sdmc:/switch/rr3-native-rehost/` 旁边（程序会自己去那里找）
-4. 用 Homebrew Launcher 启动
+1. 去 [Releases](https://github.com/ArakiW/rr3-switch/releases/latest) 下 **NSP**（v0.22.14 是 50,535,128 字节）
+2. 用 NSP 安装器装上（Tinfoil / Awoo / NSz，或 hbloader + sigpatches）。装完它就是一个「游戏」，从主菜单直接点开
+3. **游戏的数据不在包里**——7 个数据卷要你自己用数据包做，见下面「数据卷」和
+   **[tools/README-hardware-test.md](tools/README-hardware-test.md)** §10.8
+4. 不想装 NSP 就用同一个 Release 里的 `rr3-switch-app-*.zip`（约 94 MiB：NRO + romfs + 卡片脚本），
+   解压覆盖到卡根目录，再用 Homebrew Launcher 启动
 5. 进比赛后，**比赛里的教程框要自己按一下 A**
 6. 右扳机 / A 是油门，左摇杆是转向
+
+**包里有什么、没有什么**（实测，v0.22.14 的 NSP）：客机运行时（`libRealRacing3.so`、
+`libfmodex.so`、`libNimble.so`）、界面字体、`.depot` 文本**都在包里**（romfs 35 个文件 / 44,948,780 字节）；
+**游戏数据（7 个数据卷）不在包里**，要你自己做。详见 [NOTICE.md](NOTICE.md)。
 
 完整步骤（放哪些文件、分卷整包、小卡空间不够的装法、该回传哪些日志）见
 **[tools/README-hardware-test.md](tools/README-hardware-test.md)**。
@@ -50,20 +55,26 @@
 ## 怎么构建
 
 ```powershell
-powershell -File tools\Build-NativeSwitch.ps1              # 构建（完整）
+powershell -File tools\Build-NativeSwitch.ps1              # 构建（完整：客机运行时也进 RomFS）
 powershell -File tools\Build-NativeSwitch.ps1 -CleanLoader  # 构建（干净：RomFS 里不放任何 EA 材料）
 powershell -File .build\gate.ps1                           # 构建 + 自检
 ```
 
 需要 devkitPro 的 devkitA64 和 libnx。
 
-**干净构建**（`-CleanLoader`）是你要发布的那一个：它的 RomFS 里只有本项目自己的东西
-（libc++、OFL 授权的中文引导字体、字体许可），游戏的内容由使用者自己放到卡上。
-默认构建会把它们打进 RomFS，所以仓库里不需要存放任何游戏内容——两种都成立。
+**两种构建、两种发布物，差别说清楚**：
+
+- **干净构建**（`-CleanLoader`）的 RomFS 里只有本项目自己的东西（libc++、OFL 授权的中文引导字体、字体许可），
+  客机运行时和界面字体要使用者自己放到卡上。NRO 变体实测 6.5 MiB。
+- **默认构建**把客机运行时、界面字体和 `.depot` 文本一起打进 RomFS。**现在发布的 NSP 用的是这一种**
+  （打包脚本要求客机二进制必须在 RomFS 里，否则 NSP 起不来）。
+
+**两个发布物都不含游戏数据**：7 个数据卷要使用者用自己的数据包做。
 
 ## 最近修好了什么
 
-- **发布包第一次可以不含任何 EA 材料**：6.5 MiB，实测 NRO 里没有 EA 文件的字节。
+- **NRO 有个干净的变体**：`-CleanLoader` 构建的 NRO 只有 6.5 MiB，实测 RomFS 里没有 EA 文件的字节
+  （现在发布的 NSP 用的是完整构建，见上面「怎么构建」）。
 - **车终于归玩家开了。** 以前那个开关只管手柄那条路，你的主机摇杆其实是死的。
 - **追踪方向不再每帧乱翻**，车不会被自己的控制器推着倒着走。
 - **被护栏卡住能脱困**，不会撞一次就钉死在那儿不动。
@@ -115,7 +126,9 @@ dist/                   打包产物
 
 本移植层代码以 **MIT** 发布（见 [LICENSE](LICENSE)）。第三方组件与其授权见
 [NOTICE.md](NOTICE.md)。游戏本身的著作权属于 Electronic Arts；仓库不收录任何
-游戏内容，**发布包也不含**——游戏的内容由使用者从自己的应用副本取出放到卡上。
+游戏内容，**发布的 NSP 里带的是客机运行时（`libRealRacing3.so` 等，取自使用者自己的应用副本），
+但不带游戏数据**——7 个数据卷要使用者用自己的数据包做。详见 [NOTICE.md](NOTICE.md)。
+
 
 ## 致谢
 

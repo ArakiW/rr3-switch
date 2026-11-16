@@ -5645,3 +5645,44 @@ GUEST'S FMOD SYMBOLS BOUND TO libfmodex.so'S OWN EXPORTS (`cross=52`,
 `host=0`, `missing=0`), AND EVERY RELOCATION WRITE WAS READ BACK AND
 VERIFIED (158,445 of 158,445).  **THE R1 MECHANISM IS NOW MEASURED, NOT
 INFERRED.**
+### 9.57 The published package carries the guest runtime, and the docs now say so
+
+**THE CLAIM WAS FALSE, AND IT WAS FALSE ABOUT THE ARTIFACT THAT WAS
+PUBLISHED.**  NOTICE.md said "The published package is built with
+`-CleanLoader`, so its RomFS holds only what this project owns", and both
+READMEs said the package carries no game content and that the release is
+the 6.5 MiB clean build.  The measured release says otherwise:
+
+    the NSP that was DOWNLOADED BACK AND RE-VERIFIED (v0.22.14):
+      NSP            50,535,128 bytes
+      its RomFS      35 files, 44,948,780 bytes
+      romfs/libRealRacing3.so   33,110,472   byte-identical to the APK's
+      romfs/libfmodex.so         1,274,928   byte-identical to the APK's
+      romfs/libc++_shared.so     1,014,704
+      romfs/libNimble.so              5,824
+      romfs/original/*             5,785,627   the .depot text
+      romfs/ui/*                  3,150,232   the interface faces
+
+**AND IT IS NOT AN ACCIDENT: THE PACKAGING SCRIPT REQUIRES IT.**
+`tools/Pack-NativeSwitchNsp.ps1` refuses to pack without
+`romfs/libRealRacing3.so` (it throws "the RomFS tree carries no guest main
+binary"), because the port has exactly one source for the guest's C++
+runtime and an NSP without it does not start.  **AN NSP THAT IS BOTH CLEAN
+AND BOOTABLE DOES NOT EXIST**, so "the release is the clean build" could
+never have been true of the NSP.
+
+**WHAT NO RELEASE CARRIES IS THE GAME'S DATA.**  The seven volumes are not
+in any release; the port mounts the user's own volumes (or the loose
+`.depot/` tree).  That part of the claim was true, and it is now stated as
+what it is.
+
+**THE DOCS NOW SAY WHAT THE ARTIFACTS ARE**: NOTICE.md's Game data section,
+both READMEs' install / build / licence sections, and the hardware guide's
+0.4 and 1.0.  The NSP and the app zip carry the guest runtime, the faces
+and the `.depot` text; the clean `-CleanLoader` build still exists and
+produces the 6.5 MiB NRO variant; **neither carries the game data**.
+
+**=> A DOC CLAIM ABOUT AN ARTIFACT IS A CLAIM ABOUT A MEASUREMENT.**  The
+numbers above came from the release that was downloaded back and checked
+file by file; the sentence they contradicted came from an intention.
+**THE INTENTION WAS NEVER THE MEASUREMENT.**

@@ -44,17 +44,37 @@ guest binary `libRealRacing3.so` and the game data volumes are taken from the
 user's own copy of the application. The port loads them at runtime and
 circumvents no protection, licence check, or DRM.
 
-The published package is built with `-CleanLoader`, so its RomFS holds only
-what this project owns: `libc++_shared.so`, the OFL-licensed Chinese
-bootstrap face, and that face's licence text.  The guest's own files -- its
-runtime, the interface faces and the `.depot` text -- are found on the card
-next to the NRO, where the user put them.  The port's code contains the
-*names* of those files (it has to, to look for them); it contains none of
-their bytes.
+**WHAT THE PUBLISHED PACKAGE ACTUALLY CARRIES, MEASURED FROM THE RELEASE
+THAT WAS DOWNLOADED BACK AND RE-VERIFIED** (v0.22.14).  The NSP is 50,535,128
+bytes; its RomFS holds 35 files over 44,948,780 bytes, and those files
+include the guest's own runtime:
 
-A build without `-CleanLoader` stages the same files into the RomFS, so the
-build output carries EA material.  That is a build-time choice, not a
-distribution one: the release is the clean build.
+    romfs/libRealRacing3.so   33,110,472   byte-identical to the APK's
+    romfs/libfmodex.so         1,274,928   byte-identical to the APK's
+    romfs/libc++_shared.so     1,014,704
+    romfs/libNimble.so              5,824
+    romfs/original/*             5,785,627   the .depot text
+    romfs/ui/*                  3,150,232   the interface faces
+    romfs/licenses/...              4,388   the OFL face's licence text
+
+**THE PACKAGING SCRIPT REQUIRES THE GUEST BINARY TO BE THERE**
+(`tools/Pack-NativeSwitchNsp.ps1` refuses to pack without
+`romfs/libRealRacing3.so`), because the port has exactly one source for the
+guest's C++ runtime and an NSP without it does not start.  The app-only zip
+in the same release carries the same RomFS tree.
+
+**WHAT NO RELEASE CARRIES: THE GAME'S DATA.**  The seven data volumes (the
+game's textures, tracks, cars and audio) are not in any release, and the
+largest published asset is the app package.  The volumes are the user's own,
+mounted from a data pack they prepared; the port also accepts the loose
+`.depot/` tree on the card, but the volumes are the tested path.
+
+**AND THE CLEAN BUILD STILL EXISTS.**  `tools/Build-NativeSwitch.ps1
+-CleanLoader` produces the variant that carries none of the above: its
+RomFS holds only `libc++_shared.so`, the OFL-licensed Chinese bootstrap face
+and that face's licence text, and the guest's own files are then found on
+the card, where the user put them.  The port's code contains the *names* of
+those files (it has to, to look for them); it contains none of their bytes.
 
 Anyone producing a build from this source must supply their own copy of the
 application to do so.
