@@ -14354,3 +14354,32 @@ port consumes it) / P3 (the hardware plays it): P1 and P2 are provable on
 Eden, P3 needs the console, and this host's audren is the raw service API
 (no `nn::audio` wrapper, no wave-buffer helper) so the node graph has to
 be built by hand.  Full reasoning: docs/OPEN-ISSUES.md section 9.48.
+
+### 2026-11-16 The R1 feasibility verdict: the guest's real FMOD CAN run
+
+**MEASURED FROM THE SYMBOL TABLES.**  The guest game imports 52 FMOD
+symbols; the port intercepts all 52 (the real library exports all 52, so
+the interception is complete); the real `libfmodex.so` imports NO audio
+backend symbols at all -- it reaches its backend through
+`dlopen("libOpenSLES.so")`, and **the port already serves exactly that
+library**.  **=> IF THE REAL FMOD RUNS, IT FINDS A BACKEND, MIXES AND
+ENQUEUES PCM INTO THE PORT'S OPENSL DEVICE**, which is the last hop where an
+audren output would attach.
+
+**AND THE HISTORIC BLOCKER IS A LAYOUT PROBLEM, NOT A MYSTERY.**  The shim
+exists because the real library's DSP-graph code walks a list head that is
+never sentinel-initialised, and the main thread spun on it forever -- that
+was the SHIM'S objects being read by the REAL library's code.  **=> THE PORT
+MUST NEVER MIX THE TWO**, so R1 is all-or-nothing over the 52 symbols.
+
+**THE THREE CONDITIONS BEFORE THE INTERCEPTION IS TOUCHED.**  (1) the
+OpenSL device needs a real volume interface -- the guest's own log already
+says `FMOD_ZERO_VOLUME_VIRTUALISATION`, which is what a device without one
+looks like, and the port currently hands out the buffer-queue vtable for
+ANY unknown IID; (2) the interception comes out wholesale or not at all; (3)
+the shim's safety net (real objects, self-linked sentinels) goes with it.
+
+**THE MEASUREMENT THAT DECIDES IT IS P1** -- the OpenSL device's
+`bufferEnqueues`/`pcmBytes` going from 0 to >0, which is provable on
+Eden -- with P2 (the port consumes) and P3 (the hardware plays) after it.
+Full reasoning: docs/OPEN-ISSUES.md section 9.49.

@@ -5049,3 +5049,86 @@ port's own instrument, when it fails, must be LOUD.  The FMOD self-test had
 been failing in every round for the whole life of the shim, and it was
 invisible because it was a line in a 75 MB log instead of a number in the
 summary.  **=> A SELF-TEST THAT NOBODY READS IS NOT A SELF-TEST.**
+### 9.49 The R1 feasibility verdict: the guest's real FMOD can run, and here is what has to be true first
+
+**MEASURED, FROM THE SYMBOL TABLES (readelf --dyn-syms on the two guest
+libraries, cross-referenced with the port's own interception table).**
+
+    the guest game imports FMOD symbols      52
+    the port intercepts                       52   (100%)
+    the real libfmodex.so exports them        52   (so the interception is
+                                                   complete, not partial)
+    the real libfmodex.so's own imports      94
+    of those, audio-backend imports           0   (no sl*, no AAudio*)
+    "libOpenSLES.so" inside libfmodex.so    present
+    "libaaudio.so" inside libfmodex.so      absent
+
+**=> => => => => AND THE FIRST CONSEQUENCE IS THE GOOD ONE: THE REAL FMOD
+REACHES ITS AUDIO BACKEND THROUGH dlopen("libOpenSLES.so"), AND THE PORT
+ALREADY SERVES THAT EXACT LIBRARY.**  The port's OpenSL device is not a
+speculative stub: `isVirtualAudioLibrary()` /
+`virtualAudioLibraryHandle()` / `resolveVirtualAudioSymbol()` exist
+precisely because the guest's own audio library asks for it by name.  **=> IF
+THE REAL FMOD RUNS, IT WILL FIND A BACKEND, MIX THE GAME'S SOUNDS AND ENQUEUE
+PCM INTO THE PORT'S OPENSL DEVICE** -- and that device is the LAST HOP, so
+it is where an audren output would attach.
+
+**=> => => => => => AND THE SECOND CONSEQUENCE IS THE HISTORIC BLOCKER, AND
+IT IS A LAYOUT PROBLEM, NOT A MYSTERY.**  The shim's own header records why
+it exists:
+
+    the real libfmodex.so's DSP-graph code walks a circular node list whose
+    head (this + 0xa4d0) is never sentinel-initialised, so the call returns
+    nothing and the main thread spins on the resulting unmapped
+    Read64 @ 0x8 / Read32 @ 0x1C0 pair forever.
+
+**=> THE SPIN WAS A MIXED-LAYOUT FAILURE: THE SHIM'S OBJECTS WERE HANDED TO
+THE REAL LIBRARY'S CODE.**  The real library read its own expected offsets
+out of the shim's objects and walked garbage.  With the interception at
+100% the two never meet, and with it at 0% the real library builds its own
+graph and its own objects -- **=> BUT THE PORT MUST NEVER MIX THEM.**  That
+is the one rule R1 has to keep.
+
+**=> => => => => => => AND THE THREE THINGS THAT HAVE TO BE TRUE BEFORE THE
+INTERCEPTION IS TOUCHED.**
+
+1. **THE OPENSL DEVICE NEEDS A VOLUME INTERFACE.**  The guest's own log
+   already says `FMOD_ZERO_VOLUME_VIRTUALISATION` -- the real FMOD read
+   the output's volume as ZERO and virtualised the voices away, which is
+   exactly what a device without a volume interface looks like.  The port's
+   `playerGetInterface()` returns the buffer queue for ANY unrecognised
+   IID, so a `GetInterface(SL_IID_VOLUME)` would get the WRONG VTABLE
+   and read a garbage level.  **=> THE VOLUME INTERFACE MUST BE IMPLEMENTED
+   PROPERLY, AND THE UNKNOWN-IID FALLBACK MUST STOP.**
+2. **THE INTERCEPTION MUST COME OUT WHOLESALE (52 SYMBOLS) OR NOT AT ALL.**
+   A partial removal recreates the mixed-layout spin, which is the one
+   failure this shim was built to end.
+3. **THE PORT LOSES THE SHIM'S SAFETY NET WITH IT.**  The shim's reason for
+   existing is that every handle is a real, non-null object whose node
+   lists are self-linked sentinels, so a walk always terminates.  Those
+   guarantees live in the shim; R1 hands that job back to the guest's
+   library and to the port's exception handler.
+
+**=> => => => => => => => => AND THE MEASUREMENT THAT DECIDES IT, WHICH IS
+THE SAME THREE LAYERS AS SECTION 9.48.**
+
+    P1  the guest enqueues PCM     the OpenSL device's bufferEnqueues and
+                                   pcmBytes go from 0 to >0, with the
+                                   format (rate, channels, bits) read out
+                                   of the guest's SLDataFormat
+    P2  the port consumes it       a ring that the port drains
+    P3  the hardware plays it       audren's played-sample count advancing
+
+**P1 IS THE ONE THAT ANSWERS "CAN THE GUEST'S FMOD RUN AT ALL", AND IT IS
+PROVABLE ON THE EMULATOR.**  Today P1 is 0 and cannot be anything else: the
+port's FMOD API holds no PCM and the guest never reaches the OpenSL device.
+
+**=> => => => => => => => => => AND THE VERDICT.**  **R1 IS VIABLE IN
+PRINCIPLE, AND THE PORT IS ALREADY HALFWAY THERE** -- the backend handshake
+is already served, the interception table is already complete, and the
+library is already loaded and its constructors already run on device.  **THE
+PRICE IS THE THREE CONDITIONS ABOVE**, of which the first (the OpenSL volume
+interface) is small, well-understood and independently testable, and the
+second (all-or-nothing) is a rule rather than a project.  **=> THE DECISION
+LEFT IS NOT "IS IT POSSIBLE" BUT "HOW MUCH REGRESSION SURFACE IS THE
+FALLBACK WORTH".**

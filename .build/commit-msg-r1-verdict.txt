@@ -1,0 +1,59 @@
+THE R1 FEASIBILITY VERDICT: THE GUEST'S REAL FMOD CAN RUN
+
+R1 means: stop intercepting the guest's FMOD symbols and let the guest's own
+libfmodex.so mix the game's sounds.  This is the read-only assessment of
+whether that is possible, and it is measured, not guessed.
+
+FROM THE SYMBOL TABLES (readelf --dyn-syms on both guest libraries,
+cross-referenced with the port's interception table):
+
+    the guest game imports FMOD symbols      52
+    the port intercepts                       52   (100%)
+    the real libfmodex.so exports them        52   (complete, not partial)
+    the real libfmodex.so's own imports      94
+    of those, audio-backend imports           0   (no sl*, no AAudio*)
+    "libOpenSLES.so" inside libfmodex.so    present
+    "libaaudio.so" inside libfmodex.so      absent
+
+THE GOOD NEWS.  The real FMOD reaches its audio backend through
+dlopen("libOpenSLES.so"), and the port ALREADY serves exactly that library
+-- isVirtualAudioLibrary() / virtualAudioLibraryHandle() /
+resolveVirtualAudioSymbol() exist because the guest's own audio library asks
+for it by name.  So if the real FMOD runs, it finds a backend, mixes the
+game's sounds and enqueues PCM into the port's OpenSL device -- the LAST
+hop, where an audren output would attach.
+
+THE HISTORIC BLOCKER IS A LAYOUT PROBLEM, NOT A MYSTERY.  The shim exists
+because the real library's DSP-graph code walks a list head that is never
+sentinel-initialised, and the main thread spun on it forever -- that was
+the SHIM's objects being read by the REAL library's code, each expecting the
+other's offsets.  With the interception at 100% the two never meet; with it
+at 0% the real library builds its own graph.  BUT THE PORT MUST NEVER MIX
+THEM: the interception comes out all 52 at once or not at all.
+
+THE THREE CONDITIONS BEFORE THE INTERCEPTION IS TOUCHED.
+
+  1. The OpenSL device needs a real VOLUME interface.  The guest's own log
+     already says "FMOD_ZERO_VOLUME_VIRTUALISATION", which is what a device
+     without one looks like, and the port currently hands out the
+     buffer-queue vtable for ANY unrecognised IID -- so a
+     GetInterface(SL_IID_VOLUME) would read a garbage level.  Small,
+     well-understood, independently testable.
+  2. The interception comes out wholesale or not at all.
+  3. The shim's safety net goes with it: every handle was a real, non-null
+     object whose node lists were self-linked sentinels, so a walk always
+     terminated.  That job goes back to the guest's library and to the
+     port's exception handler.
+
+THE MEASUREMENT THAT DECIDES IT IS P1: the OpenSL device's bufferEnqueues
+and pcmBytes going from 0 to >0, with the format read out of the guest's
+SLDataFormat.  P1 is provable on the emulator.  P2 (the port consumes) and
+P3 (the hardware plays) come after it.
+
+The verdict: R1 IS VIABLE IN PRINCIPLE, and the port is already halfway
+there -- the backend handshake is served, the interception table is
+complete, the library is loaded and its constructors already run on device.
+The decision that is left is not "is it possible" but "how much regression
+surface is the fallback worth".
+
+docs/OPEN-ISSUES.md section 9.49 has the whole chain.
