@@ -5415,3 +5415,77 @@ BIAS, WHICH THE LOG ITSELF CONFIRMS.**  The reaper refuses to print any
 value unless `bias + addend == read` holds (it says so: "coordinate
 system unverified, no other value reported"), and this round printed
 values -- **=> the bias used to place the addresses is the port's own**.
+### 9.54 The relocation theory is dead, and the guest dies EARLIER than the audio path
+
+**THE HYPOTHESIS THIS SECTION KILLS.**  The R1 hypothesis was: "the port
+never applies libfmodex.so's OWN .rela.dyn, so the library's global vtable
+pointer stays 0 and the guest's FMOD_System_Create dereferences a null
+vtable".  **=> THAT IS FALSE, AND IT WAS FALSE BECAUSE IT WAS BASED ON A
+DEAD CALL PATH.**
+
+- `applyTable()` -- the function the hypothesis named -- is called at
+  multi_dso_linker.cpp:2528/2530/2533/2535, and those calls live in
+  `crossLinkElfPair()`, WHICH HAS NO CALLER ANYWHERE IN THE REPO.  It is
+  dead code, and `gPrimaryImage`/`gDependencyImage` are never filled in
+  the live path.
+- THE LIVE PATH IS THE FOUR-IMAGE ONE.  `main.cpp:1027-1032` builds
+  `loaderPaths[]` = {libRealRacing3.so, libNimble.so, libfmodex.so,
+  libc++_shared.so} and `loadLinkElfSet()` (multi_dso_linker.cpp:2559)
+  loads them.  The per-image loop at multi_dso_linker.cpp:2639-2651 calls
+  `applyLoaderTable(&image, image.relaAddress, image.relaSize, ...)` and
+  the jumpRel twin **FOR EVERY IMAGE, libfmodex.so INCLUDED**.
+- AND THE CONSTRUCTORS ARE CALLED, NOT COUNTED.
+  `initializeGuestDependencies()` (multi_dso_linker.cpp:2801) EXECUTES each
+  dependency image's init_array entry at multi_dso_linker.cpp:2886 and
+  counts it at 2887.  libfmodex.so is not the main image, so its two
+  entries (0x215FC, 0x216B8) are executed.
+- `elf_preflight.cpp`'s `processRelocations()` (852) operates on a
+  THROWAWAY HEAP COPY (allocated at 353, freed at 864); it never touches the
+  runtime image.  It is a validator, not the relocation pass.
+- **AND "images=4 dependency_ctors=3 main_ctors=181" IS A PLAN COUNT, NOT
+  PROOF OF EXECUTION** (it comes from `captureGuestStartupPlan()`,
+  multi_dso_linker.cpp:2770-2795).  The execution counters are
+  `constructorsCalled` against `constructorsPlanned` (2887 / 2830).
+
+**MEASURED, IN THE ROUND THAT HAD THE REAL LIBRARY IN IT** (round
+`rr3-p1attr1`, guest-view.log):
+
+    phase=loader-diag: missRel=0 needMiss=0 wxSeg=0 tlsSeg=0 permEnf=1 ready=1
+    phase=loader-diag ordinal=0 ... pac-census image=2 name=romfs:/libfmodex.so soname=libfmodex.so bytes=1609728
+    phase=auto-boot: extData=1 fsTest=1fff loader=1 plan=1
+
+=> No missing relocations, no missing needed symbols, the loader's
+activation gate PASSED, and libfmodex.so was mapped as image 2.  **THE
+RELOCATION PATH WAS NEVER THE PROBLEM.**
+
+**AND THE LEVER'S MECHANISM IS SOUND.**  `fmod=real` is read inside
+`resolveHostSymbol()` (symbol_resolver.cpp:2074): the port answers NOTHING
+for a guest FMOD symbol, so the primary image's FMOD relocation falls
+through to `findExportInLoaderScope()` (multi_dso_linker.cpp:1674) and binds
+to libfmodex.so's OWN export.  That is what "all or nothing" means here.
+
+**=> => => AND THE GUEST ACTUALLY DIES EARLIER THAN THE AUDIO PATH.**  The
+engine chain the reaper walks starts at a GOT SLOT IN THE GUEST IMAGE
+(`kEngineSingletonElfVa`), so it is the GAME's engine object -- not the
+port's, and not FMOD's System object.  The two cells, same instrument,
+same round shape:
+
+    the shim cell (rr3-p1base):
+      asset=210923ee98/211415b2c0/PRESENT eng=210922a688 f8=1c00000000 ...
+    the real cell (rr3-p1attr1):
+      asset=2108e32e98/0/NULL-FIRST-WORD eng=2108e1e688 f8=0 vt=0 table=0
+      engraw=00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000 rawwords=8
+
+=> In the shim cell the guest's engine object was written (engine+8 changes
+every second: 0x1a00000000, 0x1c00000000) and the guest's asset singleton
+has its first word PRESENT.  In the real cell the engine object is EIGHT
+ZERO WORDS and the asset singleton's first word is still NULL.  **=> WITH
+THE GUEST'S OWN FMOD THE GAME NEVER FINISHED ITS OWN ENGINE AND ASSET
+INITIALISATION.**  It stopped BEFORE the audio path, not inside it.
+
+**AND THE README WAS WRONG ABOUT THE AUDIO.**  It claimed "music and sound:
+yes".  The measurement in the very same round says `pcm_enq=0
+pcm_bytes=0`: the port hands the hardware no PCM at all.  The README rows
+(in both languages) are corrected, and they carry the census line the
+numbers come from.
+

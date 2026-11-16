@@ -31,10 +31,17 @@ and a controller really drives the car.**
 | Boots to the game's front end | ✅ |
 | Car select → into a race | ✅ |
 | Driving with a controller | ✅ |
-| Music and sound | ✅ |
+| Music and sound | ⚠️ the code path runs, but nothing is audible yet |
 | A full lap driven by you, with a working lap counter | ✅ |
 | The port's own attract-mode autopilot completing a lap | ⚠️ not yet |
 | Occasional black screen on the console | ⚠️ cause found, fix in the next build |
+
+> What the audio row means: **the guest's audio code runs the whole way**
+> (200 sounds, 1 stream, 625 channels, OpenSL device self-test `0x3ff`,
+> 48000 Hz / 2 channels), **but the port hands the hardware not one PCM
+> byte** (`pcm_enq=0 pcm_bytes=0`, measured round `p1base`, 2026-11-16)
+> => the console is silent for now.  The numbers are that round's census
+> line, not an estimate.
 
 The full status of every item is in
 [docs/FEATURE-MATRIX.md](docs/FEATURE-MATRIX.md).
