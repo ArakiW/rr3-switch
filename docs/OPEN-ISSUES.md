@@ -5381,3 +5381,37 @@ SPECIFIC.**
 PORT'S SHIM STAYS.**  It is not a workaround for a missing feature: it is
 what keeps the guest's audio code paths from waiting for an event that
 never arrives.
+### 9.53 The attribution round: whose code is the waiter, and what the engine object holds
+
+**THE INSTRUMENT FIXES THIS ROUND NEEDED.**  Two of them, both of the same
+kind -- do not assume a layout:
+
+1. **THE COND-WAIT LEDGER NOW SAYS WHOSE CODE THE WAITER IS IN.**  It
+   recorded the address the wait returned to and printed it as a bare
+   number; the port already knows how to say which guest image an address
+   belongs to (`loaderLocateAddress`, the same helper the crash dump uses
+   for the pc).
+2. **THE REAPER PRINTS THE ENGINE OBJECT'S RAW WORDS.**  The named chain
+   it used (`engine[1]` -> `*f8` -> `vtable[0x38]` ->
+   `table[0..3]`) **IS THE PORT'S SHIM'S LAYOUT**.  With the guest's own
+   library the object is laid out differently, so those names were a claim
+   about the layout and not a measurement of the object.  **=> THE
+   "ALL-ZERO ENGINE" READING WAS EXACTLY THAT KIND OF CLAIM**, and the raw
+   words are the measurement.
+
+**=> => => => => MEASURED (round `rr3-p1attr1`, the guest's own FMOD again).**
+
+    the waiter:      libc++_shared.so+0x77a30
+    the engine object, raw words:
+                     00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000
+    the last ledger line:
+      phase=cond-wait-ledger ordinal=1000 target=0000000000000003 obj=0x210fc30940 known=1 waited_ms=1000 waits=4 signals=1 deficit_at_entry=3 epoch=1 wait_caller=0x2109036a30 wait_caller_at=libc++_shared.so+0x77a30 budget_ms=120000 outcome=still-waiting
+    the last reaper line:
+      phase=reaper-asset-singleton ordinal=383000000000 target=000000003b9aca00 waited_ns=383000000000 slice_ns=1000000000 boot_ms=185486457 asset=2108e32e98/0/NULL-FIRST-WORD eng=2108e1e688 f8=0 vt=0 table=0 t0=00000000 t1=00000000 t2=00000000 t3=00000000 engraw=00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000 rawwords=8
+    frames ?      guest log 547365 B / 3134 lines
+
+**=> => => => => => AND THE BASELINE FOR THE ATTRIBUTION IS THE PORT'S OWN
+BIAS, WHICH THE LOG ITSELF CONFIRMS.**  The reaper refuses to print any
+value unless `bias + addend == read` holds (it says so: "coordinate
+system unverified, no other value reported"), and this round printed
+values -- **=> the bias used to place the addresses is the port's own**.

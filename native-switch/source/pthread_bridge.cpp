@@ -5979,6 +5979,27 @@ void* reapDetachedThreadWorker(void*) {
                     const uintptr_t table =
                         (vt != 0 && guestPointerReadable(vt + 0x38))
                             ? *reinterpret_cast<const volatile uintptr_t*>(vt + 0x38) : 0;
+                    // THE RAW WORDS OF THE ENGINE OBJECT.
+                    //
+                    // WHY: the named chain above (engine[1] -> *f8 ->
+                    // vtable[0x38] -> table[0..3]) IS THE PORT'S SHIM'S
+                    // LAYOUT.  When the guest's own FMOD is in use the
+                    // object is laid out DIFFERENTLY, so those names are a
+                    // claim about the layout and not a measurement of the
+                    // object -- and a measurement that cannot be taken
+                    // must not be printed as if it had been taken.
+                    // The raw words are the measurement, and they are
+                    // readable whatever the layout is.
+                    uint32_t raw[8] = {0};
+                    unsigned int rawWords = 0;
+                    if (engine != 0 && guestPointerReadable(engine + 8 * sizeof(uint32_t))) {
+                        const volatile uint32_t* words =
+                            reinterpret_cast<const volatile uint32_t*>(engine);
+                        for (unsigned int index = 0; index < 8; ++index) {
+                            raw[index] = words[index];
+                        }
+                        rawWords = 8;
+                    }
                     uint32_t e0 = 0, e1 = 0, e2 = 0, e3 = 0;
                     if (table != 0 && guestPointerReadable(table) &&
                         guestPointerReadable(table + 3 * sizeof(uint32_t))) {
@@ -5990,7 +6011,9 @@ void* reapDetachedThreadWorker(void*) {
                                        sizeof(details) - __builtin_strlen(details),
                                        " asset=%llx/%llx/%s"
                                        " eng=%llx f8=%llx vt=%llx table=%llx"
-                                       " t0=%08x t1=%08x t2=%08x t3=%08x",
+                                       " t0=%08x t1=%08x t2=%08x t3=%08x"
+                                       " engraw=%08x,%08x,%08x,%08x,"
+                                       "%08x,%08x,%08x,%08x rawwords=%u",
                                        static_cast<unsigned long long>(obj),
                                        static_cast<unsigned long long>(first),
                                        obj == 0 ? "NULL-SINGLETON"
@@ -6000,7 +6023,10 @@ void* reapDetachedThreadWorker(void*) {
                                        static_cast<unsigned long long>(ef8),
                                        static_cast<unsigned long long>(vt),
                                        static_cast<unsigned long long>(table),
-                                       e0, e1, e2, e3);
+                                       e0, e1, e2, e3,
+                                       raw[0], raw[1], raw[2], raw[3],
+                                       raw[4], raw[5], raw[6], raw[7],
+                                       rawWords);
                 }
             }
             guestViewWideLog("reaper-asset-singleton", waitedNanos,
@@ -6456,10 +6482,20 @@ int guestPthreadCondWait(void* condition, void* mutex) {
             // ONE acquisition for the read and the write together.
             ledger = condWaitLedgerOf(condition);
             char details[256];
+            // WHOSE CODE IS THE WAITER IN?  The ledger records the address
+            // the wait returned to, and the port already knows how to say
+            // which guest image an address belongs to (loaderLocateAddress,
+            // the same helper the crash dump uses for the pc).  A bare
+            // number cannot be acted on; "libfmodex.so+0x1d2a30" can.
+            char waitWhere[96] = "(not in a guest image)";
+            rr3::loaderLocateAddress(
+                reinterpret_cast<uint64_t>(ledger.lastWaitReturn),
+                waitWhere, sizeof(waitWhere));
             __builtin_snprintf(details, sizeof(details),
                                "obj=%p known=%d waited_ms=%llu waits=%llu "
                                "signals=%llu deficit_at_entry=%llu epoch=%llu "
-                               "wait_caller=%p budget_ms=%llu outcome=%s",
+                               "wait_caller=%p wait_caller_at=%s "
+                               "budget_ms=%llu outcome=%s",
                                condition,
                                ledger.known ? 1 : 0,
                                (unsigned long long)waitedMs,
@@ -6468,6 +6504,7 @@ int guestPthreadCondWait(void* condition, void* mutex) {
                                (unsigned long long)deficitAtEntry,
                                (unsigned long long)ledger.signalEpoch,
                                ledger.lastWaitReturn,
+                               waitWhere,
                                (unsigned long long)kCondWaitBudgetMs,
                                waitedMs >= kCondWaitBudgetMs ? "GIVING-UP"
                                                            : "still-waiting");
