@@ -1,0 +1,62 @@
+THE R1 HANG IS ATTRIBUTED: THE GUEST WAITS ON AN EVENT THAT NEVER ARRIVES
+
+The guest's own FMOD does not come up in the port's environment, and this
+commit records where it stops -- read out of the port's own instruments and
+out of the guest's own binary.
+
+THE ATTRIBUTION IS SPECIFIC, AND IT IS NOT AN ASSET PROBLEM.
+
+  1. THE GUEST'S MAIN THREAD WAITS ON A CONDITION VARIABLE THAT IS NEVER
+     SIGNALLED.  The port's cond-wait ledger, once a second: the wait count
+     grows (1, 2, 3, ...) and the signal count never does (1).  Each wait
+     exhausts the 120 s budget, the port turns it into a spurious wakeup so
+     the guest is not stuck forever, and the guest goes straight back to
+     waiting.  The ledger also records the WAITER'S OWN ADDRESS
+     (wait_caller=0x2109436a30), which is the address to attribute next.
+  2. THE ASSET SYSTEM WAS HEALTHY IN THE SAME ROUND: 8,649 assets checked,
+     8,649 agreed, 0 disagreed, 0 unresolved, and both controls behaved.
+     It is not the assets.  The guest also asked for and RECEIVED both
+     audio asset lists.
+  3. THE GAME'S OWN AUDIO PATH RAN in that round too: it printed
+     FMOD_ZERO_VOLUME_VIRTUALISATION there as well.
+
+AND THE REAL LIBRARY'S CREATE PATH, READ FROM ITS OWN BINARY.  FMOD_System_Create
+is at 0x21a70 (532 bytes) and its first move is through a GLOBAL:
+
+  21a8c: adrp x21, 139000
+  21a90: ldr  x21, [x21, #2688]   ; a global slot -> a global object
+  21aa0: ldr  x8,  [x21]           ; its VTABLE
+  21aac: ldr  x0,  [x8, #8]        ; vtable[1]
+  21ab0: bl   afb18                ; call through it
+  21ab8: bl   4c068                ; and 4c068 is the CONSTRUCTOR
+
+The constructor writes the vtable itself (stp x9, x8, [x19]) and reaches
+offset 1968, so the System object is at least 1972 bytes.  If that global
+vtable is not initialised in the port's environment, the path reads [0x8]
+of a null vtable -- exactly the "unmapped Read64 @ 0x8 / Read32 @ 0x1C0
+pair" the shim's header records.  THE HISTORIC CRASH AND THIS HANG ARE THE
+SAME SHAPE.
+
+AND THE LIBRARY'S DEPENDENCIES ARE NOT BROKEN BY THE PORT: it imports only
+malloc, free, pthread_once, dlopen, dlsym and __cxa_atexit; the port's
+malloc is a real wrapper over std::malloc, and operator new/delete are not
+intercepted at all.  The allocator is not the problem.
+
+AND ONE MEASUREMENT CAVEAT, WHICH IS THE SAME KIND OF MISTAKE: the port's
+reaper prints the engine object's fields BY NAME, at THE PORT'S SHIM'S
+OFFSETS.  With the guest's own library the layout differs, so the
+"all-zero engine" reading is layout-dependent and must not be taken as a
+measurement of the real object.  The spin is real; the field names are not
+trustworthy.  The instrument should print RAW WORDS.
+
+THE NEXT THREE STEPS ARE SPECIFIC: attribute the waiter (its address is in
+the ledger), make the reaper's dump layout-independent, and find out whether
+the global vtable the create path uses is initialised here -- it is a GOT
+slot inside libfmodex.so, so it is either a RELATIVE relocation the port
+applies or something a constructor writes.
+
+Until that is done the port's shim stays: it is not a workaround for a
+missing feature, it is what keeps the guest's audio code paths from
+waiting for an event that never arrives.
+
+docs/OPEN-ISSUES.md section 9.52 has the whole chain.
