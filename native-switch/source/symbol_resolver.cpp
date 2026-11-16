@@ -2074,6 +2074,48 @@ bool isGuestFmodSymbol(const char* name) {
         std::strncmp(name, "FMOD_", 5) == 0;
 }
 
+// THE ONE FMOD CALL THE PORT WATCHES.
+//
+// With "fmod=real" on the card the guest's 52 FMOD imports bind to the
+// guest's own libfmodex.so.  FMOD_System_Create is the FIRST of them and
+// the one that can fail: the real library allocates a 42752-byte System
+// (0xA700) out of its own memory pool, and when that allocation fails it
+// returns a NULL handle.  The guest then drives FMOD through that NULL
+// object, which is what the 2026-11-16 Eden log shows: the first fault is
+// a read at 0x50 (the real library's "ldr x0, [pool+0x50]" with pool==0),
+// then the whole System is CONSTRUCTED AT ADDRESS 0, then the endless
+// null+0x8 / null+0x1C0 walk.
+//
+// THIS IS A PASS-THROUGH, NOT A SECOND IMPLEMENTATION: it calls the guest's
+// own FMOD_System_Create and returns its result untouched.  Nothing about
+// the guest's FMOD object model changes, so the mixed-layout failure the
+// shim exists to end cannot come back through this path.  The only thing
+// added is one line in the round's log, so that "R1 does not work" can say
+// WHICH call failed and with what code.
+int fmodRealSystemCreateObserved(void** system) {
+    using CreateFn = int (*)(void**);
+    static CreateFn real = nullptr;
+    if (real == nullptr) {
+        real = reinterpret_cast<CreateFn>(
+            findLoaderExportBySoname("libfmodex.so", "FMOD_System_Create"));
+    }
+    int result = -1;
+    void* handle = nullptr;
+    if (real != nullptr) {
+        result = real(system);
+        handle = (system != nullptr) ? *system : nullptr;
+    }
+    const unsigned long long handleValue =
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(handle));
+    char details[192];
+    std::snprintf(details, sizeof(details),
+                  "fmod-real-create result=%d handle=%llx real=%p",
+                  result, handleValue, reinterpret_cast<void*>(real));
+    appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                         "fmod-real", 0, handleValue, details);
+    return result;
+}
+
 uintptr_t resolveHostSymbol(const char* name) {
     if (name == nullptr) {
         return 0;
@@ -2089,6 +2131,16 @@ uintptr_t resolveHostSymbol(const char* name) {
             // guest's FMOD symbols, and the guest's own libfmodex.so
             // provides them.
             if (isGuestFmodSymbol(symbol.name) && guestFmodUsesRealLibrary()) {
+                // ONE EXCEPTION: the port watches FMOD_System_Create.
+                //
+                // The watcher is a PASS-THROUGH to the guest's own library
+                // (see fmodRealSystemCreateObserved), not the port's shim,
+                // so the guest still receives the real library's object.
+                // Every other FMOD symbol keeps going to the real library
+                // untouched.
+                if (std::strcmp(symbol.name, "FMOD_System_Create") == 0) {
+                    return reinterpret_cast<uintptr_t>(&fmodRealSystemCreateObserved);
+                }
                 return 0;
             }
             return symbol.address;

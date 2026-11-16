@@ -261,6 +261,12 @@ GuestInitializationResult initializeGuestDependencies();
 GuestInitializationResult initializeGuestMainConstructors(
     const char* progressPath = nullptr);
 uintptr_t resolveMainImageExport(const char* name);
+// Export lookup in ONE named loaded image (by soname).
+//
+// WHY: the port's FMOD observer needs the guest's own libfmodex.so entry
+// point without hard-coding a load order or a base address.  "0" means the
+// image is not loaded, or does not export that name.
+uintptr_t findLoaderExportBySoname(const char* soname, const char* name);
 // Runtime load bias of libRealRacing3.so (0 if the image is not loaded or not mapped).
 // Guest VA = loadBias + ELF virtual address.
 //

@@ -6174,16 +6174,67 @@ GuestThread guestPthreadSelf() {
     std::abort();
 }
 
+// THE BRIDGE'S REGISTRY DECISIONS, ONE LINE EACH.
+//
+// WHY: the interesting fact is not "did the call fail" but "WHICH decision
+// did the bridge make".  The guest's own libfmodex.so keeps its
+// pthread_mutexattr_t ON THE STACK, never destroys it, and initialises a
+// new one from the same stack slot for its next memory source.  A round
+// that shows "attr-reinit" proves the guest re-used an address -- which is
+// what used to come back as EBUSY.
+//
+// BUDGETED, WITH ITS OWN EXHAUSTION LINE, BECAUSE THE WRITE IS AN FSYNC
+// PER LINE AND THE BRIDGE SITS ON THE GUEST'S HOT PATH.
+static void pthreadBridgeDiag(const char* what, const void* object, uintptr_t caller) {
+    constexpr unsigned kBudget = 64;
+    static unsigned s_lines = 0;
+    static bool s_exhaustionReported = false;
+    if (s_lines >= kBudget) {
+        return;
+    }
+    ++s_lines;
+    char details[192];
+    std::snprintf(details, sizeof(details), "%s object=%p caller=%llx", what, object,
+                  static_cast<unsigned long long>(caller));
+    rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                              "pthread-bridge", 0,
+                              static_cast<unsigned long long>(caller), details);
+    if (s_lines == kBudget && !s_exhaustionReported) {
+        s_exhaustionReported = true;
+        rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                  "pthread-bridge", 0, 0,
+                                  "budget exhausted (64 lines)");
+    }
+}
+
 int guestPthreadMutexAttrInit(void* attribute) {
     if (attribute == nullptr) return EINVAL;
+    const uintptr_t caller =
+        reinterpret_cast<uintptr_t>(__builtin_return_address(0));
     mutexLock(&gRegistryLock);
-    if (findSlot(gMutexAttributes, attribute) != nullptr) {
+    MutexAttrSlot* existing = findSlot(gMutexAttributes, attribute);
+    if (existing != nullptr) {
+        // RE-INITIALISE, DO NOT FAIL WITH EBUSY.
+        //
+        // WHY: bionic and glibc both let pthread_mutexattr_init overwrite an
+        // attribute that was never destroyed, and real code depends on that.
+        // The guest's own libfmodex.so does exactly that: its
+        // pthread_mutexattr_t lives on the stack, it never calls
+        // pthread_mutexattr_destroy, and it initialises a new attribute from
+        // the same stack slot for the next memory source.  The second call
+        // used to return EBUSY here, and FMOD turns that failure into "no
+        // memory source", which is how FMOD_System_Create came back with a
+        // NULL handle on 2026-11-16.
+        existing->type = PTHREAD_MUTEX_NORMAL;
+        existing->used = true;
         mutexUnlock(&gRegistryLock);
-        return EBUSY;
+        pthreadBridgeDiag("attr-reinit", attribute, caller);
+        return 0;
     }
     MutexAttrSlot* slot = freeSlot(gMutexAttributes);
     if (slot == nullptr) {
         mutexUnlock(&gRegistryLock);
+        pthreadBridgeDiag("attr-enomem", attribute, caller);
         return ENOMEM;
     }
     slot->guest = attribute;
@@ -6220,9 +6271,14 @@ int guestPthreadMutexAttrSetType(void* attribute, int type) {
 
 int guestPthreadMutexInit(void* mutex, const void* attribute) {
     if (mutex == nullptr) return EINVAL;
+    const uintptr_t caller =
+        reinterpret_cast<uintptr_t>(__builtin_return_address(0));
     mutexLock(&gRegistryLock);
     if (findSlot(gMutexes, mutex) != nullptr) {
         mutexUnlock(&gRegistryLock);
+        // NAMED, NOT JUST COUNTED: this is the shape that would stop FMOD's
+        // memory source from being created.
+        pthreadBridgeDiag("mutex-init-busy", mutex, caller);
         return EBUSY;
     }
     const int type = mutexTypeForAttributeLocked(attribute);

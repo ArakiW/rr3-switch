@@ -1037,6 +1037,37 @@ void loaderDiag(const char* format, ...) {
     }
 }
 
+// THE NAMES OF THE SYMBOLS THAT DID NOT RESOLVE.
+//
+// WHY: missRel is a COUNT.  A count cannot tell "the guest asked for a
+// symbol nobody in this process provides" from "the count is zero and
+// something else is wrong" -- and the second case is exactly the case the
+// 2026-11-16 Eden round landed in (missRel=0, and the guest's own
+// libfmodex.so still could not build a System).  So the names are written
+// out, once each, under their own budget with its own exhaustion line.
+void missingSymbolDiag(size_t imageIndex, const char* name) {
+    constexpr unsigned kBudget = 64;
+    static unsigned s_missingLines = 0;
+    static bool s_exhaustionReported = false;
+    if (s_missingLines >= kBudget) {
+        return;
+    }
+    ++s_missingLines;
+    char detail[256];
+    std::snprintf(detail, sizeof(detail), "missing-symbol image=%zu name=%s",
+                  imageIndex, name != nullptr ? name : "(null)");
+    rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                              "loader-diag", 0, 0, detail);
+    rr3::flushGuestBootLog("sdmc:/switch/rr3-native-rehost.guest-view.log");
+    if (s_missingLines == kBudget && !s_exhaustionReported) {
+        s_exhaustionReported = true;
+        rr3::appendGuestBootLine("sdmc:/switch/rr3-native-rehost.guest-view.log",
+                                  "loader-diag", 0, 0,
+                                  "missing-symbol budget exhausted (64 lines)");
+        rr3::flushGuestBootLog("sdmc:/switch/rr3-native-rehost.guest-view.log");
+    }
+}
+
 bool mapNormalSegmentedRange(size_t imageIndex, uint64_t pageOffset,
                              uint64_t bytes, u32 permission,
                              ElfLoaderSession* result) {
@@ -1707,6 +1738,7 @@ void applyLoaderTable(CrossImage* image, uint64_t address, uint64_t bytes,
             else {
                 ++context.result->missingRelocations;
                 addUnique(context.missingNames, name);
+                missingSymbolDiag(context.imageIndex, name);
             }
         }
         else {
@@ -3157,6 +3189,27 @@ GuestInitializationResult initializeGuestMainConstructors(
     result.completed = true;
     result.active = true;
     return result;
+}
+
+// THE EXPORT OF ONE NAMED IMAGE.
+//
+// The port's FMOD observer needs the guest's own libfmodex.so entry point
+// (FMOD_System_Create) to call it, and it must not hard-code a load order
+// or a base address: the image's runtime base is per-run.
+uintptr_t findLoaderExportBySoname(const char* soname, const char* name) {
+    if (soname == nullptr || name == nullptr) {
+        return 0;
+    }
+    const size_t index = embeddedSonameIndex(soname);
+    if (index >= gLoaderImageCount) {
+        return 0;
+    }
+    uintptr_t address = 0;
+    uint64_t symbolValue = 0;
+    if (!findExport(gLoaderImages[index], name, &address, &symbolValue)) {
+        return 0;
+    }
+    return address;
 }
 
 // Resolves an exported dynamic symbol from the main game image by name, so
