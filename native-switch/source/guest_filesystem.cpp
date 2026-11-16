@@ -220,6 +220,10 @@ unsigned long long g_resolvedPathCount = 0;
 // guest asked for the main menu's layout.
 unsigned long long g_guiLayoutOpens = 0;
 unsigned long long g_guiTwosquareOpens = 0;
+// THE RACE MARKERS.  Counted as RESOLUTION EVENTS (the guest asked for that
+// screen's layout), which is what the census always meant to measure.
+unsigned long long g_startLightsOpens = 0;
+unsigned long long g_raceScreenOpens = 0;
 
 unsigned long long guestResolvedPathCount() {
     return __atomic_load_n(&g_resolvedPathCount, __ATOMIC_RELAXED);
@@ -231,6 +235,14 @@ unsigned long long guestGuiLayoutOpens() {
 
 unsigned long long guestGuiTwosquareOpens() {
     return __atomic_load_n(&g_guiTwosquareOpens, __ATOMIC_RELAXED);
+}
+
+unsigned long long guestStartLightsOpens() {
+    return __atomic_load_n(&g_startLightsOpens, __ATOMIC_RELAXED);
+}
+
+unsigned long long guestRaceScreenOpens() {
+    return __atomic_load_n(&g_raceScreenOpens, __ATOMIC_RELAXED);
 }
 
 void logResolvedPathOnce(const char* path) {
@@ -252,6 +264,19 @@ void logResolvedPathOnce(const char* path) {
         if (std::strstr(path, "main_menu_twosquare.gui") != nullptr) {
             __atomic_add_fetch(&g_guiTwosquareOpens, 1ULL, __ATOMIC_RELAXED);
         }
+    }
+    // THE RACE MARKERS, COUNTED HERE -- before the thinning below and before
+    // the dedup -- so the number cannot depend on what the port writes to the
+    // log.  The census used to count the STRINGS in the log, and the only
+    // occurrences left in it are the port's own path-trace lines: the race
+    // screens are requested LATE, so after the dedup table filled up their
+    // paths were never written and the count collapsed.  That is the whole
+    // 27-to-2 story.  See docs/OPEN-ISSUES.md section 9.47.
+    if (std::strstr(path, "gui/processed/StartLightsScreen.gui") != nullptr) {
+        __atomic_add_fetch(&g_startLightsOpens, 1ULL, __ATOMIC_RELAXED);
+    }
+    if (std::strstr(path, "gui/processed/InGameScreen.gui") != nullptr) {
+        __atomic_add_fetch(&g_raceScreenOpens, 1ULL, __ATOMIC_RELAXED);
     }
     // ⇒ ⇒ AND THE TRACE IS NOW THINNED TO THE PART THE CENSUS READS.
     //

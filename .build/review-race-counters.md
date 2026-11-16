@@ -1,0 +1,70 @@
+# TASK: adversarial review of the race-marker counters (READ ONLY)
+
+Repo: E:\AI\RealRacing3-switch.  READ ONLY: do NOT edit, do NOT build, do NOT
+run Eden, do NOT commit, do NOT push.  Report findings only.
+
+## WHAT WAS CHANGED (git diff + the new untracked test file)
+
+    native-switch/include/rr3/guest_filesystem.hpp   two counter declarations
+    native-switch/source/guest_filesystem.cpp        the counters + the increments
+    native-switch/source/guest_view_probe.cpp        the census line gains two fields
+    tools/Test-OnEden.ps1                            the census reads the counters
+    native-switch/tests/test_guest_race_marker_contract.py   (new)
+
+Read them with:
+    git -C E:\AI\RealRacing3-switch diff
+    (and read the new test file directly)
+
+## THE FINDING BEHIND THE CHANGE
+
+The round census counted "start lights" and "race screen" by REGEXING the
+guest-view log for the strings "StartLightsScreen" and "InGameScreen".  The
+only occurrences of those strings in the log are the port's OWN path-trace
+lines, whose number is governed by the trace's policy (a gui/processed/
+thinning, a 2048-slot dedup with no eviction) and by the guest-log quota of
+4000 lines.  So the number measured the log policy, not the game.  The
+port now keeps the two markers as counters, incremented in
+logResolvedPathOnce() BEFORE the thinning and BEFORE the dedup, and the
+census reads those counters.
+
+Measured in the round archive (400 s, same host): port counters 30 start
+lights / 45 race screen; old text count 2 / 2.
+
+## WHAT I WANT YOU TO ATTACK
+
+1. Does the increment really happen on EVERY resolution event of those two
+   paths, or is there an early return / a code path in logResolvedPathOnce()
+   that bypasses it?  Trace every path into that function.
+2. Is the count atomic and safe as called (the port is multi-threaded)?
+   Compare with the existing g_guiLayoutOpens counters.
+3. Does the census in tools/Test-OnEden.ps1 parse the right field?  The
+   census line is written once per frame and the counters GROW, so the LAST
+   match is the final value.  Check: could the regex match some other line
+   in the log and produce a wrong number?  Could it match a line from a
+   PREVIOUS run?  Check how the log is archived and whether stale lines can
+   survive into the count.
+4. The census buffer is char cdiag[512] and the longest census line measured
+   in a real 400 s round is 339 characters.  Is that still true with the two
+   new fields, and is there a path where the line is longer (large counter
+   values, long paths, an error field)?
+5. Does the new contract test actually protect the property it claims, or
+   can it pass while the property is broken?  It parses the body of
+   logResolvedPathOnce() with a hand-written brace matcher -- is that
+   matcher correct?  Could the assertions pass vacuously?
+6. Is there any remaining way the port's own instrumentation can bias this
+   measurement (the guest-log quota, the trace's dedup, the order of the
+   increments)?
+7. Anything in the diff that is wrong, fragile, or that would break on a
+   different host.
+8. Does the counter semantics match the doc claims in
+   docs/OPEN-ISSUES.md section 9.47 (which says the numbers are RESOLUTION
+   EVENTS, that 30 is a lower bound on races and that the race-screen count
+   exceeds the start-lights count because InGameScreen.gui is re-resolved
+   during a race)?
+
+## OUTPUT FORMAT
+
+For each finding: the file and line, what is wrong, why it is wrong, and the
+smallest fix.  Rank by severity.  If a claim of mine above is wrong, say so
+explicitly and show the evidence.  Do not invent problems: if a section is
+clean, say so.

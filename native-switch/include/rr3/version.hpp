@@ -19,4 +19,4 @@
 // So a version bump is one edit here plus one in the Makefile plus one in
 // the .nmeta, and a forgotten one is a TEST FAILURE rather than a lie on
 // the console's screen.
-#define RR3_PORT_VERSION "0.22.13"
+#define RR3_PORT_VERSION "0.22.14"

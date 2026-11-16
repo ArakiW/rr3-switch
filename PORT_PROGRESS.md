@@ -14238,3 +14238,36 @@ aborts).  **=> A REVIEW IS EVIDENCE, NOT VERDICT** -- the same wrong field
 that produced the SPAL misreading was still sitting in the decode, and the
 review walked into it too.  The decode now names every family it claims,
 with the field each one comes from.
+
+### 2026-11-16 The 27-to-2 start-lights collapse was the CENSUS, not the game
+
+**WHAT WAS MEASURED.**  The round census counted the strings
+"StartLightsScreen" and "InGameScreen" anywhere in the guest-view log.  The
+only occurrences of those strings left in the log are the port's OWN path
+trace lines, and their number is set by the trace's thinning and its
+2048-slot dedup -- not by the game.  The archived round `mapgate1` log
+(67,270,351 B / 422,319 lines) holds exactly 2 of each, and both are
+`phase=map-app` / `phase=stat-layout` lines.  The guest-log stream is
+quota-limited at 4,000 lines (ordinal max = exactly 4000), so the guest's
+own screen names are not in the part that survived.
+
+**WHAT WAS CHANGED.**  The port now counts the two race markers as
+RESOLUTION EVENTS (`g_startLightsOpens` / `g_raceScreenOpens`, counted
+before the trace is thinned and de-duplicated), writes them into the census
+line as `lights=%llu race=%llu`, and the round census reads those counters.
+The old text counts stay as a cross-check.  A new contract test
+(`native-switch/tests/test_guest_race_marker_contract.py`) asserts the
+counters are incremented before the thinning, so the bug cannot come back.
+
+**WHAT IT MEASURES NOW.**  Two rounds, the same build, the second one restored
+the first one's starting save.  Round `racecount1` (409 s): 30 / 45; round
+`racecount2` (408 s): **6 / 9** -- the port's number moves with the game,
+because the guest's event progression is not deterministic, while the old
+text count stayed at **2 / 2 in both rounds** and in every round before them.
+A number that cannot move is not a measurement.  Round `racecount1`:
+**30 start-lights resolutions / 45 race-screen resolutions** from the port's
+counters, against the old text count of 2 / 2; frames 2400, pixels lit
+921600 of 921600, md5 mismatch 0, TrackDesc::load failures 0, race HUD
+string 110.  The guest asked for the race screens every 9 to 13 seconds for
+the whole round -- **the game was racing continuously and the "regression"
+was the instrument.**  Full reasoning: docs/OPEN-ISSUES.md section 9.47.

@@ -23,6 +23,14 @@ unsigned long long guestResolvedPathCount();
 // section 9.37.
 unsigned long long guestGuiLayoutOpens();
 unsigned long long guestGuiTwosquareOpens();
+// THE RACE MARKERS, COUNTED AS EVENTS FOR THE SAME REASON.  The census used
+// to count the STRINGS "StartLightsScreen" and "InGameScreen" in the log,
+// and the only occurrences of those strings left in it are the port's own
+// path-trace lines -- whose content is decided by the trace's thinning and
+// its dedup, not by the game.  The number therefore measured the log's
+// policy.  See docs/OPEN-ISSUES.md section 9.47.
+unsigned long long guestStartLightsOpens();
+unsigned long long guestRaceScreenOpens();
 
 constexpr size_t kExternalDataVolumeCount = 7;
 

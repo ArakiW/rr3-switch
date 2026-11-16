@@ -9080,7 +9080,7 @@ void* frameLoopDriver(void* opaque) {
                     " tt=%llu tr=%llu ts=%llu tp=%llu"
                     " jni=%llu jnitex=%llu jnistr=%llu jnifile=%llu jnioth=%llu"
                     " fs=%llu fsr=%llu fshit=%llu fsmiss=%llu"
-                    " gui=%llu twosq=%llu",
+                    " gui=%llu twosq=%llu lights=%llu race=%llu",
                     static_cast<unsigned long long>(frames),
                     static_cast<int>(g_hdBoundAfterRender),
                     static_cast<int>(g_hdViewportAfterRender[0]),
@@ -9097,7 +9097,9 @@ void* frameLoopDriver(void* opaque) {
                     // THE CENSUS'S COUNTERS, read by the round's census instead
                     // of a regex over this log's text (docs/OPEN-ISSUES.md 9.37).
                     static_cast<unsigned long long>(rr3::guestGuiLayoutOpens()),
-                    static_cast<unsigned long long>(rr3::guestGuiTwosquareOpens()));
+                    static_cast<unsigned long long>(rr3::guestGuiTwosquareOpens()),
+                    static_cast<unsigned long long>(rr3::guestStartLightsOpens()),
+                    static_cast<unsigned long long>(rr3::guestRaceScreenOpens()));
                 appendGuestBootLine(
                     "sdmc:/switch/rr3-native-rehost.guest-view.log",
                     "guest-frame-census", 249, 0, cdiag);

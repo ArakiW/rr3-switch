@@ -1,0 +1,50 @@
+THE RACE MARKERS ARE COUNTED BY THE PORT, NOT BY THE LOG
+
+The round census counted "start lights" and "race screen" by REGEXING the
+guest-view log for the strings "StartLightsScreen" and "InGameScreen".  The
+only occurrences of those strings left in the log are the port's OWN
+path-trace lines, and their number is decided by the port's logging policy,
+not by the game:
+
+  * the trace is thinned to gui/processed/ and de-duplicated by a 2048-slot
+    table with no eviction, so a path is written AT MOST ONCE for the whole
+    run -- "StartLightsScreen.gui" can produce at most one map-app line no
+    matter how many times the guest asks for that screen;
+  * the guest's own log stream is quota-limited (kAndroidLogAnyBudget = 4000
+    in guest_view_trace.cpp:37), and the archived round mapgate1 ends with
+    the ordinal at EXACTLY 4000, so the guest's own screen names are not in
+    the part that survived.
+
+So the number was the trace's policy all along: 27 in round yield2 (before
+the thinning) and 2 after it, from the same game.  The experiment section
+9.44.3 proposed -- "the same binary with the trace restored" -- would have
+restored the count without changing what was counted.
+
+THE FIX.  The port keeps the two markers as COUNTS, incremented in
+logResolvedPathOnce() BEFORE the thinning and BEFORE the dedup, i.e. as
+RESOLUTION EVENTS, which is what the census always meant to measure:
+
+  * guest_filesystem.cpp: g_startLightsOpens / g_raceScreenOpens, with
+    guestStartLightsOpens() / guestRaceScreenOpens() accessors, read with
+    the same relaxed atomic pattern as the existing layout counters;
+  * guest_view_probe.cpp: the census line now carries lights=%llu race=%llu
+    next to gui=%llu twosq=%llu;
+  * tools/Test-OnEden.ps1: the round census reads the PORT's counters.  The
+    old text counts survive as msStartLightsText / msRaceScreenText, as a
+    cross-check: a port whose counters and whose log disagree is itself
+    worth knowing about;
+  * a new contract test, native-switch/tests/test_guest_race_marker_contract.py,
+    parses the body of logResolvedPathOnce() and asserts the counters are
+    incremented BEFORE the thinning, so the bug cannot come back.
+
+MEASURED (round racecount1, 400 s, same host): 30 start-lights resolutions
+and 45 race-screen resolutions from the port's counters, against the old text
+count of 2 and 2.  Frames 2400, pixels lit 921600 of 921600, md5 mismatch 0,
+TrackDesc::load failures 0.
+
+The counters count RESOLUTION EVENTS, not completed races, so 30 is a lower
+bound on the races in 400 s and 45 is a count of layout requests (the race
+screen is re-resolved during a race).  docs/OPEN-ISSUES.md section 9.47 has
+the whole chain, and it also corrects the two stale readings that section
+9.47 settles: section 9.44.3's "next experiment" and section 9.46's closing
+sentence, which called this a game regression.

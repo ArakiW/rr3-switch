@@ -53,7 +53,7 @@
             <Language>AmericanEnglish</Language>
             <IconPath>@SDK_SAMPLE_ICON@</IconPath>
         </Icon>
-        <DisplayVersion>0.22.13</DisplayVersion>
+        <DisplayVersion>0.22.14</DisplayVersion>
         <StartupUserAccount>None</StartupUserAccount>
         <UserAccountSwitchLock>Disable</UserAccountSwitchLock>
         <SupportedLanguage>AmericanEnglish</SupportedLanguage>

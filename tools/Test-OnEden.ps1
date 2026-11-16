@@ -740,8 +740,10 @@ $summary = [ordered]@{
     # reads exactly the same value in a race (164 samples) and out of one
     # (102 samples). It is a live-looking number that carries no information
     # about the visible screen, so it is not used as a criterion here.
-    msStartLights       = 0   # "StartLightsScreen"  (the race's start sequence)
-    msRaceScreen        = 0   # "InGameScreen"      (the race itself)
+    msStartLights       = 0   # the race's start sequence, counted by the PORT
+    msRaceScreen        = 0   # the race itself, counted by the PORT
+    msStartLightsText   = 0   # the same, counted in the log's text (cross-check)
+    msRaceScreenText    = 0   # the same, counted in the log's text (cross-check)
     msRaceHud           = 0   # "Reload HUD planes" (the race HUD was built)
     msRaceObjective     = 0   # the race-only objective text
     msAstFilesOnCard    = 0   # *.ast on the card: the physical proof the .ast round trip works
@@ -941,8 +943,29 @@ if ($guestLogArchived -eq 'archived') {
     # three INDEPENDENT facts, and the objective text is a fourth: it is
     # localised Chinese, so it only appears when the localisation pipeline
     # works, which makes it a good cross-check on the other three.
-    $summary.msStartLights = [regex]::Matches($guestText, 'StartLightsScreen').Count
-    $summary.msRaceScreen  = [regex]::Matches($guestText, 'InGameScreen').Count
+    # THE RACE MARKERS COME FROM THE PORT'S COUNTERS, not from the log's
+    # text.  The text version counted the strings "StartLightsScreen" and
+    # "InGameScreen" ANYWHERE in the log -- and the only occurrences left in
+    # it are the port's own path-trace lines, whose content is decided by the
+    # trace's thinning and its 2048-slot dedup.  So the number measured the
+    # log's policy, not the game: it fell from 27 to 2 when the trace was
+    # thinned (docs/OPEN-ISSUES.md section 9.47).  The old counts are kept
+    # below as a cross-check, because a port whose counters and whose log
+    # disagree is itself worth knowing about.
+    $portStartLights = [regex]::Matches($guestText, ' lights=(\d+)(?:\s|$)')
+    $portRaceScreen = [regex]::Matches($guestText, ' race=(\d+)(?:\s|$)')
+    $summary.msStartLightsText = [regex]::Matches($guestText, 'StartLightsScreen').Count
+    $summary.msRaceScreenText = [regex]::Matches($guestText, 'InGameScreen').Count
+    if ($portStartLights.Count -gt 0 -and $portRaceScreen.Count -gt 0) {
+        # The LAST value is the final count: the counter grows.
+        $summary.msStartLights = [int]$portStartLights[$portStartLights.Count - 1].Groups[1].Value
+        $summary.msRaceScreen = [int]$portRaceScreen[$portRaceScreen.Count - 1].Groups[1].Value
+    }
+    else {
+        # An older log, without the counters: fall back to the text.
+        $summary.msStartLights = $summary.msStartLightsText
+        $summary.msRaceScreen = $summary.msRaceScreenText
+    }
     $summary.msRaceHud     = [regex]::Matches($guestText, 'Reload HUD planes').Count
     # The race-only objective text is CHINESE, so it is written as \u escapes:
     # PowerShell 5.1 reads a BOM-less file as ANSI, and a literal Chinese
@@ -1065,8 +1088,9 @@ $runSummaryPath = Join-Path $archive 'run-summary.txt'
     ('  front-end layout opened  {0}   ("gui/processed/main_menu/main_menu_twosquare.gui" in the PORT trace -- want > 0 for the main menu panel)' -f $summary.msTwosquare)
     ('  main menu layouts open   {0}   (gui/processed/main_menu/ -- want > 0 once the front end is up)' -f $summary.msMainMenuLayouts)
     ('  EventMapScreen           {0}   (want > 0 for the front end)' -f $summary.msEventMapScreen)
-    ('  start lights             {0}   (StartLightsScreen -- the race start sequence)' -f $summary.msStartLights)
-    ('  race screen              {0}   (InGameScreen -- the race itself; want > 0 to be IN a race)' -f $summary.msRaceScreen)
+    ('  start lights             {0}   (the race start sequence, counted by the PORT)' -f $summary.msStartLights)
+    ('  race screen              {0}   (the race itself, counted by the PORT; want > 0 to be IN a race)' -f $summary.msRaceScreen)
+    ('  race markers in the log  {0} start lights / {1} race screen (the text count; it measures the path trace, not the game)' -f $summary.msStartLightsText, $summary.msRaceScreenText)
     ('  race marker: HUD string  {0}   ("Reload HUD planes" -- the guest RENDERS this debug string during a race; it is a race marker, NOT evidence that the HUD was built)' -f $summary.msRaceHud)
     ('  race marker: objective   {0}   (the localised objective string in the guest log; a race marker, and a cross-check that the text pipeline works)' -f $summary.msRaceObjective)
     ''
