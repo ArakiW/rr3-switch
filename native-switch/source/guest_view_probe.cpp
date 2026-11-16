@@ -1,5 +1,6 @@
 #include "rr3/jni_bridge.hpp"
 #include "rr3/guest_filesystem.hpp"
+#include "rr3/fmod_shim.hpp"
 
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
@@ -9072,9 +9073,11 @@ void* frameLoopDriver(void* opaque) {
                     fshit = prevFsHit;
                     fsmiss = prevFsMiss;
                 }
+                // THE FMOD SHIM'S STATE, read once per census line.
+                const rr3::FmodShimStats fmodStats = rr3::fmodShimStats();
                 std::snprintf(
                     cdiag, sizeof(cdiag),
-                    "frame=%llu lights=%llu race=%llu census bound=%d viewport=%d,%d,%d,%d"
+                    "frame=%llu lights=%llu race=%llu fmst=0x%llx snd=%llu str=%llu ch=%llu census bound=%d viewport=%d,%d,%d,%d"
                     " scene=fbo=%u size=%ux%u binds=%u changes=%u vpChanges=%u"
                     " draws=%u arr=%u"
                     " tt=%llu tr=%llu ts=%llu tp=%llu"
@@ -9082,6 +9085,30 @@ void* frameLoopDriver(void* opaque) {
                     " fs=%llu fsr=%llu fshit=%llu fsmiss=%llu"
                     " gui=%llu twosq=%llu",
                     static_cast<unsigned long long>(frames),
+                    // THE RACE NUMBERS AND THE FMOD STATE COME FIRST, ON
+                    // PURPOSE.  The log file is written by two threads into
+                    // one file, so a line can be SPLIT: the head keeps its
+                    // "phase=..." prefix and the tail loses it.  The fields
+                    // at the END of a line are the ones a split can
+                    // separate from their line, so the numbers the census
+                    // reads are at the HEAD, where a split cannot take
+                    // them away.
+                    static_cast<unsigned long long>(rr3::guestStartLightsOpens()),
+                    static_cast<unsigned long long>(rr3::guestRaceScreenOpens()),
+                    // THE FMOD SHIM'S OWN STATE.  The shim's self-test used
+                    // to log a FAILING value into the log where nobody read
+                    // it (bits=0xf1f, expected=0xfff): the guest could not
+                    // create a sound or a DSP at all, and the port's own
+                    // instrument said so.  It is in the census now.
+                    static_cast<unsigned long long>(fmodStats.selfTestBits),
+                    static_cast<unsigned long long>(fmodStats.soundCreates),
+                    static_cast<unsigned long long>(fmodStats.streamCreates),
+                    static_cast<unsigned long long>(fmodStats.channelsStarted),
+                    static_cast<int>(g_hdBoundAfterRender),
+                    static_cast<int>(g_hdViewportAfterRender[0]),
+                    static_cast<int>(g_hdViewportAfterRender[1]),
+                    static_cast<int>(g_hdViewportAfterRender[2]),
+                    static_cast<int>(g_hdViewportAfterRender[3]),
                     // THE TWO RACE NUMBERS COME FIRST, ON PURPOSE.  The log
                     // file is written by two threads into one file, so a
                     // line can be SPLIT: the head keeps its "phase=..."
@@ -9091,13 +9118,6 @@ void* frameLoopDriver(void* opaque) {
                     // separate from their line, so the two numbers the
                     // census reads are at the HEAD, where a split cannot
                     // take them away.
-                    static_cast<unsigned long long>(rr3::guestStartLightsOpens()),
-                    static_cast<unsigned long long>(rr3::guestRaceScreenOpens()),
-                    static_cast<int>(g_hdBoundAfterRender),
-                    static_cast<int>(g_hdViewportAfterRender[0]),
-                    static_cast<int>(g_hdViewportAfterRender[1]),
-                    static_cast<int>(g_hdViewportAfterRender[2]),
-                    static_cast<int>(g_hdViewportAfterRender[3]),
                     stats.lastNonZeroFramebuffer, stats.lastNonZeroFboWidth,
                     stats.lastNonZeroFboHeight, stats.bindFramebuffer,
                     stats.fboBindChanges, stats.viewportChanges,

@@ -105,8 +105,8 @@ def mutate(root, name):
     elif name == "F-numbers-back-at-the-tail":
         path = os.path.join(root, VIEW)
         text = read(path)
-        old = '"frame=%llu lights=%llu race=%llu census bound=%d'
-        new = '"frame=%llu census bound=%d'
+        old = '"frame=%llu lights=%llu race=%llu'
+        new = '"frame=%llu'
         assert old in text, "mutant F did not apply"
         text = text.replace(old, new)
         old2 = '" gui=%llu twosq=%llu",'

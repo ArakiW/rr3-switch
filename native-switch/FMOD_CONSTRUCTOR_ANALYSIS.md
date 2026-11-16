@@ -102,3 +102,33 @@ Report line: `fmod_audio silent=yes ... audible=0 ...`.
 This does not change the dependency-constructor path: the two FMOD
 constructors only initialize global state and still pass 3/3 on device.
 Device open happens later, when (and if) the game calls `FMOD_System_Init`.
+
+### The FMOD API shim, and what "silent" does NOT mean (2026-11-16)
+
+**THE GUEST'S FMOD IS THE PORT'S OWN SHIM.**  The port intercepts the
+guest's FMOD symbols at the symbol level (`_ZN4FMOD6System4initEijPv` and
+about sixty more) and serves them from `source/fmod_shim.cpp`.  The
+guest's `libfmodex.so` is loaded, but its API never runs.
+
+**=> SO THE PORT MODELS THE FMOD API; IT DOES NOT DECODE, MIX OR OUTPUT
+AUDIO.**  A Sound is a handle with a state and a length, a Channel a handle
+with a volume and a 3-D position, a DSP a node in a list.  There is no PCM
+in the port, and `audible` stays 0 -- that is what "silent stub" means,
+and it is why the OpenSL device above is (so far) never reached: the guest's
+FMOD would have to be the real one for anything to be enqueued.
+
+**=> AND THE API LAYER ITSELF WAS BROKEN.**  The Sound and DSP pools
+searched for a slot with `released == true`, and every slot starts
+`released == false`, so `createSound()` and `createDSPByType()` could not
+allocate anything in a fresh session.  The shim's own self-test said so
+(`bits=0xf1f expected=0xfff`, and the three missing bits are exactly
+createSound, the callback that needs a channel, and playSound) -- in a log
+line nobody read.  Fixed by `markPoolsFree()`, and the self-test's result
+is now in the census (`fmst=0x%llx snd=%llu str=%llu ch=%llu`) where the
+round's summary prints it.
+
+**=> THE TWO CLAIMS ARE SEPARATE AND BOTH MUST BE MADE.**  "The API works"
+and "there is sound" are different facts.  The first is true now; the
+second is still false, and the way to make it true is named in
+docs/OPEN-ISSUES.md section 9.48 (R1: let the guest's real `libfmodex.so`
+run; R2: the port decodes and mixes itself).

@@ -1,0 +1,56 @@
+THE FMOD API LAYER WAS DEAD TOO: THE POOLS HAD NO FREE SLOTS
+
+The port has no sound, and the layer under the sound was broken as well.
+
+WHAT THE PORT IS.  The port intercepts the guest's FMOD symbols at the
+symbol level -- _ZN4FMOD6System4initEijPv and about sixty more -- and
+serves them from source/fmod_shim.cpp.  The guest's libfmodex.so is
+loaded, but its API never runs.  So the port MODELS the FMOD API: a Sound
+is a handle with a state and a length, a Channel a handle with a volume
+and a 3-D position, a DSP a node in a list.  There is no PCM in the port
+and audible is 0 by design.  "The API works" and "there is sound" are two
+different claims, and only the first one is about this change.
+
+WHAT WAS BROKEN.  The Sound and DSP pools searched for a slot with
+released == true, and every slot starts released == false -- so in a fresh
+session createSound() and createDSPByType() could not allocate ANYTHING.
+The guest could never make a sound and never make a DSP.  The ChannelGroup
+pool already had it right (owner == nullptr means free), which is why its
+self-test bit passed.
+
+AND THE PORT KNEW, AND NOBODY READ IT.  The shim runs a twelve-check
+self-test and wrote the result into the log: "bits=0xf1f expected=0xfff".
+The three missing bits are exactly createSound (5), the callback that needs
+a channel (6) and playSound (7).  A failing instrument that is a log line
+nobody reads is worse than no instrument, because it looks like a passing
+one.
+
+THE FIX.
+
+  * markPoolsFree() marks the never-used slots free once, before the first
+    allocation.  The pools' meaning does not change: released == true
+    still means "free", and the guest never sees the flag.
+  * The self-test's result is now in the CENSUS -- fmst=0x%llx snd=%llu
+    str=%llu ch=%llu, at the HEAD of the census line -- so the round's
+    summary prints it and nobody has to go looking in a 75 MB log.
+  * A new contract test (native-switch/tests/test_fmod_pool_contract.py)
+    keeps both true, and it is mutation-tested: six ways of breaking the
+    property, all six caught (.build/mutation-test-fmod-pool.py).
+  * The mutation harness caught two weak assertions in that test's first
+    version -- one accepted a string that also appeared in a comment, one
+    accepted a value that was parsed and thrown away.  Both are now
+    assertions about what the code DOES.
+
+AND THE OTHER AUDIO DEFECTS ARE NOW MEASURED TOO.  The game pops an error
+dialog every round: "EngineRamp::Load() failed to load audio/Vehicles",
+32 times, once per car.  It wants audio/Vehicles/v8_10/id_303_accel.decomp
+(a content version and a car id) and the shipped data has the model-named
+layout.  The game's own asset list matches the shipped files exactly (325
+entries, 325 files), so this is a DATA-NAMING gap, not a resolver bug.
+
+docs/OPEN-ISSUES.md section 9.48 has the whole chain, including the two
+routes to actual sound (R1: let the guest's real libfmodex.so run; R2: the
+port decodes and mixes itself), the three-layer measurement plan (P1 the
+guest produces PCM, P2 the port consumes it, P3 the hardware plays it),
+and the fact that this host's audren is the raw service API with no
+nn::audio wrapper, so the node graph has to be built by hand.

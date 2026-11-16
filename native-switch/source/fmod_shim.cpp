@@ -55,6 +55,41 @@ unsigned int gGroupCursor = 0;
 unsigned int gConnectionCursor = 0;
 unsigned int gChannelCursor = 0;
 
+// THE POOLS' FREE MARKERS.  A slot is free when it has been released -- and
+// a NEVER-USED slot is free too.
+//
+// MEASURED 2026-11-16 (round racecount3): the shim's own self-test logged
+// "bits=0xf1f expected=0xfff", and the three missing bits are exactly
+// createSound (5), the callback that needs a channel (6) and playSound (7).
+// The cause: the Sound and DSP pools searched for a slot with
+// released==true, and every slot starts released==false -- so in a fresh
+// session createSound() and createDSPByType() could not allocate ANYTHING.
+// The guest could never make a sound and never make a DSP, and the game's
+// audio code paths all failed on that.
+//
+// The ChannelGroup pool already had it right (owner==nullptr means free),
+// which is why ITS bit passed.
+//
+// The marker is set once, before the first allocation, so the pools' meaning
+// does not change: released==true still means "free", and the guest never
+// sees the flag.
+void markPoolsFree() {
+    static bool done = false;
+    if (done) {
+        return;
+    }
+    done = true;
+    for (unsigned int index = 0; index < kMaxSounds; ++index) {
+        gSounds[index].released = true;
+        gSounds[index].inUse = false;
+    }
+    for (unsigned int index = 0; index < kMaxDsps; ++index) {
+        gDsps[index].released = true;
+        gDsps[index].userData = nullptr;
+        gDsps[index].owner = nullptr;
+    }
+}
+
 // ---- deferred callback queue ----------------------------------------------
 //
 // Answering a channel callback inline re-enters the engine from inside its own
@@ -314,6 +349,8 @@ FMOD_RESULT fmodSystemCreateSound(FMOD::System* self, const char* name, unsigned
     if (sound == nullptr) {
         return FMOD_ERR_INVALID_HANDLE;
     }
+    // THE POOL MUST HAVE A FREE SLOT.  See markPoolsFree().
+    markPoolsFree();
     FMOD::Sound* created = nullptr;
     for (unsigned int attempt = 0; attempt < kMaxSounds; ++attempt) {
         FMOD::Sound* candidate = &gSounds[(gSoundCursor + attempt) % kMaxSounds];
@@ -369,6 +406,8 @@ FMOD_RESULT fmodSystemCreateDSPByType(FMOD::System* self, FMOD_DSP_TYPE type, FM
     if (dsp == nullptr) {
         return FMOD_ERR_INVALID_HANDLE;
     }
+    // THE POOL MUST HAVE A FREE SLOT.  See markPoolsFree().
+    markPoolsFree();
     FMOD::DSP* created = allocDsp(type, self);
     if (created == nullptr) {
         return FMOD_ERR_INVALID_HANDLE;
@@ -381,6 +420,8 @@ FMOD_RESULT fmodSystemCreateDSP(FMOD::System* self, FMOD_DSP_DESCRIPTION* descri
     if (dsp == nullptr) {
         return FMOD_ERR_INVALID_HANDLE;
     }
+    // THE POOL MUST HAVE A FREE SLOT.  See markPoolsFree().
+    markPoolsFree();
     const FMOD_DSP_TYPE type = FMOD_DSP_TYPE_UNKNOWN;
     FMOD::DSP* created = allocDsp(type, self);
     if (created == nullptr) {

@@ -753,6 +753,14 @@ $summary = [ordered]@{
     # The frame the census sampled the counters at: the counters grow, and
     # the last line in the log is a SAMPLE of them, not the end of the run.
     msCensusFrame       = 0
+    # THE FMOD SHIM'S STATE.  fmst is the shim's own self-test bits: every
+    # check the shim makes about itself, and 0xfff means all twelve pass.
+    # It was a log line nobody read (the round archive shows bits=0xf1f),
+    # and it is in the census now.
+    msFmodSelfTest      = '000'
+    msFmodSounds        = 0   # sounds the guest asked the port for
+    msFmodStreams       = 0   # streams the guest asked the port for
+    msFmodChannels      = 0   # channels the guest started
     msRaceHud           = 0   # "Reload HUD planes" (the race HUD was built)
     msRaceObjective     = 0   # the race-only objective text
     msAstFilesOnCard    = 0   # *.ast on the card: the physical proof the .ast round trip works
@@ -1008,6 +1016,23 @@ if ($guestLogArchived -eq 'archived') {
         $summary.msRaceScreen = $summary.msRaceScreenText
         $summary.msRaceMarkerSource = 'text'
     }
+    # THE FMOD SHIM'S STATE, read out of the census line.
+    $fmodBits = [regex]::Matches($censusText, ' fmst=0x([0-9a-fA-F]+)')
+    $fmodSnd = [regex]::Matches($censusText, ' snd=(\d+)')
+    $fmodStr = [regex]::Matches($censusText, ' str=(\d+)')
+    $fmodCh = [regex]::Matches($censusText, ' ch=(\d+)')
+    if ($fmodBits.Count -gt 0) {
+        $summary.msFmodSelfTest = $fmodBits[$fmodBits.Count - 1].Groups[1].Value
+        if ($fmodSnd.Count -gt 0) {
+            $summary.msFmodSounds = [int]$fmodSnd[$fmodSnd.Count - 1].Groups[1].Value
+        }
+        if ($fmodStr.Count -gt 0) {
+            $summary.msFmodStreams = [int]$fmodStr[$fmodStr.Count - 1].Groups[1].Value
+        }
+        if ($fmodCh.Count -gt 0) {
+            $summary.msFmodChannels = [int]$fmodCh[$fmodCh.Count - 1].Groups[1].Value
+        }
+    }
     $summary.msRaceHud     = [regex]::Matches($guestText, 'Reload HUD planes').Count
     # The race-only objective text is CHINESE, so it is written as \u escapes:
     # PowerShell 5.1 reads a BOM-less file as ANSI, and a literal Chinese
@@ -1134,6 +1159,8 @@ $runSummaryPath = Join-Path $archive 'run-summary.txt'
     ('  race screen              {0}   (the race itself, counted by the {1}; want > 0 to be IN a race)' -f $summary.msRaceScreen, $summary.msRaceMarkerSource)
     ('  census sample frame      {0}   (the frame the counters were sampled at; the guest keeps working after the last frame)' -f $summary.msCensusFrame)
     ('  race markers in the log  {0} start lights / {1} race screen (the text count; it measures the path trace, not the game)' -f $summary.msStartLightsText, $summary.msRaceScreenText)
+    ('  FMOD shim self-test     0x{0}   (want 0xfff: every check the shim makes about itself)' -f $summary.msFmodSelfTest)
+    ('  FMOD sounds/streams/ch  {0}/{1}/{2}   (the guest asked the port for this many sounds, streams and channels)' -f $summary.msFmodSounds, $summary.msFmodStreams, $summary.msFmodChannels)
     ('  race marker: HUD string  {0}   ("Reload HUD planes" -- the guest RENDERS this debug string during a race; it is a race marker, NOT evidence that the HUD was built)' -f $summary.msRaceHud)
     ('  race marker: objective   {0}   (the localised objective string in the guest log; a race marker, and a cross-check that the text pipeline works)' -f $summary.msRaceObjective)
     ''

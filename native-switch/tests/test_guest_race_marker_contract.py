@@ -161,10 +161,15 @@ def main():
     #    written by two threads into one file and a line can be SPLIT; the
     #    fields at the END of a line are the ones a split can separate from
     #    their line.
-    assert '"frame=%llu lights=%llu race=%llu census bound=%d' in view, \
-        "the race numbers are not at the head of the census line"
+    #    THE ORDER IS THE PROPERTY, NOT THE WHOLE FORMAT STRING.  The
+    #    census grew new fields after this test was written, and a test that
+    #    pinned the entire string failed on an unrelated addition -- a
+    #    brittle test, not a caught defect.
     assert '" gui=%llu twosq=%llu",' in view, \
-        "the census line's tail still holds the race numbers"
+        "the census line's tail changed"
+    head = view[view.index('"frame=%llu'):view.index('census bound=%d')]
+    assert 'lights=%llu' in head and 'race=%llu' in head, \
+        "the race numbers are not in the head of the census line"
     assert "rr3::guestStartLightsOpens()" in view
     assert "rr3::guestRaceScreenOpens()" in view
 
